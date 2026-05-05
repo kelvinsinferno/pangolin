@@ -12,6 +12,13 @@ description = "Cryptographic primitives — AEAD, KDF, signing, key wrapping. Re
 [lints]
 workspace = true
 
+[features]
+# Gates tests that intentionally exercise the locked KDF parameters
+# (256 MiB / t=3) — too slow for the default `cargo test` lane, but
+# critical for end-of-issue regression sweeps. Run with:
+#   cargo test --features slow-tests
+slow-tests = []
+
 [dependencies]
 chacha20poly1305 = { workspace = true }
 argon2            = { workspace = true }

@@ -13,6 +13,7 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod aead;
+pub mod kdf;
 pub mod rng;
 pub mod secret;
 
