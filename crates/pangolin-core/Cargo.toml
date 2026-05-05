@@ -1,0 +1,13 @@
+[package]
+name = "pangolin-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Pangolin core vault engine — single source of truth for security-critical logic."
+
+[lints]
+workspace = true

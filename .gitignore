@@ -1,0 +1,53 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Foundry
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/lib/
+
+# Node (extension, desktop UI)
+node_modules/
+.pnpm-store/
+dist/
+build/
+.next/
+.turbo/
+
+# Tauri
+apps/desktop/src-tauri/target/
+
+# Mobile
+apps/ios/build/
+apps/ios/DerivedData/
+apps/ios/Pods/
+apps/android/build/
+apps/android/.gradle/
+apps/android/local.properties
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+deployments/*.local.json
+
+# Test artifacts
+*.profraw
+coverage/
+
+# OS
+.DS_Store
+Thumbs.db

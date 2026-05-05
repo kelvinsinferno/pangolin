@@ -1,0 +1,4 @@
+# Allowlist for forbidden-terms CI check (Design Spec §15.2).
+# Lines starting with # are comments. Add specific path globs (one per line)
+# where a forbidden term has a legitimate, justified use case.
+# Empty for now — will populate as legitimate exceptions arise.

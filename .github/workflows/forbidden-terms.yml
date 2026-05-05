@@ -1,0 +1,44 @@
+# Issue 18.12 — CI enforcement of forbidden user-facing terms.
+# Per Design Spec §15.2: never use "gas", "blockchain", "transaction" (in user copy),
+# "decentralized storage", "hashes", or "revisions" in user-visible surfaces.
+
+name: Forbidden Terms Check
+
+on:
+  pull_request:
+    paths:
+      - 'apps/**'
+      - 'design/**'
+      - 'README.md'
+      - '**/*.md'
+
+jobs:
+  forbidden-terms:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ripgrep
+        run: sudo apt-get install -y ripgrep
+
+      - name: Scan user-facing surfaces
+        run: |
+          set -e
+          # Allowlist file: lines starting with # are comments; each non-empty line is a regex of allowed paths
+          ALLOWLIST=".github/forbidden-terms-allowlist.txt"
+          PATTERNS='\bgas\b|\bblockchain\b|\bdecentralized storage\b|\bhashes\b|\brevisions\b'
+
+          # Scan apps/ and design/ aggressively (user-facing)
+          # README.md and *.md outside docs/ also user-facing
+          rg --pcre2 -n -i "$PATTERNS" apps/ design/ README.md 2>&1 | tee /tmp/forbidden-hits.txt || true
+
+          if [ -s /tmp/forbidden-hits.txt ]; then
+            echo ""
+            echo "::error::Forbidden user-facing terms detected. See Design Spec §15.2."
+            echo "If a usage is legitimate (e.g., import-format documentation), add it to $ALLOWLIST."
+            cat /tmp/forbidden-hits.txt
+            exit 1
+          fi
+
+          echo "No forbidden user-facing terms detected."
