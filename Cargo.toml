@@ -10,6 +10,25 @@ members = [
     "crates/pangolin-cli",
 ]
 
+# Workspace-wide dependency pins. Crypto-bearing crates are restricted to the
+# allow-list defined in `docs/issue-plans/P1.md` and enforced by `deny.toml`.
+[workspace.dependencies]
+# Cryptographic primitives — vetted RustCrypto + dalek-cryptography crates.
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc", "getrandom"] }
+argon2            = { version = "=0.5.3", default-features = false, features = ["alloc", "zeroize"] }
+ed25519-dalek     = { version = "=2.2.0", default-features = false, features = ["std", "zeroize", "rand_core"] }
+hkdf              = { version = "=0.12.4", default-features = false }
+sha2              = { version = "=0.10.9", default-features = false }
+zeroize           = { version = "=1.8.2", default-features = false, features = ["zeroize_derive", "alloc"] }
+secrecy           = { version = "=0.10.3", default-features = false }
+subtle            = { version = "=2.6.1", default-features = false }
+rand_core         = { version = "=0.6.4", default-features = false, features = ["getrandom"] }
+static_assertions = "=1.1.0"
+
+# Test-only.
+proptest          = "=1.7.0"
+hex               = "=0.4.3"
+
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
