@@ -34,7 +34,13 @@ quote_style = "double"
 # Invariant runs default. Per docs/issue-plans/P5-1.md success criterion #3,
 # CI must run >= 10,000 fuzzed invariant runs. Local devs can override with
 # `FOUNDRY_INVARIANT_RUNS=256 forge test` for faster iteration.
+#
+# `fail_on_revert = true` is deliberate (security-audit fix M-2): under
+# `false`, handler-level early-returns silently mask reverts the runner
+# would otherwise surface. The handler uses `vm.assume(...)` instead of
+# early-`return` so out-of-bounds fuzzed inputs cleanly skip a call
+# without polluting the run-count or hiding regressions.
 [invariant]
 runs = 10000
 depth = 32
-fail_on_revert = false
+fail_on_revert = true
