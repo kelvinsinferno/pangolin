@@ -133,6 +133,36 @@ contract RevisionLogV0Test is Test {
         assertFalse(ok, "non-payable call with value must revert");
     }
 
+    /// @dev Audit fix L-1: extend ETH-rejection coverage to the
+    ///      empty-calldata and unknown-selector paths. solc emits a
+    ///      single CALLVALUE/ISZERO/JUMPI/REVERT guard at the top of
+    ///      the dispatcher when there is no `receive()`, no
+    ///      `fallback()`, and no `payable` function: every incoming
+    ///      call is rejected when `msg.value > 0` regardless of the
+    ///      selector (or absence thereof). These three sub-cases
+    ///      pin that behavior so a future contributor cannot quietly
+    ///      add a `receive()` without breaking this test.
+    function test_contract_rejectsEthOnAllCallPaths() public {
+        vm.deal(address(this), 1 ether);
+
+        // 1. Empty calldata + value -> dispatcher's CALLVALUE guard reverts.
+        (bool ok1,) = address(revLog).call{value: 1 wei}("");
+        assertFalse(ok1, "empty calldata with value must revert (no receive())");
+
+        // 2. Unknown selector + value -> still hits the CALLVALUE guard
+        //    (which sits before any selector dispatch). The selector
+        //    being unknown is incidental; value is the rejection cause.
+        (bool ok2,) = address(revLog).call{value: 1 wei}(hex"deadbeef");
+        assertFalse(ok2, "unknown selector with value must revert");
+
+        // 3. Unknown selector + zero value -> reverts on the
+        //    no-matching-function path (no fallback()). Demonstrates
+        //    the contract has zero implicit payable surface AND no
+        //    catch-all fallback.
+        (bool ok3,) = address(revLog).call{value: 0}(hex"deadbeef");
+        assertFalse(ok3, "unknown selector with no fallback must revert");
+    }
+
     /// @dev Maps to plan: test_contract_hasNoOwnerFunction
     function test_contract_hasNoOwnerFunction() public {
         bytes memory cd = abi.encodeWithSignature("owner()");
@@ -149,20 +179,48 @@ contract RevisionLogV0Test is Test {
         assertEq(ret.length, 0);
     }
 
-    /// @dev Maps to plan: test_contract_hasNoUpgradeFunction
-    /// @dev Probes the four canonical upgrade selectors used by
-    ///      OpenZeppelin proxies / UUPS / TransparentUpgradeableProxy.
-    function test_contract_hasNoUpgradeFunction() public {
-        bytes[4] memory probes = [
-            abi.encodeWithSignature("upgrade()"),
+    /// @dev Maps to plan: test_contract_hasNoUpgradeFunction (renamed to
+    ///      `test_contract_hasNoAdminOrProxySelectors` per audit fix L-2).
+    /// @dev Probes the canonical admin / ownership / pause / upgrade
+    ///      selectors a proxy or admin-key contract would expose.
+    ///      All must revert (no fallback, no receive, no matching
+    ///      function). Probing the full set rather than the original
+    ///      4 selectors hardens the surface assertion: a future
+    ///      contributor accidentally importing an `Ownable` mixin or
+    ///      a proxy-storage layout would be caught here.
+    /// @dev Selectors verified offline; one assertion per selector
+    ///      keeps the failure message specific.
+    function test_contract_hasNoAdminOrProxySelectors() public {
+        bytes[16] memory probes = [
+            // Ownership family (Ownable / Ownable2Step).
+            abi.encodeWithSignature("transferOwnership(address)", address(0)),
+            abi.encodeWithSignature("renounceOwnership()"),
+            abi.encodeWithSignature("acceptOwnership()"),
+            abi.encodeWithSignature("pendingOwner()"),
+            abi.encodeWithSignature("owner()"),
+            // Admin family (TransparentUpgradeableProxy).
+            abi.encodeWithSignature("changeAdmin(address)", address(0)),
+            abi.encodeWithSignature("admin()"),
+            // Pause family (Pausable).
+            abi.encodeWithSignature("pause()"),
+            abi.encodeWithSignature("unpause()"),
+            abi.encodeWithSignature("paused()"),
+            // Self-destruct / kill family.
+            abi.encodeWithSignature("kill()"),
+            abi.encodeWithSignature("destroy()"),
+            // Upgrade family (UUPS / TransparentUpgradeableProxy).
             abi.encodeWithSignature("upgradeTo(address)", address(0)),
             abi.encodeWithSignature("upgradeToAndCall(address,bytes)", address(0), bytes("")),
-            abi.encodeWithSignature("implementation()")
+            abi.encodeWithSignature("implementation()"),
+            // Audit gap #3: a fictitious sequence-mutator that, if
+            // ever introduced, would let an admin reset the global
+            // counter. Prove no such selector exists.
+            abi.encodeWithSignature("setNextSequence(uint256)", uint256(0))
         ];
         for (uint256 i = 0; i < probes.length; i++) {
             (bool ok, bytes memory ret) = address(revLog).call(probes[i]);
-            assertFalse(ok, "upgrade-family selector must not exist");
-            assertEq(ret.length, 0, "no return data from missing upgrade selector");
+            assertFalse(ok, "admin/proxy/upgrade selector must not exist");
+            assertEq(ret.length, 0, "no return data from missing admin/proxy selector");
         }
     }
 
