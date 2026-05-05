@@ -42,3 +42,25 @@ Or, for a quick repro of just the 256-byte case:
 cd contracts
 forge test --match-test test_publishRevision_256BytePayload_under50kGas -vvv
 ```
+
+## Build metadata (CBOR trailer)
+
+`foundry.toml` sets `bytecode_hash = "none"` to suppress solc's IPFS / bzzr
+metadata hash, which would otherwise embed a hash of the (path-dependent)
+sources and break bit-deterministic rebuilds across machines. Even with
+`bytecode_hash = "none"` set, solc still appends a 12-byte CBOR-encoded
+trailer to every contract's runtime bytecode that records the compiler
+version. For Solidity 0.8.24 this trailer is exactly:
+
+```
+a164736f6c6343000818000a
+```
+
+which decodes to the CBOR map `{"solc": <0x000818> ("0.8.24")}` with a
+two-byte length suffix (`0x000a` = 10). It carries no source hash and
+no path information; only the compiler version. Two consecutive
+`forge build --force` runs on the same machine produce byte-identical
+runtime bytecode (verified post-P5-1), and the trailer is identical
+across machines that pin the same solc version. This is solc behavior
+and not a Foundry configuration gap; reproducible builds across
+machines remain unaffected. (Audit fix L-4.)

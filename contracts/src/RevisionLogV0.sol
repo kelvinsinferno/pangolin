@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+// @dev Exact-pinned pragma (NOT `^0.8.24`): per docs/issue-plans/P5-1.md
+//      "Solidity compiler regression" failure-mode mitigation, the
+//      contract must build with the exact compiler version it was
+//      audited against. A future contributor MUST NOT relax this to a
+//      caret range. (Audit fix L-3.)
 pragma solidity 0.8.24;
 
 /// @title RevisionLogV0
