@@ -16,6 +16,7 @@ pub mod aead;
 pub mod kdf;
 pub mod rng;
 pub mod secret;
+pub mod sign;
 
 /// Returns the crate name. Useful for diagnostics and version reporting.
 #[must_use]
