@@ -179,11 +179,8 @@ contract RevisionLogV0InvariantTest is Test {
         // combos. The keys are arbitrary but include zero-key,
         // common test-fuzz constants, and a couple of high-entropy
         // values so a misuse is more likely to land here.
-        bytes32[3] memory keys = [
-            bytes32(0),
-            keccak256("vault-1"),
-            keccak256(abi.encode(address(0xBEEF), uint256(1)))
-        ];
+        bytes32[3] memory keys =
+            [bytes32(0), keccak256("vault-1"), keccak256(abi.encode(address(0xBEEF), uint256(1)))];
         uint256[4] memory slotIndices = [uint256(0), uint256(1), uint256(2), uint256(7)];
         for (uint256 ki = 0; ki < keys.length; ki++) {
             for (uint256 si = 0; si < slotIndices.length; si++) {

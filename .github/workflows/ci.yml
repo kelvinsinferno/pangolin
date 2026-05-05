@@ -133,13 +133,15 @@ jobs:
       - name: forge build
         run: forge build
       - name: Extract freshly built ABI
+        # Match the committed file's POSIX trailing-newline convention so
+        # diff does not flag a spurious end-of-file mismatch.
         run: |
-          python3 -c "import json,sys; d=json.load(open('out/RevisionLogV0.sol/RevisionLogV0.json')); json.dump(d['abi'], open('/tmp/RevisionLogV0.fresh.json','w'), indent=2)"
+          python3 -c "import json; d=json.load(open('out/RevisionLogV0.sol/RevisionLogV0.json')); f=open('/tmp/RevisionLogV0.fresh.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()"
       - name: Diff committed ABI against fresh ABI
         run: |
           if ! diff -u abi/RevisionLogV0.json /tmp/RevisionLogV0.fresh.json; then
             echo "::error::ABI drift detected between contracts/abi/RevisionLogV0.json and forge build output."
-            echo "::error::Re-run: cd contracts && forge build && python3 -c \"import json; d=json.load(open('out/RevisionLogV0.sol/RevisionLogV0.json')); json.dump(d['abi'], open('abi/RevisionLogV0.json','w'), indent=2)\""
+            echo "::error::Re-run: cd contracts && forge build && python3 -c \"import json; d=json.load(open('out/RevisionLogV0.sol/RevisionLogV0.json')); f=open('abi/RevisionLogV0.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()\""
             exit 1
           fi
 
