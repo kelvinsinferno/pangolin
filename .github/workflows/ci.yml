@@ -77,6 +77,14 @@ jobs:
         run: forge build --deny-warnings --sizes
       - name: forge fmt --check
         run: forge fmt --check
+      # Audit gap-7: dry-run the deploy script so a regression in the
+      # script (bad import, missing constructor arg, vm.startBroadcast
+      # misuse, etc.) is caught at build time. We invoke it without
+      # --rpc-url / --broadcast / --private-key so it executes against
+      # a local in-memory EVM and never tries to send a transaction;
+      # `vm.startBroadcast()` with no broadcaster signed-up is a no-op.
+      - name: forge script (deploy dry-run)
+        run: forge script script/DeployRevisionLogV0.s.sol --sig "run()" --tc DeployRevisionLogV0
 
   contracts-test:
     name: contracts / forge test (incl. invariants)
