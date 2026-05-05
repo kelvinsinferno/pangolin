@@ -93,6 +93,16 @@ impl SigningKey {
         let b_slice: &[u8] = &*b;
         a_slice.ct_eq(b_slice)
     }
+
+    /// Crate-internal accessor returning a zeroizing copy of the 32-byte
+    /// secret seed.
+    ///
+    /// Used by [`crate::keys::AuthorityKey`] to derive the VDK-wrap AEAD
+    /// key via HKDF-SHA512. **Not exposed beyond the crate.** The returned
+    /// buffer wipes itself on drop.
+    pub(crate) fn seed_bytes(&self) -> zeroize::Zeroizing<[u8; SECRET_KEY_LEN]> {
+        zeroize::Zeroizing::new(self.inner.to_bytes())
+    }
 }
 
 impl core::fmt::Debug for SigningKey {

@@ -75,6 +75,14 @@ impl AeadKey {
         a.ct_eq(b)
     }
 
+    /// Crate-internal accessor that exposes the raw 32-byte AEAD key.
+    ///
+    /// Used **only** by [`crate::keys::VdkKey`] when feeding the VDK into
+    /// the wrap-AEAD `seal` call. Not exposed to consumers of the crate.
+    pub(crate) fn expose_bytes_for_keys(&self) -> &[u8; KEY_LEN] {
+        &self.inner
+    }
+
     /// Encrypts and authenticates `plaintext` under this key, binding `aad`.
     ///
     /// The returned [`Ciphertext`] includes the 16-byte Poly1305 tag at the

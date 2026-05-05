@@ -14,6 +14,7 @@
 
 pub mod aead;
 pub mod kdf;
+pub mod keys;
 pub mod rng;
 pub mod secret;
 pub mod sign;
