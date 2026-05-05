@@ -41,6 +41,7 @@ Per-component threat enumeration lands as part of MVP-1 issue 0.2 and is updated
 |---|---|---|
 | Local encrypted store | MVP-1 | TBD (issue 0.2) |
 | Session policy engine | MVP-1 | TBD (issue 0.2) |
+| Revision Log v0 contract | PoC | DOCUMENTED (P5-1) |
 | Revision Log v1 contract | MVP-2 | TBD (issue 2.1 plan) |
 | Funder service | MVP-2 | TBD (issue 3.4 plan) |
 | Ephemeral local indexer | MVP-2 | TBD (issue 4.2 plan) |
@@ -48,3 +49,17 @@ Per-component threat enumeration lands as part of MVP-1 issue 0.2 and is updated
 | Browser extension | MVP-4 | TBD (issue 7.2.x plans) |
 | Native messaging boundary | MVP-4 | TBD (issue 7.2.2 plan) |
 | iOS / Android autofill extensions | MVP-5 | TBD (issue 8.x plans) |
+
+### Revision Log v0 contract
+
+> Source: `docs/issue-plans/P5-1.md` §"Threat enumeration". v0 is the PoC
+> append-only log: zero on-chain validation, no admin keys, no upgrades.
+> v1 (MVP-2 issue 2.1) will add signature verification and a "signer
+> must be a registered device key for vaultId" check; the v0 differences
+> are noted inline below.
+
+1. **Adversary publishes garbage to a vault's log to slow sync.** Defense: clients filter by `vaultId` topic; per-vault `eth_getLogs` is unaffected by other vaults' garbage. Gas cost falls on the adversary. *v0 difference:* v0 has no on-chain authentication, so any address can call `publishRevision` with arbitrary bytes. v1 will require a valid signature; v0 explicitly does not.
+2. **Adversary publishes a fake "next revision" forking a user's account.** Defense: client-side conflict detection (master plan MVP-1 issue 1.6) detects multiple heads. User resolves explicitly per Whitepaper §7. *v0 difference:* same client-side detection applies; v0's lack of signature checks does not change the resolution path because the client always treats on-chain data as untrusted.
+3. **Adversary tampers with on-chain ciphertext.** Defense: AEAD AAD binds revision metadata (P1-1 design). Tampered ciphertext fails authentication on the client. The contract is *not* the integrity layer; AEAD is. *v0 difference:* none — encrypt-then-MAC on the client fails closed regardless of contract version.
+4. **Chain reorg or network partition.** Defense: clients tolerate reorgs by tracking `(blockNumber, logIndex)` per known revision; on reorg, re-pull from the last known stable block. Out of scope for the contract; in scope for `pangolin-chain` (issue P7). *v0 difference:* none — reorg tolerance is a client concern.
+5. **Permanent contract corruption (storage attack).** Defense: contract has only one storage slot (`nextSequence`); no functions write to other slots. The `invariant_noStorageMutationBesidesSequence` test asserts this under fuzzed call sequences (10,000 runs × 32-call depth in CI). *v0 difference:* v0 has no mappings, but the invariant additionally probes a sample of hashed (mapping-style) slots so the assertion future-proofs for v1's mapping storage.
