@@ -476,13 +476,7 @@ impl SessionState {
 /// Caps at `session_started_at + ABSOLUTE_MAX_DEFAULT`. This helper is
 /// the single source of truth for the absolute-max ceiling — every code
 /// path that extends a deadline routes through it.
-///
-/// Currently exercised by unit tests and (in the next commit) by
-/// `Vault::touch_session`; the `allow(dead_code)` keeps `cargo clippy
-/// -D warnings` green between commits in this issue. P4-3 wires it
-/// into `vault.rs`.
 #[must_use]
-#[allow(dead_code)]
 pub(crate) fn next_idle_deadline(now: SystemTime, session_started_at: SystemTime) -> SystemTime {
     let absolute_ceiling = session_started_at + ABSOLUTE_MAX_DEFAULT;
     let proposed = now + IDLE_TIMEOUT_DEFAULT;

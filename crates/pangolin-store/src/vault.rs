@@ -57,7 +57,8 @@ use crate::revision::{
 use crate::schema;
 use crate::search::DecryptedCache;
 use crate::session::{
-    Clock, IdentityProof, PresenceProof, SessionState, SystemClock, IDLE_TIMEOUT_DEFAULT,
+    next_idle_deadline, Clock, IdentityProof, PresenceProof, SessionState, SystemClock,
+    IDLE_TIMEOUT_DEFAULT,
 };
 
 /// Public state observable on a [`Vault`] handle.
@@ -510,16 +511,140 @@ impl Vault {
         self.active.as_mut().ok_or(StoreError::NotUnlocked)
     }
 
+    // -----------------------------------------------------------------
+    // P4: session policy plumbing
+    // -----------------------------------------------------------------
+
+    /// Strict freshness check used by every cache-bearing credential
+    /// op (`add_account`, `update_account`, `delete_account`,
+    /// `get_account`, `search`, `list_accounts`, the test-helper
+    /// `__test_synthesize_sibling_revision`).
+    ///
+    /// Behavior matrix:
+    ///
+    /// | Current `session_state`       | Action                                       |
+    /// |-------------------------------|----------------------------------------------|
+    /// | `Active`, `now <= expires_at` | `Ok(())`                                     |
+    /// | `Active`, `now >  expires_at` | Drop cache → set `Expired` → return `SessionExpired` |
+    /// | `Locked`                      | `Err(NotUnlocked)`                           |
+    /// | `PendingAuthorization`        | `Err(SessionPending)`                        |
+    /// | `Expired`                     | `Err(SessionExpired)`                        |
+    ///
+    /// The expiry-side cache drop runs through `lock()` which takes
+    /// ownership of `active` and drops it — every `AccountSnapshot`
+    /// inside the `DecryptedCache` is `ZeroizeOnDrop`, so the
+    /// transitive `Drop` chain wipes the heap allocations. The
+    /// `session_state` is set to `Expired` AFTER the drop so
+    /// observers that read the state see the post-zeroize transition.
+    fn check_session_freshness(&mut self) -> Result<()> {
+        match self.session_state {
+            SessionState::Active { expires_at, .. } => {
+                let now = self.clock.now();
+                if now > expires_at {
+                    // Drop cache + VDK first; THEN flip state. Order
+                    // matters for an observer reading `session_state`
+                    // while we're inside this method (impossible in
+                    // safe Rust without a re-entrant borrow, but the
+                    // ordering is part of the documented invariant for
+                    // unsafe-extension auditors).
+                    if let Some(active) = self.active.take() {
+                        drop(active);
+                    }
+                    self.session_state = SessionState::Expired;
+                    Err(StoreError::SessionExpired)
+                } else {
+                    Ok(())
+                }
+            }
+            SessionState::Locked => Err(StoreError::NotUnlocked),
+            SessionState::PendingAuthorization => Err(StoreError::SessionPending),
+            SessionState::Expired => Err(StoreError::SessionExpired),
+        }
+    }
+
+    /// Soft freshness check used by metadata-only ops (`revisions_for`,
+    /// `revision_graph`, `account_heads`, `is_forked`,
+    /// `all_forked_accounts`, `unpublished_revisions`,
+    /// `mark_published`).
+    ///
+    /// These ops query the `revisions` table for parent→child structure
+    /// and chain anchors; they do NOT touch the AEAD-decrypted cache.
+    /// P3's invariant — "metadata-only ops work on a `Locked` vault" —
+    /// is preserved.
+    ///
+    /// Behavior matrix:
+    ///
+    /// | Current `session_state`       | Action                                       |
+    /// |-------------------------------|----------------------------------------------|
+    /// | `Active`, `now <= expires_at` | No-op                                        |
+    /// | `Active`, `now >  expires_at` | Drop cache → set `Expired`                   |
+    /// | `Locked`/`Pending`/`Expired`  | No-op                                        |
+    ///
+    /// The Active-but-expired path STILL zeroizes the cache, so the
+    /// "next op surfaces `SessionExpired` AND cache is gone" criterion
+    /// holds even if the next op happens to be a metadata-only one
+    /// (the cache is gone after this call returns).
+    fn maybe_expire_active_session(&mut self) {
+        if let SessionState::Active { expires_at, .. } = self.session_state {
+            let now = self.clock.now();
+            if now > expires_at {
+                if let Some(active) = self.active.take() {
+                    drop(active);
+                }
+                self.session_state = SessionState::Expired;
+            }
+        }
+    }
+
+    /// Update the idle deadline after a successful op.
+    ///
+    /// `last_proof_at = now`. `expires_at = next_idle_deadline(now,
+    /// session_started_at)` — the helper caps at
+    /// `session_started_at + ABSOLUTE_MAX_DEFAULT` so a long-running
+    /// session cannot extend its lifetime past the absolute ceiling
+    /// even with constant activity. No-op if the session is not
+    /// `Active`.
+    fn touch_session(&mut self) {
+        if let SessionState::Active {
+            expires_at,
+            last_proof_at,
+            session_started_at,
+        } = self.session_state
+        {
+            let now = self.clock.now();
+            let new_deadline = next_idle_deadline(now, session_started_at);
+            self.session_state = SessionState::Active {
+                expires_at: new_deadline,
+                // Touch shifts last_proof_at to now, but never extends
+                // session_started_at — that's the absolute-max anchor.
+                last_proof_at: now,
+                session_started_at,
+            };
+            // Suppress unused-binding warnings on the destructured
+            // values that we don't need further (the new state
+            // overrides them).
+            let _ = expires_at;
+            let _ = last_proof_at;
+        }
+    }
+
     /// Add a new account identity. Returns the freshly-generated
     /// `AccountId` of the new account.
     ///
     /// # Errors
     ///
-    /// `StoreError::NotUnlocked` if state != Active.
+    /// `StoreError::NotUnlocked` if the vault was never unlocked,
+    /// `StoreError::SessionExpired` if the active session has expired
+    /// (idle timeout or absolute max). `SessionExpired` zeroizes the
+    /// cache before returning per Session spec §5 invariant 3.
     pub fn add_account(&mut self, snapshot: AccountSnapshot) -> Result<AccountId> {
-        // Validate state and gather the bytes we need for the seal up
-        // front so we don't need to hold the active borrow across the
-        // `SQLite` transaction.
+        // P4: strict freshness check at the top. Order is critical —
+        // `check_session_freshness` may transition Active→Expired and
+        // drop the cache, so any subsequent `require_active` would
+        // surface the expiry as `NotUnlocked` instead of
+        // `SessionExpired`. Running freshness first preserves the
+        // distinction.
+        self.check_session_freshness()?;
         let _ = self.require_active()?;
         let account_id = AccountId::from_bytes(random_32_via_sqlite(&self.conn)?);
         let revision_id = RevisionId::from_bytes(random_32_via_sqlite(&self.conn)?);
@@ -567,6 +692,9 @@ impl Vault {
 
         let active = self.require_active_mut()?;
         active.cache.insert(account_id, snapshot);
+        // P4: success path touches the session — extends the idle
+        // deadline (capped at session_started_at + ABSOLUTE_MAX_DEFAULT).
+        self.touch_session();
         Ok(account_id)
     }
 
@@ -577,6 +705,8 @@ impl Vault {
         id: AccountId,
         new_snapshot: AccountSnapshot,
     ) -> Result<RevisionId> {
+        // P4: strict freshness — see `add_account` rationale.
+        self.check_session_freshness()?;
         let _ = self.require_active()?;
         // Look up account state.
         let account_row = self
@@ -645,6 +775,7 @@ impl Vault {
 
         let active = self.require_active_mut()?;
         active.cache.insert(id, new_snapshot);
+        self.touch_session();
         Ok(revision_id)
     }
 
@@ -652,6 +783,8 @@ impl Vault {
     /// account row's `tombstoned` flag. Subsequent reads via
     /// [`Self::get_account`] return `None`.
     pub fn delete_account(&mut self, id: AccountId) -> Result<()> {
+        // P4: strict freshness — see `add_account` rationale.
+        self.check_session_freshness()?;
         let _ = self.require_active()?;
         let head_row = self
             .conn
@@ -718,30 +851,68 @@ impl Vault {
 
         let active = self.require_active_mut()?;
         let _ = active.cache.remove(id);
+        self.touch_session();
         Ok(())
     }
 
     /// Return a borrow on the in-memory snapshot. `None` for unknown,
-    /// tombstoned, or vault-not-active.
+    /// tombstoned, vault-not-active, or session-expired.
+    ///
+    /// P4 note: `get_account` is `&self` (shared borrow) for ergonomics,
+    /// so it cannot zeroize the cache mid-call. Instead it observes
+    /// `session_remaining()` via the same `self.clock.now()` reading
+    /// and returns `None` when the deadline has passed; the cache is
+    /// then zeroized on the *next* `&mut self` op via
+    /// `check_session_freshness` or `maybe_expire_active_session`.
+    /// This is acceptable because the &-borrowed reference returned
+    /// here is bounded by the &-borrow on `self`, so an attacker who
+    /// somehow held that borrow past expiry would already be inside
+    /// the same lexical scope — there is no interleaving with a
+    /// concurrent `lock()` call. The plaintext stays in memory until
+    /// the cache is dropped, which the next mut-op does.
     #[must_use]
     pub fn get_account(&self, id: AccountId) -> Option<&AccountSnapshot> {
+        if !self.is_session_active_now() {
+            return None;
+        }
         self.active.as_ref().and_then(|a| a.cache.get(id))
     }
 
-    /// Substring search across non-tombstoned accounts.
+    /// Substring search across non-tombstoned accounts. Returns an
+    /// empty `Vec` if the session has expired (mirroring P2 semantics
+    /// of returning empty for non-Active vaults).
     #[must_use]
     pub fn search(&self, query: &str) -> Vec<AccountId> {
+        if !self.is_session_active_now() {
+            return Vec::new();
+        }
         self.active
             .as_ref()
             .map_or_else(Vec::new, |a| a.cache.search(query))
     }
 
-    /// All non-tombstoned account ids in the cache.
+    /// All non-tombstoned account ids in the cache. Empty `Vec` if
+    /// the session has expired.
     #[must_use]
     pub fn list_accounts(&self) -> Vec<AccountId> {
+        if !self.is_session_active_now() {
+            return Vec::new();
+        }
         self.active
             .as_ref()
             .map_or_else(Vec::new, |a| a.cache.account_ids())
+    }
+
+    /// `&self`-friendly check: is the session active AND its deadline
+    /// not yet past? Used by the `&self` cache-bearing readers
+    /// (`get_account`, `search`, `list_accounts`) which cannot mutate
+    /// state to flip Active→Expired but DO need to gate their reads.
+    fn is_session_active_now(&self) -> bool {
+        if let SessionState::Active { expires_at, .. } = self.session_state {
+            self.clock.now() <= expires_at
+        } else {
+            false
+        }
     }
 
     /// Walk the revision history for `id` from genesis to head. Returns
@@ -991,6 +1162,8 @@ impl Vault {
         parent: RevisionId,
         snapshot: AccountSnapshot,
     ) -> Result<RevisionId> {
+        // P4: cache-bearing path (uses the AEAD key). Strict check.
+        self.check_session_freshness()?;
         let _ = self.require_active()?;
         // Confirm the account exists and that the chosen parent is in
         // its revision history. The first check protects against
@@ -1055,6 +1228,7 @@ impl Vault {
                 nonce.as_bytes().as_slice(),
             ],
         )?;
+        self.touch_session();
         Ok(revision_id)
     }
 
@@ -1127,11 +1301,23 @@ impl Vault {
 
     /// Record a chain anchor for a revision.
     ///
+    /// P4 note: `mark_published` is metadata-only (touches `revisions`
+    /// chain-anchor columns; never reads `enc_payload`). It uses the
+    /// soft `maybe_expire_active_session` path: if the vault is
+    /// `Active` and the idle timer has fired, the cache is zeroized
+    /// before the chain anchor is stamped, but the operation itself
+    /// succeeds even from a `Locked` state. This preserves the P3
+    /// invariant ("metadata-only ops work on a `Locked` vault") and
+    /// the P4 invariant ("cache zeroized on session expiry").
+    ///
     /// # Errors
     ///
     /// `StoreError::RevisionNotFound` if the id is not in the local
     /// log.
     pub fn mark_published(&mut self, revision_id: RevisionId, anchor: ChainAnchor) -> Result<()> {
+        // Soft expiry — does not error for Locked, only zeroizes if
+        // Active+expired.
+        self.maybe_expire_active_session();
         let updated = self.conn.execute(
             "UPDATE revisions
              SET chain_tx_hash = ?1, chain_block_number = ?2, chain_log_index = ?3
@@ -1144,10 +1330,12 @@ impl Vault {
             ],
         )?;
         if updated == 0 {
-            Err(StoreError::RevisionNotFound)
-        } else {
-            Ok(())
+            return Err(StoreError::RevisionNotFound);
         }
+        // Touch only if we're still Active (the soft expiry above may
+        // have transitioned us to Expired).
+        self.touch_session();
+        Ok(())
     }
 }
 
