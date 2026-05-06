@@ -506,7 +506,7 @@ mod tests {
 
     // ---------- Compile-time: not Clone / not Copy / not Serialize --
 
-    /// `static_assertions::assert_not_impl_all!` runs at compile time —
+    /// `static_assertions::assert_not_impl_any!` runs at compile time —
     /// this test simply ensures the assertion module is wired in (the
     /// real check fires during `cargo build`). Tagged
     /// `#[allow(dead_code)]` because the function body is only there to
@@ -514,14 +514,13 @@ mod tests {
     #[test]
     fn no_serialize_compile_time_assertions_present() {
         // The real compile-time guarantees are at the top of `keys.rs`:
-        //   assert_not_impl_all!(VdkKey: Clone, Copy);
-        //   assert_not_impl_all!(AuthorityKey: Clone, Copy);
-        //   assert_not_impl_all!(DeviceKey: Clone, Copy);
-        // If serde is later added and any of these types accidentally
-        // derives Serialize, the build fails because Serialize would
-        // require Clone-able internal state in many designs — the
-        // canonical defense, however, is the lack of any
-        // `#[derive(Serialize)]` or hand-rolled impl in this module.
+        //   assert_not_impl_any!(VdkKey: Clone, Copy);
+        //   assert_not_impl_any!(AuthorityKey: Clone, Copy);
+        //   assert_not_impl_any!(DeviceKey: Clone, Copy);
+        // The defense-in-depth against `Serialize` lives in `deny.toml`,
+        // which bans `serde` and `serde_derive` from this crate's
+        // dependency graph entirely (see HIGH-1 fix). Without `serde` in
+        // the dependency tree, no `Serialize` impl is even expressible.
         // This runtime test is purely a documentation marker.
     }
 

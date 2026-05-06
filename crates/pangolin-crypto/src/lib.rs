@@ -10,7 +10,7 @@
 //!
 //! See `docs/issue-plans/P1.md` for the full specification.
 
-#![cfg_attr(not(test), forbid(unsafe_code))]
+#![forbid(unsafe_code)]
 
 pub mod aead;
 pub mod kdf;
