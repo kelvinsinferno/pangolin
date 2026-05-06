@@ -216,6 +216,43 @@ impl Nonce {
     pub const fn as_bytes(&self) -> &[u8; NONCE_LEN] {
         &self.0
     }
+
+    /// Reconstructs a `Nonce` from bytes that were previously produced by
+    /// [`Self::random`] (or [`Self::random_with`]) and persisted alongside
+    /// their ciphertext.
+    ///
+    /// **This constructor must only be used to round-trip a nonce that was
+    /// originally produced randomly by this crate.** It is the
+    /// deserialization peer of [`Self::as_bytes`].
+    ///
+    /// # Why this is not the same threat as `from_bytes`
+    ///
+    /// HIGH-2 of the P1 audit forbade *deterministic-nonce construction*
+    /// (e.g., a caller making up a fixed nonce and reusing it across two
+    /// seal calls under the same key — which is fatal for stream-cipher
+    /// AEADs). That foot-gun is still gated behind `pub(crate)` and the
+    /// `test-vectors` feature.
+    ///
+    /// `from_storage_bytes` exists for the strictly different
+    /// disk-roundtrip case: the `pangolin-store` crate persists the
+    /// `(ciphertext, nonce, AAD-context)` triple atomically, then loads it
+    /// back to authenticate-and-decrypt. The nonce was random when first
+    /// produced; reloading it from storage cannot create a reuse since the
+    /// ciphertext that pairs with it is the same one that was sealed. This
+    /// is the same threat profile as [`Ciphertext::from_vec`], which is
+    /// already `pub` for the same reason.
+    ///
+    /// # Misuse-resistance reminder for downstream callers
+    ///
+    /// Do not invent nonce bytes here. Do not derive nonce bytes from any
+    /// secret material. Do not pass `[0u8; NONCE_LEN]` or any other
+    /// hard-coded value. The only legitimate input is a slice of bytes
+    /// that this crate previously emitted via [`Self::as_bytes`] and a
+    /// store layer wrote to durable storage.
+    #[must_use]
+    pub const fn from_storage_bytes(bytes: [u8; NONCE_LEN]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl core::fmt::Debug for Nonce {
@@ -485,6 +522,27 @@ mod tests {
         let pt = b"abc";
         let ct = key.seal(&nonce, pt, b"").unwrap();
         assert_eq!(ct.len(), pt.len() + TAG_LEN);
+    }
+
+    /// P1.1: `Nonce::from_storage_bytes` is the public deserialization
+    /// peer of `as_bytes`. Round-trip a randomly-produced nonce through
+    /// raw bytes and verify it reconstructs identically and decrypts the
+    /// matching ciphertext.
+    #[test]
+    fn nonce_round_trips_via_from_storage_bytes() {
+        let key = AeadKey::from_bytes([0x77; KEY_LEN]);
+        let original = Nonce::random();
+        let stored = *original.as_bytes();
+        let reconstructed = Nonce::from_storage_bytes(stored);
+        assert_eq!(original.as_bytes(), reconstructed.as_bytes());
+
+        // Round-trip through the open path: seal under original, persist nonce
+        // bytes, reload, decrypt — must succeed byte-equal.
+        let pt = b"vault-blob-payload";
+        let aad = b"context";
+        let ct = key.seal(&original, pt, aad).unwrap();
+        let pt2 = key.open(&reconstructed, &ct, aad).unwrap();
+        assert_eq!(pt2, pt);
     }
 
     #[test]

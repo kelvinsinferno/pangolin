@@ -24,9 +24,22 @@ subtle            = { version = "=2.6.1", default-features = false }
 rand_core         = { version = "=0.6.4", default-features = false, features = ["getrandom"] }
 static_assertions = "=1.1.0"
 
+# Storage primitives for `pangolin-store` (P2). `rusqlite` ships SQLite
+# vendored via the `bundled` feature so no system dependency drift is
+# possible across Linux/Windows/macOS hosts. `ciborium-ll` is the
+# *low-level* CBOR encoder/decoder that does NOT pull serde (the
+# higher-level `ciborium` crate would). Per `docs/issue-plans/P2.md` and
+# the workspace serde-ban policy in `deny.toml`, no serde is permissible
+# anywhere in the workspace dep tree.
+rusqlite          = { version = "=0.39.0", default-features = false, features = ["bundled"] }
+ciborium-ll       = { version = "=0.2.2", default-features = false, features = ["alloc"] }
+ciborium-io       = { version = "=0.2.2", default-features = false, features = ["std"] }
+thiserror         = "=2.0.18"
+
 # Test-only.
 proptest          = "=1.7.0"
 hex               = "=0.4.3"
+tempfile          = "=3.13.0"
 
 [workspace.package]
 version = "0.0.0"

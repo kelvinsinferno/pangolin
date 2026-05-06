@@ -266,6 +266,32 @@ impl WrappedVdk {
         &self.ctx
     }
 
+    /// Reconstructs a `WrappedVdk` from parts that were previously
+    /// produced by [`VdkKey::wrap`] and persisted (e.g., by the
+    /// `pangolin-store` vault file's meta header).
+    ///
+    /// **Use only to round-trip a `WrappedVdk` through durable storage.**
+    /// This constructor performs no validation beyond field assignment;
+    /// the resulting wrapper authenticates only when subsequently passed
+    /// to [`Self::unwrap_with`] under the matching authority and
+    /// `WrapContext`. A tampered `ciphertext`, `nonce`, or `ctx` will
+    /// fail authentication then, which is the design.
+    ///
+    /// # Misuse warning
+    ///
+    /// Do not synthesize the parts. The only legitimate input is the
+    /// triple `(ciphertext, nonce, ctx)` that was produced by a prior
+    /// call to [`VdkKey::wrap`] in this crate and stored by a downstream
+    /// store layer.
+    #[must_use]
+    pub fn from_parts(ciphertext: Ciphertext, nonce: Nonce, ctx: WrapContext) -> Self {
+        Self {
+            ciphertext,
+            nonce,
+            ctx,
+        }
+    }
+
     /// Sealing helper. Derives the authority's wrap key, generates a fresh
     /// nonce, and seals the VDK bytes under the HKDF-derived AEAD key,
     /// binding the encoded `ctx` blob as AAD.
@@ -386,6 +412,37 @@ impl AuthorityKey {
     pub(crate) fn generate_with<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         Self {
             inner: SigningKey::generate_with(rng),
+        }
+    }
+
+    /// Reconstructs an `AuthorityKey` from a 32-byte seed.
+    ///
+    /// Mirrors [`SigningKey::from_seed`]. Used by `pangolin-store`'s
+    /// `Vault::unlock` to deterministically derive the same authority on
+    /// every unlock by feeding `Argon2id(password, salt, params)` into
+    /// this constructor. Wrong password → different seed → different
+    /// authority → different HKDF-derived wrap key →
+    /// [`WrappedVdk::unwrap_with`] returns [`AeadError::Tampered`],
+    /// indistinguishable from any other tampering case.
+    ///
+    /// # Misuse warning
+    ///
+    /// Do not synthesize seeds here. Do not pass `[0u8; 32]` or any
+    /// other hard-coded value. The only legitimate inputs are:
+    /// - Bytes produced by a KDF over user input (e.g., Argon2id over a
+    ///   password) where wrong inputs deterministically produce wrong
+    ///   bytes.
+    /// - Seeds previously emitted by this crate via the
+    ///   [`SigningKey`] surface and persisted/recovered through a
+    ///   protocol the caller has audited.
+    ///
+    /// The caller's array is moved into the underlying [`SigningKey`]
+    /// via [`SigningKey::from_seed`], which zeroes the parameter slot
+    /// after the dalek key consumes it.
+    #[must_use]
+    pub fn from_seed(seed: [u8; crate::sign::SECRET_KEY_LEN]) -> Self {
+        Self {
+            inner: SigningKey::from_seed(seed),
         }
     }
 
@@ -820,5 +877,80 @@ mod tests {
         let wrapped = vdk.wrap(&auth, &ctx).unwrap();
         let recovered = wrapped.unwrap_with(&auth).unwrap();
         assert!(bool::from(vdk.ct_eq(&recovered)));
+    }
+
+    // ---------- P1.2: AuthorityKey::from_seed round-trip ----------
+
+    /// `AuthorityKey::from_seed` is the public deterministic constructor
+    /// used by `pangolin-store`'s password-derived unlock path. Two calls
+    /// with the same seed must produce equal authorities, and the
+    /// derived wrap key must successfully unwrap a `WrappedVdk` that was
+    /// originally sealed under that authority.
+    #[test]
+    fn authority_key_from_seed_is_deterministic_and_unwraps() {
+        // Same seed → equal AuthorityKeys (via constant-time eq on
+        // their underlying signing keys).
+        let seed = [0xA5u8; crate::sign::SECRET_KEY_LEN];
+        let auth_a = AuthorityKey::from_seed(seed);
+        let auth_b = AuthorityKey::from_seed(seed);
+        assert!(bool::from(auth_a.signing_key().ct_eq(auth_b.signing_key())));
+
+        // Different seed → different authority → unwrap fails.
+        let other_seed = [0x5Au8; crate::sign::SECRET_KEY_LEN];
+        let auth_other = AuthorityKey::from_seed(other_seed);
+
+        // Round-trip a VDK through wrap/unwrap with the deterministic
+        // authority — this is exactly the pangolin-store unlock path.
+        let vdk = VdkKey::generate();
+        let ctx = WrapContext::new(VAULT_A);
+        let wrapped = vdk.wrap(&auth_a, &ctx).unwrap();
+
+        // Unwrap with a freshly-reconstructed authority from the same
+        // seed succeeds and recovers the original VDK byte-equal.
+        let recovered = wrapped.unwrap_with(&auth_b).unwrap();
+        assert!(bool::from(vdk.ct_eq(&recovered)));
+
+        // Unwrap with a different-seed authority fails with Tampered.
+        assert_eq!(
+            wrapped.unwrap_with(&auth_other).unwrap_err(),
+            crate::aead::AeadError::Tampered,
+        );
+    }
+
+    // ---------- P1.1: WrappedVdk::from_parts round-trip ----------
+
+    /// Round-trip a `WrappedVdk` through its publicly-accessible parts
+    /// — `ciphertext()`, `nonce()`, `context()` — and reconstruct it via
+    /// `from_parts`. The reconstructed wrapper must unwrap to the same
+    /// VDK that was originally wrapped, and must fail under a different
+    /// authority just like the original.
+    ///
+    /// This is the disk-roundtrip path that `pangolin-store` uses for
+    /// the meta-table `wrapped_vdk` BLOB.
+    #[test]
+    fn wrapped_vdk_round_trips_via_from_parts() {
+        let vdk = VdkKey::generate();
+        let auth_a = AuthorityKey::generate();
+        let auth_b = AuthorityKey::generate();
+        let ctx = WrapContext::new(VAULT_A);
+
+        let original = vdk.wrap(&auth_a, &ctx).unwrap();
+
+        // Extract parts as a downstream store layer would, persist them,
+        // and reconstruct.
+        let ciphertext = original.ciphertext().clone();
+        let nonce = *original.nonce();
+        let ctx_persisted = *original.context();
+        let reconstructed = WrappedVdk::from_parts(ciphertext, nonce, ctx_persisted);
+
+        // Reconstructed wrapper unwraps under the correct authority…
+        let recovered = reconstructed.unwrap_with(&auth_a).unwrap();
+        assert!(bool::from(vdk.ct_eq(&recovered)));
+
+        // …and rejects the wrong authority, just like the original.
+        assert_eq!(
+            reconstructed.unwrap_with(&auth_b).unwrap_err(),
+            crate::aead::AeadError::Tampered,
+        );
     }
 }
