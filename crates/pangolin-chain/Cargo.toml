@@ -11,3 +11,73 @@ description = "EVM chain adapter — direct submit; signed-revision builder; no 
 
 [lints]
 workspace = true
+
+[features]
+# Exposes `MockChainAdapter` to downstream crates for their own tests.
+# Production downstream consumers MUST NOT enable this feature; doing so
+# would let the chain adapter be substituted with the in-memory mock at
+# the boundary between `pangolin-store`/`pangolin-cli` and the real
+# `BaseSepoliaAdapter`. The feature is named to mirror similar
+# `test-utilities` flags in tokio/serde/etc.
+test-utilities = []
+
+# Network-dependent end-to-end tests under `tests/integration.rs` are
+# gated behind this feature so the default `cargo test --workspace
+# --lib` does not attempt to reach `https://sepolia.base.org`. CI runs
+# without this feature; humans enable it for manual smoke verification.
+# Mirrors the same flag on `tools/chaincli`.
+integration-tests = []
+
+[dependencies]
+# alloy — modern async EVM client. Same workspace pin as `tools/chaincli/`
+# (P6); the dep set is shared because the audit surface is the same.
+# `pangolin-chain` does NOT pull `alloy-signer-local` directly — it only
+# needs the `signers` feature on the umbrella `alloy` crate, plus the
+# crypto plumbing imported through the standard alloy entry. The
+# Foundry-keystore decryption path comes in via `alloy-signer-local`
+# (workspace dep) used in the `new_with_keystore` constructor only.
+alloy              = { workspace = true }
+alloy-signer-local = { workspace = true }
+
+# Async machinery. `tokio` here uses the same workspace-pinned features
+# as chaincli; the Send+Sync trait shape requires `rt-multi-thread`.
+tokio              = { workspace = true }
+async-trait        = { workspace = true }
+
+# Local Pangolin crates.
+#
+# `pangolin-crypto` is consumed for `DeviceKey` (revision signing,
+# evm-wallet derivation source), `Signature` / `VerifyingKey` (signed-
+# revision verification path), and `SecretBytes` (keystore-password
+# argument). NO secret material crosses out of `pangolin-crypto`; only
+# the publicly-defined accessors on `DeviceKey` are used.
+#
+# `pangolin-store` is consumed in the integration commit (P7-7) so
+# `pangolin-chain` can re-export `ChainAnchor` as the canonical type.
+# The dep is one-way (chain → store) at the type-re-export level only;
+# `pangolin-store` then re-exports `pangolin-chain::ChainAnchor` to keep
+# the existing surface stable.
+pangolin-crypto = { path = "../pangolin-crypto" }
+pangolin-store  = { path = "../pangolin-store" }
+
+# Errors. `thiserror` derives `Display` + `Error`; we hand-write
+# `Debug` on every payload-bearing variant so secret material cannot
+# leak through `{:?}`.
+thiserror          = { workspace = true }
+
+# Hex encoding for the `Display` impl on `RevisionEvent` and friends —
+# never used to decode untrusted input (HIGH-2 discipline).
+hex                = { workspace = true }
+
+[dev-dependencies]
+# Test fixtures need `tempfile` for keystore decryption tests and
+# `pangolin-store` integration tests with on-disk vault files.
+tempfile           = { workspace = true }
+# `pangolin-store` test-utilities feature exposes the deterministic-
+# clock and presence-proof helpers we need to drive a `Vault` through
+# the chain anchor flow without a real session prompt.
+pangolin-store     = { path = "../pangolin-store", features = ["test-utilities"] }
+# Self-feature for tests so `MockChainAdapter` is reachable without an
+# external feature flag. Mirrors the pattern in
+# `crates/pangolin-store/Cargo.toml` for `test-utilities`.
+pangolin-chain     = { path = ".", features = ["test-utilities"] }

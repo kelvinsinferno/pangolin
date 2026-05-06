@@ -2746,6 +2746,18 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 [[package]]
 name = "pangolin-chain"
 version = "0.0.0"
+dependencies = [
+ "alloy",
+ "alloy-signer-local",
+ "async-trait",
+ "hex",
+ "pangolin-chain",
+ "pangolin-crypto",
+ "pangolin-store",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
 
 [[package]]
 name = "pangolin-cli"
