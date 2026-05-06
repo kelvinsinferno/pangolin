@@ -1,11 +1,12 @@
 //! chaincli — debug oracle CLI for the deployed `RevisionLogV0` contract.
 //!
-//! See `docs/issue-plans/P6.md` for the full design. P6-3 wires up the
-//! `status` sub-command; P6-4 / P6-5 add `list` / `dump` / `publish`.
+//! See `docs/issue-plans/P6.md` for the full design. P6-3 wires `status`,
+//! P6-4 adds `list` + `dump`, P6-5 adds `publish`.
 
 mod client;
 mod commands;
 mod contract;
+mod format;
 
 use anyhow::Result;
 use clap::Parser;
@@ -49,6 +50,13 @@ enum Command {
     /// current value. Zero-config — uses public Base Sepolia RPC by
     /// default.
     Status,
+
+    /// List `RevisionPublished` events filtered by `vaultId`.
+    List(commands::list::ListArgs),
+
+    /// Pretty-print a single `RevisionPublished` event by tx-hash or
+    /// (block, log-index).
+    Dump(commands::dump::DumpArgs),
 }
 
 fn main() -> Result<()> {
@@ -68,6 +76,8 @@ fn main() -> Result<()> {
     runtime.block_on(async {
         match cli.command {
             Command::Status => commands::status::run(&deployment, &rpc_url).await,
+            Command::List(args) => commands::list::run(&deployment, &rpc_url, args).await,
+            Command::Dump(args) => commands::dump::run(&deployment, &rpc_url, args).await,
         }
     })
 }
