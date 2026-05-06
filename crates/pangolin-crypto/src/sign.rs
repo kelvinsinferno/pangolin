@@ -31,8 +31,12 @@ pub const SIGNATURE_LEN: usize = 64;
 ///
 /// Wraps `ed25519_dalek::SigningKey`, which itself zeroizes on drop. The
 /// public surface here suppresses [`PartialEq`], [`Clone`], [`Copy`], and
-/// [`serde::Serialize`] so that secret material cannot be cloned, compared
+/// `serde::Serialize` so that secret material cannot be cloned, compared
 /// with timing leakage, or serialized without an explicit caller request.
+/// (`serde::Serialize` is referenced as plain text rather than an intra-doc
+/// link because `serde` is banned from this crate's dep graph at the
+/// supply-chain layer per HIGH-1; rustdoc cannot resolve a link to a crate
+/// that is intentionally unreachable.)
 pub struct SigningKey {
     inner: DalekSigningKey,
 }

@@ -17,7 +17,7 @@
 use core::fmt;
 
 use subtle::ConstantTimeEq;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Heap-allocated, zero-on-drop, fixed-size secret buffer.
 ///
@@ -77,6 +77,12 @@ impl<const N: usize> Drop for BoxedSecret<N> {
         self.zeroize();
     }
 }
+
+// Marker trait — runtime contract is fulfilled by the `Drop` impl above;
+// implementing the marker makes the intent self-documenting and lets
+// downstream callers `assert_impl_all!(BoxedSecret<32>: ZeroizeOnDrop)`
+// at compile time if they want extra defense-in-depth.
+impl<const N: usize> ZeroizeOnDrop for BoxedSecret<N> {}
 
 impl<const N: usize> fmt::Debug for BoxedSecret<N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -159,6 +165,8 @@ impl Drop for SecretBytes {
         self.inner.zeroize();
     }
 }
+
+impl ZeroizeOnDrop for SecretBytes {}
 
 #[cfg(test)]
 mod tests {
