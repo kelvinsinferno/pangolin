@@ -201,6 +201,59 @@ pub fn derive_key(
     Ok(key)
 }
 
+/// Derives a raw 32-byte seed from a password, salt, and parameter set
+/// using Argon2id (same algorithm/version/parameters as [`derive_key`]).
+///
+/// The returned bytes are wrapped in [`zeroize::Zeroizing`] so that any
+/// `Drop` — including drops triggered by panic unwinding — wipes the
+/// buffer. The caller takes ownership and is responsible for promptly
+/// consuming the seed (e.g., feeding it into
+/// [`crate::keys::AuthorityKey::from_seed`]) before the wrapper drops.
+///
+/// # Why this exists alongside `derive_key`
+///
+/// `derive_key` returns an [`AeadKey`] whose bytes are deliberately not
+/// exposed (per MEDIUM-8 / supply-chain discipline). Some downstream
+/// callers — `pangolin-store`'s password-unlock path being the canonical
+/// example — need the raw 32 bytes to feed into a non-AEAD-key
+/// constructor (e.g., [`crate::keys::AuthorityKey::from_seed`]). Without
+/// `derive_seed` they have no public path; with it, both KDF entry
+/// points share the same Argon2id wiring while differing only in output
+/// framing.
+///
+/// # Discipline for callers
+///
+/// Use `derive_seed` only when you need the raw bytes for a
+/// type-constructor that takes `[u8; 32]` (e.g., `AuthorityKey::from_seed`,
+/// `SigningKey::from_seed`). For symmetric encryption, use [`derive_key`]
+/// — that path keeps the bytes inside an AEAD key newtype that prevents
+/// accidental re-use across primitives.
+///
+/// # Errors
+///
+/// Returns [`KdfError::ParamsTooWeak`] if the supplied params are below the
+/// validation floor; [`KdfError::Internal`] if the upstream Argon2 crate
+/// rejects them at the protocol level.
+pub fn derive_seed(
+    password: &SecretBytes,
+    salt: &KdfSalt,
+    params: &KdfParams,
+) -> Result<zeroize::Zeroizing<[u8; KEY_LEN]>, KdfError> {
+    params.validate()?;
+    let argon_params = Params::new(
+        params.memory_kib,
+        params.time_cost,
+        params.parallelism,
+        Some(KEY_LEN),
+    )
+    .map_err(|_| KdfError::Internal)?;
+    let ctx = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params);
+    let mut out = zeroize::Zeroizing::new([0u8; KEY_LEN]);
+    ctx.hash_password_into(password.expose(), salt.as_bytes(), &mut *out)
+        .map_err(|_| KdfError::Internal)?;
+    Ok(out)
+}
+
 /// Internal derivation helper for callers (e.g., RFC test vectors) that
 /// need raw bytes rather than a typed [`AeadKey`].
 ///
@@ -221,8 +274,8 @@ pub(crate) fn derive_raw(
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_key, derive_raw, KdfError, KdfParams, KdfSalt, MIN_MEMORY_KIB, MIN_PARALLELISM,
-        MIN_TIME_COST, SALT_LEN,
+        derive_key, derive_raw, derive_seed, KdfError, KdfParams, KdfSalt, MIN_MEMORY_KIB,
+        MIN_PARALLELISM, MIN_TIME_COST, SALT_LEN,
     };
     use crate::secret::SecretBytes;
     use argon2::Params;
@@ -241,6 +294,85 @@ mod tests {
     fn output_len_matches_aead_key_len() {
         use crate::aead::KEY_LEN;
         assert_eq!(KdfParams::OUTPUT_LEN as usize, KEY_LEN);
+    }
+
+    /// P1.3: `derive_seed` is the public seed-returning peer of
+    /// `derive_key`. For identical inputs both must produce the same
+    /// 32 bytes — anything else means the two entry points have drifted
+    /// and a downstream consumer (e.g., `pangolin-store`) would derive
+    /// a different `AuthorityKey` than expected. We use `derive_raw`
+    /// (the crate-private test-only path) to extract the bytes from
+    /// `derive_key`'s `AeadKey` for comparison.
+    #[test]
+    fn derive_seed_matches_derive_raw_bytes() {
+        let pwd = SecretBytes::new(b"correct horse battery staple".to_vec());
+        let salt = KdfSalt::from_bytes([0x42; SALT_LEN]);
+        // Use the smallest valid params for fast tests.
+        let params = KdfParams {
+            memory_kib: MIN_MEMORY_KIB,
+            time_cost: MIN_TIME_COST,
+            parallelism: MIN_PARALLELISM,
+        };
+
+        let from_seed = derive_seed(&pwd, &salt, &params).unwrap();
+
+        // Replicate the inputs to the crate-private `derive_raw` so we can
+        // compare byte-for-byte. `derive_raw` takes raw slices and a
+        // pre-built argon2 `Params`.
+        let argon_params = Params::new(
+            params.memory_kib,
+            params.time_cost,
+            params.parallelism,
+            Some(crate::aead::KEY_LEN),
+        )
+        .unwrap();
+        let mut from_raw = [0u8; crate::aead::KEY_LEN];
+        derive_raw(pwd.expose(), salt.as_bytes(), &argon_params, &mut from_raw).unwrap();
+
+        assert_eq!(*from_seed, from_raw);
+    }
+
+    /// P1.3: `derive_seed` is deterministic — same inputs produce same
+    /// bytes — and varies under input changes (different password,
+    /// different salt, different params).
+    #[test]
+    fn derive_seed_is_deterministic_and_input_sensitive() {
+        let pwd_a = SecretBytes::new(b"alpha".to_vec());
+        let pwd_b = SecretBytes::new(b"bravo".to_vec());
+        let salt_a = KdfSalt::from_bytes([0x11; SALT_LEN]);
+        let salt_b = KdfSalt::from_bytes([0x22; SALT_LEN]);
+        let params = KdfParams {
+            memory_kib: MIN_MEMORY_KIB,
+            time_cost: MIN_TIME_COST,
+            parallelism: MIN_PARALLELISM,
+        };
+
+        let s1 = derive_seed(&pwd_a, &salt_a, &params).unwrap();
+        let s2 = derive_seed(&pwd_a, &salt_a, &params).unwrap();
+        assert_eq!(*s1, *s2, "same inputs → same seed");
+
+        let s3 = derive_seed(&pwd_b, &salt_a, &params).unwrap();
+        assert_ne!(*s1, *s3, "different password → different seed");
+
+        let s4 = derive_seed(&pwd_a, &salt_b, &params).unwrap();
+        assert_ne!(*s1, *s4, "different salt → different seed");
+    }
+
+    /// P1.3: `derive_seed` rejects below-floor params just like
+    /// `derive_key` does.
+    #[test]
+    fn derive_seed_rejects_below_floor_params() {
+        let pwd = SecretBytes::new(b"x".to_vec());
+        let salt = KdfSalt::from_bytes([0u8; SALT_LEN]);
+        let bad_params = KdfParams {
+            memory_kib: MIN_MEMORY_KIB,
+            time_cost: MIN_TIME_COST - 1,
+            parallelism: MIN_PARALLELISM,
+        };
+        assert_eq!(
+            derive_seed(&pwd, &salt, &bad_params).unwrap_err(),
+            KdfError::ParamsTooWeak,
+        );
     }
 
     /// MEDIUM-6: `validate` must accept `RECOMMENDED` and reject the
