@@ -989,6 +989,91 @@ impl Vault {
         Ok(out)
     }
 
+    /// Run an operation under session-policy supervision; on
+    /// expiration, prompt the supplied re-auth callback and resume.
+    ///
+    /// Mirrors Pangolin §8.5 (mid-action expiration semantics): when
+    /// the user invokes a credential op and the session is found to
+    /// be expired (idle timeout / absolute max), the host UI is
+    /// supposed to prompt for re-auth and then transparently resume
+    /// the action. `with_session` is the storage-layer primitive that
+    /// host shells (CLI, Tauri desktop, mobile) wrap with their own
+    /// UI prompt code.
+    ///
+    /// # Order of operations (per the plan §"Mid-action resume primitive")
+    ///
+    /// ```text
+    /// match check_session_freshness() {
+    ///     Ok(())               => op(self)
+    ///     Err(SessionExpired)  => reauth(self)?; op(self)
+    ///     Err(other)           => return Err(other)
+    /// }
+    /// ```
+    ///
+    /// The proactive `check_session_freshness` guarantees that any
+    /// expiry detected at-or-before the start of the op surfaces the
+    /// re-auth prompt. (A session that expires mid-op — e.g., after
+    /// an Argon2 derivation runs for ~1.5 s and the deadline was
+    /// within that window — is NOT retried; the op returns whatever
+    /// the underlying call returned. `PoC` accepts this; MVP-1 may
+    /// add a "transactional retry" wrapper.)
+    ///
+    /// # Information leakage discipline
+    ///
+    /// Critical security invariant: the `reauth` callback MUST NOT
+    /// see anything that could distinguish "session was active and
+    /// op ran" from "session was expired and reauth was prompted",
+    /// other than the bare fact that reauth was called. The op
+    /// itself is invoked AFTER reauth on the expired-session branch,
+    /// so the op cannot leak information about the session's prior
+    /// state via the reauth callback's inputs (which are just
+    /// `&mut self`).
+    ///
+    /// # Errors
+    ///
+    /// Forwards every error from `op` and `reauth`. If `reauth`
+    /// returns `Err(_)`, the original op is NOT executed and the
+    /// reauth error propagates.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use pangolin_store::{Vault, AccountSnapshot};
+    /// # use pangolin_store::{PinIdentityProof, PressYPresenceProof};
+    /// # use pangolin_crypto::secret::SecretBytes;
+    /// # fn ex(vault: &mut Vault, pwd: &SecretBytes) -> pangolin_store::Result<()> {
+    /// let count = vault.with_session(
+    ///     |v| Ok(v.list_accounts().len()),
+    ///     |v| {
+    ///         let presence = PressYPresenceProof::confirmed();
+    ///         let identity = PinIdentityProof::new(SecretBytes::new(pwd.expose().to_vec()));
+    ///         v.unlock(&presence, &identity)
+    ///     },
+    /// )?;
+    /// # let _ = count;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_session<F, T, R>(&mut self, op: F, reauth: R) -> Result<T>
+    where
+        F: FnOnce(&mut Self) -> Result<T>,
+        R: FnOnce(&mut Self) -> Result<()>,
+    {
+        match self.check_session_freshness() {
+            Ok(()) => op(self),
+            Err(StoreError::SessionExpired) => {
+                // Re-auth: the host UI's prompt + 2-proof unlock flow.
+                // If reauth succeeds, the vault is back in Active and
+                // the op runs. If reauth itself errors (user
+                // cancelled, wrong PIN, ...), the error propagates
+                // and the original op is NOT executed.
+                reauth(self)?;
+                op(self)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     /// Export an account's sealed payload for future key migration /
     /// backup.
     ///
