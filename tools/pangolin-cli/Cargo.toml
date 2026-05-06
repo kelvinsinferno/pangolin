@@ -1,0 +1,69 @@
+[package]
+name = "pangolin-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "pangolin-cli — user-facing PoC sync orchestrator. Drives publish + pull + status against a local vault and the deployed RevisionLogV0 (D-014)."
+
+[[bin]]
+name = "pangolin-cli"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[features]
+# Network-dependent end-to-end tests are gated behind this feature so
+# the default `cargo test --workspace --lib` does not attempt to reach
+# `https://sepolia.base.org`. Mirrors `tools/chaincli` and
+# `crates/pangolin-chain` flags. CI runs without this feature; humans
+# enable it for manual smoke verification of the full publish/pull
+# round-trip against the deployed contract.
+integration-tests = []
+
+[dependencies]
+# Local crates — pangolin-cli is the orchestrator binary that wires the
+# encrypted local store (pangolin-store) to the chain transport
+# (pangolin-chain) plus the device-key signing path (pangolin-crypto).
+# pangolin-cli is intentionally a binary-only crate with zero library
+# exports (see `lib.rs` absence — there is no lib).
+pangolin-store  = { path = "../../crates/pangolin-store" }
+pangolin-chain  = { path = "../../crates/pangolin-chain" }
+pangolin-crypto = { path = "../../crates/pangolin-crypto" }
+
+# alloy is needed for the deployment-file loader Path resolution + the
+# Foundry-keystore loader. Same workspace pin chaincli uses; the audit
+# surface is shared. We do NOT pull `alloy-signer-local` here directly
+# because pangolin-chain's `BaseSepoliaAdapter::new_with_keystore` does
+# the keystore decryption inside the chain crate.
+alloy              = { workspace = true }
+alloy-signer-local = { workspace = true }
+
+tokio      = { workspace = true }
+clap       = { workspace = true }
+serde_json = { workspace = true }
+anyhow     = { workspace = true }
+hex        = { workspace = true }
+# rpassword reads keystore + vault passwords without echo. Pure Rust +
+# std only; license Apache-2.0; no FFI; no crypto.
+rpassword  = { workspace = true }
+# zeroize wraps the keystore-password `String` so the heap buffer is
+# overwritten on drop rather than merely deallocated. Same pattern as
+# tools/chaincli/src/commands/publish.rs.
+zeroize    = { workspace = true }
+
+[dev-dependencies]
+# Integration tests need temp vault paths.
+tempfile           = { workspace = true }
+# `MockChainAdapter` is gated behind `pangolin-chain`'s `test-utilities`
+# feature; we enable it ONLY in dev-dependencies so the production
+# build of `pangolin-cli` cannot link against the mock.
+pangolin-chain     = { path = "../../crates/pangolin-chain", features = ["test-utilities"] }
+# `pangolin-store::test-utilities` exposes the deterministic-clock /
+# presence-proof helpers for driving a `Vault` through the publish/pull
+# flow without a real session prompt.
+pangolin-store     = { path = "../../crates/pangolin-store", features = ["test-utilities"] }

@@ -2767,7 +2767,19 @@ dependencies = [
 name = "pangolin-cli"
 version = "0.0.0"
 dependencies = [
- "pangolin-core",
+ "alloy",
+ "alloy-signer-local",
+ "anyhow",
+ "clap",
+ "hex",
+ "pangolin-chain",
+ "pangolin-crypto",
+ "pangolin-store",
+ "rpassword",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]
