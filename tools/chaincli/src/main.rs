@@ -1,11 +1,11 @@
 //! chaincli — debug oracle CLI for the deployed `RevisionLogV0` contract.
 //!
-//! See `docs/issue-plans/P6.md` for the full design. P6-2 wires up
-//! the deployment-file loader and the alloy-provider construction;
-//! subsequent commits add the `status`, `list`, `dump`, and `publish`
-//! sub-commands.
+//! See `docs/issue-plans/P6.md` for the full design. P6-3 wires up the
+//! `status` sub-command; P6-4 / P6-5 add `list` / `dump` / `publish`.
 
 mod client;
+mod commands;
+mod contract;
 
 use anyhow::Result;
 use clap::Parser;
@@ -39,34 +39,35 @@ struct Cli {
     rpc_url: Option<String>,
 
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Debug, clap::Subcommand)]
 enum Command {
-    /// Print resolved configuration without contacting the chain.
-    /// Subsequent commits replace this with a real
-    /// `status`/`list`/`dump`/`publish` dispatch.
-    Echo,
+    /// Sanity-check command: confirms RPC reachable, contract address
+    /// matches deployment metadata, and `nextSequence()` returns a
+    /// current value. Zero-config — uses public Base Sepolia RPC by
+    /// default.
+    Status,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Echo) {
-        Command::Echo => {
-            let dep_path = if let Some(p) = cli.deployment_file {
-                p
-            } else {
-                let cwd = std::env::current_dir()?;
-                client::Deployment::find_default(&cwd)?
-            };
-            let dep = client::Deployment::load(&dep_path)?;
-            let rpc = client::resolve_rpc_url(cli.rpc_url.as_deref(), RPC_URL_ENV_VAR, &dep);
-            println!("deployment_file    : {}", dep.source_path.display());
-            println!("chain_id           : {}", dep.chain_id);
-            println!("contract_address   : {:?}", dep.contract_address);
-            println!("rpc                : {rpc}");
+    let dep_path = if let Some(p) = cli.deployment_file {
+        p
+    } else {
+        let cwd = std::env::current_dir()?;
+        client::Deployment::find_default(&cwd)?
+    };
+    let deployment = client::Deployment::load(&dep_path)?;
+    let rpc_url = client::resolve_rpc_url(cli.rpc_url.as_deref(), RPC_URL_ENV_VAR, &deployment);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        match cli.command {
+            Command::Status => commands::status::run(&deployment, &rpc_url).await,
         }
-    }
-    Ok(())
+    })
 }
