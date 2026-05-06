@@ -39,6 +39,11 @@ serde_json = { workspace = true }
 anyhow     = { workspace = true }
 hex        = { workspace = true }
 rpassword  = { workspace = true }
+# zeroize wraps the keystore-password `String` so its heap buffer is
+# overwritten on drop rather than merely deallocated. The `alloc`
+# feature on the workspace pin enables `Zeroize for String`. Used only
+# by `commands/publish.rs`.
+zeroize    = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

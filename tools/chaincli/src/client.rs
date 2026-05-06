@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 
 use alloy::json_abi::JsonAbi;
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 use anyhow::{anyhow, bail, Context, Result};
 
 /// The deployer-recorded chain id we expect for Base Sepolia. If
@@ -64,6 +64,13 @@ pub struct Deployment {
     /// `contracts.RevisionLogV0.bytecode.runtime_size_bytes`.
     #[allow(dead_code)]
     pub runtime_size_bytes: u64,
+    /// `contracts.RevisionLogV0.bytecode.deployed_runtime_keccak256` —
+    /// the keccak256 hash of the on-chain runtime bytecode at deploy
+    /// time. `chaincli status` cross-checks this against the live
+    /// `eth_getCode` result so a tampered deployment file (or a CREATE2
+    /// collision) cannot redirect chaincli to a foreign contract on the
+    /// right chain that happens to expose the same selectors.
+    pub runtime_keccak: B256,
     /// Resolved absolute path to the ABI file referenced from the
     /// deployment file.
     #[allow(dead_code)]
@@ -127,6 +134,21 @@ impl Deployment {
                      /bytecode/runtime_size_bytes (u64)"
                 )
             })?;
+        let runtime_keccak_str = contract
+            .pointer("/bytecode/deployed_runtime_keccak256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                anyhow!(
+                    "deployment file missing /contracts/{CONTRACT_NAME}\
+                     /bytecode/deployed_runtime_keccak256 (string)"
+                )
+            })?;
+        let runtime_keccak = runtime_keccak_str.parse::<B256>().with_context(|| {
+            format!(
+                "deployed_runtime_keccak256 is not a valid 0x-prefixed \
+                     32-byte hex value: {runtime_keccak_str}"
+            )
+        })?;
         let abi_rel = contract
             .pointer("/abi")
             .and_then(serde_json::Value::as_str)
@@ -160,6 +182,7 @@ impl Deployment {
             deployer,
             deploy_block,
             runtime_size_bytes,
+            runtime_keccak,
             abi_path,
         })
     }
@@ -265,12 +288,82 @@ mod tests {
             format!("{:?}", dep.contract_address).to_ascii_lowercase(),
             "0x8566d3de653ee55775783bd7918fe91b66373896"
         );
+        // The bytecode hash field must parse as a 32-byte 0x-prefixed
+        // value. The exact value is asserted against the canonical
+        // file recorded for the deployed contract.
+        assert_eq!(
+            format!("{:?}", dep.runtime_keccak).to_ascii_lowercase(),
+            "0xaeff0a8fc34b478cb4c93b6f5bfd293cc12dd5f0a65a997c7c022b23f3e4e2d0"
+        );
         assert!(dep.abi_path.is_file());
         // ABI loads as a JsonAbi.
         let abi = dep.load_abi().expect("ABI parses");
         assert!(abi.functions.contains_key("nextSequence"));
         assert!(abi.functions.contains_key("publishRevision"));
         assert!(abi.events.contains_key("RevisionPublished"));
+    }
+
+    #[test]
+    fn deployment_file_missing_runtime_keccak_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let abi_path = dir.path().join("abi.json");
+        std::fs::write(&abi_path, "[]").expect("write abi");
+        let json = format!(
+            r#"{{
+                "chain": {{ "chain_id": {EXPECTED_CHAIN_ID}, "rpc_default": "https://example.com" }},
+                "contracts": {{
+                    "RevisionLogV0": {{
+                        "address": "0x8566D3de653ee55775783bD7918Fe91b66373896",
+                        "deployer": "0x89e720238A3913688CB0E025ef03a64539575c54",
+                        "deploy_block": 1,
+                        "bytecode": {{ "runtime_size_bytes": 443 }},
+                        "abi": "{}"
+                    }}
+                }}
+            }}"#,
+            abi_path.file_name().unwrap().to_str().unwrap()
+        );
+        let p = dir.path().join("base-sepolia.json");
+        std::fs::write(&p, json).expect("write deployment");
+        let err = Deployment::load(&p).expect_err("missing runtime keccak rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("deployed_runtime_keccak256"),
+            "expected runtime-keccak missing error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn deployment_file_malformed_runtime_keccak_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let abi_path = dir.path().join("abi.json");
+        std::fs::write(&abi_path, "[]").expect("write abi");
+        let json = format!(
+            r#"{{
+                "chain": {{ "chain_id": {EXPECTED_CHAIN_ID}, "rpc_default": "https://example.com" }},
+                "contracts": {{
+                    "RevisionLogV0": {{
+                        "address": "0x8566D3de653ee55775783bD7918Fe91b66373896",
+                        "deployer": "0x89e720238A3913688CB0E025ef03a64539575c54",
+                        "deploy_block": 1,
+                        "bytecode": {{
+                            "runtime_size_bytes": 443,
+                            "deployed_runtime_keccak256": "not-a-hash"
+                        }},
+                        "abi": "{}"
+                    }}
+                }}
+            }}"#,
+            abi_path.file_name().unwrap().to_str().unwrap()
+        );
+        let p = dir.path().join("base-sepolia.json");
+        std::fs::write(&p, json).expect("write deployment");
+        let err = Deployment::load(&p).expect_err("malformed runtime keccak rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a valid 0x-prefixed"),
+            "expected hex-parse error, got: {msg}"
+        );
     }
 
     #[test]
@@ -286,7 +379,10 @@ mod tests {
                         "address": "0x8566D3de653ee55775783bD7918Fe91b66373896",
                         "deployer": "0x89e720238A3913688CB0E025ef03a64539575c54",
                         "deploy_block": 1,
-                        "bytecode": {{ "runtime_size_bytes": 443 }},
+                        "bytecode": {{
+                            "runtime_size_bytes": 443,
+                            "deployed_runtime_keccak256": "0x0000000000000000000000000000000000000000000000000000000000000000"
+                        }},
                         "abi": "{}"
                     }}
                 }}
@@ -448,6 +544,7 @@ mod tests {
             deployer: alloy::primitives::Address::ZERO,
             deploy_block: 0,
             runtime_size_bytes: 0,
+            runtime_keccak: alloy::primitives::B256::ZERO,
             abi_path: std::path::PathBuf::from("/dev/null"),
         }
     }

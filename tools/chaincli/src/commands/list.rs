@@ -2,9 +2,11 @@
 //! filtered by `vaultId`. Output: JSON-Lines by default; `--text` for
 //! a tabular human form.
 
-use alloy::primitives::{keccak256, B256};
+use std::io::Write;
+
+use alloy::primitives::{keccak256, Address, B256};
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::rpc::types::Filter;
+use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
@@ -107,6 +109,9 @@ pub async fn run(deployment: &Deployment, rpc_url: &str, args: ListArgs) -> Resu
             format!("eth_getLogs RPC call failed for blocks {cursor}..={chunk_end}")
         })?;
 
+        let mut stderr = std::io::stderr();
+        let logs = filter_logs_by_emitter(logs, deployment.contract_address, &mut stderr);
+
         for log in logs {
             let decoded =
                 RevisionLogV0::RevisionPublished::decode_log(&log.inner).with_context(|| {
@@ -146,10 +151,50 @@ pub async fn run(deployment: &Deployment, rpc_url: &str, args: ListArgs) -> Resu
     Ok(())
 }
 
+/// Defense-in-depth (audit MEDIUM-4) emitter filter.
+///
+/// `eth_getLogs` is filtered server-side by `address` already; an
+/// honest RPC will only return logs from `expected`. A misbehaving or
+/// compromised RPC could splice in logs from other emitters that
+/// happen to share the topic-0 hash. We drop those locally and warn on
+/// `warn_sink` so the operator notices the divergence rather than
+/// silently consuming attacker-controlled bytes.
+///
+/// Pulled out of `run` so it is unit-testable without needing a live
+/// RPC; `dump.rs` uses an inline equivalent (single-log path).
+fn filter_logs_by_emitter<W: Write>(
+    logs: Vec<Log>,
+    expected: Address,
+    warn_sink: &mut W,
+) -> Vec<Log> {
+    logs.into_iter()
+        .filter(|log| {
+            if log.address() == expected {
+                true
+            } else {
+                // Best-effort warning; we deliberately ignore I/O errors
+                // on the warn channel — the alternative would be
+                // failing the whole list call because stderr is closed,
+                // which is worse than silently dropping a warning.
+                let _ = writeln!(
+                    warn_sink,
+                    "warning: skipping log with unexpected emitter {:?} \
+                     (expected {:?}); RPC returned a log not matching \
+                     the filter",
+                    log.address(),
+                    expected
+                );
+                false
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_b256, ListArgs};
-    use alloy::primitives::B256;
+    use super::{filter_logs_by_emitter, parse_b256, ListArgs};
+    use alloy::primitives::{Address, Bytes, LogData, B256};
+    use alloy::rpc::types::Log;
     use clap::Parser;
 
     /// Wrap `ListArgs` in a tiny harness so clap parses argv as a real
@@ -240,5 +285,56 @@ mod tests {
         let z = parse_b256("0x0000000000000000000000000000000000000000000000000000000000000000")
             .expect("zero parses");
         assert_eq!(z, B256::ZERO);
+    }
+
+    /// Helper: build a `Log` with a chosen emitter `Address`. The
+    /// payload is irrelevant for the emitter check.
+    fn log_with_address(addr: Address) -> Log {
+        Log {
+            inner: alloy::primitives::Log {
+                address: addr,
+                data: LogData::new_unchecked(vec![B256::ZERO], Bytes::new()),
+            },
+            ..Log::default()
+        }
+    }
+
+    #[test]
+    fn malicious_rpc_log_with_wrong_emitter_is_rejected() {
+        // Audit MEDIUM-4: simulate an RPC that returns a log emitted
+        // by an address other than the deployment's contract. The
+        // filter must drop it and write a warning to stderr.
+        let expected = Address::from([0x11; 20]);
+        let attacker = Address::from([0x22; 20]);
+        let logs = vec![
+            log_with_address(expected),
+            log_with_address(attacker),
+            log_with_address(expected),
+        ];
+        let mut warn = Vec::new();
+        let kept = filter_logs_by_emitter(logs, expected, &mut warn);
+        assert_eq!(kept.len(), 2, "two honest logs must be kept");
+        for k in &kept {
+            assert_eq!(k.address(), expected);
+        }
+        let warn_str = String::from_utf8(warn).expect("utf-8 warning");
+        assert!(
+            warn_str.contains("unexpected emitter"),
+            "expected warning text, got: {warn_str}"
+        );
+        assert!(
+            warn_str.contains(&format!("{attacker:?}")),
+            "warning must include the rogue emitter address"
+        );
+    }
+
+    #[test]
+    fn filter_logs_by_emitter_passes_through_when_all_match() {
+        let expected = Address::from([0x33; 20]);
+        let logs = vec![log_with_address(expected), log_with_address(expected)];
+        let mut warn = Vec::new();
+        let kept = filter_logs_by_emitter(logs, expected, &mut warn);
+        assert_eq!(kept.len(), 2);
+        assert!(warn.is_empty(), "no warnings when all logs match");
     }
 }

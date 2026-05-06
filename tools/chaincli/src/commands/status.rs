@@ -10,12 +10,19 @@
 //!   compares the function selector for `nextSequence()` between the
 //!   compiled `sol!` binding and the JSON ABI we loaded; if they
 //!   diverge, chaincli refuses to proceed.
+//! - The `keccak256` of the live runtime bytecode at
+//!   `deployment.contract_address` matches
+//!   `bytecode.deployed_runtime_keccak256` from the deployment file
+//!   (defense against "tampered deployment file points us at a foreign
+//!   contract on the right chain that exposes the same selectors" — a
+//!   CREATE2 collision or honest-but-stale metadata file). This is
+//!   strictly stronger than the chain-id + ABI checks combined.
 //! - `nextSequence()` returns; the value is printed as the running
 //!   counter at the time of the check.
 //!
 //! Exit 0 on full success; non-zero on any verification failure.
 
-use alloy::primitives::B256;
+use alloy::primitives::{keccak256, B256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::sol_types::{SolCall, SolEvent};
 use anyhow::{anyhow, Context, Result};
@@ -55,6 +62,33 @@ pub async fn run(deployment: &Deployment, rpc_url: &str) -> Result<()> {
     println!(
         "chain_id           : {}  (expected: {})  OK",
         chain_id, deployment.chain_id
+    );
+
+    // Live-bytecode keccak cross-check. Done AFTER the chain_id check so
+    // we never hash bytes from the wrong chain — a wrong-chain mismatch
+    // would already have failed above with a clearer diagnostic.
+    let live_code = provider
+        .get_code_at(deployment.contract_address)
+        .await
+        .with_context(|| {
+            format!(
+                "eth_getCode RPC call failed for {:?}",
+                deployment.contract_address
+            )
+        })?;
+    let live_keccak: B256 = keccak256(live_code.as_ref());
+    if live_keccak != deployment.runtime_keccak {
+        return Err(anyhow!(
+            "runtime bytecode keccak mismatch at {:?}: live={:?}, \
+             expected (from deployment file)={:?}. Refusing to proceed.",
+            deployment.contract_address,
+            live_keccak,
+            deployment.runtime_keccak
+        ));
+    }
+    println!(
+        "bytecode_keccak    : {:?}  (expected: {:?})  OK",
+        live_keccak, deployment.runtime_keccak
     );
 
     let contract = RevisionLogV0::new(deployment.contract_address, &provider);

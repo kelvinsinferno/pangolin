@@ -38,6 +38,8 @@ fn status_against_base_sepolia() {
         "contract_address   : 0x8566d3de653ee55775783bd7918fe91b66373896",
         "chain_id           : 84532",
         "abi_cross_check    : OK",
+        // Live-bytecode keccak cross-check (audit M-1).
+        "bytecode_keccak    : 0xaeff0a8fc34b478cb4c93b6f5bfd293cc12dd5f0a65a997c7c022b23f3e4e2d0",
         "nextSequence       :",
     ] {
         assert!(
