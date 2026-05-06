@@ -685,12 +685,19 @@ impl Vault {
         // pay the full RevisionGraph::build cost when the caller only
         // wants the head set. Plan §"Schema implications" anchors the
         // NOT EXISTS subquery as the canonical multi-head detector.
+        // M-1 (P3 audit): scope the NOT EXISTS subquery by `account_id`
+        // as defense-in-depth against a hypothetical future code path
+        // that allows cross-account `parent_revision_id` references.
+        // RevisionIds are 32-byte CSPRNG output, so accidental
+        // collision is cryptographically negligible — this is belt +
+        // suspenders, not a fix for a current vulnerability.
         let mut stmt = self.conn.prepare(
             "SELECT r.revision_id, r.created_at FROM revisions r
              WHERE r.account_id = ?1
                AND NOT EXISTS (
                  SELECT 1 FROM revisions r2
                  WHERE r2.parent_revision_id = r.revision_id
+                   AND r2.account_id = r.account_id
                )
              ORDER BY r.created_at ASC, r.revision_id ASC",
         )?;
@@ -733,6 +740,8 @@ impl Vault {
     ///
     /// `StoreError::Sqlite` on any database issue.
     pub fn all_forked_accounts(&self) -> Result<Vec<AccountId>> {
+        // M-1 (P3 audit): scope the NOT EXISTS subquery by `account_id`
+        // (defense-in-depth — see `account_heads` above for rationale).
         let mut stmt = self.conn.prepare(
             "SELECT account_id FROM (
                 SELECT r.account_id, COUNT(*) AS head_count
@@ -740,6 +749,7 @@ impl Vault {
                 WHERE NOT EXISTS (
                     SELECT 1 FROM revisions r2
                     WHERE r2.parent_revision_id = r.revision_id
+                      AND r2.account_id = r.account_id
                 )
                 GROUP BY r.account_id
                 HAVING head_count > 1
@@ -792,8 +802,8 @@ impl Vault {
     ///
     /// Public so `tests/e2e.rs` (an integration test that links the
     /// crate as an external dependency) can build a fork without
-    /// needing the chain adapter. The `__` prefix and the
-    /// `#[doc(hidden)]` attribute on the wrapping `impl` block are
+    /// needing the chain adapter. The `__` prefix on the method name
+    /// plus the `#[doc(hidden)]` attribute on the method itself are
     /// the standard Rust idiom for "this is in the public surface
     /// strictly to make the test harness work; not for downstream
     /// consumption." A future iteration that introduces a

@@ -180,11 +180,20 @@ pub struct ChainAnchor {
 ///   head.
 #[derive(Debug, Clone)]
 pub struct RevisionGraph {
-    /// Topologically-ordered list of all revisions in this graph. The
-    /// order is roots-first (genesis revisions and dangling-parent
-    /// orphans), then breadth-first by ancestry depth, with ties broken
-    /// by `created_at` ascending then `revision_id` byte-order. Stable
-    /// across runs — useful for deterministic UI rendering.
+    /// Topologically-ordered list of all revisions in this graph.
+    ///
+    /// The order is: roots first (genesis revisions and
+    /// dangling-parent orphans, sorted by `created_at` ASC then
+    /// `revision_id` byte-order ASC), then a breadth-first walk
+    /// outward from each root through its descendants. Within each
+    /// root's subtree the walk is BFS-by-ancestry-depth with the
+    /// same per-level tie-break by `(created_at, revision_id)`.
+    ///
+    /// Globally the order is NOT a single
+    /// `(created_at, revision_id)` sort — it's "all of root A's tree
+    /// before any of root B's tree" — but it IS deterministic across
+    /// runs given the same inputs, which is what tests + UI rendering
+    /// require.
     revisions: Vec<RevisionMeta>,
     /// child → parent index. Only present for non-genesis revisions
     /// whose parent IS in the graph; a dangling-parent orphan does NOT
@@ -205,6 +214,16 @@ pub struct RevisionGraph {
     /// `revision_id` byte-order). `None` if the graph is empty or no
     /// row uses the all-zeros sentinel.
     genesis: Option<RevisionId>,
+    /// M-2 (P3 audit): per the plan §"Failure modes considered", a
+    /// revision that references a `parent_revision_id` not present in
+    /// the input is treated as a synthetic root ("dangling-parent
+    /// orphan") and surfaces here. Empty for well-formed local-store
+    /// inputs; non-empty when fed a partial chain extracted from a
+    /// future P7 partial-replay, OR when an attacker has injected a
+    /// revision pointing at a fabricated parent. Callers (P9, P7) can
+    /// use `genesis_extra()` to flag corruption-or-truncation distinct
+    /// from a canonical genesis.
+    genesis_extra: Vec<RevisionId>,
     /// Index from `revision_id` to its position in `revisions` for O(1)
     /// metadata lookup.
     by_id: HashMap<RevisionId, usize>,
@@ -344,12 +363,15 @@ impl RevisionGraph {
             .min_by_key(|m| (m.created_at, m.revision_id.0))
             .map(|m| m.revision_id);
 
+        let genesis_extra = compute_genesis_extra(&revisions, &by_id);
+
         Ok(Self {
             revisions,
             parents,
             children,
             heads,
             genesis,
+            genesis_extra,
             by_id,
         })
     }
@@ -403,6 +425,34 @@ impl RevisionGraph {
     #[must_use]
     pub fn genesis(&self) -> Option<&RevisionId> {
         self.genesis.as_ref()
+    }
+
+    /// "Synthetic-root" revisions whose declared `parent_revision_id`
+    /// is non-zero but NOT present in the graph — i.e., they reference
+    /// a parent that the local store never saw. Empty for a
+    /// well-formed local-store query.
+    ///
+    /// **Distinct from `genesis()`.** A canonical-genesis revision
+    /// uses [`RevisionId::GENESIS_PARENT`] as its parent (32 zero
+    /// bytes); a `genesis_extra` orphan uses *some other* non-zero
+    /// parent that the graph builder couldn't resolve. Two legitimate
+    /// causes:
+    /// 1. **Partial chain replay** (future P7): a future chain
+    ///    adapter pulls a slice of revisions from the chain and feeds
+    ///    them into `RevisionGraph::build`. Revisions whose parents
+    ///    are older than the slice show up as orphans.
+    /// 2. **Attacker injection**: a tampered local store has a
+    ///    revision with a fabricated `parent_revision_id`.
+    ///
+    /// Callers (P9 conflict UI, future P7 chain reconciliation)
+    /// distinguish these by domain context. The graph itself does
+    /// NOT decide which case obtains — it only flags the structural
+    /// anomaly.
+    ///
+    /// Order: `created_at` ASC, then `revision_id` byte-order ASC.
+    #[must_use]
+    pub fn genesis_extra(&self) -> &[RevisionId] {
+        &self.genesis_extra
     }
 
     /// Number of revisions in the graph.
@@ -478,6 +528,31 @@ impl RevisionGraph {
             }
         }
     }
+}
+
+/// Identify "synthetic-root" revisions per M-2 (P3 audit): revisions
+/// whose declared parent is non-zero but is not present in the
+/// graph. Sorted deterministically by `(created_at, revision_id)`.
+///
+/// Extracted from `RevisionGraph::build` to keep that function under
+/// the workspace's `clippy::too_many_lines` lint floor.
+fn compute_genesis_extra(
+    revisions: &[RevisionMeta],
+    by_id: &HashMap<RevisionId, usize>,
+) -> Vec<RevisionId> {
+    let mut v: Vec<RevisionId> = revisions
+        .iter()
+        .filter(|m| {
+            m.parent_revision_id != RevisionId::GENESIS_PARENT
+                && !by_id.contains_key(&m.parent_revision_id)
+        })
+        .map(|m| m.revision_id)
+        .collect();
+    v.sort_by_key(|r| {
+        let idx = by_id[r];
+        (revisions[idx].created_at, r.0)
+    });
+    v
 }
 
 #[cfg(test)]
@@ -766,7 +841,8 @@ mod tests {
         assert!(matches!(err, StoreError::Corrupted(ref m) if m.contains("duplicate")));
     }
 
-    /// Empty input → empty graph; `is_forked` false; `genesis` None.
+    /// Empty input → empty graph; `is_forked` false; `genesis` None;
+    /// `genesis_extra` empty.
     #[test]
     fn empty_graph() {
         let g = RevisionGraph::build(Vec::new()).unwrap();
@@ -775,12 +851,17 @@ mod tests {
         assert!(g.heads().is_empty());
         assert!(!g.is_forked());
         assert_eq!(g.genesis(), None);
+        assert!(g.genesis_extra().is_empty());
     }
 
     /// Dangling-parent orphan: a non-genesis revision whose parent is
     /// not in the input is treated as a synthetic root, NOT as a
     /// build-time error. Documented at the type-level for partial-sync
     /// scenarios (P7 chain replay).
+    ///
+    /// M-2 (P3 audit): the orphan also surfaces in `genesis_extra()`
+    /// so callers can distinguish "true genesis (parent==zeros)" from
+    /// "synthetic root with non-zero unresolvable parent."
     #[test]
     fn dangling_parent_treated_as_root() {
         // R5 references parent R4, but R4 is not in the input.
@@ -794,5 +875,29 @@ mod tests {
         assert_eq!(g.genesis(), None);
         // parent_of returns None for orphans (parent not in graph).
         assert_eq!(g.parent_of(&rev(0x05)), None);
+        // M-2: the orphan IS reported in genesis_extra.
+        assert_eq!(g.genesis_extra(), &[rev(0x05)]);
+    }
+
+    /// M-2 (P3 audit): a graph with both a canonical genesis AND a
+    /// dangling-parent orphan distinguishes them — the canonical
+    /// surfaces in `genesis()`, the orphan in `genesis_extra()`.
+    #[test]
+    fn canonical_genesis_and_orphan_are_distinguished() {
+        // R1 is canonical genesis (parent = GENESIS_PARENT).
+        // R5 is an orphan (parent = R4, which is NOT in input).
+        // R2 is a normal child of R1.
+        let rows = vec![
+            meta(0x01, 0x00, 100),
+            meta(0x02, 0x01, 200),
+            meta(0x05, 0x04, 300),
+        ];
+        let g = RevisionGraph::build(rows).unwrap();
+        assert_eq!(g.genesis(), Some(&rev(0x01)));
+        assert_eq!(g.genesis_extra(), &[rev(0x05)]);
+        // Two heads: R2 (linear chain head) and R5 (orphan head).
+        let mut heads_sorted = g.heads().to_vec();
+        heads_sorted.sort_by_key(|r| r.0);
+        assert_eq!(heads_sorted, vec![rev(0x02), rev(0x05)]);
     }
 }
