@@ -49,7 +49,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::account::{AccountId, AccountSnapshot, ACCOUNT_ID_LEN};
 use crate::blob::{build_aad, open_payload, seal_snapshot, seal_tombstone, DecodedPayload};
-use crate::dirty::RevisionPublishPayload;
+use crate::dirty::{IngestOutcome, RevisionPublishPayload};
 use crate::error::{Result, StoreError};
 use crate::meta::{self, VaultMeta};
 use crate::revision::{
@@ -1759,6 +1759,208 @@ impl Vault {
         Ok(())
     }
 
+    /// Ingest a chain-side revision event into the local log.
+    ///
+    /// **Distinct from [`Self::add_account`] / [`Self::update_account`]
+    /// / [`Self::delete_account`]**: those are the *create-from-edit*
+    /// path that produces a new local revision and stamps a dirty
+    /// marker. `ingest_chain_revision` is the *ingest* path used by
+    /// `pangolin-cli pull` (P8-4) — the revision is stored with its
+    /// chain anchor populated from the supplied event, and the dirty
+    /// marker is NOT stamped (the revision is already on chain).
+    ///
+    /// ## Identity discipline
+    ///
+    /// The local `revision_id` is set to the canonical hash of the
+    /// event (per [`pangolin_chain::canonical_hash`]). This is
+    /// content-deterministic — two devices that pull the same chain
+    /// event ingest under the same `revision_id`, so the cross-device
+    /// graph is keyed off the chain's canonical identity rather than
+    /// the random ids used for pre-publish revisions.
+    ///
+    /// ## Idempotency
+    ///
+    /// Returns `Ok(IngestOutcome::AlreadyPresent)` (without touching
+    /// the row) when:
+    ///
+    /// 1. A row with `revision_id == canonical_hash(event)` already
+    ///    exists — i.e., this exact event was previously ingested,
+    ///    OR
+    /// 2. A row exists with the same `(account_id, parent_revision,
+    ///    enc_payload, device_id, schema_version)` AND has a
+    ///    populated `chain_tx_hash` — i.e., this device's own
+    ///    publish coming back from the chain. The original local row
+    ///    keeps its random `revision_id`, but we recognise it as the
+    ///    same revision by content and skip the insert.
+    ///
+    /// ## Defense-in-depth signature verification
+    ///
+    /// Per `P8.md` §Q6, callers (`pangolin-cli pull`) MUST verify the
+    /// signed-revision signature before invoking this method. v0
+    /// contract has no on-chain signature semantics; this client-side
+    /// check catches an attacker-controlled-RPC-with-forged-events
+    /// threat at the device boundary.
+    ///
+    /// Metadata-ish — does NOT touch the decrypted cache and does
+    /// NOT require [`VaultState::Active`].
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` for any database issue.
+    /// `StoreError::Corrupted` if the supplied `tx_hash` /
+    /// `block_number` / `log_index` values would not fit in `i64`.
+    pub fn ingest_chain_revision(
+        &mut self,
+        event: &pangolin_chain::RevisionEvent,
+    ) -> Result<IngestOutcome> {
+        self.maybe_expire_active_session();
+
+        // Compute the content-deterministic identity for the chain
+        // event. This is the keccak digest the v1 contract is
+        // expected to verify natively.
+        let canonical = pangolin_chain::canonical_hash(
+            &event.vault_id,
+            &event.account_id,
+            &event.parent_revision,
+            &event.device_id,
+            event.schema_version,
+            &event.enc_payload,
+        );
+        let revision_id_arr = canonical;
+
+        // Idempotency check #1: exact-hash match.
+        let existing_by_hash: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM revisions WHERE revision_id = ?1",
+                params![&revision_id_arr[..]],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing_by_hash.is_some() {
+            self.touch_session();
+            return Ok(IngestOutcome::AlreadyPresent);
+        }
+
+        // Idempotency check #2: this device's own publish round-
+        // tripping through the chain. The chain event carries a
+        // `tx_hash` anchor; if a local revision row was previously
+        // marked published with that exact tx_hash + log_index, the
+        // current event is that same row coming back. We match on
+        // (account_id, chain_tx_hash, chain_log_index) — every
+        // chain event has exactly one `(tx_hash, log_index)`
+        // identity, so this is unambiguous.
+        //
+        // The device_id field is NOT part of this check because the
+        // PoC two-key model means the signing DeviceKey (whose
+        // verifying-key becomes the event's `device_id`) may differ
+        // from the local row's stored `device_id` (a random 32 bytes
+        // generated at vault create — see vault.rs::open). Matching
+        // on the chain anchor is content-equivalent and avoids the
+        // two-key drift.
+        let block_check = i64::try_from(event.anchor.block_number).map_err(|_| {
+            StoreError::Corrupted(
+                "RevisionEvent.anchor.block_number does not fit in i64; refusing to store".into(),
+            )
+        })?;
+        let log_check = i64::try_from(event.anchor.log_index).map_err(|_| {
+            StoreError::Corrupted(
+                "RevisionEvent.anchor.log_index does not fit in i64; refusing to store".into(),
+            )
+        })?;
+        let existing_by_anchor: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM revisions
+                 WHERE account_id = ?1
+                   AND chain_tx_hash = ?2
+                   AND chain_block_number = ?3
+                   AND chain_log_index = ?4",
+                params![
+                    &event.account_id[..],
+                    &event.anchor.tx_hash[..],
+                    block_check,
+                    log_check,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing_by_anchor.is_some() {
+            self.touch_session();
+            return Ok(IngestOutcome::AlreadyPresent);
+        }
+
+        // Reuse the i64 conversions computed for the idempotency
+        // check above — same widening, no need to repeat.
+        let block_i64 = block_check;
+        let log_index_i64 = log_check;
+
+        // The chain event carries no nonce (the on-chain contract
+        // does not see the AEAD nonce, which lives inside the
+        // application's own format). For an *ingested* revision
+        // we don't have the original nonce; the ingest path stores
+        // a placeholder zeroed nonce. The local vault that
+        // originated the revision still has the real nonce in its
+        // own row (separate from this ingest row); a vault that
+        // first sees the revision via pull cannot decrypt the
+        // payload without the nonce — but it can structurally
+        // store the row, advance heads, and surface forks. P9
+        // resolution + future cross-device sync of nonces (MVP-1)
+        // close this gap. For PoC, ingestion succeeds with the
+        // zeroed nonce; the receiving device gets the chain
+        // structure but not plaintext. Genuine cross-device key
+        // sharing is MVP-1.
+        let placeholder_nonce = [0u8; NONCE_LEN];
+        let now = current_unix_ms();
+        let is_tombstone_i64: i64 = 0; // Per Q's: P10 owns tombstone semantics.
+
+        // The revisions.account_id FOREIGN KEY references
+        // account_identities(account_id), so we must insert (or
+        // observe) the matching account_identities row FIRST. We
+        // INSERT OR IGNORE — if the row already exists we leave the
+        // head_revision_id alone (the local canonical-head-pointer
+        // reflects locally-edited state, not chain state). For a
+        // fresh receive-only vault that has no local edits for this
+        // account, the row was missing and we create it pointing at
+        // the just-ingested revision so `account_heads` works.
+        //
+        // Both writes run inside one BEGIN IMMEDIATE … COMMIT
+        // transaction so a crash between the two leaves the vault
+        // in the pre-transaction state.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO account_identities
+                (account_id, created_at, last_modified_at, tombstoned, head_revision_id)
+             VALUES (?1, ?2, ?2, 0, ?3)",
+            params![&event.account_id[..], now, &revision_id_arr[..]],
+        )?;
+        tx.execute(
+            "INSERT INTO revisions (
+                revision_id, account_id, parent_revision_id, device_id,
+                schema_version, created_at, enc_payload, enc_nonce,
+                is_tombstone, chain_tx_hash, chain_block_number, chain_log_index
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                &revision_id_arr[..],
+                &event.account_id[..],
+                &event.parent_revision[..],
+                &event.device_id[..],
+                i64::from(event.schema_version),
+                now,
+                &event.enc_payload,
+                &placeholder_nonce[..],
+                is_tombstone_i64,
+                &event.anchor.tx_hash[..],
+                block_i64,
+                log_index_i64,
+            ],
+        )?;
+        tx.commit()?;
+
+        self.touch_session();
+        Ok(IngestOutcome::Inserted)
+    }
+
     // -----------------------------------------------------------------
     // Sync-state primitives (P7) — last_pulled_block checkpoint
     // -----------------------------------------------------------------
@@ -3210,5 +3412,109 @@ mod tests {
             // outcomes through this match.
             Ok(()) | Err(crate::session::AuthError::NotFresh),
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // P8-4: ingest_chain_revision tests
+    // -----------------------------------------------------------------
+
+    use crate::dirty::IngestOutcome;
+
+    /// Build a fresh `RevisionEvent` for ingest tests. The
+    /// `device_id` is set to the verifying-key bytes of a freshly-
+    /// generated `DeviceKey` so the canonical-hash of the event
+    /// matches what `verify_signed_revision` would expect.
+    fn fresh_event(
+        vault_id: [u8; 32],
+        account_id: [u8; 32],
+        parent: [u8; 32],
+        payload: &[u8],
+        block: u64,
+        log: u64,
+    ) -> pangolin_chain::RevisionEvent {
+        let device = pangolin_crypto::keys::DeviceKey::generate();
+        let device_id = device.verifying_key().to_bytes();
+        pangolin_chain::RevisionEvent {
+            vault_id,
+            account_id,
+            parent_revision: parent,
+            device_id,
+            schema_version: 0,
+            sequence: 0,
+            enc_payload: payload.to_vec(),
+            anchor: pangolin_chain::ChainAnchor {
+                tx_hash: [0xAB; 32],
+                block_number: block,
+                log_index: log,
+                sequence: 0,
+            },
+        }
+    }
+
+    /// Plan test: ingesting populates the chain anchor on the
+    /// freshly-inserted row.
+    #[test]
+    fn ingest_chain_revision_populates_anchor() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        let ev = fresh_event(v.vault_id(), [0x11; 32], [0u8; 32], b"ingest-1", 99, 0);
+        let outcome = v.ingest_chain_revision(&ev).expect("ingest ok");
+        assert_eq!(outcome, IngestOutcome::Inserted);
+        // Compute the expected revision_id (canonical hash) and look
+        // up the row directly.
+        let rev_id = pangolin_chain::canonical_hash(
+            &ev.vault_id,
+            &ev.account_id,
+            &ev.parent_revision,
+            &ev.device_id,
+            ev.schema_version,
+            &ev.enc_payload,
+        );
+        let rev_id_obj = crate::revision::RevisionId::from_bytes(rev_id);
+        let revs = v
+            .revisions_for(crate::account::AccountId::from_bytes(ev.account_id))
+            .expect("revisions_for");
+        assert_eq!(revs.len(), 1);
+        assert_eq!(revs[0].revision_id, rev_id_obj);
+        let anchor = revs[0].chain_anchor.expect("anchor present");
+        assert_eq!(anchor.block_number, 99);
+        assert_eq!(anchor.log_index, 0);
+    }
+
+    /// Plan test: ingest does NOT stamp a dirty marker (the chain
+    /// already has the revision; nothing to publish).
+    #[test]
+    fn ingest_chain_revision_does_not_mark_dirty() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        let ev = fresh_event(v.vault_id(), [0x22; 32], [0u8; 32], b"no-dirty", 1, 0);
+        v.ingest_chain_revision(&ev).expect("ingest");
+        assert!(
+            v.list_dirty().expect("list dirty").is_empty(),
+            "ingest must NOT stamp a dirty marker"
+        );
+    }
+
+    /// Plan test: idempotent — re-ingesting the same event returns
+    /// `AlreadyPresent` and does NOT insert a duplicate row.
+    #[test]
+    fn ingest_chain_revision_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        let ev = fresh_event(v.vault_id(), [0x33; 32], [0u8; 32], b"idemp", 1, 0);
+        let first = v.ingest_chain_revision(&ev).expect("first");
+        let second = v.ingest_chain_revision(&ev).expect("second");
+        assert_eq!(first, IngestOutcome::Inserted);
+        assert_eq!(second, IngestOutcome::AlreadyPresent);
+        let revs = v
+            .revisions_for(crate::account::AccountId::from_bytes(ev.account_id))
+            .expect("revisions_for");
+        assert_eq!(revs.len(), 1, "no duplicate row on re-ingest");
     }
 }

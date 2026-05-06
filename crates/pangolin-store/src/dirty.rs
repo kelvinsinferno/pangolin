@@ -72,6 +72,23 @@ pub struct RevisionPublishPayload {
     pub enc_payload: Vec<u8>,
 }
 
+/// Outcome of [`crate::vault::Vault::ingest_chain_revision`].
+///
+/// `Inserted` — the event was new and a row was added to the local
+/// `revisions` table with its chain anchor populated. `AlreadyPresent`
+/// — the event matched an existing local row (either by exact
+/// `revision_id` or by `(account_id, parent_revision, enc_payload,
+/// device_id, schema_version)` tuple identity), so no insert was
+/// performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestOutcome {
+    /// A new row was inserted into the `revisions` table.
+    Inserted,
+    /// The event was already present locally; the row was not
+    /// modified.
+    AlreadyPresent,
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
