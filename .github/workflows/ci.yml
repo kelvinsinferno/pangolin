@@ -1,5 +1,11 @@
 # P0-1 — Rust CI: fmt, clippy, test on Linux + Windows + macOS.
 # Toolchain pinned via rust-toolchain.toml at the repo root.
+#
+# P5-1 — adds contracts jobs:
+#   - contracts-build: forge build (deny-warnings); enforces solc 0.8.24 + Shanghai EVM
+#   - contracts-test: forge test (unit + invariant; >=10k invariant runs)
+#   - contracts-abi-drift: re-build and diff out/ABI vs committed contracts/abi/RevisionLogV0.json
+#   - contracts-slither: static analysis; zero high-severity findings required
 
 name: CI
 
@@ -47,3 +53,126 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace --all-targets
+
+  # -----------------------------------------------------------------
+  # P5-1: contracts pipeline
+  # -----------------------------------------------------------------
+
+  contracts-build:
+    name: contracts / forge build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Install forge-std (no submodule)
+        run: forge install foundry-rs/forge-std --no-git --no-commit
+      - name: forge build (deny warnings, sizes)
+        run: forge build --deny-warnings --sizes
+      - name: forge fmt --check
+        run: forge fmt --check
+      # Audit gap-7: dry-run the deploy script so a regression in the
+      # script (bad import, missing constructor arg, vm.startBroadcast
+      # misuse, etc.) is caught at build time. We invoke it without
+      # --rpc-url / --broadcast / --private-key so it executes against
+      # a local in-memory EVM and never tries to send a transaction;
+      # `vm.startBroadcast()` with no broadcaster signed-up is a no-op.
+      - name: forge script (deploy dry-run)
+        run: forge script script/DeployRevisionLogV0.s.sol --sig "run()" --tc DeployRevisionLogV0
+
+  contracts-test:
+    name: contracts / forge test (incl. invariants)
+    runs-on: ubuntu-latest
+    needs: contracts-build
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Install forge-std (no submodule)
+        run: forge install foundry-rs/forge-std --no-git --no-commit
+      # Per docs/issue-plans/P5-1.md success criterion #3 the invariant
+      # tests must run with at least 10,000 fuzzed runs. The default in
+      # foundry.toml is already 10000; this env var is a belt-and-braces
+      # guarantee in case foundry.toml is edited.
+      - name: forge test (unit + invariant >= 10k runs)
+        env:
+          FOUNDRY_INVARIANT_RUNS: "10000"
+        run: forge test -vv
+
+  contracts-abi-drift:
+    name: contracts / ABI drift check
+    runs-on: ubuntu-latest
+    needs: contracts-build
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Install forge-std (no submodule)
+        run: forge install foundry-rs/forge-std --no-git --no-commit
+      # Re-build the contract from source and compare its ABI against
+      # the committed JSON. Any drift = compilation reproducibility
+      # failure or stale ABI commit.
+      - name: forge build
+        run: forge build
+      - name: Extract freshly built ABI
+        # Match the committed file's POSIX trailing-newline convention so
+        # diff does not flag a spurious end-of-file mismatch.
+        run: |
+          python3 -c "import json; d=json.load(open('out/RevisionLogV0.sol/RevisionLogV0.json')); f=open('/tmp/RevisionLogV0.fresh.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()"
+      - name: Diff committed ABI against fresh ABI
+        run: |
+          if ! diff -u abi/RevisionLogV0.json /tmp/RevisionLogV0.fresh.json; then
+            echo "::error::ABI drift detected between contracts/abi/RevisionLogV0.json and forge build output."
+            echo "::error::Re-run: cd contracts && forge build && python3 -c \"import json; d=json.load(open('out/RevisionLogV0.sol/RevisionLogV0.json')); f=open('abi/RevisionLogV0.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()\""
+            exit 1
+          fi
+
+  contracts-slither:
+    name: contracts / slither
+    runs-on: ubuntu-latest
+    needs: contracts-build
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Install forge-std (no submodule)
+        run: forge install foundry-rs/forge-std --no-git --no-commit
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install slither + pinned solc
+        run: |
+          pip install slither-analyzer
+          solc-select install 0.8.24
+          solc-select use 0.8.24
+      # Plan success criterion #4: zero high-severity findings.
+      # `--fail-high` exits non-zero on any High-severity issue.
+      # We do NOT exclude lower severities by default; informational and
+      # low-severity findings are tolerated but visible in CI logs so a
+      # reviewer can decide whether to address them.
+      - name: slither
+        run: slither src/RevisionLogV0.sol --fail-high

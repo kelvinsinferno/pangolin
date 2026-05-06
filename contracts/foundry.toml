@@ -1,0 +1,46 @@
+# Foundry configuration for Pangolin contracts.
+#
+# Pinned per docs/issue-plans/P5-1.md and DECISIONS.md D-005:
+#   - solc = "0.8.24"            (Cancun-era compiler, but...)
+#   - evm_version = "shanghai"   (target Shanghai EVM for cross-chain
+#                                 portability — no Base-specific opcodes)
+#   - bytecode_hash = "none"     (deterministic builds; no metadata-hash
+#                                 drift from local toolchain differences)
+#   - optimizer = true / runs=200 (standard Foundry default)
+
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+solc = "0.8.24"
+evm_version = "shanghai"
+optimizer = true
+optimizer_runs = 200
+bytecode_hash = "none"
+# Treat compiler warnings as errors. Per plan success criterion #9 the
+# build must produce zero Solidity warnings. (CLI side: CI runs
+# `forge build --deny-warnings`. Setting `deny_warnings` here does not
+# work in current Foundry; the CLI flag is the supported entrypoint.)
+
+[fmt]
+line_length = 100
+tab_width = 4
+bracket_spacing = false
+int_types = "long"
+quote_style = "double"
+
+# Invariant runs default. Per docs/issue-plans/P5-1.md success criterion #3,
+# CI must run >= 10,000 fuzzed invariant runs. Local devs can override with
+# `FOUNDRY_INVARIANT_RUNS=256 forge test` for faster iteration.
+#
+# `fail_on_revert = true` is deliberate (security-audit fix M-2): under
+# `false`, handler-level early-returns silently mask reverts the runner
+# would otherwise surface. The handler uses `vm.assume(...)` instead of
+# early-`return` so out-of-bounds fuzzed inputs cleanly skip a call
+# without polluting the run-count or hiding regressions.
+[invariant]
+runs = 10000
+depth = 32
+fail_on_revert = true
