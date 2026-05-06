@@ -266,6 +266,32 @@ impl WrappedVdk {
         &self.ctx
     }
 
+    /// Reconstructs a `WrappedVdk` from parts that were previously
+    /// produced by [`VdkKey::wrap`] and persisted (e.g., by the
+    /// `pangolin-store` vault file's meta header).
+    ///
+    /// **Use only to round-trip a `WrappedVdk` through durable storage.**
+    /// This constructor performs no validation beyond field assignment;
+    /// the resulting wrapper authenticates only when subsequently passed
+    /// to [`Self::unwrap_with`] under the matching authority and
+    /// `WrapContext`. A tampered `ciphertext`, `nonce`, or `ctx` will
+    /// fail authentication then, which is the design.
+    ///
+    /// # Misuse warning
+    ///
+    /// Do not synthesize the parts. The only legitimate input is the
+    /// triple `(ciphertext, nonce, ctx)` that was produced by a prior
+    /// call to [`VdkKey::wrap`] in this crate and stored by a downstream
+    /// store layer.
+    #[must_use]
+    pub fn from_parts(ciphertext: Ciphertext, nonce: Nonce, ctx: WrapContext) -> Self {
+        Self {
+            ciphertext,
+            nonce,
+            ctx,
+        }
+    }
+
     /// Sealing helper. Derives the authority's wrap key, generates a fresh
     /// nonce, and seals the VDK bytes under the HKDF-derived AEAD key,
     /// binding the encoded `ctx` blob as AAD.
@@ -820,5 +846,42 @@ mod tests {
         let wrapped = vdk.wrap(&auth, &ctx).unwrap();
         let recovered = wrapped.unwrap_with(&auth).unwrap();
         assert!(bool::from(vdk.ct_eq(&recovered)));
+    }
+
+    // ---------- P1.1: WrappedVdk::from_parts round-trip ----------
+
+    /// Round-trip a `WrappedVdk` through its publicly-accessible parts
+    /// — `ciphertext()`, `nonce()`, `context()` — and reconstruct it via
+    /// `from_parts`. The reconstructed wrapper must unwrap to the same
+    /// VDK that was originally wrapped, and must fail under a different
+    /// authority just like the original.
+    ///
+    /// This is the disk-roundtrip path that `pangolin-store` uses for
+    /// the meta-table `wrapped_vdk` BLOB.
+    #[test]
+    fn wrapped_vdk_round_trips_via_from_parts() {
+        let vdk = VdkKey::generate();
+        let auth_a = AuthorityKey::generate();
+        let auth_b = AuthorityKey::generate();
+        let ctx = WrapContext::new(VAULT_A);
+
+        let original = vdk.wrap(&auth_a, &ctx).unwrap();
+
+        // Extract parts as a downstream store layer would, persist them,
+        // and reconstruct.
+        let ciphertext = original.ciphertext().clone();
+        let nonce = *original.nonce();
+        let ctx_persisted = *original.context();
+        let reconstructed = WrappedVdk::from_parts(ciphertext, nonce, ctx_persisted);
+
+        // Reconstructed wrapper unwraps under the correct authority…
+        let recovered = reconstructed.unwrap_with(&auth_a).unwrap();
+        assert!(bool::from(vdk.ct_eq(&recovered)));
+
+        // …and rejects the wrong authority, just like the original.
+        assert_eq!(
+            reconstructed.unwrap_with(&auth_b).unwrap_err(),
+            crate::aead::AeadError::Tampered,
+        );
     }
 }
