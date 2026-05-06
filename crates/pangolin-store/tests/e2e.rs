@@ -7,7 +7,22 @@
 use std::process::Command;
 
 use pangolin_crypto::secret::SecretBytes;
-use pangolin_store::{AccountSnapshot, Vault};
+use pangolin_store::{AccountSnapshot, PinIdentityProof, PressYPresenceProof, StoreError, Vault};
+
+/// Build a fresh `PinIdentityProof` from `fresh_password()`. P4
+/// session-policy: every unlock requires both a presence proof and an
+/// identity proof, so e2e tests construct proofs at each call site.
+/// The original P2 single-password signature is gone; this helper
+/// keeps the call sites compact.
+fn fresh_pin() -> PinIdentityProof {
+    PinIdentityProof::new(fresh_password())
+}
+
+/// Build a fresh `PressYPresenceProof` ("user pressed y").
+/// `PoC` proofs are single-use, so each `unlock` call gets its own.
+fn fresh_presence() -> PressYPresenceProof {
+    PressYPresenceProof::confirmed()
+}
 
 /// Helper — convenience constructor for a snapshot whose password
 /// field carries a unique marker, used by the plaintext-on-disk
@@ -74,7 +89,6 @@ fn no_plaintext_on_disk() {
     Vault::create(&path, &fresh_password()).unwrap();
     let mut total_bytes_scanned: u64 = 0;
     let n_iterations: usize = 100;
-    let pwd = fresh_password();
 
     for i in 0..n_iterations {
         let seed = format!("{i:08}-{}", random_suffix(i));
@@ -83,7 +97,7 @@ fn no_plaintext_on_disk() {
         // file is fully flushed between writes.
         {
             let mut v = Vault::open(&path).unwrap();
-            v.unlock(&pwd).unwrap();
+            v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
             v.add_account(snapshot_from_markers(&markers)).unwrap();
             v.lock();
             v.close().unwrap();
@@ -164,7 +178,7 @@ fn round_trip_property() {
 
     Vault::create(&path, &pwd).unwrap();
     let mut v = Vault::open(&path).unwrap();
-    v.unlock(&pwd).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
 
     let mut expected: Vec<(pangolin_store::AccountId, [u8; 32])> = Vec::with_capacity(1024);
     for i in 0..1024u32 {
@@ -195,10 +209,22 @@ fn round_trip_property() {
     v.lock();
     v.close().unwrap();
     let mut v = Vault::open(&path).unwrap();
-    v.unlock(&pwd).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
     for (id, marker) in &expected {
-        let snap = v.get_account(*id).expect("missing on reopen");
-        assert_eq!(snap.password.expose(), &marker[..]);
+        // P4 H-1 fix: `AccountSnapshot.password` is `pub(crate)`, so
+        // external callers (this integration test) must route through
+        // the presence-gated `reveal_password` accessor. Each iteration
+        // gets its own fresh `PressYPresenceProof` — single-use replay
+        // resistance forbids reusing one across calls.
+        assert!(
+            v.get_account(*id).is_some(),
+            "missing on reopen for id {id:?}"
+        );
+        let presence = PressYPresenceProof::confirmed();
+        let pwd = v
+            .reveal_password(*id, &presence)
+            .expect("reveal_password must succeed on a freshly-unlocked vault");
+        assert_eq!(pwd.expose(), &marker[..]);
     }
 }
 
@@ -243,7 +269,7 @@ fn crash_during_write_recovers_via_wal() {
     Vault::create(&path, &pwd).unwrap();
     let survivor_id = {
         let mut v = Vault::open(&path).unwrap();
-        v.unlock(&pwd).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         let id = v.add_account(snapshot_with_marker("survivor")).unwrap();
         v.lock();
         v.close().unwrap();
@@ -251,7 +277,7 @@ fn crash_during_write_recovers_via_wal() {
     };
     let pre_count = {
         let mut v = Vault::open(&path).unwrap();
-        v.unlock(&pwd).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         let n = v.list_accounts().len();
         v.lock();
         v.close().unwrap();
@@ -293,7 +319,7 @@ fn crash_during_write_recovers_via_wal() {
         std::fs::remove_file(&stale_lock).unwrap();
     }
     let mut v = Vault::open(&path).unwrap();
-    v.unlock(&pwd).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
     let accounts = v.list_accounts();
     assert_eq!(
         accounts.len(),
@@ -399,7 +425,7 @@ fn adversarial_cross_account_row_transplant_fails() {
     let id_b;
     {
         let mut v = Vault::open(&path).unwrap();
-        v.unlock(&pwd).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         id_a = v.add_account(snapshot_with_marker("alpha")).unwrap();
         id_b = v.add_account(snapshot_with_marker("bravo")).unwrap();
         v.lock();
@@ -440,7 +466,7 @@ fn adversarial_cross_account_row_transplant_fails() {
     // transplanted revision blob's AAD disagrees with the runtime AAD
     // built from the SQL row.
     let mut v = Vault::open(&path).unwrap();
-    let err = v.unlock(&pwd).unwrap_err();
+    let err = v.unlock(&fresh_presence(), &fresh_pin()).unwrap_err();
     assert!(
         matches!(err, pangolin_store::StoreError::AuthenticationFailed),
         "expected AuthenticationFailed for cross-account row transplant; got {err:?}",
@@ -463,7 +489,7 @@ fn adversarial_per_row_schema_version_tamper_fails() {
     Vault::create(&path, &pwd).unwrap();
     {
         let mut v = Vault::open(&path).unwrap();
-        v.unlock(&pwd).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         v.add_account(snapshot_with_marker("schema-tamper"))
             .unwrap();
         v.lock();
@@ -482,7 +508,7 @@ fn adversarial_per_row_schema_version_tamper_fails() {
     }
 
     let mut v = Vault::open(&path).unwrap();
-    let err = v.unlock(&pwd).unwrap_err();
+    let err = v.unlock(&fresh_presence(), &fresh_pin()).unwrap_err();
     assert!(
         matches!(err, pangolin_store::StoreError::AuthenticationFailed),
         "expected AuthenticationFailed for tampered per-row schema_version; got {err:?}",
@@ -580,7 +606,7 @@ fn adversarial_kdf_param_tampering_fails() {
             .unwrap();
     }
     let mut v = Vault::open(&path).unwrap();
-    let err = v.unlock(&pwd).unwrap_err();
+    let err = v.unlock(&fresh_presence(), &fresh_pin()).unwrap_err();
     assert!(
         matches!(err, pangolin_store::StoreError::AuthenticationFailed),
         "expected AuthenticationFailed for sub-floor KDF params; got {err:?}",
@@ -608,7 +634,7 @@ fn adversarial_kdf_param_tampering_fails() {
         .unwrap();
     }
     let mut v = Vault::open(&path2).unwrap();
-    let err = v.unlock(&pwd).unwrap_err();
+    let err = v.unlock(&fresh_presence(), &fresh_pin()).unwrap_err();
     assert!(
         matches!(err, pangolin_store::StoreError::AuthenticationFailed),
         "expected AuthenticationFailed for tampered salt; got {err:?}"
@@ -635,7 +661,7 @@ fn fork_detection_round_trip() {
     let r2_alt;
     {
         let mut v = Vault::open(&path).unwrap();
-        v.unlock(&pwd).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         // Genesis (R0) -> R1 -> R2 (linear so far).
         id = v.add_account(snapshot_with_marker("genesis")).unwrap();
         r0 = v.account_heads(id).unwrap()[0];
@@ -676,7 +702,7 @@ fn fork_detection_round_trip() {
     // disk round-trip. Cardinal-principle 4 ("never silent merge")
     // is enforced by storage shape, not in-memory state.
     let mut v = Vault::open(&path).unwrap();
-    v.unlock(&pwd).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
     assert!(
         v.is_forked(id).unwrap(),
         "fork must still be visible after lock+reopen+unlock"
@@ -745,9 +771,81 @@ fn adversarial_wrapped_vdk_bit_flip_fails() {
         .unwrap();
     }
     let mut v = Vault::open(&path).unwrap();
-    let err = v.unlock(&pwd).unwrap_err();
+    let err = v.unlock(&fresh_presence(), &fresh_pin()).unwrap_err();
     assert!(
         matches!(err, pangolin_store::StoreError::AuthenticationFailed),
         "expected AuthenticationFailed for bit-flipped wrapped_vdk; got {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------
+// P4 / Plan §"Test plan": full_session_lifecycle integration test.
+// Real time, real PIN, real "press-y" — exercises the spec's session
+// flow end-to-end without TestClock injection.
+// ---------------------------------------------------------------------
+#[test]
+fn full_session_lifecycle() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("lifecycle.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+
+    let mut v = Vault::open(&path).unwrap();
+    // Locked: session is not active; session_remaining is None.
+    assert!(!v.is_session_active());
+    assert!(v.session_remaining().is_none());
+
+    // Cardinal-principle 5: Start = 2 proofs.
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    assert!(v.is_session_active());
+    // Right after unlock, ~15 minutes remaining.
+    let remaining = v.session_remaining().unwrap();
+    assert!(remaining > std::time::Duration::from_secs(14 * 60));
+    assert!(remaining <= std::time::Duration::from_secs(15 * 60));
+
+    // Active session: routine credential ops succeed (1-proof maintain).
+    // Marker is the literal password we'll later round-trip through
+    // reveal_password.
+    let id = v
+        .add_account(snapshot_with_marker("hunter2-real-time"))
+        .unwrap();
+    assert!(v.get_account(id).is_some());
+    let _ = v.list_accounts();
+
+    // High-risk op (reveal_password) requires an explicit fresh
+    // presence proof EVEN during an active session (cardinal-principle
+    // 5: high-risk requires explicit presence even mid-session).
+    let presence = PressYPresenceProof::confirmed();
+    let pwd = v.reveal_password(id, &presence).unwrap();
+    assert_eq!(pwd.expose(), b"hunter2-real-time");
+
+    // Replayed presence proof → AuthenticationFailed (single-use
+    // replay rejection).
+    let err = v.reveal_password(id, &presence).unwrap_err();
+    assert!(matches!(err, StoreError::AuthenticationFailed));
+
+    // Export-payload exercises the same proof discipline.
+    let presence_export = PressYPresenceProof::confirmed();
+    let bytes = v.export_payload(id, &presence_export).unwrap();
+    assert!(bytes.len() > 50);
+
+    // Lock → session goes inactive.
+    v.lock();
+    assert!(!v.is_session_active());
+    assert!(v.session_remaining().is_none());
+    // Cache is gone — list_accounts is empty after lock.
+    assert!(v.list_accounts().is_empty());
+
+    // After lock, every credential op surfaces NotUnlocked (P2
+    // semantics) until the next 2-proof unlock.
+    let err = v
+        .add_account(snapshot_with_marker("after-lock"))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotUnlocked));
+
+    // Re-unlock with both proofs → session is active again, the
+    // previously-added account is loaded back from disk.
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    assert!(v.get_account(id).is_some());
+    v.lock();
+    v.close().unwrap();
 }

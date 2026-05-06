@@ -11,6 +11,8 @@
 use pangolin_crypto::aead::AeadError;
 use pangolin_crypto::kdf::KdfError;
 
+use crate::session::AuthError;
+
 /// Convenience alias used across the crate.
 pub type Result<T> = core::result::Result<T, StoreError>;
 
@@ -106,6 +108,35 @@ pub enum StoreError {
     /// `PRAGMA integrity_check` returning anything other than "ok").
     #[error("storage corruption detected: {0}")]
     Corrupted(String),
+
+    /// The session was active but its idle timer or absolute-max ceiling
+    /// fired. The cache is zeroized at the moment of expiry; the next
+    /// op must re-supply both proofs (presence + identity) per Session
+    /// spec §3 invariant 3.
+    ///
+    /// `with_session` callers can recover by running the supplied
+    /// re-auth callback and re-running the original op.
+    #[error("session expired; both proofs are required to resume")]
+    SessionExpired,
+
+    /// The session is in the [`crate::session::SessionState::PendingAuthorization`]
+    /// state — a re-auth flow is in progress and the host UI has not yet
+    /// gathered both proofs. Operations are deferred. Distinct from
+    /// `NotUnlocked` so callers can distinguish "vault was never
+    /// unlocked" from "vault entered the prompt-state and is waiting on
+    /// the host UI".
+    #[error("session is awaiting authorization (proofs in flight)")]
+    SessionPending,
+
+    /// A high-risk operation (`reveal_password`, `export_payload`,
+    /// future recovery-changes / device-approvals) was called without
+    /// the explicit fresh presence proof Session spec §5.3 requires.
+    /// Distinct from `AuthenticationFailed` because the failure mode
+    /// is structural ("you didn't supply the proof") rather than
+    /// cryptographic ("the proof failed to verify"). Callers should
+    /// prompt the user for an explicit presence confirmation and retry.
+    #[error("operation requires a fresh presence proof")]
+    PresenceProofRequired,
 }
 
 impl From<AeadError> for StoreError {
@@ -127,6 +158,26 @@ impl From<KdfError> for StoreError {
         // with the meta row's KDF parameters cannot distinguish that
         // tamper from a salt or ciphertext tamper. Indistinguishability
         // is the explicit promise of `THREAT_MODEL.md` row #7.
+        Self::AuthenticationFailed
+    }
+}
+
+impl From<AuthError> for StoreError {
+    fn from(_: AuthError) -> Self {
+        // P4: every proof-verification failure (PIN empty, presence
+        // already consumed, presence stale, generic "Failed") collapses
+        // into `AuthenticationFailed`. Same MEDIUM-1 indistinguishability
+        // discipline as the AEAD/KDF paths: a caller MUST NOT be able
+        // to tell "you supplied an empty PIN" from "your presence proof
+        // was replayed" from "the KDF derivation rejected" — those are
+        // all "authentication failed" from the user's perspective.
+        //
+        // Note: `SessionExpired`, `SessionPending`, and
+        // `PresenceProofRequired` are STRUCTURAL conditions detected
+        // before any proof verify runs and are surfaced via their own
+        // distinct variants. They cannot be confused with proof-
+        // verification failure because they happen at a different point
+        // in the call chain (state-machine check vs. crypto check).
         Self::AuthenticationFailed
     }
 }

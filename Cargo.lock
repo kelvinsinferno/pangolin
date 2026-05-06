@@ -504,6 +504,7 @@ dependencies = [
  "pangolin-crypto",
  "proptest",
  "rusqlite",
+ "static_assertions",
  "subtle",
  "tempfile",
  "thiserror",
