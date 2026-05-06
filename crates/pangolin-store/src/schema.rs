@@ -94,6 +94,22 @@ CREATE TABLE IF NOT EXISTS sync_state (
     id                  INTEGER PRIMARY KEY CHECK (id = 0),
     last_pulled_block   INTEGER NOT NULL DEFAULT 0
 );
+
+-- P8-2: per-(account, revision) dirty marker so `pangolin-cli publish`
+-- never loses track of an unpublished revision across restarts. Same
+-- additive `CREATE TABLE IF NOT EXISTS` posture as `sync_state` above
+-- (no `format_version` bump; existing P0..P7 vaults pick this up on
+-- next open). See `docs/issue-plans/P8.md` §A1+A2 for the rationale
+-- and the composite-primary-key (`account_id`, `revision_id`)
+-- discipline that protects against duplicate-publish on re-run.
+CREATE TABLE IF NOT EXISTS dirty_accounts (
+    account_id   BLOB NOT NULL,
+    revision_id  BLOB NOT NULL,
+    marked_at    INTEGER NOT NULL,
+    PRIMARY KEY (account_id, revision_id)
+);
+CREATE INDEX IF NOT EXISTS dirty_accounts_marked_at_idx
+    ON dirty_accounts (marked_at);
 ";
 
 /// Apply all pragmas and the schema DDL on the supplied connection.

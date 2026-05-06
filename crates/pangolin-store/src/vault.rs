@@ -731,7 +731,11 @@ impl Vault {
         let (ct, nonce) = seal_snapshot(active.vdk.aead_key(), &snapshot, &aad)?;
         let now = current_unix_ms();
 
-        // Use a single immediate transaction for the two-row write.
+        // P8-2: wrap account_identities + revisions + dirty_accounts
+        // in one immediate transaction. A crash between rows leaves
+        // the vault in the pre-transaction state — the dirty marker
+        // is never present without the revision row that produced it
+        // (and vice versa).
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO account_identities (
@@ -757,6 +761,16 @@ impl Vault {
                 now,
                 ct.as_bytes(),
                 nonce.as_bytes().as_slice(),
+            ],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO dirty_accounts
+                (account_id, revision_id, marked_at)
+             VALUES (?1, ?2, ?3)",
+            params![
+                account_id.as_bytes().as_slice(),
+                revision_id.as_bytes().as_slice(),
+                now,
             ],
         )?;
         tx.commit()?;
@@ -815,6 +829,8 @@ impl Vault {
         let (ct, nonce) = seal_snapshot(active.vdk.aead_key(), &new_snapshot, &aad)?;
         let now = current_unix_ms();
 
+        // P8-2: revisions + account_identities head pointer + dirty
+        // marker in one transaction.
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO revisions (
@@ -840,6 +856,16 @@ impl Vault {
                 revision_id.as_bytes().as_slice(),
                 now,
                 id.as_bytes().as_slice(),
+            ],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO dirty_accounts
+                (account_id, revision_id, marked_at)
+             VALUES (?1, ?2, ?3)",
+            params![
+                id.as_bytes().as_slice(),
+                revision_id.as_bytes().as_slice(),
+                now,
             ],
         )?;
         tx.commit()?;
@@ -891,6 +917,11 @@ impl Vault {
         let (ct, nonce) = seal_tombstone(active.vdk.aead_key(), &aad)?;
         let now = current_unix_ms();
 
+        // P8-2: tombstone-revision + flip + dirty marker in one
+        // transaction. Tombstone revisions also need publishing —
+        // P10 (delete) reads them off the chain like any other
+        // revision; the dirty marker tracks them through the publish
+        // path identically.
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO revisions (
@@ -916,6 +947,16 @@ impl Vault {
                 revision_id.as_bytes().as_slice(),
                 now,
                 id.as_bytes().as_slice(),
+            ],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO dirty_accounts
+                (account_id, revision_id, marked_at)
+             VALUES (?1, ?2, ?3)",
+            params![
+                id.as_bytes().as_slice(),
+                revision_id.as_bytes().as_slice(),
+                now,
             ],
         )?;
         tx.commit()?;
@@ -1788,6 +1829,121 @@ impl Vault {
             params![new_i64],
         )?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Dirty-marker primitives (P8-2) — `dirty_accounts` table API
+    // -----------------------------------------------------------------
+
+    /// Stamp `(account_id, revision_id)` into `dirty_accounts`.
+    ///
+    /// Idempotent — uses `INSERT OR IGNORE` so a re-stamp of the same
+    /// `(account_id, revision_id)` pair is a no-op. The auto-stamp
+    /// inside [`Self::add_account`] / [`Self::update_account`] /
+    /// [`Self::delete_account`] runs in the same transaction as the
+    /// revision INSERT, so callers don't usually need to invoke this
+    /// directly. The public method is exposed for forward-compat with
+    /// future ingestion paths (e.g., importing a revision from an
+    /// out-of-band source).
+    ///
+    /// Metadata-only — does NOT require [`VaultState::Active`].
+    /// Touches the soft-expiry path so a long-idle session is properly
+    /// zeroized but the operation itself proceeds even from a `Locked`
+    /// vault.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` for any database issue. `StoreError::Corrupted`
+    /// if the unix-ms timestamp does not fit in `i64` (impossible
+    /// before year ~292M).
+    pub fn mark_dirty(&mut self, account_id: AccountId, revision_id: RevisionId) -> Result<()> {
+        self.maybe_expire_active_session();
+        let now = current_unix_ms();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO dirty_accounts
+                (account_id, revision_id, marked_at)
+             VALUES (?1, ?2, ?3)",
+            params![
+                account_id.as_bytes().as_slice(),
+                revision_id.as_bytes().as_slice(),
+                now,
+            ],
+        )?;
+        self.touch_session();
+        Ok(())
+    }
+
+    /// Remove the marker for `(account_id, revision_id)`. No-op if
+    /// no such marker exists. Idempotent.
+    ///
+    /// Per `P8.md` §A2 the pair-key discipline means clearing a
+    /// `(account_id, wrong_revision_id)` pair has no effect on other
+    /// markers for the same account — this is the test
+    /// `clear_with_wrong_revision_id_is_noop` (below).
+    ///
+    /// Metadata-only — does NOT require [`VaultState::Active`].
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` for any database issue.
+    pub fn clear_dirty(&mut self, account_id: AccountId, revision_id: RevisionId) -> Result<()> {
+        self.maybe_expire_active_session();
+        self.conn.execute(
+            "DELETE FROM dirty_accounts
+             WHERE account_id = ?1 AND revision_id = ?2",
+            params![
+                account_id.as_bytes().as_slice(),
+                revision_id.as_bytes().as_slice(),
+            ],
+        )?;
+        self.touch_session();
+        Ok(())
+    }
+
+    /// Snapshot the current dirty list, sorted by `marked_at` ASC
+    /// (FIFO).
+    ///
+    /// Empty `Vec` for a freshly-created vault. Length grows by one
+    /// per call to `add_account` / `update_account` / `delete_account`
+    /// and shrinks by one per `clear_dirty` (or per successful
+    /// `mark_published` + clear in the publish orchestrator — see
+    /// `pangolin-cli sync.rs`, P8-3).
+    ///
+    /// Metadata-only — does NOT require [`VaultState::Active`].
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` for any database issue.
+    /// `StoreError::Corrupted` if a stored row's BLOB columns are not
+    /// 32 bytes (storage corruption).
+    pub fn list_dirty(&self) -> Result<Vec<crate::dirty::DirtyEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT account_id, revision_id, marked_at
+             FROM dirty_accounts
+             ORDER BY marked_at ASC, account_id ASC, revision_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let account_id: Vec<u8> = row.get(0)?;
+            let revision_id: Vec<u8> = row.get(1)?;
+            let marked_at: i64 = row.get(2)?;
+            Ok((account_id, revision_id, marked_at))
+        })?;
+        let mut out: Vec<crate::dirty::DirtyEntry> = Vec::new();
+        for row in rows {
+            let (acc_blob, rev_blob, marked_at) = row?;
+            let acc_arr: [u8; ACCOUNT_ID_LEN] = acc_blob.as_slice().try_into().map_err(|_| {
+                StoreError::Corrupted("dirty_accounts.account_id not 32 bytes".into())
+            })?;
+            let rev_arr: [u8; REVISION_ID_LEN] = rev_blob.as_slice().try_into().map_err(|_| {
+                StoreError::Corrupted("dirty_accounts.revision_id not 32 bytes".into())
+            })?;
+            out.push(crate::dirty::DirtyEntry {
+                account_id: AccountId::from_bytes(acc_arr),
+                revision_id: RevisionId::from_bytes(rev_arr),
+                marked_at,
+            });
+        }
+        Ok(out)
     }
 }
 
