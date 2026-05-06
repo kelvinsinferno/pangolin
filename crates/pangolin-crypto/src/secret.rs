@@ -5,6 +5,11 @@
 //! via the [`zeroize`] crate and never exposes its contents through
 //! [`core::fmt::Debug`].
 //!
+//! [`BoxedSecret`] is a heap-allocated owner of a fixed-size secret array
+//! used by `AeadKey` and `VdkKey` (per MEDIUM-8) — heap allocation gives
+//! stronger move-semantics safety because the secret bytes never move
+//! through stack frames during a return-by-value chain.
+//!
 //! Equality on secret material is **not** provided through [`PartialEq`] —
 //! callers that legitimately need to compare two secret values must use
 //! [`subtle::ConstantTimeEq`] explicitly.
@@ -13,6 +18,78 @@ use core::fmt;
 
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
+
+/// Heap-allocated, zero-on-drop, fixed-size secret buffer.
+///
+/// The standard `Zeroizing<Box<[u8; N]>>` pattern doesn't work directly
+/// because `zeroize 1.8` does not provide a `Zeroize` impl on
+/// `Box<[u8; N]>` (it covers `Box<[u8]>` slices, but not boxed arrays).
+/// `BoxedSecret` is a thin newtype around `Box<[u8; N]>` with a manual
+/// `Zeroize` impl that wipes the heap allocation in place — the address
+/// is stable because the value is owned and not moved.
+///
+/// The dereference accessors deliberately go through `&[u8; N]` rather
+/// than handing out a raw pointer so that the type system can't be
+/// bypassed by accident.
+///
+/// Heap-allocation cost is `N` bytes per instance — for `KEY_LEN = 32`
+/// this is a single 32-byte allocation per key, negligible compared to
+/// the AEAD context that holds it.
+pub struct BoxedSecret<const N: usize> {
+    inner: Box<[u8; N]>,
+}
+
+impl<const N: usize> BoxedSecret<N> {
+    /// Wraps caller-supplied bytes by moving them onto the heap. The
+    /// caller's stack-allocated array is the caller's responsibility to
+    /// zeroize after this call returns.
+    #[must_use]
+    pub fn new(bytes: [u8; N]) -> Self {
+        Self {
+            inner: Box::new(bytes),
+        }
+    }
+
+    /// Returns a reference to the stored bytes.
+    #[must_use]
+    pub fn as_array(&self) -> &[u8; N] {
+        &self.inner
+    }
+
+    /// Returns a slice view of the stored bytes.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        self.inner.as_slice()
+    }
+}
+
+impl<const N: usize> Zeroize for BoxedSecret<N> {
+    fn zeroize(&mut self) {
+        // `[u8; N]` implements `Zeroize`; `Box::deref_mut` gives us a
+        // stable mutable reference to the heap allocation, so the wipe
+        // hits the same bytes that any borrow has been seeing.
+        (*self.inner).zeroize();
+    }
+}
+
+impl<const N: usize> Drop for BoxedSecret<N> {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl<const N: usize> fmt::Debug for BoxedSecret<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BoxedSecret")
+            .field("len", &N)
+            .field("data", &"<redacted>")
+            .finish()
+    }
+}
+
+// `BoxedSecret` carries the same "no Clone, no Copy, no PartialEq, no
+// Serialize" discipline as the rest of the secret-bearing surface.
+// We deliberately do not derive any of those traits.
 
 /// Owned, heap-allocated secret bytes that zero on drop.
 ///
@@ -85,7 +162,32 @@ impl Drop for SecretBytes {
 
 #[cfg(test)]
 mod tests {
-    use super::SecretBytes;
+    use super::{BoxedSecret, SecretBytes};
+    use zeroize::Zeroize;
+
+    #[test]
+    fn boxed_secret_round_trips_bytes() {
+        let bs: BoxedSecret<32> = BoxedSecret::new([0x42; 32]);
+        assert_eq!(bs.as_array(), &[0x42u8; 32]);
+        assert_eq!(bs.as_slice().len(), 32);
+    }
+
+    #[test]
+    fn boxed_secret_zeroizes_in_place() {
+        let mut bs: BoxedSecret<8> = BoxedSecret::new([0xFFu8; 8]);
+        assert_eq!(bs.as_array(), &[0xFFu8; 8]);
+        bs.zeroize();
+        assert_eq!(bs.as_array(), &[0u8; 8]);
+    }
+
+    #[test]
+    fn boxed_secret_debug_redacts() {
+        let bs: BoxedSecret<32> = BoxedSecret::new([0xAB; 32]);
+        let printed = format!("{bs:?}");
+        assert!(printed.contains("<redacted>"));
+        assert!(!printed.contains("ab"));
+        assert!(printed.contains("len: 32"));
+    }
 
     #[test]
     fn debug_redacts_contents() {

@@ -14,9 +14,10 @@
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 use subtle::ConstantTimeEq;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 use crate::rng::{CryptoRng, OsRng, RngCore};
+use crate::secret::BoxedSecret;
 
 /// Length of an [`AeadKey`] in bytes.
 pub const KEY_LEN: usize = 32;
@@ -31,11 +32,15 @@ pub const TAG_LEN: usize = 16;
 ///
 /// Zeroes its memory on drop; never implements [`Clone`], [`Copy`], or
 /// [`PartialEq`]. Use [`AeadKey::ct_eq`] for constant-time equality.
+///
+/// Per MEDIUM-8 the key bytes live on the heap inside a
+/// [`BoxedSecret<KEY_LEN>`]. The ~32-byte heap allocation per key is a
+/// small cost; the benefit is stronger move-semantics safety — an
+/// inline `[u8; 32]` would be byte-copied through stack frames on
+/// return-by-value chains, leaving stale unzeroed copies in the
+/// caller frames that the optimizer is free to leave alone.
 pub struct AeadKey {
-    /// Inner buffer is `Zeroizing<[u8; 32]>` — `[u8; N]` implements
-    /// [`Zeroize`] for any `N`, and the wrapper guarantees `zeroize` runs
-    /// on every drop path including panic unwinding.
-    inner: Zeroizing<[u8; KEY_LEN]>,
+    inner: BoxedSecret<KEY_LEN>,
 }
 
 impl AeadKey {
@@ -47,22 +52,26 @@ impl AeadKey {
 
     /// Generates a fresh random key from a caller-supplied CSPRNG.
     ///
-    /// Used by tests that need reproducibility.
-    pub fn generate_with<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
+    /// Crate-private: production callers must use [`AeadKey::generate`]
+    /// (which always pulls from `OsRng`) so an external caller cannot
+    /// inject a deterministic / weak RNG. Tests inside the crate can
+    /// still reach this path. See MEDIUM-11.
+    pub(crate) fn generate_with<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         let mut bytes = [0u8; KEY_LEN];
         rng.fill_bytes(&mut bytes);
-        let inner = Zeroizing::new(bytes);
+        let inner = BoxedSecret::new(bytes);
         bytes.zeroize();
         Self { inner }
     }
 
     /// Wraps caller-supplied key bytes.
     ///
-    /// The caller's array is moved in, then zeroed on the stack via
-    /// [`Zeroize`] so a stale stack frame cannot leak the key.
+    /// The caller's array is moved onto the heap; the stack-side copy
+    /// is then zeroed via [`Zeroize`] so a stale stack frame cannot
+    /// leak the key.
     #[must_use]
     pub fn from_bytes(mut bytes: [u8; KEY_LEN]) -> Self {
-        let inner = Zeroizing::new(bytes);
+        let inner = BoxedSecret::new(bytes);
         bytes.zeroize();
         Self { inner }
     }
@@ -70,9 +79,7 @@ impl AeadKey {
     /// Constant-time equality with another key.
     #[must_use]
     pub fn ct_eq(&self, other: &Self) -> subtle::Choice {
-        let a: &[u8] = &*self.inner;
-        let b: &[u8] = &*other.inner;
-        a.ct_eq(b)
+        self.inner.as_slice().ct_eq(other.inner.as_slice())
     }
 
     /// Crate-internal accessor that exposes the raw 32-byte AEAD key.
@@ -80,7 +87,7 @@ impl AeadKey {
     /// Used **only** by [`crate::keys::VdkKey`] when feeding the VDK into
     /// the wrap-AEAD `seal` call. Not exposed to consumers of the crate.
     pub(crate) fn expose_bytes_for_keys(&self) -> &[u8; KEY_LEN] {
-        &self.inner
+        self.inner.as_array()
     }
 
     /// Encrypts and authenticates `plaintext` under this key, binding `aad`.
@@ -93,8 +100,8 @@ impl AeadKey {
         plaintext: &[u8],
         aad: &[u8],
     ) -> Result<Ciphertext, AeadError> {
-        let cipher =
-            XChaCha20Poly1305::new_from_slice(&*self.inner).map_err(|_| AeadError::InvalidKey)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(self.inner.as_slice())
+            .map_err(|_| AeadError::InvalidKey)?;
         let payload = Payload {
             msg: plaintext,
             aad,
@@ -111,15 +118,27 @@ impl AeadKey {
     /// Returns [`AeadError::Tampered`] for any authentication failure —
     /// wrong key, wrong nonce, modified ciphertext, modified AAD, or a
     /// truncated buffer all produce the same error so that callers cannot
-    /// distinguish them.
+    /// distinguish them. Per LOW-12, the open path collapses ALL upstream
+    /// failure causes (including the otherwise-unreachable
+    /// `InvalidKey` branch from `new_from_slice`) into `Tampered` so a
+    /// caller cannot accidentally construct an oracle on the failure
+    /// mode.
     pub fn open(
         &self,
         nonce: &Nonce,
         ciphertext: &Ciphertext,
         aad: &[u8],
     ) -> Result<Vec<u8>, AeadError> {
-        let cipher =
-            XChaCha20Poly1305::new_from_slice(&*self.inner).map_err(|_| AeadError::InvalidKey)?;
+        // LOW-15: the ciphertext must include at least the 16-byte
+        // Poly1305 tag; anything shorter cannot authenticate. Detect the
+        // obvious case deterministically and return `Tampered` — the
+        // upstream `decrypt` path also rejects this, but doing it here
+        // means we never even invoke the AEAD on a nonsense buffer.
+        if ciphertext.len() < TAG_LEN {
+            return Err(AeadError::Tampered);
+        }
+        let cipher = XChaCha20Poly1305::new_from_slice(self.inner.as_slice())
+            .map_err(|_| AeadError::Tampered)?;
         let payload = Payload {
             msg: ciphertext.as_bytes(),
             aad,
@@ -154,7 +173,10 @@ impl Nonce {
     }
 
     /// Generates a random nonce from a caller-supplied CSPRNG.
-    pub fn random_with<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
+    ///
+    /// Crate-private: production callers must use [`Nonce::random`].
+    /// See MEDIUM-11.
+    pub(crate) fn random_with<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         let mut n = [0u8; NONCE_LEN];
         rng.fill_bytes(&mut n);
         Self(n)
@@ -308,6 +330,23 @@ mod tests {
             prop_assert_eq!(pt, plaintext);
         }
 
+        /// LOW-12 / coverage gap: round-trip with empty plaintext AND
+        /// empty AAD across random keys/nonces — covers the corner case
+        /// the existing `round_trip` proptest only hits with low
+        /// probability (vec(0..512) generates `len = 0` rarely).
+        #[test]
+        fn empty_plaintext_empty_aad_round_trip(
+            key_bytes in any::<[u8; KEY_LEN]>(),
+            nonce_bytes in any::<[u8; NONCE_LEN]>(),
+        ) {
+            let key = AeadKey::from_bytes(key_bytes);
+            let nonce = Nonce::from_bytes(nonce_bytes);
+            let ct = key.seal(&nonce, &[], &[]).unwrap();
+            prop_assert_eq!(ct.len(), TAG_LEN);
+            let pt = key.open(&nonce, &ct, &[]).unwrap();
+            prop_assert_eq!(pt.as_slice(), &[][..]);
+        }
+
         #[test]
         fn tamper_ciphertext_fails(
             plaintext in proptest::collection::vec(any::<u8>(), 1..256),
@@ -381,6 +420,41 @@ mod tests {
             key.open(&nonce, &truncated, b"context").unwrap_err(),
             AeadError::Tampered,
         );
+    }
+
+    /// LOW-15: a ciphertext shorter than `TAG_LEN` cannot authenticate;
+    /// the open path returns `Tampered` without invoking the AEAD.
+    /// Specifically covers the empty-buffer edge case.
+    #[test]
+    fn open_rejects_buffer_shorter_than_tag() {
+        let key = AeadKey::from_bytes([0x55; KEY_LEN]);
+        let nonce = Nonce::from_bytes([0x66; NONCE_LEN]);
+        // Empty buffer.
+        let empty = Ciphertext::from_vec(Vec::new());
+        assert_eq!(
+            key.open(&nonce, &empty, b"").unwrap_err(),
+            AeadError::Tampered,
+        );
+        // 15 bytes — one less than TAG_LEN.
+        let undersize = Ciphertext::from_vec(vec![0u8; TAG_LEN - 1]);
+        assert_eq!(
+            key.open(&nonce, &undersize, b"").unwrap_err(),
+            AeadError::Tampered,
+        );
+    }
+
+    /// LOW-12: empty plaintext + empty AAD round-trips without surfacing
+    /// the otherwise-unreachable `InvalidKey` branch (proptest peer to
+    /// the existing `round_trip` test). We keep this as a unit test
+    /// rather than a proptest because all the inputs are constants.
+    #[test]
+    fn empty_plaintext_and_empty_aad_round_trip() {
+        let key = AeadKey::from_bytes([0u8; KEY_LEN]);
+        let nonce = Nonce::from_bytes([0u8; NONCE_LEN]);
+        let ct = key.seal(&nonce, b"", b"").unwrap();
+        assert_eq!(ct.len(), TAG_LEN);
+        let pt = key.open(&nonce, &ct, b"").unwrap();
+        assert_eq!(pt, b"");
     }
 
     #[test]

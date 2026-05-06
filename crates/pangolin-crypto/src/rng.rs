@@ -11,7 +11,12 @@
 //! constructors (`AeadKey::generate`, `Nonce::random`, etc.) always pull
 //! from [`OsRng`].
 
-pub use rand_core::{CryptoRng, OsRng, RngCore};
+pub use rand_core::{CryptoRng, OsRng};
+// `RngCore` is the trait through which a non-CSPRNG could feed bytes
+// into the `_with` constructors; we keep it crate-private so external
+// (downstream-crate) consumers cannot reach the deterministic-RNG
+// surface even if they tried. See MEDIUM-11.
+pub(crate) use rand_core::RngCore;
 
 /// Returns a fresh handle to the operating-system CSPRNG.
 ///

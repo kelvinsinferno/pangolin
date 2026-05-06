@@ -279,19 +279,47 @@ fn vdk_wrapper_tamper_is_detected() {
 // this on `SecretBytes` because the heap pointer is stable across the
 // borrow we hand out via `expose()`.
 
+/// LOW-14: renamed from `secret_bytes_drop_does_not_panic_under_unwind`.
+/// The old name implied we were proving the absence of a panic; what
+/// the test actually demonstrates is that `Drop` runs along the
+/// unwinding path and the secret's `Zeroizing` wrapper completes
+/// without panicking. The atomic-recording harness counts how many
+/// `Drop`s ran so we can assert the unwind path actually executed
+/// the destructor.
 #[test]
-fn secret_bytes_drop_does_not_panic_under_unwind() {
-    // A scoped panic during a borrow of the secret's bytes must still
-    // run the secret's `Drop` (zeroize). We catch_unwind to verify the
-    // panic is propagated and no double-free / leak occurs.
+fn secret_bytes_drop_runs_during_unwind() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    /// Side-channel harness: bumps `DROP_COUNT` on drop. We park it in
+    /// the same scope as the secret so a panic in the same scope must
+    /// run both destructors before unwinding past the `catch_unwind`
+    /// boundary.
+    struct DropCounter;
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let before = DROP_COUNT.load(Ordering::SeqCst);
     let result = std::panic::catch_unwind(|| {
+        let _counter = DropCounter;
         let s = pangolin_crypto::secret::SecretBytes::new(b"payload-bytes".to_vec());
         let _len = s.len();
         panic!("intentional panic to exercise drop-on-unwind");
     });
+    let after = DROP_COUNT.load(Ordering::SeqCst);
+
     assert!(
         result.is_err(),
         "expected the catch_unwind to capture the panic"
+    );
+    assert_eq!(
+        after - before,
+        1,
+        "DropCounter::drop must have run during unwind",
     );
 }
 

@@ -149,7 +149,10 @@ impl VdkKey {
     }
 
     /// Generates a fresh random VDK from a caller-supplied CSPRNG.
-    pub fn generate_with<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
+    ///
+    /// Crate-private: production callers must use [`VdkKey::generate`].
+    /// See MEDIUM-11.
+    pub(crate) fn generate_with<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         Self {
             inner: AeadKey::generate_with(rng),
         }
@@ -377,7 +380,10 @@ impl AuthorityKey {
     }
 
     /// Generates a fresh authority keypair from a caller-supplied CSPRNG.
-    pub fn generate_with<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
+    ///
+    /// Crate-private: production callers must use
+    /// [`AuthorityKey::generate`]. See MEDIUM-11.
+    pub(crate) fn generate_with<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         Self {
             inner: SigningKey::generate_with(rng),
         }
@@ -446,7 +452,10 @@ impl DeviceKey {
     }
 
     /// Generates a fresh device keypair from a caller-supplied CSPRNG.
-    pub fn generate_with<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
+    ///
+    /// Crate-private: production callers must use [`DeviceKey::generate`].
+    /// See MEDIUM-11.
+    pub(crate) fn generate_with<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         Self {
             inner: SigningKey::generate_with(rng),
         }
@@ -499,8 +508,11 @@ impl VdkKey {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthorityKey, DeviceKey, VdkKey, WrapContext, WrappedVdk, WRAP_KEY_INFO};
-    use crate::aead::AeadError;
+    use super::{
+        AuthorityKey, DeviceKey, VdkKey, WrapContext, WrappedVdk, VAULT_ID_LEN, WRAP_KEY_INFO,
+    };
+    use crate::aead::{AeadError, AeadKey, KEY_LEN};
+    use crate::sign::SigningKey;
 
     /// Fixture vault id used across the test module so that intent
     /// (`auth_a` wraps for `vault_a`, etc.) is obvious in failure logs.
@@ -749,6 +761,40 @@ mod tests {
         // dependency graph entirely (see HIGH-1 fix). Without `serde` in
         // the dependency tree, no `Serialize` impl is even expressible.
         // This runtime test is purely a documentation marker.
+    }
+
+    // ---------- Property tests on VDK wrap/unwrap -------------------
+    //
+    // Coverage gap closed here: proptest over random `vault_id` and
+    // random VDK, asserting wrap/unwrap round-trips byte-equal
+    // recovery. ≥1024 cases.
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 1024,
+            ..proptest::prelude::ProptestConfig::default()
+        })]
+
+        #[test]
+        fn vdk_wrap_unwrap_proptest(
+            vault_id in proptest::prelude::any::<[u8; VAULT_ID_LEN]>(),
+            schema_version in proptest::prelude::any::<u8>(),
+            vdk_bytes in proptest::prelude::any::<[u8; KEY_LEN]>(),
+            auth_seed in proptest::prelude::any::<[u8; 32]>(),
+        ) {
+            // Build a deterministic VDK and authority from the prop bytes
+            // — we exercise the wrap_with / generate_with crate-private
+            // surface here (ok inside the crate's own test module).
+            let vdk = VdkKey { inner: AeadKey::from_bytes(vdk_bytes) };
+            let auth = AuthorityKey { inner: SigningKey::from_seed(auth_seed) };
+            let ctx = WrapContext { vault_id, schema_version };
+            let wrapped = vdk.wrap(&auth, &ctx).unwrap();
+            let recovered = wrapped.unwrap_with(&auth).unwrap();
+            proptest::prop_assert!(bool::from(vdk.ct_eq(&recovered)));
+            // And the carried ctx round-trips intact.
+            proptest::prop_assert_eq!(wrapped.context().vault_id, vault_id);
+            proptest::prop_assert_eq!(wrapped.context().schema_version, schema_version);
+        }
     }
 
     // ---------- Adversarial: VDK plaintext length is enforced -------

@@ -45,7 +45,12 @@ impl SigningKey {
     }
 
     /// Generates a fresh keypair from a caller-supplied CSPRNG.
-    pub fn generate_with<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
+    ///
+    /// Crate-private: production callers must use
+    /// [`SigningKey::generate`] (which always pulls from `OsRng`) so an
+    /// external caller cannot inject a deterministic / weak RNG. See
+    /// MEDIUM-11.
+    pub(crate) fn generate_with<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         let mut seed = [0u8; SECRET_KEY_LEN];
         rng.fill_bytes(&mut seed);
         let inner = DalekSigningKey::from_bytes(&seed);
