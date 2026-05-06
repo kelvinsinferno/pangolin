@@ -293,7 +293,7 @@ mod tests {
         // file recorded for the deployed contract.
         assert_eq!(
             format!("{:?}", dep.runtime_keccak).to_ascii_lowercase(),
-            "0xaeff0a8fc34b478cb4c93b6f5bfd293cc12dd5f0a65a997c7c022b23f3e4e2d0"
+            "0xdbab504e86eca48cbedf61bb1fbc04ab17a5bb880d5a468cbb64e4b64e95c6fe"
         );
         assert!(dep.abi_path.is_file());
         // ABI loads as a JsonAbi.

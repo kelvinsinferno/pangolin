@@ -125,7 +125,7 @@
    rpc                : https://sepolia.base.org
    abi_cross_check    : OK
    chain_id           : 84532  (expected: 84532)  OK
-   bytecode_keccak    : 0xaeff0a8fc34b478cb4c93b6f5bfd293cc12dd5f0a65a997c7c022b23f3e4e2d0  (expected: 0xaeff0a8fc34b478cb4c93b6f5bfd293cc12dd5f0a65a997c7c022b23f3e4e2d0)  OK
+   bytecode_keccak    : 0xdbab504e86eca48cbedf61bb1fbc04ab17a5bb880d5a468cbb64e4b64e95c6fe  (expected: 0xdbab504e86eca48cbedf61bb1fbc04ab17a5bb880d5a468cbb64e4b64e95c6fe)  OK
    nextSequence       : <current value, ≥1 once any write has landed>
    ```
    The `abi_cross_check` line confirms the on-disk JSON ABI matches the binding chaincli compiled against (selectors + event topic-0). The `bytecode_keccak` line additionally hashes the live runtime bytecode at the recorded address (`eth_getCode`) and compares it to `bytecode.deployed_runtime_keccak256` from the deployment file — defense-in-depth against a tampered deployment file pointing at a foreign contract that happens to expose the same selectors.
