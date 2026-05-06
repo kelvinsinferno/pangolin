@@ -61,6 +61,30 @@ use crate::session::{
     IDLE_TIMEOUT_DEFAULT,
 };
 
+// ---------------------------------------------------------------------
+// P4 audit M-3: compile-time thread-safety contract for `Vault`.
+// ---------------------------------------------------------------------
+//
+// `Vault` MUST be `Send` (so a `Vault` instance can be moved between
+// threads — useful for host-side worker patterns where a UI thread
+// hands off the vault handle to a background thread for an Argon2id
+// unlock) but MUST NOT be `Sync` (concurrent access from two threads
+// would race the underlying `rusqlite::Connection`, which we open with
+// `SQLITE_OPEN_NO_MUTEX` to disable SQLite's own thread-safety
+// machinery). The `Connection` is `Send` but `!Sync` under those
+// flags; `Vault` inherits both via its `conn: Connection` field, plus
+// its `clock: Box<dyn Clock>` where `Clock: Send + 'static` (no `Sync`
+// bound — see `session.rs`). The assertions below pin both invariants
+// at compile time so a future refactor that, e.g., switches the
+// connection to a `Mutex<Connection>` (making `Vault: Sync`) would
+// fail the build with a clear error pointing at this audit finding.
+//
+// `assert_impl_all!` triggers a compile error if the bound is missing;
+// `assert_not_impl_any!` triggers a compile error if the bound is
+// added. Together they pin the type to exactly `Send` (and not `Sync`).
+static_assertions::assert_impl_all!(Vault: Send);
+static_assertions::assert_not_impl_any!(Vault: Sync);
+
 /// Public state observable on a [`Vault`] handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VaultState {
@@ -293,12 +317,21 @@ impl Vault {
     /// never need this — `Vault::open` and `Vault::create` install a
     /// [`SystemClock`] by default.
     ///
-    /// # Visibility
+    /// # Visibility (P4 audit M-1)
     ///
-    /// Public so the integration test in `tests/e2e.rs` can install a
-    /// long-window test clock if needed. The `Box<dyn Clock>` requires
-    /// `'static` so callers cannot accidentally tie the clock's
-    /// lifetime to a stack frame.
+    /// Gated behind `cfg(any(test, feature = "test-utilities"))` so
+    /// production builds cannot link against it. The previous
+    /// `#[doc(hidden)]`-only gate let downstream code call this and
+    /// install a malicious / mis-configured clock — the `cfg` gate
+    /// fixes that. The `feature = "test-utilities"` clause is
+    /// forward-compat for future external integration testing; the
+    /// feature is not declared in `Cargo.toml` yet because all
+    /// in-process tests live inside this crate and `cfg(test)` alone
+    /// suffices.
+    ///
+    /// The `Box<dyn Clock>` requires `'static` so callers cannot
+    /// accidentally tie the clock's lifetime to a stack frame.
+    #[cfg(any(test, feature = "test-utilities"))]
     #[doc(hidden)]
     #[must_use]
     pub fn with_clock(mut self, clock: Box<dyn Clock>) -> Self {
@@ -334,11 +367,30 @@ impl Vault {
         self.session_state
     }
 
-    /// `true` iff the session is currently active.
-    /// Convenience for the common case in P4-aware callers.
+    /// `true` iff the session is currently active **and** its idle
+    /// deadline has not yet been crossed against the vault's clock.
+    ///
+    /// # P4 audit M-4
+    ///
+    /// The previous implementation returned the raw state-machine
+    /// variant — `SessionState::Active { .. }` was treated as "active"
+    /// even when the wall-clock had already advanced past
+    /// `expires_at`, because the state-machine flip from `Active` to
+    /// `Expired` only happens inside `check_session_freshness` (i.e.,
+    /// on the next `&mut self` op). That was misleading: a caller
+    /// checking `is_session_active()` between an idle expiry and the
+    /// next mut-op would see `true` and proceed under the wrong
+    /// assumption. The clock-aware check folded into the public method
+    /// (the `is_session_active_now` private helper) makes the answer
+    /// match reality regardless of which lifecycle phase the caller
+    /// happens to observe.
     #[must_use]
     pub fn is_session_active(&self) -> bool {
-        self.session_state.is_active()
+        if let SessionState::Active { expires_at, .. } = self.session_state {
+            self.clock.now() <= expires_at
+        } else {
+            false
+        }
     }
 
     /// Time remaining on the active session, or `None` if the session
@@ -434,6 +486,25 @@ impl Vault {
         // ensures a stale/replayed presence is caught immediately.
         // Both verifies route through `From<AuthError> for StoreError`,
         // collapsing to `AuthenticationFailed`.
+        //
+        // M-2 (P4 audit) — known timing distinguishability between
+        // structural and content-class identity failures; PoC accepts;
+        // MVP-1 hardening = run Argon2id on every code path that
+        // produces an `AuthenticationFailed`. Concretely: a stale or
+        // already-consumed presence proof, or an empty PIN, fails
+        // here in microseconds; a wrong (non-empty) PIN fails after
+        // the full ~1.5s Argon2id derivation downstream. An attacker
+        // observing wall-clock timing can therefore distinguish
+        // "structural rejection" from "content-class rejection" —
+        // but NOT "right PIN" from "wrong PIN" (both run Argon2id to
+        // completion). This residual distinguishability is acceptable
+        // for PoC because the structural-failure timing leak does
+        // not reveal any secret-bearing material; MVP-1 closes it
+        // by routing every authentication-failure path through a
+        // constant Argon2id round-trip. Do NOT add a sleep or
+        // always-run-Argon2id workaround at PoC stage — those would
+        // harm UX (every empty-PIN typo would 1.5s) and are out of
+        // PoC scope.
         presence.verify()?;
         identity.verify()?;
 
@@ -872,7 +943,7 @@ impl Vault {
     /// the cache is dropped, which the next mut-op does.
     #[must_use]
     pub fn get_account(&self, id: AccountId) -> Option<&AccountSnapshot> {
-        if !self.is_session_active_now() {
+        if !self.is_session_active() {
             return None;
         }
         self.active.as_ref().and_then(|a| a.cache.get(id))
@@ -883,7 +954,7 @@ impl Vault {
     /// of returning empty for non-Active vaults).
     #[must_use]
     pub fn search(&self, query: &str) -> Vec<AccountId> {
-        if !self.is_session_active_now() {
+        if !self.is_session_active() {
             return Vec::new();
         }
         self.active
@@ -895,24 +966,12 @@ impl Vault {
     /// the session has expired.
     #[must_use]
     pub fn list_accounts(&self) -> Vec<AccountId> {
-        if !self.is_session_active_now() {
+        if !self.is_session_active() {
             return Vec::new();
         }
         self.active
             .as_ref()
             .map_or_else(Vec::new, |a| a.cache.account_ids())
-    }
-
-    /// `&self`-friendly check: is the session active AND its deadline
-    /// not yet past? Used by the `&self` cache-bearing readers
-    /// (`get_account`, `search`, `list_accounts`) which cannot mutate
-    /// state to flip Active→Expired but DO need to gate their reads.
-    fn is_session_active_now(&self) -> bool {
-        if let SessionState::Active { expires_at, .. } = self.session_state {
-            self.clock.now() <= expires_at
-        } else {
-            false
-        }
     }
 
     // -----------------------------------------------------------------
@@ -970,20 +1029,85 @@ impl Vault {
         id: AccountId,
         presence: &dyn PresenceProof,
     ) -> Result<SecretBytes> {
+        self.reveal_secret_field(id, presence, |snap| snap.password.expose().to_vec())
+    }
+
+    /// Reveal the plaintext notes for an account.
+    ///
+    /// **High-risk operation** (Pangolin §5.4 — same reveal-class
+    /// umbrella as `reveal_password`). Notes can carry recovery
+    /// phrases or answers to security questions, so the same presence
+    /// gate applies. Returns a freshly-allocated [`SecretBytes`] cloned
+    /// from the in-memory cache.
+    ///
+    /// Added in P4-fix-pass-H-1 alongside making
+    /// [`crate::account::AccountSnapshot::notes`] crate-private. Without
+    /// this accessor, external callers would have no way to read notes
+    /// off an unlocked vault — which is the point: every secret-field
+    /// readout must route through a presence-gated entry point.
+    ///
+    /// # Errors
+    ///
+    /// Same set as [`Self::reveal_password`].
+    pub fn reveal_notes(
+        &mut self,
+        id: AccountId,
+        presence: &dyn PresenceProof,
+    ) -> Result<SecretBytes> {
+        self.reveal_secret_field(id, presence, |snap| snap.notes.expose().to_vec())
+    }
+
+    /// Reveal the plaintext TOTP secret for an account.
+    ///
+    /// **High-risk operation** (Pangolin §5.4 — same reveal-class
+    /// umbrella as `reveal_password`). The TOTP shared secret is
+    /// directly equivalent to a second-factor seed; revealing it lets
+    /// the caller generate codes, so it is gated identically to the
+    /// password.
+    ///
+    /// Returns a freshly-allocated [`SecretBytes`] cloned from the
+    /// in-memory cache. If the account has no TOTP configured the
+    /// returned `SecretBytes` is empty (`expose() == b""`).
+    ///
+    /// # Errors
+    ///
+    /// Same set as [`Self::reveal_password`].
+    pub fn reveal_totp_secret(
+        &mut self,
+        id: AccountId,
+        presence: &dyn PresenceProof,
+    ) -> Result<SecretBytes> {
+        self.reveal_secret_field(id, presence, |snap| snap.totp_secret.expose().to_vec())
+    }
+
+    /// Shared implementation for the three `reveal_*` accessors.
+    ///
+    /// Order of operations is identical to the per-method docstring on
+    /// [`Self::reveal_password`] — the only thing that varies between
+    /// password / notes / totp is which `SecretBytes` field gets
+    /// cloned out at step 3.
+    fn reveal_secret_field<F>(
+        &mut self,
+        id: AccountId,
+        presence: &dyn PresenceProof,
+        extract: F,
+    ) -> Result<SecretBytes>
+    where
+        F: FnOnce(&AccountSnapshot) -> Vec<u8>,
+    {
         // Step 1: structural session check. If this fails, the
         // presence proof is NOT consumed — the caller can retry after
         // reauthing.
         self.check_session_freshness()?;
         // Step 2: verify presence proof (consumes single-use flag).
         presence.verify()?;
-        // Step 3: read from the in-memory cache. The cache entry's
-        // password field is a SecretBytes — clone its bytes into a
-        // fresh allocation for the caller. The original stays in the
-        // cache; both copies zero on drop.
+        // Step 3: read from the in-memory cache. Clone the requested
+        // field's bytes into a fresh allocation for the caller; the
+        // original stays in the cache. Both copies zero on drop.
         let active = self.require_active()?;
         let snapshot = active.cache.get(id).ok_or(StoreError::AccountNotFound)?;
-        let password_bytes = snapshot.password.expose().to_vec();
-        let out = SecretBytes::new(password_bytes);
+        let bytes = extract(snapshot);
+        let out = SecretBytes::new(bytes);
         // Step 4: touch the session (extends the idle deadline).
         self.touch_session();
         Ok(out)
@@ -1068,6 +1192,17 @@ impl Vault {
                 // cancelled, wrong PIN, ...), the error propagates
                 // and the original op is NOT executed.
                 reauth(self)?;
+                // L-3 (P4 audit): re-validate session freshness AFTER
+                // reauth claims `Ok(())`. A malformed reauth
+                // implementation that returns `Ok(())` without
+                // actually transitioning the vault back to `Active`
+                // (or leaving it Active-but-already-expired against
+                // the clock — possible if reauth burns enough time)
+                // would otherwise let `op` run against an invalid
+                // session. Surfacing `SessionExpired` immediately is
+                // both more explicit and avoids any ambiguity about
+                // what state `op` ran under.
+                self.check_session_freshness()?;
                 op(self)
             }
             Err(other) => Err(other),
@@ -2515,6 +2650,44 @@ mod tests {
         assert!(matches!(err, StoreError::AuthenticationFailed));
     }
 
+    /// P4 audit L-3: a malformed reauth callback that returns
+    /// `Ok(())` WITHOUT actually transitioning the vault back to
+    /// `Active` must NOT cause `with_session` to run `op`. The
+    /// post-reauth `check_session_freshness` re-validation surfaces
+    /// `SessionExpired` immediately. This protects against host UIs
+    /// whose reauth flow paths can erroneously short-circuit success
+    /// (e.g., a UI bug that loses the focus event between the prompt
+    /// and the unlock call).
+    #[test]
+    fn with_session_revalidates_after_reauth_returns_ok() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "with-session-revalidate.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let (mut v, clock) = open_vault_with_test_clock(&p);
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        v.add_account(fresh_snapshot()).unwrap();
+
+        // Expire the session.
+        clock.advance(IDLE_TIMEOUT_DEFAULT + Duration::from_secs(1));
+
+        // The malformed reauth: returns Ok(()) without unlocking.
+        // `op` MUST NOT run. The error must be `SessionExpired`,
+        // surfaced by the L-3 re-validation step inside
+        // `with_session`.
+        let err = v
+            .with_session(
+                |_v_inner| -> Result<usize, StoreError> {
+                    panic!("op must NOT run when reauth lies about success");
+                },
+                |_v_inner| Ok(()),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::SessionExpired),
+            "expected SessionExpired from L-3 re-validation; got {err:?}"
+        );
+    }
+
     /// Plan success criterion 9:
     /// `vault::tests::session_remaining_decreases_with_time` — the
     /// `is_session_active` and `session_remaining` accessors reflect
@@ -2578,7 +2751,8 @@ mod tests {
 
         // First op after expiry: surfaces SessionExpired AND the cache
         // is gone (read-side already reports empty/None because
-        // is_session_active_now == false).
+        // `is_session_active()` is now clock-aware (P4 M-4) and
+        // returns `false` once the deadline is crossed).
         assert!(v.get_account(id).is_none());
         assert!(v.list_accounts().is_empty());
         let err = v.update_account(id, fresh_snapshot()).unwrap_err();

@@ -90,27 +90,111 @@ impl fmt::Debug for AccountId {
 /// Decrypted plaintext of an account's "current state" — the in-memory
 /// representation an unlocked vault hands back to its caller.
 ///
+/// # Regression: secret fields are crate-private (P4 H-1 fix)
+///
+/// External callers cannot read the `password`, `notes`, or
+/// `totp_secret` fields directly off a `&AccountSnapshot`. The
+/// following snippet must FAIL to compile — the
+/// `compile_fail`-annotated doctest doubles as a regression test that
+/// catches a future refactor accidentally re-exposing a secret field.
+///
+/// ```compile_fail
+/// use pangolin_store::AccountSnapshot;
+/// use pangolin_crypto::secret::SecretBytes;
+///
+/// let snap = AccountSnapshot::new(
+///     SecretBytes::new(b"d".to_vec()),
+///     SecretBytes::new(b"u".to_vec()),
+///     SecretBytes::new(b"p".to_vec()),
+///     SecretBytes::new(b"https://x".to_vec()),
+///     SecretBytes::new(b"n".to_vec()),
+///     SecretBytes::new(b"".to_vec()),
+/// );
+/// // Each of the three lines below MUST be a compile error
+/// // (private field access) — that's the H-1 fix.
+/// let _ = snap.password.expose();
+/// let _ = snap.notes.expose();
+/// let _ = snap.totp_secret.expose();
+/// ```
+///
+/// Non-secret fields remain `pub` per spec §5.4 (they are not on the
+/// high-risk list):
+///
+/// ```
+/// use pangolin_store::AccountSnapshot;
+/// use pangolin_crypto::secret::SecretBytes;
+///
+/// let snap = AccountSnapshot::new(
+///     SecretBytes::new(b"d".to_vec()),
+///     SecretBytes::new(b"u".to_vec()),
+///     SecretBytes::new(b"p".to_vec()),
+///     SecretBytes::new(b"https://x".to_vec()),
+///     SecretBytes::new(b"n".to_vec()),
+///     SecretBytes::new(b"".to_vec()),
+/// );
+/// // These compile because display_name/username/url are non-secret
+/// // identity fields per spec §5.4.
+/// let _ = snap.display_name.expose();
+/// let _ = snap.username.expose();
+/// let _ = snap.url.expose();
+/// ```
+///
 /// Every field is heap-allocated and zero-on-drop. The struct itself is
 /// [`zeroize::ZeroizeOnDrop`] (via its fields) and deliberately has no
 /// derive of `Clone`, `Copy`, `PartialEq`, or `Serialize`. Equality on
 /// secret fields uses [`subtle::ConstantTimeEq`] through
 /// [`Self::ct_eq`]; non-secret identity equality is not provided —
 /// callers compare by [`AccountId`] outside the snapshot.
+///
+/// # Presence-escalation discipline (spec §5.4 / P4 H-1 fix)
+///
+/// Spec §5.4 ("High-Risk Action Escalation") lists `reveal password`,
+/// `export vault`, `modify recovery`, `approve devices`, and
+/// `extend long sessions` as high-risk actions that **MUST** require an
+/// explicit fresh presence proof even during an active session. The
+/// secret-bearing fields below — `password`, `notes`, `totp_secret` —
+/// fall under that "reveal credential" umbrella. To enforce the
+/// presence gate at the type system layer, those fields are
+/// `pub(crate)`: external callers cannot read them via field access on
+/// a `&AccountSnapshot` returned by [`crate::vault::Vault::get_account`].
+/// The presence-gated entry points are:
+///
+/// - [`crate::vault::Vault::reveal_password`]
+/// - [`crate::vault::Vault::reveal_notes`]
+/// - [`crate::vault::Vault::reveal_totp_secret`]
+///
+/// Each requires a fresh [`crate::session::PresenceProof`] in addition
+/// to an active session. Without these accessors, an external caller
+/// holding a `&AccountSnapshot` reference can only observe the
+/// non-secret identity fields (`display_name`, `username`, `url`),
+/// which are not on spec §5.4's high-risk list. Internal crate code
+/// (the AEAD seal/open path, the search index, `ct_eq`) still has
+/// crate-private access.
 pub struct AccountSnapshot {
     /// Human-readable display name. Plaintext — but still encrypted at
     /// rest because revealing service display names is a credential
-    /// metadata leak.
+    /// metadata leak. Public field: not on spec §5.4's high-risk list.
     pub display_name: SecretBytes,
-    /// Login-username field.
+    /// Login-username field. Public field: not on spec §5.4's
+    /// high-risk list.
     pub username: SecretBytes,
-    /// Password.
-    pub password: SecretBytes,
-    /// Service URL the credential applies to.
+    /// Password. Crate-private — external callers must route through
+    /// [`crate::vault::Vault::reveal_password`] (presence-gated). See
+    /// the type-level "Presence-escalation discipline" docstring.
+    pub(crate) password: SecretBytes,
+    /// Service URL the credential applies to. Public field: not on
+    /// spec §5.4's high-risk list.
     pub url: SecretBytes,
-    /// Free-form notes.
-    pub notes: SecretBytes,
+    /// Free-form notes. Crate-private — external callers must route
+    /// through [`crate::vault::Vault::reveal_notes`] (presence-gated).
+    /// Notes can carry recovery phrases / answers to security
+    /// questions, so they fall under the same reveal-class umbrella as
+    /// `password`.
+    pub(crate) notes: SecretBytes,
     /// Optional TOTP secret. Empty `SecretBytes` when not configured.
-    pub totp_secret: SecretBytes,
+    /// Crate-private — external callers must route through
+    /// [`crate::vault::Vault::reveal_totp_secret`] (presence-gated).
+    pub(crate) totp_secret: SecretBytes,
 }
 
 impl AccountSnapshot {

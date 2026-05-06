@@ -12,17 +12,35 @@ description = "Encrypted local store — SQLite + encrypted blobs. Corruption-sa
 [lints]
 workspace = true
 
+[features]
+# P4 audit M-1 / I-6: forward-compat hook for an external
+# integration-test crate that may need to construct presence proofs
+# with caller-controlled timestamps or install a mockable `Clock` on a
+# `Vault`. Enabling this feature exposes those helpers without the
+# `cfg(test)` gate (which only fires inside this crate's own tests).
+# The feature carries no compiled artifacts beyond the gated
+# helpers themselves; default builds (and external production
+# consumers) cannot link against the helpers because the feature
+# is opt-in only.
+#
+# Naming + semantics deliberately mirror similar `test-utilities`
+# features in the broader Rust ecosystem (e.g., `tokio` crate).
+test-utilities = []
+
 [dependencies]
 # Encrypted-blob crypto consumed only through pangolin-crypto's public
 # API surface — this crate never invents primitives.
 pangolin-crypto = { path = "../pangolin-crypto" }
 
-rusqlite    = { workspace = true }
-ciborium-ll = { workspace = true }
-ciborium-io = { workspace = true }
-thiserror   = { workspace = true }
-zeroize     = { workspace = true }
-subtle      = { workspace = true }
+rusqlite          = { workspace = true }
+ciborium-ll       = { workspace = true }
+ciborium-io       = { workspace = true }
+thiserror         = { workspace = true }
+zeroize           = { workspace = true }
+subtle            = { workspace = true }
+# P4 audit M-3: compile-time thread-safety assertions on `Vault`
+# (`Send` is asserted; `Sync` is asserted NOT to be implemented).
+static_assertions = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

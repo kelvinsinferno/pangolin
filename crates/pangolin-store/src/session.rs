@@ -228,6 +228,19 @@ impl PressYPresenceProof {
     /// Test-only constructor that pins `created_at` to a caller-supplied
     /// value, used by the unit tests to drive the freshness window
     /// deterministically.
+    ///
+    /// # Visibility (P4 audit I-6 / M-1)
+    ///
+    /// Gated behind `cfg(any(test, feature = "test-utilities"))` so
+    /// production builds cannot link against it. The previous
+    /// `#[doc(hidden)]`-only gate let a downstream caller forge a
+    /// presence proof with an arbitrary timestamp — the `cfg` gate
+    /// fixes that. The `feature = "test-utilities"` clause is
+    /// forward-compat for future external integration testing; the
+    /// feature is not declared in `Cargo.toml` yet because all
+    /// in-process tests live inside this crate and `cfg(test)` alone
+    /// suffices.
+    #[cfg(any(test, feature = "test-utilities"))]
     #[doc(hidden)]
     #[must_use]
     pub fn __test_with_timestamp(created_at: SystemTime) -> Self {
@@ -304,12 +317,19 @@ impl IdentityProof for PinIdentityProof {
         if self.pin.is_empty() {
             return Err(AuthError::Empty);
         }
-        // Clone the bytes into a fresh `SecretBytes`. Both copies
-        // zeroize on drop (the original on `self` drop, the returned
-        // one on the caller's drop). The bytes briefly exist twice in
-        // memory; this is acceptable because the original is the
-        // authoritative copy and is lifetime-bounded by the caller's
-        // `&dyn IdentityProof` borrow.
+        // L-1 (P4 audit): clone the bytes into a fresh `SecretBytes`.
+        // Both copies zeroize on drop (the original on `self` drop, the
+        // returned one on the caller's drop). The bytes briefly exist
+        // twice in memory; this is acceptable because the original is
+        // the authoritative copy and is lifetime-bounded by the
+        // caller's `&dyn IdentityProof` borrow. Avoiding the clone
+        // would require either (a) consuming `self` in `derive_secret`
+        // (which forces the proof's life to end at the unlock site,
+        // breaking the trait's `&self` shape) or (b) handing out an
+        // internal-`SecretBytes` reference (which leaks lifetime
+        // through the trait object). Both are worse than the brief
+        // double-allocation. PoC accepts the cost; documented for
+        // audit traceability.
         Ok(SecretBytes::new(self.pin.expose().to_vec()))
     }
 
@@ -476,15 +496,37 @@ impl SessionState {
 /// Caps at `session_started_at + ABSOLUTE_MAX_DEFAULT`. This helper is
 /// the single source of truth for the absolute-max ceiling — every code
 /// path that extends a deadline routes through it.
+///
+/// # P4 audit L-2: overflow-safe saturating arithmetic
+///
+/// Both addends are computed with `SystemTime::checked_add`; if either
+/// overflows (which can only happen if `now` or `session_started_at`
+/// is pathologically close to `SystemTime`'s representable range —
+/// roughly the year 262,000 AD on most platforms, but a malicious or
+/// buggy clock could synthesize one), we fall back to the
+/// pre-addition `SystemTime` value. That fallback is intentionally
+/// **not** session-extending: a saturated `idle_deadline` of `now`
+/// produces immediate expiry on the next `check_session_freshness`
+/// call, and a saturated `abs_max_deadline` of `session_started_at`
+/// is in the past, so the `min` between the two still gives a
+/// past-or-equal-to-now deadline. The fail-safe is "expire now"
+/// rather than "extend forever".
 #[must_use]
 pub(crate) fn next_idle_deadline(now: SystemTime, session_started_at: SystemTime) -> SystemTime {
-    let absolute_ceiling = session_started_at + ABSOLUTE_MAX_DEFAULT;
-    let proposed = now + IDLE_TIMEOUT_DEFAULT;
-    if proposed > absolute_ceiling {
-        absolute_ceiling
-    } else {
-        proposed
-    }
+    // Saturating fallback on `now`: if adding IDLE_TIMEOUT_DEFAULT
+    // overflows `SystemTime`, fall back to `now` itself — the next
+    // freshness check will see `now > expires_at` and expire the
+    // session. This is the correct fail-safe: never silently extend
+    // beyond representable time.
+    let idle_deadline = now.checked_add(IDLE_TIMEOUT_DEFAULT).unwrap_or(now);
+    // Same discipline for the absolute ceiling. A saturated value
+    // here is always <= `idle_deadline` because it was computed
+    // earlier — so the `min` below still produces a fail-safe
+    // deadline.
+    let abs_max_deadline = session_started_at
+        .checked_add(ABSOLUTE_MAX_DEFAULT)
+        .unwrap_or(session_started_at);
+    idle_deadline.min(abs_max_deadline)
 }
 
 #[cfg(test)]
@@ -618,6 +660,74 @@ mod tests {
         let mid = started + Duration::from_secs(14 * 60);
         let deadline = next_idle_deadline(mid, started);
         assert_eq!(deadline, mid + IDLE_TIMEOUT_DEFAULT);
+    }
+
+    /// P4 audit L-2: a `now` close to `SystemTime`'s representable
+    /// upper bound must NOT panic; instead the function returns a
+    /// saturating fallback (`now` itself, which produces immediate
+    /// expiry on the next freshness check). This protects the vault
+    /// from a malicious or buggy clock that hands out `SystemTime`
+    /// values near the upper representable range.
+    ///
+    /// The platform's representable upper bound is implementation-
+    /// defined (Windows uses `i64`-encoded NT epoch for `SystemTime`;
+    /// Unix uses `i64` seconds + nanos), so this test does a binary
+    /// search for the largest representable `SystemTime` and uses
+    /// that as `now`. The expected behavior is that
+    /// `next_idle_deadline(near_max, near_max)` returns
+    /// `<= near_max` (i.e., past-or-equal-to-now), proving the
+    /// saturating fallback engaged.
+    #[test]
+    fn next_idle_deadline_saturates_on_overflow() {
+        // Binary search for the largest `Duration` we can add to
+        // `UNIX_EPOCH` without overflow. Bounds: [0, u64::MAX].
+        // Cap the additive search at `u64::MAX / 2` seconds so the
+        // `Duration::from_secs` call itself cannot overflow.
+        let mut lo: u64 = 0;
+        let mut hi: u64 = u64::MAX / 2;
+        // Find a `hi` whose addition fails. If even `u64::MAX/2` does
+        // not overflow on this platform, we cannot test saturation
+        // (the platform's `SystemTime` range exceeds the
+        // u64-second domain). Skip in that case.
+        if SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(hi))
+            .is_some()
+        {
+            // Platform's representable range is unreachable in
+            // u64-second arithmetic; the saturation guard is still
+            // present in the function but unprovable from this test.
+            // A normal-value sanity check is the most we can do.
+            let normal = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+            let _ = next_idle_deadline(normal, normal);
+            return;
+        }
+        // Binary search until lo+1 == hi: the boundary between
+        // representable (lo) and non-representable (hi).
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(mid))
+                .is_some()
+            {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        // `lo` is the largest representable second-offset; `lo + 1`
+        // overflows. Pick `near_max = UNIX_EPOCH + lo` and confirm
+        // adding even a 1-second duration overflows.
+        let near_max = SystemTime::UNIX_EPOCH + Duration::from_secs(lo);
+        assert!(
+            near_max.checked_add(Duration::from_secs(1)).is_none(),
+            "binary search did not converge to overflow boundary",
+        );
+        // The saturation guard must engage and produce <= near_max.
+        let deadline = next_idle_deadline(near_max, near_max);
+        assert!(
+            deadline <= near_max,
+            "saturating fallback must not extend past `now` on overflow",
+        );
     }
 
     // -----------------------------------------------------------------

@@ -211,8 +211,20 @@ fn round_trip_property() {
     let mut v = Vault::open(&path).unwrap();
     v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
     for (id, marker) in &expected {
-        let snap = v.get_account(*id).expect("missing on reopen");
-        assert_eq!(snap.password.expose(), &marker[..]);
+        // P4 H-1 fix: `AccountSnapshot.password` is `pub(crate)`, so
+        // external callers (this integration test) must route through
+        // the presence-gated `reveal_password` accessor. Each iteration
+        // gets its own fresh `PressYPresenceProof` — single-use replay
+        // resistance forbids reusing one across calls.
+        assert!(
+            v.get_account(*id).is_some(),
+            "missing on reopen for id {id:?}"
+        );
+        let presence = PressYPresenceProof::confirmed();
+        let pwd = v
+            .reveal_password(*id, &presence)
+            .expect("reveal_password must succeed on a freshly-unlocked vault");
+        assert_eq!(pwd.expose(), &marker[..]);
     }
 }
 
