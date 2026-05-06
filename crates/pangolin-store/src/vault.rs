@@ -647,9 +647,9 @@ impl Vault {
     /// # Errors
     ///
     /// `StoreError::Sqlite` for any database issue,
-    /// `StoreError::Corrupted` if the row data fails the
-    /// length-checks in [`RawRevisionRow::into_meta`] or if the
-    /// graph build detects a cycle / duplicate.
+    /// `StoreError::Corrupted` if a stored row fails internal length
+    /// checks (e.g., a 32-byte id field that isn't actually 32 bytes)
+    /// or if the graph build detects a cycle or duplicate.
     pub fn revision_graph(&self, id: AccountId) -> Result<RevisionGraph> {
         let rows = self.read_revision_rows_for(id)?;
         RevisionGraph::build(rows)
