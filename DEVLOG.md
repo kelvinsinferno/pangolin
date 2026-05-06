@@ -119,3 +119,41 @@ THREAT_MODEL.md "Local encrypted store" row moves from `TBD (issue 0.2)` to `DOC
 Unblocks: P3 (account identity production), P4 (session policy), P7 (chain adapter against deployed Base Sepolia RevisionLogV0 from P5-4), P9 (conflict resolution).
 
 Next: **P3** (account identity production), **P4** (session policy engine), **P6** (chaincli debug oracle), and **P7** (Rust chain adapter) are now all unblocked and parallelizable. P6 + P7 both consume the deployed RevisionLogV0 from P5-4 plus the now-merged pangolin-crypto + pangolin-store. P3 + P4 build on top of pangolin-store's API.
+
+## 2026-05-06 · P3 — RevisionGraph + fork detection  ✅ MERGED
+
+Adds fork-detection primitives on top of pangolin-store. `RevisionGraph` type with full parent→child indexing, head computation accommodating multi-head accounts, ancestor walks, and common-ancestor (LCA at fork point). New `Vault` API: `revision_graph(AccountId)`, `account_heads`, `is_forked`, `all_forked_accounts`. Public test helper `__test_synthesize_sibling_revision` (cfg-gated by name + `#[doc(hidden)]`) lets integration tests build forks without going through P7's chain adapter — uses real AAD-bound encryption matching production paths.
+
+Schema unchanged: `account_identities.head_revision_id` retains its meaning as the canonical-head pointer; multi-head detection happens at query time via `NOT EXISTS` subquery (now scoped by `account_id` per the M-1 audit fix). Cardinal principle 4 preserved: graph DETECTS forks; resolution is P9.
+
+Audit history: 0 CRITICAL, 0 HIGH, 2 MEDIUM, 2 LOW, 4 INFO. Fix-pass closed all 4 actionable items (M-1 NOT EXISTS scoping, M-2 `genesis_extra` flag exposed for P7 partial-replay + P9 conflict-distinguishing, L-1 docstring mention of `#[doc(hidden)]` placement, L-2 topological-order docstring accuracy). Re-audit verdict: APPROVE — 100% CLEAN. 125 lib + 10 e2e tests pass; cardinal-principle-2 verifier (`no_plaintext_on_disk`) still green; pangolin-crypto unchanged.
+
+Surprises: building `genesis_extra` from the existing `revisions` table required a ~20-line filter that pushed `RevisionGraph::build` over clippy's 100-line floor. Extracted as `compute_genesis_extra` free function — cleaner than suppressing the lint. Merged as `5a5079e`.
+
+## 2026-05-06 · P4 — Session policy engine  ✅ MERGED
+
+The full Unified Session Authority spec on top of P3. **Security-critical** per §16.3.
+
+Implements: 2-proof unlock (presence + identity), state machine `Locked → PendingAuthorization → Active{expires_at, last_proof_at, session_started_at} → Expired`, idle timeout (15 min default) + absolute max (4 hr) with `next_idle_deadline` as the single-source-of-truth that caps at `session_started + ABSOLUTE_MAX`, presence escalation for high-risk ops (`reveal_password`, `reveal_notes`, `reveal_totp_secret`, `export_payload`), and the `with_session` mid-action resume primitive. Cache zeroized on every expiry path (BoxedSecret + Zeroizing<Vec<u8>> drop chain, before state flip).
+
+PoC stand-in proofs: `PinIdentityProof` (carries password bytes, ZeroizeOnDrop) + `PressYPresenceProof` (single-use `Cell<bool>`, freshness 60s). Trait-based design slots in real NFC + platform passkey in MVP-1 without API change.
+
+**BREAKING change to `Vault::unlock`** — was `unlock(&SecretBytes)`, now `unlock(&dyn PresenceProof, &dyn IdentityProof)`. No external consumers existed; all internal + e2e tests migrated.
+
+Audit history: 0 CRITICAL, 1 HIGH, 4 MEDIUM, 3 LOW, 1 actionable INFO. Fix-pass closed all 9:
+- **H-1 (the spec violation):** `AccountSnapshot.password` was `pub`, allowing `vault.get_account(id).unwrap().password.expose()` to bypass `reveal_password`'s presence gate — a structural violation of spec §5.4 ("high-risk actions MUST require presence proof"). Fixed by making `password`/`notes`/`totp_secret` `pub(crate)`; added `reveal_notes` + `reveal_totp_secret` for symmetry. Compile-fail doctest at `account.rs:101` pins the regression — external code attempting to read those fields via `&AccountSnapshot` no longer compiles.
+- **M-1 + I-6:** `with_clock` and `__test_with_timestamp` cfg-gated behind a new `test-utilities` feature so production downstream consumers cannot install a malicious clock or pre-dated presence proof.
+- **M-2:** unlock timing oracle (structural-vs-content distinguishability — empty PIN microsecond-fail vs. wrong-PIN ~1.5s Argon2id) DOCUMENTED with detailed audit-traceable comment. Right-PIN vs. wrong-PIN are NOT distinguishable (both run Argon2id to completion). MVP-1 hardening: always-Argon2id on every `AuthenticationFailed` path.
+- **M-3:** `static_assertions::assert_impl_all!(Vault: Send) + assert_not_impl_any!(Vault: Sync)` match rusqlite's NO_MUTEX `Connection` contract.
+- **M-4:** `is_session_active()` is now clock-aware (was state-machine variant only; misleading).
+- **L-1:** `derive_secret` double-allocation DOCUMENTED.
+- **L-2:** `next_idle_deadline` uses `checked_add` with saturating fallback; `SystemTime` overflow fails-safe to immediate expiry instead of panicking.
+- **L-3:** `with_session` re-validates session AFTER reauth returns Ok, catching "reauth claims success but didn't actually unlock" before re-running the original op.
+
+Re-audit verdict: APPROVE — 100% CLEAN. Spec §4–§9 compliance verified MUST-by-MUST. 148 lib + 4 doctests (incl. the H-1 compile_fail regression) + 11 e2e tests pass. No new `unsafe`; no new deps (`static_assertions` was already a workspace dep). `pangolin-crypto` unchanged.
+
+Surprises: H-1 was the most substantive finding — a textbook "the gate exists but the data is also accessible by another path" pattern. The fix had to thread through the test suite (every test that called `snap.password.expose()` had to migrate to `vault.reveal_password(id, &PressYPresenceProof::confirmed())`). Worth it: spec §5.4 is now structurally enforced at the type-system layer rather than as a documentation invariant.
+
+Unblocks: P5+ host UI shells (Tauri desktop, iOS, Android) — they consume the trait-based proof API and the `with_session` resume primitive. **P6** (chaincli debug oracle) and **P7** (Rust chain adapter) are also unblocked but those don't need session policy; they consume P5-4's deployed contract directly via `pangolin-chain`. Merged as `aab248f`.
+
+Next: **P6** (chaincli) and **P7** (chain adapter) are the natural next pair — both consume the deployed RevisionLogV0 from P5-4 + pangolin-crypto's signing + pangolin-store's local revisions. They unblock **P8** (sync flow), **P9** (conflict resolution), **P10** (tombstones), **P11** (E2E demo), **P12** (packaging) — i.e., the rest of the PoC.
