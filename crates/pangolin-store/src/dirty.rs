@@ -55,6 +55,23 @@ pub struct DirtyEntry {
     pub marked_at: i64,
 }
 
+/// Publish-relevant fields of a stored revision row.
+///
+/// Returned by [`crate::vault::Vault::read_revision_for_publish`].
+/// The `enc_payload` is the AEAD-sealed bytes exactly as they were
+/// stored — opaque to the chain layer (`pangolin-chain` treats them
+/// as a `Vec<u8>` and never decodes them structurally).
+#[derive(Debug, Clone)]
+pub struct RevisionPublishPayload {
+    /// Parent revision id (genesis sentinel = all zeros).
+    pub parent_revision: RevisionId,
+    /// AEAD-payload schema version of the stored row.
+    pub schema_version: u8,
+    /// The AEAD-sealed payload bytes. Forwarded into
+    /// [`pangolin_chain::signing::build_signed_revision`] verbatim.
+    pub enc_payload: Vec<u8>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;

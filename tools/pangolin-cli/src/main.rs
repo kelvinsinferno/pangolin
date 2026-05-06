@@ -41,6 +41,9 @@
 mod cli;
 mod commands;
 mod config;
+mod keystore;
+mod sync;
+mod vault_open;
 
 use anyhow::Result;
 use clap::Parser;

@@ -47,7 +47,7 @@ pub(crate) mod schema;
 pub(crate) mod search;
 
 pub use account::{AccountId, AccountSnapshot};
-pub use dirty::DirtyEntry;
+pub use dirty::{DirtyEntry, RevisionPublishPayload};
 pub use error::{Result, StoreError};
 pub use revision::{ChainAnchor, DeviceId, RevisionGraph, RevisionId, RevisionMeta};
 pub use session::{

@@ -49,6 +49,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::account::{AccountId, AccountSnapshot, ACCOUNT_ID_LEN};
 use crate::blob::{build_aad, open_payload, seal_snapshot, seal_tombstone, DecodedPayload};
+use crate::dirty::RevisionPublishPayload;
 use crate::error::{Result, StoreError};
 use crate::meta::{self, VaultMeta};
 use crate::revision::{
@@ -1829,6 +1830,65 @@ impl Vault {
             params![new_i64],
         )?;
         Ok(())
+    }
+
+    /// Fetch the publish-relevant fields of a single revision row:
+    /// `(parent_revision, schema_version, enc_payload)`.
+    ///
+    /// `pangolin-cli publish` (P8-3) calls this to feed
+    /// [`pangolin_chain::signing::build_signed_revision`] without
+    /// decrypting the payload. The returned `enc_payload` is the
+    /// AEAD-sealed bytes exactly as they were stored — opaque to this
+    /// layer and to the publish path; only a future receiver that
+    /// holds the same VDK can decrypt them.
+    ///
+    /// Metadata-ish — does NOT touch the decrypted cache and does
+    /// NOT require [`VaultState::Active`]. Soft-expiry path.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::RevisionNotFound` if the `(account_id,
+    /// revision_id)` pair does not match any local row.
+    /// `StoreError::Sqlite` for any database issue.
+    /// `StoreError::Corrupted` if the `schema_version` column is out
+    /// of `u8` range.
+    pub fn read_revision_for_publish(
+        &mut self,
+        account_id: AccountId,
+        revision_id: RevisionId,
+    ) -> Result<RevisionPublishPayload> {
+        self.maybe_expire_active_session();
+        let row: Option<(Vec<u8>, i64, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT parent_revision_id, schema_version, enc_payload
+                 FROM revisions
+                 WHERE account_id = ?1 AND revision_id = ?2",
+                params![
+                    account_id.as_bytes().as_slice(),
+                    revision_id.as_bytes().as_slice(),
+                ],
+                |row| {
+                    let parent: Vec<u8> = row.get(0)?;
+                    let sv: i64 = row.get(1)?;
+                    let payload: Vec<u8> = row.get(2)?;
+                    Ok((parent, sv, payload))
+                },
+            )
+            .optional()?;
+        let (parent_blob, sv_i64, enc_payload) = row.ok_or(StoreError::RevisionNotFound)?;
+        let parent_arr: [u8; REVISION_ID_LEN] = parent_blob
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Corrupted("parent_revision_id not 32 bytes".into()))?;
+        let schema_version = u8::try_from(sv_i64).map_err(|_| {
+            StoreError::Corrupted("revisions.schema_version out of u8 range".into())
+        })?;
+        Ok(RevisionPublishPayload {
+            parent_revision: RevisionId::from_bytes(parent_arr),
+            schema_version,
+            enc_payload,
+        })
     }
 
     // -----------------------------------------------------------------

@@ -59,6 +59,11 @@ zeroize    = { workspace = true }
 [dev-dependencies]
 # Integration tests need temp vault paths.
 tempfile           = { workspace = true }
+# Test-only ChainAdapter impls (always-fail, flaky) live in
+# `src/sync.rs::tests` and need `#[async_trait]` to satisfy the
+# trait's dyn-compatible shape. Same workspace pin pangolin-chain
+# uses.
+async-trait        = { workspace = true }
 # `MockChainAdapter` is gated behind `pangolin-chain`'s `test-utilities`
 # feature; we enable it ONLY in dev-dependencies so the production
 # build of `pangolin-cli` cannot link against the mock.
