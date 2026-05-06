@@ -56,6 +56,7 @@ pub mod types;
 pub mod mock;
 
 pub use adapter::ChainAdapter;
+pub use base_sepolia::{BaseSepoliaAdapter, BASE_SEPOLIA_CHAIN_ID};
 pub use error::ChainError;
 pub use evm::{derive_evm_address, derive_evm_wallet, EvmWallet};
 pub use signing::{

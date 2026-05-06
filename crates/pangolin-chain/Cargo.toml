@@ -79,6 +79,12 @@ sha2               = { workspace = true }
 # pangolin-crypto; named here directly for the same hygiene reason.
 zeroize            = { workspace = true }
 
+# JSON tree-walking for the deployment-file loader in `base_sepolia.rs`.
+# Read-only; pangolin-chain does NOT structurally deserialize chain
+# payload bytes (per the audit constraint). Same workspace pin
+# `tools/chaincli/` uses.
+serde_json         = { workspace = true }
+
 [dev-dependencies]
 # Test fixtures need `tempfile` for keystore decryption tests and
 # `pangolin-store` integration tests with on-disk vault files.
