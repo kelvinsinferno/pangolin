@@ -14,12 +14,19 @@
 //! ```no_run
 //! use std::path::Path;
 //! use pangolin_crypto::secret::SecretBytes;
-//! use pangolin_store::{Vault, AccountSnapshot};
+//! use pangolin_store::{
+//!     Vault, AccountSnapshot, PinIdentityProof, PressYPresenceProof,
+//! };
 //!
 //! let pwd = SecretBytes::new(b"correct horse battery staple".to_vec());
 //! Vault::create(Path::new("./vault.pvf"), &pwd)?;
 //! let mut v = Vault::open(Path::new("./vault.pvf"))?;
-//! v.unlock(&pwd)?;
+//! // P4 session policy: 2 proofs at unlock (presence + identity).
+//! let presence = PressYPresenceProof::confirmed();
+//! let identity = PinIdentityProof::new(
+//!     SecretBytes::new(b"correct horse battery staple".to_vec()),
+//! );
+//! v.unlock(&presence, &identity)?;
 //! // … add_account / search / update_account / lock / close …
 //! # Ok::<(), pangolin_store::StoreError>(())
 //! ```
@@ -30,6 +37,7 @@
 pub mod account;
 pub mod error;
 pub mod revision;
+pub mod session;
 pub mod vault;
 
 pub(crate) mod blob;
@@ -40,6 +48,11 @@ pub(crate) mod search;
 pub use account::{AccountId, AccountSnapshot};
 pub use error::{Result, StoreError};
 pub use revision::{ChainAnchor, DeviceId, RevisionGraph, RevisionId, RevisionMeta};
+pub use session::{
+    AuthError, Clock, IdentityProof, PinIdentityProof, PresenceProof, PressYPresenceProof,
+    SessionState, SystemClock, ABSOLUTE_MAX_DEFAULT, IDLE_TIMEOUT_DEFAULT, PRESENCE_FRESHNESS,
+    PROMPT_TIMEOUT,
+};
 pub use vault::{Vault, VaultState};
 
 /// Returns the crate name. Useful for diagnostics and version reporting.
