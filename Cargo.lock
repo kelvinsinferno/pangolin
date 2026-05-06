@@ -2751,12 +2751,15 @@ dependencies = [
  "alloy-signer-local",
  "async-trait",
  "hex",
+ "hkdf",
  "pangolin-chain",
  "pangolin-crypto",
  "pangolin-store",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

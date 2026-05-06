@@ -69,6 +69,16 @@ thiserror          = { workspace = true }
 # never used to decode untrusted input (HIGH-2 discipline).
 hex                = { workspace = true }
 
+# HKDF-SHA256 for the Ed25519 → secp256k1 wallet derivation in
+# `evm.rs`. Same workspace pin pangolin-crypto uses (HKDF + SHA-2 from
+# RustCrypto); naming both crates as direct deps keeps the audit
+# surface explicit (no transitive-only access).
+hkdf               = { workspace = true }
+sha2               = { workspace = true }
+# Inline OKM-buffer wipe in `evm.rs`. Already pulled transitively via
+# pangolin-crypto; named here directly for the same hygiene reason.
+zeroize            = { workspace = true }
+
 [dev-dependencies]
 # Test fixtures need `tempfile` for keystore decryption tests and
 # `pangolin-store` integration tests with on-disk vault files.

@@ -57,6 +57,7 @@ pub mod mock;
 
 pub use adapter::ChainAdapter;
 pub use error::ChainError;
+pub use evm::{derive_evm_address, derive_evm_wallet, EvmWallet};
 pub use signing::{
     build_signed_revision, canonical_hash, verify_signed_revision, SignatureInvalid,
 };
