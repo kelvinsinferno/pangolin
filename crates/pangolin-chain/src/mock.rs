@@ -38,6 +38,7 @@ use async_trait::async_trait;
 
 use crate::adapter::ChainAdapter;
 use crate::error::ChainError;
+use crate::signing::verify_signed_revision;
 use crate::types::{ChainAnchor, EventLocation, RevisionEvent, SignedRevision, VaultId};
 
 /// In-memory chain log + sequence counter. Internal to `mock.rs`.
@@ -92,6 +93,14 @@ impl MockChainAdapter {
 #[async_trait]
 impl ChainAdapter for MockChainAdapter {
     async fn publish(&self, signed: &SignedRevision) -> Result<ChainAnchor, ChainError> {
+        // P7 audit MED-4: verify the signature eagerly. v0 contract
+        // doesn't, but the mock should match v1's planned behavior
+        // (per MVP-2 issue 2.1) so any regression in
+        // `build_signed_revision` that produces invalid signatures
+        // surfaces at the first test that publishes through the
+        // mock, rather than silently passing and hiding the bug
+        // until v1 ships. See MED-4 for full rationale.
+        verify_signed_revision(signed).map_err(|_| ChainError::SignatureInvalid)?;
         // The whole publish runs under one lock; the function ends
         // when the guard drops. Wrapped in a block so clippy's
         // `significant_drop_tightening` is satisfied — the guard's
@@ -198,16 +207,27 @@ impl ChainAdapter for MockChainAdapter {
 mod tests {
     use super::MockChainAdapter;
     use crate::adapter::ChainAdapter;
+    use crate::error::ChainError;
     use crate::types::{EventLocation, SignedRevision};
     use pangolin_crypto::keys::DeviceKey;
 
     use crate::signing::build_signed_revision;
 
     fn fresh_signed(payload: &[u8]) -> SignedRevision {
+        fresh_signed_with_vault([0xAA; 32], payload)
+    }
+
+    /// Build a fresh signed revision with the requested `vault_id`.
+    /// Tests that need to pin a specific vault must use this helper
+    /// rather than `fresh_signed` + post-mutation, because P7 audit
+    /// MED-4 added eager signature verification to
+    /// `MockChainAdapter::publish`: post-signing tampering is a forged
+    /// signature and is rejected.
+    fn fresh_signed_with_vault(vault_id: [u8; 32], payload: &[u8]) -> SignedRevision {
         let device = DeviceKey::generate();
         build_signed_revision(
             &device,
-            [0xAA; 32],
+            vault_id,
             [0xBB; 32],
             [0u8; 32],
             0,
@@ -298,9 +318,7 @@ mod tests {
     async fn pull_excludes_earlier_blocks() {
         let adapter = MockChainAdapter::new();
         for i in 0u8..3 {
-            let s = fresh_signed(&[i]);
-            let mut s = s;
-            s.vault_id = [0x77; 32]; // pin same vault so the pull sees them
+            let s = fresh_signed_with_vault([0x77; 32], &[i]);
             adapter.publish(&s).await.unwrap();
         }
         let from_block_1 = adapter.pull_since(&[0x77; 32], 1, None).await.unwrap();
@@ -356,8 +374,7 @@ mod tests {
     async fn pull_respects_until_block() {
         let adapter = MockChainAdapter::new();
         for _ in 0..5 {
-            let mut s = fresh_signed(b"x");
-            s.vault_id = [0x99; 32];
+            let s = fresh_signed_with_vault([0x99; 32], b"x");
             adapter.publish(&s).await.unwrap();
         }
         // 5 publishes => events at blocks 1..=5. Pull (0, Some(3)]
@@ -380,6 +397,70 @@ mod tests {
         let from_b = b.pull_since(&signed.vault_id, 0, None).await.unwrap();
         assert_eq!(from_b.len(), 1, "b sees a's published event");
         assert_eq!(b.event_count(), 1);
+    }
+
+    /// P7 audit MED-4: a `SignedRevision` whose signature does not
+    /// verify is rejected at publish time with
+    /// `ChainError::SignatureInvalid`. We forge an invalid revision
+    /// by tampering with the payload after signing — the embedded
+    /// signature was made over the original payload's hash, so it
+    /// won't verify under the new payload.
+    #[tokio::test]
+    async fn publish_rejects_invalid_signature() {
+        let adapter = MockChainAdapter::new();
+        let device = DeviceKey::generate();
+        let mut signed = build_signed_revision(
+            &device,
+            [0xAA; 32],
+            [0xBB; 32],
+            [0u8; 32],
+            0,
+            b"original payload".to_vec(),
+        );
+        // Tamper post-signing — signature now binds the original
+        // payload, but the revision claims a different one.
+        signed.enc_payload = b"tampered payload".to_vec();
+        let err = adapter
+            .publish(&signed)
+            .await
+            .expect_err("tampered revision must be rejected");
+        assert!(
+            matches!(err, ChainError::SignatureInvalid),
+            "expected ChainError::SignatureInvalid, got: {err:?}"
+        );
+        // And the chain log is unchanged — the failed publish did
+        // NOT advance the sequence/block counters.
+        assert_eq!(adapter.event_count(), 0);
+    }
+
+    /// Companion to `publish_rejects_invalid_signature`: substituting
+    /// a different `device_id` (with the original device's signature
+    /// still attached) is also a forgery and is rejected.
+    #[tokio::test]
+    async fn publish_rejects_substituted_device_id() {
+        let adapter = MockChainAdapter::new();
+        let device_a = DeviceKey::generate();
+        let device_b = DeviceKey::generate();
+        let mut signed = build_signed_revision(
+            &device_a,
+            [0xAA; 32],
+            [0xBB; 32],
+            [0u8; 32],
+            0,
+            b"payload".to_vec(),
+        );
+        // Swap the device_id to device_b's pubkey while keeping
+        // device_a's signature — classic cross-device forgery
+        // attempt.
+        signed.device_id = device_b.verifying_key().to_bytes();
+        let err = adapter
+            .publish(&signed)
+            .await
+            .expect_err("substituted device_id must be rejected");
+        assert!(
+            matches!(err, ChainError::SignatureInvalid),
+            "expected ChainError::SignatureInvalid, got: {err:?}"
+        );
     }
 
     /// `event_count` matches what tests would otherwise infer from

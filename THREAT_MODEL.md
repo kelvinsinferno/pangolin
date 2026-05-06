@@ -143,6 +143,26 @@ Per-component threat enumeration lands as part of MVP-1 issue 0.2 and is updated
    time. Same-seed → same-address determinism is asserted by
    `evm::tests::derive_is_deterministic`; cryptographic separation
    is structural via HKDF.
+
+   *Cryptographic assumption (P7 audit HIGH-1, named explicitly):*
+   the security argument requires **Ed25519-deterministic-sign to be
+   treated as a PRF in the seed when the message is fixed** —
+   i.e., for a fixed domain message `m` and uniformly random 32-byte
+   seed `s`, `Sign(s, m)` is computationally indistinguishable from
+   uniform 64 bytes to any adversary that does not know `s`. This is
+   not a standard Ed25519 hardness assumption, but it is structurally
+   similar to one that deterministic Ed25519 already relies on
+   internally: RFC 8032 §5.1.6 derives the per-signature nonce as
+   `r = SHA-512(prefix || msg)` with `prefix` being a seed-expanded
+   half, and the signature-unforgeability proof requires that round
+   of SHA-512 to be PRF-like in `prefix`. The composition
+   `Sign(seed, fixed-msg) → HKDF-Expand(...)` extends that one-round
+   assumption to the full Ed25519 primitive plus an HMAC-SHA256-based
+   HKDF expand; each additional layer can only preserve or strengthen
+   the PRF property. Directionality: the leak of the secp256k1 scalar
+   does NOT leak the Ed25519 seed (HKDF-Expand is one-way via HMAC
+   preimage resistance); the reverse direction is the derivation
+   itself, no hardness claim required.
 8. **Signed-revision forgery (cross-device).** Defense: `signing.rs`
    binds the canonical hash to `device_id` (= the device's Ed25519
    verifying key bytes), and the signature is verified under that
@@ -150,9 +170,42 @@ Per-component threat enumeration lands as part of MVP-1 issue 0.2 and is updated
    into a captured `SignedRevision` will not have the matching secret
    key to re-sign, and the existing signature will fail verification.
    Asserted by `signing::tests::substituted_device_id_fails_verification`.
-   Note: v0 contract does NOT verify signatures on-chain (P5-1 audit
-   threat #2); v1 (MVP-2 issue 2.1) will. The discipline is
-   client-side now so MVP-2 doesn't need a client-side migration.
+
+   *v1 forward-prep — what actually transfers (P7 audit HIGH-2).* v0
+   contract does NOT verify signatures on-chain (P5-1 audit threat #2);
+   v1 (MVP-2 issue 2.1) will. The earlier framing claimed P7 was
+   "forward-prep so MVP-2 doesn't need a client-side migration"; that
+   overstated the case. Two plausible v1 paths exist and only the
+   *canonical-hash* part is path-independent:
+
+   - **Path A: Solidity Ed25519 verifier.** Cost ≈ 500k gas per
+     verification (lower-bound figure for current pure-Solidity
+     Ed25519 implementations). On Base mainnet (an L2) at typical 2026
+     fees that's ~$0.01–0.02 per verify; on Ethereum L1 it's
+     ~$25–50/verify, which makes Path A L2-only in practice. Under
+     Path A, the existing `signing.rs` API surface
+     (`SignedRevision`, the Ed25519 `signature` field, `device_id`
+     semantics as Ed25519 verifying-key bytes, `build_signed_revision`,
+     `verify_signed_revision`) survives unchanged.
+   - **Path B: v1 switches to secp256k1.** Likely on L1 mainnet for
+     cost reasons (`ecrecover` is the 3 000-gas precompile, ~150x
+     cheaper than the cheapest Solidity Ed25519). Under Path B,
+     `device_id` semantics change from Ed25519 verifying-key bytes to
+     a secp256k1 EVM-address (or a separately-registered v1 device
+     key per vault), the `signature` field type changes, and the
+     canonical-hash construction may need re-keying so the digest
+     binds the secp256k1 identity. The current `signing.rs` is
+     Path-A-shaped; Path B would require a new `secp256k1_signing.rs`
+     (or a refactor to a generic `Signer` trait abstracting both
+     primitives), and stored `SignedRevision` records on disk would
+     need to be re-signed before re-broadcast under v1.
+
+   What survives in **both** paths: the canonical-hash structure
+   (keccak256 of fixed-width fields, payload reduced to its keccak
+   digest, versioned domain separator). What survives in **only
+   Path A**: the Ed25519 signature semantics and the current
+   `signing.rs` API. The honest claim is: "the canonical-hash
+   construction transfers; the signature primitive may not".
 9. **`MockChainAdapter` substitution in production.** Defense: the
    mock is `cfg(any(test, feature = "test-utilities"))`-gated.
    Production downstream consumers (`pangolin-store`, `pangolin-cli`)

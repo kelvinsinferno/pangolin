@@ -56,6 +56,35 @@ pub trait ChainAdapter: Send + Sync {
     /// current head). The `from_block` is **exclusive** so a caller
     /// can pass `last_pulled_block` and not re-fetch the boundary
     /// event.
+    ///
+    /// ## All-or-nothing semantics (P7 audit MED-3 — deferred)
+    ///
+    /// The Base Sepolia impl chunks `eth_getLogs` calls into 9 000-
+    /// block windows because the public RPC caps at 10 000. Each
+    /// chunk's events are accumulated into a single `Vec` that is
+    /// only returned after every chunk succeeds. If chunk N succeeds
+    /// and chunk N+1 fails (e.g., transient RPC flake), **all** of
+    /// chunk N's events are discarded and the caller sees a single
+    /// `ChainError::Rpc`. The caller has to retry from `from_block`
+    /// from scratch.
+    ///
+    /// This is fine for short ranges and small backlogs but amplifies
+    /// latency under flaky RPC conditions for large catch-up syncs
+    /// (e.g., a vault that has been offline for weeks). The right fix
+    /// is to expose granular per-chunk progress — for instance via a
+    /// streaming variant
+    /// (`pull_since_streaming(...) -> impl Stream<Item = ...>`) or a
+    /// callback (`pull_since_with_progress(..., on_chunk: F)`) — so
+    /// P8's sync orchestrator can advance its checkpoint after every
+    /// successful chunk and resume mid-range on retry.
+    ///
+    /// **Decision: defer the trait-shape change to P8.** P7 is the
+    /// transport layer; the partial-progress design touches sync
+    /// semantics that belong to P8 (sync-orchestration), and locking
+    /// the trait shape now would prejudge that design. P8 implementers:
+    /// see this docstring before reaching for `pull_since` on a long
+    /// catch-up path.
+    // TODO: MED-3 (P7 audit): partial-progress reporting deferred to P8.
     async fn pull_since(
         &self,
         vault_id: &VaultId,

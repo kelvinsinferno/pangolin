@@ -104,4 +104,49 @@ pub enum ChainError {
     /// path is logged at the call site by the adapter.
     #[error("io error: {0}")]
     Io(String),
+
+    /// The runtime bytecode at the deployment file's recorded
+    /// contract address does not match the file's recorded
+    /// `deployed_runtime_keccak256`. Surfaces from the constructor's
+    /// `eth_getCode` cross-check (P7 audit MED-2). Same fail-closed
+    /// posture as `WrongChain`: a CREATE2 collision, a tampered
+    /// deployment file, or a wrong contract address would all trigger
+    /// this; refuse to proceed in any of those cases.
+    ///
+    /// Both fields are 0x-prefixed 32-byte hex strings so the operator
+    /// can paste them into `cast` / a search tool without further
+    /// formatting.
+    #[error(
+        "runtime bytecode keccak mismatch: live RPC reports {found}, \
+         deployment file expects {expected}"
+    )]
+    DeploymentMismatch {
+        /// `deployed_runtime_keccak256` from the deployment file.
+        expected: String,
+        /// keccak256 of the live `eth_getCode` response at the
+        /// deployment's contract address, observed at construction
+        /// time.
+        found: String,
+    },
+
+    /// A `SignedRevision` failed signature verification at the
+    /// adapter boundary.
+    ///
+    /// Surfaces from:
+    ///
+    /// - `MockChainAdapter::publish` (P7 audit MED-4) — the mock
+    ///   verifies signatures eagerly so a regression in
+    ///   `build_signed_revision` that produces invalid signatures
+    ///   fires loudly in tests.
+    /// - `BaseSepoliaAdapter::pull_since` / `get_revision` when a
+    ///   future v1 contract enforces signatures and returns logs
+    ///   bearing them; v0 does not, so this variant is dormant in
+    ///   production today.
+    ///
+    /// Carries no payload by design — the underlying Ed25519
+    /// strict-mode verifier collapses every failure cause into a
+    /// single sentinel so a timing attacker cannot tell wrong-key
+    /// from wrong-message from non-canonical-encoding.
+    #[error("signed revision did not verify")]
+    SignatureInvalid,
 }

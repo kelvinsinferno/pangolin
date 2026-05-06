@@ -60,6 +60,54 @@
 //!    over the uncompressed encoding's last 64 bytes, taking the
 //!    final 20 bytes — the standard EIP-55 address derivation.
 //!
+//! ## Cryptographic assumption (P7 audit HIGH-1)
+//!
+//! The construction `seed → Sign(seed, fixed-msg) → HKDF-Expand(...)`
+//! requires this assumption to be sound:
+//!
+//! > **Ed25519-deterministic-sign is treated as a PRF in the seed when
+//! > the message is fixed.** That is, for a fixed domain-separator
+//! > message `m` and a uniformly random 32-byte seed `s`, the 64-byte
+//! > output `Sign(s, m)` is computationally indistinguishable from a
+//! > uniformly random 64-byte string by an adversary that does not
+//! > know `s`.
+//!
+//! This assumption is plausible — and structurally similar to the one
+//! Ed25519 itself already relies on internally — but it is *not* a
+//! standard hardness assumption from the original Ed25519 paper, so
+//! we name it explicitly here.
+//!
+//! **Why it's plausible.** RFC 8032 §5.1.6 (the deterministic-Ed25519
+//! signing procedure) derives the per-signature nonce as
+//! `r = SHA-512(prefix || msg)` where `prefix` is a 32-byte half of
+//! the SHA-512-expanded seed. The security of deterministic Ed25519
+//! against signature-forgery already relies on `SHA-512(prefix || msg)`
+//! being PRF-like in `prefix` (which is itself derived from the
+//! seed) — otherwise the per-signature nonce `r` would be predictable
+//! and the scheme would be insecure. Our construction
+//! `Sign(seed, fixed-msg) → HKDF-Expand(...)` is one HKDF round
+//! beyond that same PRF assumption: where Ed25519's internal use is
+//! "one round of SHA-512 with a seed-dependent prefix", our use is
+//! "the full Ed25519 signing primitive (which incorporates that round
+//! of SHA-512 plus point-multiplication and hashing) followed by an
+//! HMAC-SHA256-based HKDF expand". Each additional layer can only
+//! preserve or strengthen the PRF property, never weaken it.
+//!
+//! **Directionality of the secrecy guarantee.** The composition is
+//! one-way: an attacker who recovers the secp256k1 scalar (e.g., from
+//! a compromised keystore on a stolen device that has already been
+//! unlocked) cannot recover the Ed25519 seed in polynomial time. This
+//! follows from HMAC-SHA256 preimage resistance: HKDF-Expand is built
+//! on HMAC-SHA256, and inverting a single HMAC-SHA256 call to recover
+//! its 64-byte input would already be a break of HMAC. The
+//! revision-signing identity (Ed25519 seed) is therefore strictly
+//! protected even when the gas-paying identity (secp256k1 scalar) is
+//! compromised. This is the cryptographic separation property
+//! Pangolin requires: "a leaked gas wallet must not endanger the
+//! revision-signing identity". The reverse direction (Ed25519 seed →
+//! secp256k1 scalar) is trivial by design — that's the derivation
+//! itself; no hardness claim there.
+//!
 //! ## Properties we test
 //!
 //! - **Determinism**: same `DeviceKey` → same EVM address (success

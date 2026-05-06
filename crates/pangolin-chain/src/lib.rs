@@ -15,9 +15,59 @@
 //!   `DeviceKey` always produces the same EVM address.
 //! - Signature over a domain-separated keccak-hash of the canonical
 //!   revision fields. v0 contract ignores the signature (per P5-1 audit
-//!   threat #2); v1 will verify (MVP-2 issue 2.1). The discipline lives
-//!   on the client side now so MVP-2 doesn't need a client-side
-//!   migration.
+//!   threat #2); v1 (MVP-2 issue 2.1) will verify. We sign on the client
+//!   today so the **canonical-hash construction** (keccak256 of fixed-
+//!   width fields, with payload reduced to its keccak digest) transfers
+//!   into v1 unchanged — that's the part of the discipline that
+//!   survives every plausible v1 path. The **signature primitive
+//!   itself** may not transfer (see HIGH-2 caveat below); v1's choice
+//!   of primitive may force a client-side rework even though the hash
+//!   stays the same.
+//!
+//! ## v1 forward-prep — what actually transfers (P7 audit HIGH-2)
+//!
+//! The original P7 framing claimed P5-1's signed-revision discipline
+//! is "forward-prep so MVP-2 doesn't need a client-side migration".
+//! That overstated the case. There are two plausible v1 paths and
+//! only the *canonical-hash* part is path-independent:
+//!
+//! - **Path A — Solidity Ed25519 verifier on chain.** Cost is roughly
+//!   500k gas per verification (the lower-bound figure for current
+//!   pure-Solidity Ed25519 implementations; see e.g. the
+//!   `ed25519-solidity` reference and analogous gas reports). On
+//!   Base mainnet (an L2) at typical 2026 fees that's
+//!   ~$0.01–0.02/verify; on Ethereum L1 at non-trivial gas prices
+//!   that'd be ~$25–50/verify, which is not viable for per-revision
+//!   verification. Path A is therefore L2-only in practice.
+//!
+//!   Under Path A: every byte of `signing.rs`'s API surface
+//!   (`SignedRevision`, the Ed25519 `signature` field, `device_id`
+//!   semantics as Ed25519 verifying-key bytes, `build_signed_revision`,
+//!   `verify_signed_revision`) survives unchanged. The contract
+//!   verifies the same digest the client builds today.
+//!
+//! - **Path B — v1 switches to secp256k1 signatures.** Likely on L1
+//!   mainnet for cost reasons (`ecrecover` is a 3 000-gas precompile,
+//!   ~150x cheaper than the cheapest Solidity Ed25519). Under Path B:
+//!   `device_id` semantics change from "Ed25519 verifying-key bytes"
+//!   to "secp256k1 EVM-address" (or to a separately-registered key
+//!   per-vault), the `signature` field changes type, and the
+//!   canonical-hash construction may need re-keying so the digest
+//!   binds the secp256k1 identity rather than the Ed25519 one.
+//!
+//!   Under Path B: the current `signing.rs` API surface is
+//!   Path-A-shaped. Path B would require a new
+//!   `secp256k1_signing.rs` (or a refactor to a generic `Signer`
+//!   trait that abstracts over both primitives), and stored
+//!   `SignedRevision` records on disk would need a re-sign before
+//!   they could be re-broadcast under v1's verifier.
+//!
+//! What survives in **both** paths: the canonical-hash structure
+//! (keccak256 of fixed-width fields, payload-keccak fed in as a
+//! 32-byte digest, versioned domain separator). What survives in
+//! **only Path A**: the Ed25519 signature semantics and the current
+//! `signing.rs` API. The honest claim is: "the canonical-hash
+//! construction transfers; the signature primitive may not".
 //!
 //! ## Modules
 //!

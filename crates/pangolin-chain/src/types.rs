@@ -44,8 +44,12 @@ pub type VaultId = [u8; 32];
 ///
 /// **v0 contract** (`RevisionLogV0`) ignores the signature; **v1**
 /// (MVP-2 issue 2.1) will verify it on-chain. Building the signature
-/// into the client now means MVP-2 doesn't need a client-side
-/// migration.
+/// into the client now means MVP-2 inherits the *canonical-hash*
+/// discipline ready-made — see HIGH-2 caveat in [`crate::signing`] and
+/// the crate-level docstring for the limits of this carry-forward
+/// (the canonical-hash construction transfers; the signature
+/// primitive may not, depending on whether v1 deploys an Ed25519
+/// verifier on L2 or switches to secp256k1 for an L1 deployment).
 ///
 /// The signature is over a domain-separated keccak-hash of the
 /// canonical-encoded args — see [`crate::signing`] for the canonical

@@ -37,7 +37,7 @@
 use std::path::{Path, PathBuf};
 
 use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, Bytes, B256};
+use alloy::primitives::{keccak256, Address, Bytes, B256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::{BlockNumberOrTag, Filter};
 use alloy::signers::local::{LocalSigner, PrivateKeySigner};
@@ -46,6 +46,7 @@ use alloy::sol_types::SolEvent;
 use async_trait::async_trait;
 use pangolin_crypto::keys::DeviceKey;
 use pangolin_crypto::secret::SecretBytes;
+use pangolin_crypto::sign::VerifyingKey;
 
 use crate::adapter::ChainAdapter;
 use crate::error::ChainError;
@@ -113,6 +114,11 @@ struct Deployment {
     chain_id: u64,
     contract_address: Address,
     deploy_block: u64,
+    /// `bytecode.deployed_runtime_keccak256` — keccak256 of the
+    /// runtime bytecode at the deployment's contract address as
+    /// recorded at deploy time. Cross-checked at construction time
+    /// against the live `eth_getCode` response (P7 audit MED-2).
+    runtime_keccak: B256,
 }
 
 impl Deployment {
@@ -153,9 +159,20 @@ impl Deployment {
             .pointer("/address")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| ChainError::Deployment(format!("missing {contract_path}/address")))?;
-        let contract_address = address_str.parse::<Address>().map_err(|e| {
+        // P7 audit MED-1: validate the EIP-55 (mixed-case) checksum,
+        // not just hex shape. We pass `None` for the chain id because
+        // the deployment file's address is plain EIP-55 (the form
+        // Foundry, Etherscan, and the rest of the EVM toolchain emit
+        // by default). Passing `Some(BASE_SEPOLIA_CHAIN_ID)` would
+        // require the EIP-1191 chain-id-bound checksum variant, which
+        // RSK and a few others use but which Foundry does not emit;
+        // requiring it here would reject the canonical Pangolin
+        // deployment file. A mis-checksummed address (anyone bit-
+        // flipped a single hex character's case) is rejected; that's
+        // the threat MED-1 names.
+        let contract_address = Address::parse_checksummed(address_str, None).map_err(|e| {
             ChainError::Deployment(format!(
-                "address {address_str} is not a valid EVM address: {e}"
+                "address {address_str} is not a valid EIP-55 checksummed EVM address: {e}"
             ))
         })?;
 
@@ -166,10 +183,31 @@ impl Deployment {
                 ChainError::Deployment(format!("missing {contract_path}/deploy_block"))
             })?;
 
+        // P7 audit MED-2: parse the recorded runtime keccak so the
+        // constructor can cross-check it against the live
+        // `eth_getCode` response. The chaincli `Deployment` struct
+        // already parses the same field; this brings the production
+        // library to parity.
+        let runtime_keccak_str = contract
+            .pointer("/bytecode/deployed_runtime_keccak256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                ChainError::Deployment(format!(
+                    "missing {contract_path}/bytecode/deployed_runtime_keccak256"
+                ))
+            })?;
+        let runtime_keccak = runtime_keccak_str.parse::<B256>().map_err(|e| {
+            ChainError::Deployment(format!(
+                "deployed_runtime_keccak256 is not a valid 0x-prefixed 32-byte \
+                 hex value: {runtime_keccak_str} ({e})"
+            ))
+        })?;
+
         Ok(Self {
             chain_id,
             contract_address,
             deploy_block,
+            runtime_keccak,
         })
     }
 }
@@ -213,6 +251,11 @@ impl BaseSepoliaAdapter {
             .await
             .map_err(|e| ChainError::Rpc(format!("connect {rpc_url}: {e}")))?;
         check_chain_id(&provider, &deployment).await?;
+        // P7 audit MED-2: cross-check live runtime bytecode against
+        // the deployment file's recorded keccak. Done after the
+        // chain-id check so a wrong-chain mismatch has a chance to
+        // surface a clearer diagnostic first.
+        check_runtime_keccak(&provider, &deployment).await?;
         Ok(Self {
             provider: provider.erased(),
             deployment,
@@ -221,8 +264,11 @@ impl BaseSepoliaAdapter {
     }
 
     /// Construct an adapter that signs txs via a Foundry-format
-    /// keystore. The password is consumed (and zeroized) inside
-    /// `alloy-signer-local`'s `decrypt_keystore`.
+    /// keystore. The password is borrowed (not consumed); the
+    /// caller's `SecretBytes` retains ownership and zeroizes itself
+    /// when its handle is dropped. `alloy-signer-local`'s
+    /// `decrypt_keystore` only borrows the slice for the duration of
+    /// the call.
     ///
     /// # Errors
     ///
@@ -238,10 +284,25 @@ impl BaseSepoliaAdapter {
         password: &SecretBytes,
     ) -> Result<Self, ChainError> {
         let deployment = Deployment::load(deployment_path)?;
-        // The keystore-password buffer in pangolin-crypto's SecretBytes
-        // wipes itself on drop. We borrow the bytes only for the
-        // duration of `decrypt_keystore`. alloy then internalizes the
-        // decrypted secp256k1 key in a `k256::SecretKey` (ZeroizeOnDrop).
+        // P7 audit INFO-1: the password's lifecycle, accurately:
+        //
+        // - The caller's `SecretBytes` is what owns the password
+        //   bytes and what zeroizes them — its `Drop` impl wipes the
+        //   underlying buffer when the caller's handle goes away.
+        //   Nothing here consumes that buffer.
+        // - We hand `decrypt_keystore` a `&str` slice that borrows
+        //   into the caller's buffer for the duration of the call.
+        //   alloy / eth-keystore reads the bytes, runs the scrypt KDF,
+        //   and decrypts; it never takes ownership of our slice.
+        // - The decrypted secp256k1 secret key is internalized inside
+        //   alloy's `LocalSigner` (a `k256::SecretKey` wrapper that is
+        //   `ZeroizeOnDrop`); that's the only piece of secret material
+        //   `decrypt_keystore` returns to us.
+        //
+        // Earlier comments here said "the password is consumed (and
+        // zeroized) inside `decrypt_keystore`" — that was misleading.
+        // The caller's `SecretBytes` is what zeroizes; the keystore
+        // helper only borrows.
         let password_str = std::str::from_utf8(password.expose())
             .map_err(|_| ChainError::Keystore("keystore password is not valid utf-8".into()))?;
         let signer = LocalSigner::decrypt_keystore(keystore_path, password_str)
@@ -266,7 +327,7 @@ impl BaseSepoliaAdapter {
     }
 
     /// Shared internal constructor: build a wallet-bearing provider
-    /// and verify chain id.
+    /// and verify chain id + live bytecode.
     async fn with_signer(
         rpc_url: &str,
         deployment: Deployment,
@@ -280,6 +341,12 @@ impl BaseSepoliaAdapter {
             .await
             .map_err(|e| ChainError::Rpc(format!("connect {rpc_url}: {e}")))?;
         check_chain_id(&provider, &deployment).await?;
+        // P7 audit MED-2: cross-check live runtime bytecode against
+        // the deployment file's recorded keccak. Same fail-closed
+        // posture as the chain-id check above. Adds one extra RPC
+        // call per `BaseSepoliaAdapter` construction; production
+        // hardening cost.
+        check_runtime_keccak(&provider, &deployment).await?;
         Ok(Self {
             provider: provider.erased(),
             deployment,
@@ -440,11 +507,28 @@ impl ChainAdapter for BaseSepoliaAdapter {
                 let tx_hash = log
                     .transaction_hash
                     .ok_or_else(|| ChainError::Decode("log missing transaction_hash".into()))?;
+                // P7 audit MED-5: validate the `device_id` bytes are
+                // a canonical Ed25519 verifying-key encoding *here*
+                // (at the adapter boundary) so downstream consumers
+                // (P8 sync, indexer, etc.) can rely on the invariant
+                // and don't have to re-check at every callsite. v0
+                // contract does not enforce this; v1 will (MVP-2).
+                // Catch it now so a P8 consumer doesn't panic on a
+                // non-canonical pubkey when it tries to verify the
+                // signature.
+                let device_id_bytes: [u8; 32] = decoded.deviceId.into();
+                if VerifyingKey::from_bytes(device_id_bytes).is_err() {
+                    return Err(ChainError::Decode(format!(
+                        "device_id is not a canonical Ed25519 verifying key: \
+                         0x{}",
+                        bytes_to_hex(&device_id_bytes)
+                    )));
+                }
                 out.push(RevisionEvent {
                     vault_id: decoded.vaultId.into(),
                     account_id: decoded.accountId.into(),
                     parent_revision: decoded.parentRevision.into(),
-                    device_id: decoded.deviceId.into(),
+                    device_id: device_id_bytes,
                     schema_version: decoded.schemaVersion,
                     sequence,
                     enc_payload: decoded.encPayload.to_vec(),
@@ -498,11 +582,21 @@ impl ChainAdapter for BaseSepoliaAdapter {
         let block_number = log
             .block_number
             .ok_or_else(|| ChainError::Decode("log missing block_number".into()))?;
+        // P7 audit MED-5: same canonical-Ed25519 check as in
+        // `pull_since`. See that function's MED-5 comment for
+        // rationale.
+        let device_id_bytes: [u8; 32] = decoded.deviceId.into();
+        if VerifyingKey::from_bytes(device_id_bytes).is_err() {
+            return Err(ChainError::Decode(format!(
+                "device_id is not a canonical Ed25519 verifying key: 0x{}",
+                bytes_to_hex(&device_id_bytes)
+            )));
+        }
         Ok(Some(RevisionEvent {
             vault_id: decoded.vaultId.into(),
             account_id: decoded.accountId.into(),
             parent_revision: decoded.parentRevision.into(),
-            device_id: decoded.deviceId.into(),
+            device_id: device_id_bytes,
             schema_version: decoded.schemaVersion,
             sequence,
             enc_payload: decoded.encPayload.to_vec(),
@@ -523,6 +617,20 @@ impl ChainAdapter for BaseSepoliaAdapter {
     }
 }
 
+/// Lowercase-hex encode a fixed-size byte slice without pulling a
+/// `hex` crate dep. Used by the MED-5 device-id-rejection diagnostic.
+fn bytes_to_hex(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        // SAFETY of unwrap: writing two hex chars to a String never
+        // fails. Using `core::fmt::Write` so we don't pull `format!`
+        // into a tight loop.
+        use core::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// Confirm that the RPC's reported chain id matches the deployment.
 async fn check_chain_id<P: Provider>(
     provider: &P,
@@ -536,6 +644,54 @@ async fn check_chain_id<P: Provider>(
         return Err(ChainError::WrongChain {
             expected: deployment.chain_id,
             observed,
+        });
+    }
+    Ok(())
+}
+
+/// P7 audit MED-2: cross-check live runtime bytecode against the
+/// deployment file's recorded `deployed_runtime_keccak256`.
+///
+/// `eth_getCode(deployment.contract_address)` returns the runtime
+/// bytecode at the address (the post-constructor bytes that actually
+/// execute on call). We hash it with keccak256 and compare against the
+/// recorded value. A mismatch returns
+/// [`ChainError::DeploymentMismatch`] with both digests, formatted
+/// as 0x-prefixed hex so the operator can paste them into `cast`.
+///
+/// This catches three threat profiles:
+///
+/// 1. **Tampered deployment file** redirecting the adapter to a
+///    foreign contract on the same chain that happens to expose the
+///    same selectors.
+/// 2. **CREATE2 redeployment collision** at the recorded address but
+///    with substituted code.
+/// 3. **Misbehaving / MITM'd RPC** rewriting `eth_getCode` to point
+///    at attacker-controlled bytecode (the cross-check fails closed
+///    because the recorded keccak in the deployment file is signed
+///    out-of-band by the workspace history, not by the RPC).
+///
+/// Cost: one extra `eth_getCode` per `BaseSepoliaAdapter` construction.
+/// Acceptable for production hardening — chaincli has done the same
+/// check in `commands/status.rs` since P6.
+async fn check_runtime_keccak<P: Provider>(
+    provider: &P,
+    deployment: &Deployment,
+) -> Result<(), ChainError> {
+    let live_code = provider
+        .get_code_at(deployment.contract_address)
+        .await
+        .map_err(|e| {
+            ChainError::Rpc(format!(
+                "eth_getCode {:?}: {e}",
+                deployment.contract_address
+            ))
+        })?;
+    let live_keccak: B256 = keccak256(live_code.as_ref());
+    if live_keccak != deployment.runtime_keccak {
+        return Err(ChainError::DeploymentMismatch {
+            expected: format!("{:?}", deployment.runtime_keccak),
+            found: format!("{live_keccak:?}"),
         });
     }
     Ok(())
@@ -567,6 +723,13 @@ mod tests {
             "0x8566d3de653ee55775783bd7918fe91b66373896"
         );
         assert!(dep.deploy_block > 0, "deploy_block must be set");
+        // P7 audit MED-2: the recorded runtime keccak parses and
+        // matches the canonical value cross-checked by chaincli's
+        // status command.
+        assert_eq!(
+            format!("{:?}", dep.runtime_keccak).to_ascii_lowercase(),
+            "0xdbab504e86eca48cbedf61bb1fbc04ab17a5bb880d5a468cbb64e4b64e95c6fe"
+        );
     }
 
     /// A deployment file declaring a wrong chain id is rejected at
@@ -644,6 +807,134 @@ mod tests {
         assert!(
             matches!(err, ChainError::Io(_)),
             "expected ChainError::Io for missing file, got: {err:?}"
+        );
+    }
+
+    /// P7 audit MED-2: a deployment file missing
+    /// `bytecode.deployed_runtime_keccak256` is rejected at load
+    /// time. The constructor's runtime-keccak cross-check needs this
+    /// field; refusing to load a file that doesn't carry it is the
+    /// fail-closed posture.
+    #[test]
+    fn missing_runtime_keccak_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let json = r#"{
+            "chain": { "chain_id": 84532, "rpc_default": "https://x" },
+            "contracts": {
+                "RevisionLogV0": {
+                    "address": "0x8566D3de653ee55775783bD7918Fe91b66373896",
+                    "deploy_block": 1
+                }
+            }
+        }"#;
+        let p = dir.path().join("base-sepolia.json");
+        std::fs::write(&p, json).expect("write");
+        let err = Deployment::load(&p).expect_err("missing runtime keccak rejected");
+        let msg = format!("{err}");
+        assert!(
+            matches!(err, ChainError::Deployment(_)),
+            "expected Deployment error, got: {msg}"
+        );
+        assert!(
+            msg.contains("deployed_runtime_keccak256"),
+            "expected runtime-keccak missing message, got: {msg}"
+        );
+    }
+
+    /// P7 audit MED-2: a deployment file whose runtime keccak is not
+    /// a valid 0x-prefixed 32-byte hex string is rejected.
+    #[test]
+    fn malformed_runtime_keccak_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let json = r#"{
+            "chain": { "chain_id": 84532, "rpc_default": "https://x" },
+            "contracts": {
+                "RevisionLogV0": {
+                    "address": "0x8566D3de653ee55775783bD7918Fe91b66373896",
+                    "deploy_block": 1,
+                    "bytecode": {
+                        "deployed_runtime_keccak256": "not-a-hex-string"
+                    }
+                }
+            }
+        }"#;
+        let p = dir.path().join("base-sepolia.json");
+        std::fs::write(&p, json).expect("write");
+        let err = Deployment::load(&p).expect_err("malformed keccak rejected");
+        let msg = format!("{err}");
+        assert!(
+            matches!(err, ChainError::Deployment(_)),
+            "expected Deployment error, got: {msg}"
+        );
+        assert!(
+            msg.contains("not a valid 0x-prefixed"),
+            "expected hex-parse error, got: {msg}"
+        );
+    }
+
+    /// P7 audit MED-2: the `check_runtime_keccak` helper computes the
+    /// digest of the live bytecode and compares against the
+    /// deployment record. We can't reach the live network from a unit
+    /// test, so this checks the helper's *comparison* logic by
+    /// running an in-process anvil-style provider via alloy's
+    /// `MockProvider` is similarly out-of-scope; instead we assert
+    /// the construction-time wiring at the type level by ensuring
+    /// `DeploymentMismatch` carries both digests as 0x-prefixed
+    /// strings and round-trips through `Display`. Live cross-check
+    /// is exercised by the gated integration test.
+    #[test]
+    fn deployment_mismatch_error_format() {
+        let err = ChainError::DeploymentMismatch {
+            expected: "0xaaaa".into(),
+            found: "0xbbbb".into(),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("0xaaaa"),
+            "expected 'expected' field in msg: {msg}"
+        );
+        assert!(
+            msg.contains("0xbbbb"),
+            "expected 'found' field in msg: {msg}"
+        );
+        assert!(
+            msg.contains("keccak"),
+            "message should reference keccak: {msg}"
+        );
+    }
+
+    /// P7 audit MED-1: a deployment file whose contract address has
+    /// the right hex bytes but a wrong EIP-55 checksum is rejected at
+    /// load time. The canonical address has mixed case
+    /// (`0x8566D3de...`); flipping it to all-lowercase breaks the
+    /// EIP-55 invariant and must trip `Address::parse_checksummed`.
+    #[test]
+    fn mis_checksummed_address_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Same hex bytes as the canonical address but with the
+        // checksum case mangled (all-lowercase). Plain `parse::<Address>()`
+        // would accept this (it's still 20 valid hex bytes); EIP-55
+        // checksummed parsing must reject it.
+        let json = r#"{
+            "chain": { "chain_id": 84532, "rpc_default": "https://x" },
+            "contracts": {
+                "RevisionLogV0": {
+                    "address": "0x8566d3de653ee55775783bd7918fe91b66373896",
+                    "deploy_block": 1
+                }
+            }
+        }"#;
+        let p = dir.path().join("base-sepolia.json");
+        std::fs::write(&p, json).expect("write");
+        let err = Deployment::load(&p).expect_err("mis-checksummed address rejected");
+        let msg = format!("{err}");
+        assert!(
+            matches!(err, ChainError::Deployment(_)),
+            "expected Deployment error, got: {msg}"
+        );
+        assert!(
+            msg.contains("EIP-55"),
+            "expected EIP-55-checksum error message, got: {msg}"
         );
     }
 }

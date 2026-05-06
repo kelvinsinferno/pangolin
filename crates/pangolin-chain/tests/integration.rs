@@ -82,6 +82,27 @@ async fn current_block_returns_a_value() {
     );
 }
 
+/// P7 audit MED-2: the constructor's `eth_getCode` keccak cross-check
+/// must succeed against the live chain — i.e., the canonical
+/// deployment file's `deployed_runtime_keccak256` matches what the
+/// real RPC returns. If `BaseSepoliaAdapter::new_read_only` returns
+/// `Ok`, the cross-check fired and matched. If a future contract is
+/// re-deployed without the deployment file being updated, this test
+/// fails with `ChainError::DeploymentMismatch` and the operator knows
+/// to refresh the recorded keccak.
+#[tokio::test]
+async fn runtime_keccak_cross_check_passes_on_live_chain() {
+    let result = BaseSepoliaAdapter::new_read_only(&rpc_url(), &deployment_path()).await;
+    let adapter =
+        result.expect("constructor's runtime-keccak cross-check must pass against live chain");
+    // Using the adapter to do another read confirms the provider is
+    // in working order and not just a stub.
+    let _ = adapter
+        .current_block()
+        .await
+        .expect("post-cross-check provider call works");
+}
+
 #[tokio::test]
 async fn pull_since_returns_smoke_revision() {
     let adapter = BaseSepoliaAdapter::new_read_only(&rpc_url(), &deployment_path())

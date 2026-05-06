@@ -1,10 +1,36 @@
 //! Canonical hash + Ed25519 signed-revision builder.
 //!
 //! The on-chain `RevisionLogV0` (P5-1) does NOT verify a revision
-//! signature today — that's planned for MVP-2 issue 2.1. **But** the
-//! client signs every revision with its device key anyway, so when v1
-//! ships there is no client-side migration to perform: existing
-//! anchored revisions already carry valid signatures.
+//! signature today — that's planned for MVP-2 issue 2.1. The client
+//! signs every revision with its Ed25519 device key anyway, but the
+//! degree to which v1 can consume those signatures unchanged depends
+//! on how v1 elects to verify them.
+//!
+//! ## What transfers to v1 (P7 audit HIGH-2)
+//!
+//! - **The canonical-hash construction transfers in every plausible
+//!   v1 path.** keccak256 over fixed-width fields with the payload
+//!   reduced to its keccak digest is what a Solidity verifier
+//!   computes natively, and it's what any practical secp256k1
+//!   verifier would also compute (so a v1 that swaps the signature
+//!   primitive can still bind to the same digest layout).
+//! - **The Ed25519 signature itself transfers only if v1 uses an
+//!   on-chain Ed25519 verifier** (Path A in the crate-level
+//!   docstring). Path A is viable on L2 (~500k gas per verify ≈
+//!   $0.01–0.02 on Base mainnet) but not on L1 mainnet at typical
+//!   2026 fees (~$25–50/verify). If v1 instead chooses secp256k1
+//!   (Path B — most likely the L1 path because `ecrecover` is the
+//!   3 000-gas precompile), the existing Ed25519 signatures would
+//!   need to be **re-signed** under the secp256k1 identity before
+//!   they can verify under v1, and `device_id` would need to be
+//!   re-keyed (Ed25519 verifying-key bytes → secp256k1 EVM-address
+//!   or a separately-registered v1 device key).
+//!
+//! The honest claim is therefore "the canonical-hash construction
+//! transfers; the signature primitive may not". The current
+//! `signing.rs` API surface is Path-A-shaped; Path B would require a
+//! new `secp256k1_signing.rs` (or a refactor to a generic `Signer`
+//! trait abstracting over both primitives).
 //!
 //! ## Canonical-hash construction
 //!
