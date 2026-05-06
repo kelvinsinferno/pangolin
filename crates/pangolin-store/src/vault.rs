@@ -31,7 +31,9 @@ use crate::account::{AccountId, AccountSnapshot, ACCOUNT_ID_LEN};
 use crate::blob::{build_aad, open_payload, seal_snapshot, seal_tombstone, DecodedPayload};
 use crate::error::{Result, StoreError};
 use crate::meta::{self, VaultMeta};
-use crate::revision::{ChainAnchor, DeviceId, RevisionId, RevisionMeta, REVISION_ID_LEN};
+use crate::revision::{
+    ChainAnchor, DeviceId, RevisionGraph, RevisionId, RevisionMeta, REVISION_ID_LEN,
+};
 use crate::schema;
 use crate::search::DecryptedCache;
 
@@ -626,6 +628,317 @@ impl Vault {
     }
 
     // -----------------------------------------------------------------
+    // Revision graph + fork detection (P3)
+    // -----------------------------------------------------------------
+
+    /// Build the [`RevisionGraph`] for `account_id`. Reads every
+    /// `revisions` row for the account, indexes the parent→child
+    /// structure, and returns. Does not require [`VaultState::Active`]
+    /// because the graph is metadata-only (no `enc_payload`,
+    /// no decrypted plaintext) — a `Locked` vault can still answer
+    /// fork-detection queries.
+    ///
+    /// Returns an empty graph if the `account_id` has no revisions in
+    /// the local store. (`account_identities` is not consulted; the
+    /// graph is built directly from the `revisions` table so callers
+    /// in P7's chain-replay path can build a graph for an account
+    /// whose identity row hasn't been written yet.)
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` for any database issue,
+    /// `StoreError::Corrupted` if a stored row fails internal length
+    /// checks (e.g., a 32-byte id field that isn't actually 32 bytes)
+    /// or if the graph build detects a cycle or duplicate.
+    pub fn revision_graph(&self, id: AccountId) -> Result<RevisionGraph> {
+        let rows = self.read_revision_rows_for(id)?;
+        RevisionGraph::build(rows)
+    }
+
+    /// Heads of the revision graph for `account_id`.
+    ///
+    /// Length 1: the account is in a clean linear state. Length > 1:
+    /// the account is forked. Length 0: the account has no revisions
+    /// (either truly empty or the row hasn't been written yet).
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::AccountNotFound` if the account is unknown — i.e.,
+    /// no row in `account_identities` matches `id`. The graph itself
+    /// is built from the `revisions` table; we cross-check against
+    /// `account_identities` here so callers get a clear "no such
+    /// account" signal rather than a silently-empty result.
+    pub fn account_heads(&self, id: AccountId) -> Result<Vec<RevisionId>> {
+        // Cross-check the account exists at the identity layer.
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM account_identities WHERE account_id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(StoreError::AccountNotFound);
+        }
+        // Use a SQL pre-filter for the multi-head case so we don't
+        // pay the full RevisionGraph::build cost when the caller only
+        // wants the head set. Plan §"Schema implications" anchors the
+        // NOT EXISTS subquery as the canonical multi-head detector.
+        // M-1 (P3 audit): scope the NOT EXISTS subquery by `account_id`
+        // as defense-in-depth against a hypothetical future code path
+        // that allows cross-account `parent_revision_id` references.
+        // RevisionIds are 32-byte CSPRNG output, so accidental
+        // collision is cryptographically negligible — this is belt +
+        // suspenders, not a fix for a current vulnerability.
+        let mut stmt = self.conn.prepare(
+            "SELECT r.revision_id, r.created_at FROM revisions r
+             WHERE r.account_id = ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM revisions r2
+                 WHERE r2.parent_revision_id = r.revision_id
+                   AND r2.account_id = r.account_id
+               )
+             ORDER BY r.created_at ASC, r.revision_id ASC",
+        )?;
+        let rows = stmt.query_map(params![id.as_bytes().as_slice()], |row| {
+            let rid: Vec<u8> = row.get(0)?;
+            let created_at: i64 = row.get(1)?;
+            Ok((rid, created_at))
+        })?;
+        let mut out: Vec<RevisionId> = Vec::new();
+        for row in rows {
+            let (rid, _ts) = row?;
+            let arr: [u8; REVISION_ID_LEN] = rid
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Corrupted("head revision_id not 32 bytes".into()))?;
+            out.push(RevisionId::from_bytes(arr));
+        }
+        Ok(out)
+    }
+
+    /// `true` iff `account_heads(id).len() > 1`.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Self::account_heads`].
+    pub fn is_forked(&self, id: AccountId) -> Result<bool> {
+        Ok(self.account_heads(id)?.len() > 1)
+    }
+
+    /// Every account in the local store that currently has more than
+    /// one head — the "needs attention" set for P9's eventual conflict
+    /// resolution UI.
+    ///
+    /// The query groups the `revisions` table by `account_id` and
+    /// retains only those whose count of children-less rows
+    /// (heads) exceeds one. Order: `account_id` byte-order ASC for
+    /// deterministic iteration.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` on any database issue.
+    pub fn all_forked_accounts(&self) -> Result<Vec<AccountId>> {
+        // M-1 (P3 audit): scope the NOT EXISTS subquery by `account_id`
+        // (defense-in-depth — see `account_heads` above for rationale).
+        let mut stmt = self.conn.prepare(
+            "SELECT account_id FROM (
+                SELECT r.account_id, COUNT(*) AS head_count
+                FROM revisions r
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM revisions r2
+                    WHERE r2.parent_revision_id = r.revision_id
+                      AND r2.account_id = r.account_id
+                )
+                GROUP BY r.account_id
+                HAVING head_count > 1
+            )
+            ORDER BY account_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id: Vec<u8> = row.get(0)?;
+            Ok(id)
+        })?;
+        let mut out: Vec<AccountId> = Vec::new();
+        for row in rows {
+            let id = row?;
+            let arr: [u8; ACCOUNT_ID_LEN] = id
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Corrupted("account_id not 32 bytes".into()))?;
+            out.push(AccountId::from_bytes(arr));
+        }
+        Ok(out)
+    }
+
+    // -----------------------------------------------------------------
+    // P3 test helpers (cfg(test) only)
+    // -----------------------------------------------------------------
+
+    /// **Test-only**: synthesize a sibling revision whose parent is the
+    /// caller-chosen `parent_revision_id` rather than the account's
+    /// current canonical head. This is the ONLY way to exercise fork
+    /// detection from inside this crate without going through P7's
+    /// chain adapter — production [`Self::add_account`] and
+    /// [`Self::update_account`] always advance linearly.
+    ///
+    /// The synthesized revision uses the same crypto primitives as
+    /// production: it AEAD-seals the supplied snapshot under the
+    /// active VDK with an AAD bound to (`vault_id`, `account_id`,
+    /// chosen `parent_revision_id`, `schema_version`). A round-trip
+    /// through the unlock path therefore decrypts cleanly, and any
+    /// future divergence (e.g., wrong AAD) would be caught by the
+    /// existing AEAD authentication discipline.
+    ///
+    /// The vault must be `Active`; the account must exist and not be
+    /// tombstoned. Unlike `update_account`, this method does NOT
+    /// modify `account_identities.head_revision_id` — the canonical
+    /// head pointer remains whatever it was before the call. The
+    /// fork-detection query (`NOT EXISTS` subquery) discovers the new
+    /// head independently.
+    ///
+    /// # Visibility
+    ///
+    /// Public so `tests/e2e.rs` (an integration test that links the
+    /// crate as an external dependency) can build a fork without
+    /// needing the chain adapter. The `__` prefix on the method name
+    /// plus the `#[doc(hidden)]` attribute on the method itself are
+    /// the standard Rust idiom for "this is in the public surface
+    /// strictly to make the test harness work; not for downstream
+    /// consumption." A future iteration that introduces a
+    /// `cargo`-feature-gated test-utilities surface (`feature =
+    /// "test-utilities"`) can move this method behind that gate
+    /// without breaking any consumer that respects the prefix
+    /// convention.
+    ///
+    /// Returns the synthesized revision's id.
+    ///
+    /// # Errors
+    ///
+    /// Same set as `update_account`, plus `RevisionNotFound` if the
+    /// declared parent is not in the account's revision history.
+    #[doc(hidden)]
+    // Mirrors the `add_account` / `update_account` signature shape
+    // (snapshot taken by value) so a test reads identically to a
+    // production write. Production paths consume the snapshot into
+    // the cache; this one does not, but matching the signature keeps
+    // the test-side ergonomics aligned with the API the helper
+    // pretends to be.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn __test_synthesize_sibling_revision(
+        &mut self,
+        id: AccountId,
+        parent: RevisionId,
+        snapshot: AccountSnapshot,
+    ) -> Result<RevisionId> {
+        let _ = self.require_active()?;
+        // Confirm the account exists and that the chosen parent is in
+        // its revision history. The first check protects against
+        // typos in tests; the second prevents synthesizing an
+        // attacker-style "orphan revision" with no shared lineage.
+        let account_row = self
+            .conn
+            .query_row(
+                "SELECT tombstoned FROM account_identities WHERE account_id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| {
+                    let t: i64 = row.get(0)?;
+                    Ok(t != 0)
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::AccountNotFound)?;
+        if account_row {
+            return Err(StoreError::AccountTombstoned);
+        }
+        let parent_exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM revisions
+                 WHERE account_id = ?1 AND revision_id = ?2",
+                params![id.as_bytes().as_slice(), parent.as_bytes().as_slice(),],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if parent_exists.is_none() {
+            return Err(StoreError::RevisionNotFound);
+        }
+
+        let revision_id = RevisionId::from_bytes(random_32_via_sqlite(&self.conn)?);
+        let aad = build_aad(
+            &self.meta.vault_id,
+            &id,
+            &parent,
+            self.meta.wrap_context.schema_version,
+        );
+        let active = self.require_active()?;
+        let (ct, nonce) = seal_snapshot(active.vdk.aead_key(), &snapshot, &aad)?;
+        let now = current_unix_ms();
+
+        // INSERT only into `revisions` — do NOT touch
+        // `account_identities.head_revision_id`. The whole point of
+        // this helper is to leave the canonical head pointer alone so
+        // multi-head detection has work to do.
+        self.conn.execute(
+            "INSERT INTO revisions (
+                revision_id, account_id, parent_revision_id, device_id,
+                schema_version, created_at, enc_payload, enc_nonce, is_tombstone
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+            params![
+                revision_id.as_bytes().as_slice(),
+                id.as_bytes().as_slice(),
+                parent.as_bytes().as_slice(),
+                self.device_id.0.as_slice(),
+                i64::from(self.meta.wrap_context.schema_version),
+                now,
+                ct.as_bytes(),
+                nonce.as_bytes().as_slice(),
+            ],
+        )?;
+        Ok(revision_id)
+    }
+
+    /// Internal: read every `revisions` row for `account_id` into
+    /// [`RevisionMeta`] form. Used by [`Self::revision_graph`].
+    fn read_revision_rows_for(&self, id: AccountId) -> Result<Vec<RevisionMeta>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT revision_id, parent_revision_id, device_id,
+                    schema_version, created_at, is_tombstone,
+                    chain_tx_hash, chain_block_number, chain_log_index
+             FROM revisions WHERE account_id = ?1
+             ORDER BY created_at ASC, revision_id ASC",
+        )?;
+        let rows = stmt.query_map(params![id.as_bytes().as_slice()], |row| {
+            let revision_id: Vec<u8> = row.get(0)?;
+            let parent: Vec<u8> = row.get(1)?;
+            let device_id: Vec<u8> = row.get(2)?;
+            let schema_version: i64 = row.get(3)?;
+            let created_at: i64 = row.get(4)?;
+            let is_tombstone: i64 = row.get(5)?;
+            let chain_tx_hash: Option<Vec<u8>> = row.get(6)?;
+            let chain_block_number: Option<i64> = row.get(7)?;
+            let chain_log_index: Option<i64> = row.get(8)?;
+            Ok(RawRevisionRow {
+                revision_id,
+                parent,
+                device_id,
+                schema_version,
+                created_at,
+                is_tombstone,
+                chain_tx_hash,
+                chain_block_number,
+                chain_log_index,
+            })
+        })?;
+        let mut out: Vec<RevisionMeta> = Vec::new();
+        for raw in rows {
+            out.push(raw?.into_meta()?);
+        }
+        Ok(out)
+    }
+
+    // -----------------------------------------------------------------
     // Chain anchor primitives (P7 hooks)
     // -----------------------------------------------------------------
 
@@ -1099,6 +1412,158 @@ mod tests {
             assert!(depth < 100, "lineage walk did not terminate");
         }
         assert_eq!(depth, 6);
+    }
+
+    // -----------------------------------------------------------------
+    // P3 vault-side fork-detection tests
+    // -----------------------------------------------------------------
+
+    /// Plan success criterion 2: a clean linear edit history exposes
+    /// `is_forked() == false`, `account_heads().len() == 1`, and the
+    /// graph contains exactly one head whose id equals the
+    /// `account_identities.head_revision_id` canonical pointer.
+    #[test]
+    fn is_forked_false_after_linear_edits() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "linear.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_password()).unwrap();
+        let id = v.add_account(fresh_snapshot()).unwrap();
+        for _ in 0..5 {
+            v.update_account(id, fresh_snapshot()).unwrap();
+        }
+        let heads = v.account_heads(id).unwrap();
+        assert_eq!(heads.len(), 1, "linear lineage must have exactly one head");
+        assert!(!v.is_forked(id).unwrap());
+        let graph = v.revision_graph(id).unwrap();
+        assert_eq!(graph.heads().len(), 1);
+        assert!(!graph.is_forked());
+        assert_eq!(graph.len(), 6); // genesis + 5 updates
+                                    // Genesis is detected, and the canonical head from the
+                                    // identity row matches the graph's head.
+        assert!(graph.genesis().is_some());
+        // Cross-check: account_heads via SQL agrees with the graph.
+        assert_eq!(graph.heads()[0], heads[0]);
+    }
+
+    /// Plan success criterion 3 (vault path): synthesize a fork via
+    /// the test helper and confirm `is_forked()` flips, both heads
+    /// surface from `account_heads`, and the common ancestor is the
+    /// shared parent.
+    #[test]
+    fn vault_two_way_fork_via_test_helper() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "fork.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_password()).unwrap();
+        let id = v.add_account(fresh_snapshot()).unwrap();
+        // Linear: genesis (R0) -> R1 -> R2.
+        let r1 = v.update_account(id, fresh_snapshot()).unwrap();
+        let _r2 = v.update_account(id, fresh_snapshot()).unwrap();
+        assert!(!v.is_forked(id).unwrap());
+        // Synthesize a sibling of R2 by inserting another revision
+        // whose parent is R1. This is what "another device's update
+        // from R1 has just synced in" looks like at the storage layer.
+        let r2_alt = v
+            .__test_synthesize_sibling_revision(id, r1, fresh_snapshot())
+            .unwrap();
+        // Now there are two heads.
+        assert!(v.is_forked(id).unwrap());
+        let heads = v.account_heads(id).unwrap();
+        assert_eq!(heads.len(), 2, "two-way fork must surface as two heads");
+        let graph = v.revision_graph(id).unwrap();
+        assert!(graph.is_forked());
+        assert_eq!(graph.heads().len(), 2);
+        // r2_alt is one of the heads.
+        let head_set: std::collections::HashSet<_> = heads.into_iter().collect();
+        assert!(head_set.contains(&r2_alt));
+        // Common ancestor of the two heads is R1 (the fork point).
+        let head_vec: Vec<_> = head_set.into_iter().collect();
+        let lca = graph.common_ancestor(&head_vec[0], &head_vec[1]).unwrap();
+        assert_eq!(lca, r1, "fork point must be R1");
+    }
+
+    /// Plan success criterion 7 (vault path): an account with mixed
+    /// forked / unforked siblings reports only the forked ones via
+    /// `all_forked_accounts`.
+    #[test]
+    fn all_forked_accounts_lists_only_forked() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "mixed.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_password()).unwrap();
+        // Two accounts, only the second one will be forked.
+        let id_clean = v.add_account(fresh_snapshot()).unwrap();
+        v.update_account(id_clean, fresh_snapshot()).unwrap();
+        v.update_account(id_clean, fresh_snapshot()).unwrap();
+
+        let id_fork = v.add_account(fresh_snapshot()).unwrap();
+        let parent = v.update_account(id_fork, fresh_snapshot()).unwrap();
+        v.update_account(id_fork, fresh_snapshot()).unwrap();
+        v.__test_synthesize_sibling_revision(id_fork, parent, fresh_snapshot())
+            .unwrap();
+
+        // Only the forked account should appear.
+        let forked = v.all_forked_accounts().unwrap();
+        assert_eq!(forked.len(), 1, "exactly one forked account expected");
+        assert_eq!(forked[0], id_fork);
+        assert!(!v.is_forked(id_clean).unwrap());
+        assert!(v.is_forked(id_fork).unwrap());
+    }
+
+    /// Plan failure-mode coverage: querying an unknown account yields
+    /// `AccountNotFound` rather than an empty / silent answer.
+    #[test]
+    fn account_heads_unknown_account_errors() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "unknown.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_password()).unwrap();
+        let bogus = crate::account::AccountId::from_bytes([0x99; 32]);
+        let err = v.account_heads(bogus).unwrap_err();
+        assert!(matches!(err, StoreError::AccountNotFound));
+        let err = v.is_forked(bogus).unwrap_err();
+        assert!(matches!(err, StoreError::AccountNotFound));
+    }
+
+    /// `revision_graph` is metadata-only and works while the vault is
+    /// `Locked` (no VDK in memory). Cardinal-principle 2 sanity: no
+    /// plaintext is needed to enumerate the lineage.
+    #[test]
+    fn revision_graph_works_while_locked() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "locked.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let id;
+        {
+            let mut v = Vault::open(&p).unwrap();
+            v.unlock(&fresh_password()).unwrap();
+            id = v.add_account(fresh_snapshot()).unwrap();
+            v.update_account(id, fresh_snapshot()).unwrap();
+            v.lock();
+            v.close().unwrap();
+        }
+        let v = Vault::open(&p).unwrap();
+        // Vault is Locked; no unlock call.
+        assert_eq!(v.state(), VaultState::Locked);
+        let g = v.revision_graph(id).unwrap();
+        assert_eq!(g.len(), 2);
+        assert!(!g.is_forked());
+    }
+
+    /// Empty vault: `all_forked_accounts` returns an empty Vec.
+    #[test]
+    fn all_forked_accounts_empty_vault() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "empty.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let v = Vault::open(&p).unwrap();
+        let forked = v.all_forked_accounts().unwrap();
+        assert!(forked.is_empty());
     }
 
     /// Success criterion 3 (kernel): create -> open -> unlock round
