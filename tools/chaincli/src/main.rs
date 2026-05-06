@@ -57,6 +57,11 @@ enum Command {
     /// Pretty-print a single `RevisionPublished` event by tx-hash or
     /// (block, log-index).
     Dump(commands::dump::DumpArgs),
+
+    /// Publish a new revision (write path). Signs with a Foundry
+    /// keystore via `--account <name>`; password is read from the
+    /// terminal without echo.
+    Publish(commands::publish::PublishArgs),
 }
 
 fn main() -> Result<()> {
@@ -78,6 +83,7 @@ fn main() -> Result<()> {
             Command::Status => commands::status::run(&deployment, &rpc_url).await,
             Command::List(args) => commands::list::run(&deployment, &rpc_url, args).await,
             Command::Dump(args) => commands::dump::run(&deployment, &rpc_url, args).await,
+            Command::Publish(args) => commands::publish::run(&deployment, &rpc_url, args).await,
         }
     })
 }

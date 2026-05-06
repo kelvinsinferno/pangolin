@@ -2,4 +2,5 @@
 
 pub mod dump;
 pub mod list;
+pub mod publish;
 pub mod status;
