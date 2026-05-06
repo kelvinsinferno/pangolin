@@ -1,12 +1,25 @@
 //! Cryptographic primitives for Pangolin.
 //!
-//! AEAD (XChaCha20-Poly1305), KDF (Argon2id), signing (Ed25519), and key
+//! AEAD (`XChaCha20-Poly1305`), KDF (Argon2id), signing (Ed25519), and key
 //! wrapping live here. This crate **reuses vetted libraries**; it never
-//! invents new primitives. Real implementations land in the P1 series.
+//! invents new primitives.
+//!
+//! Every secret-bearing type implements [`zeroize::Zeroize`] on drop, exposes
+//! a redacted [`core::fmt::Debug`] impl, and never derives [`PartialEq`] —
+//! equality on secret material goes through [`subtle::ConstantTimeEq`].
+//!
+//! See `docs/issue-plans/P1.md` for the full specification.
 
-#![cfg_attr(not(test), forbid(unsafe_code))]
+#![forbid(unsafe_code)]
 
-/// Returns the crate name. Placeholder for P0-1.
+pub mod aead;
+pub mod kdf;
+pub mod keys;
+pub mod rng;
+pub mod secret;
+pub mod sign;
+
+/// Returns the crate name. Useful for diagnostics and version reporting.
 #[must_use]
 pub fn name() -> &'static str {
     "pangolin-crypto"

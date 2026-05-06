@@ -11,3 +11,41 @@ description = "Cryptographic primitives — AEAD, KDF, signing, key wrapping. Re
 
 [lints]
 workspace = true
+
+[features]
+# Gates tests that intentionally exercise the locked KDF parameters
+# (256 MiB / t=3) — too slow for the default `cargo test` lane, but
+# critical for end-of-issue regression sweeps. Run with:
+#   cargo test --features slow-tests
+slow-tests = []
+
+# Widens the visibility of crate-private deterministic-nonce
+# constructors (`aead::Nonce::from_bytes`) to `pub` so that the crate's
+# own RFC known-answer integration tests in `tests/test_vectors.rs` can
+# compile against the public surface. Production builds of downstream
+# crates MUST NOT enable this feature — the whole point is that
+# deterministic-nonce constructors stay hidden from production callers.
+# See HIGH-2 in the audit / `crates/pangolin-crypto/src/aead.rs` for
+# rationale.
+test-vectors = []
+
+[dependencies]
+chacha20poly1305 = { workspace = true }
+argon2            = { workspace = true }
+ed25519-dalek     = { workspace = true }
+hkdf              = { workspace = true }
+sha2              = { workspace = true }
+zeroize           = { workspace = true }
+subtle            = { workspace = true }
+rand_core         = { workspace = true }
+static_assertions = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+hex      = { workspace = true }
+# Self-reference enables `test-vectors` for the integration-test
+# compile target (`tests/test_vectors.rs`) so that the
+# deterministic-nonce constructor is visible to KAT vectors. The
+# feature is gated such that production downstream crates cannot
+# enable it.
+pangolin-crypto = { path = ".", features = ["test-vectors"] }

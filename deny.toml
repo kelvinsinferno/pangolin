@@ -1,0 +1,122 @@
+# cargo-deny configuration — Pangolin workspace.
+#
+# Two roles:
+#   1. Lock the set of crypto-bearing crates we ship to the audit
+#      surface defined in `docs/issue-plans/P1.md`. The closed-world
+#      enforcement is **the workspace `[workspace.dependencies]` block
+#      with pinned `=X.Y.Z` versions plus the committed `Cargo.lock`**;
+#      this file's `bans.deny` table is the secondary defense, listing
+#      crypto-bearing crates that are NEVER allowed and would shadow
+#      one of the locked primitives.
+#   2. Fail the build on advisories (RUSTSEC), license incompatibility,
+#      and unknown registries / git sources.
+#
+# Run locally with:
+#   cargo install --locked cargo-deny
+#   cargo deny check
+#
+# CI runs `cargo deny check advisories bans licenses sources` per
+# `.github/workflows/ci.yml` (see the `deny` job).
+
+[graph]
+all-features = false
+
+[advisories]
+# RUSTSEC database advisories are hard failures.
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses we accept across the workspace dependency tree.
+# Anything outside this list triggers a manual review per the plan.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    # `unicode-ident` ships under Unicode-DFS-2016 OR (Apache-2.0 WITH
+    # LLVM-exception) — covered above. No additional entries needed.
+]
+confidence-threshold = 0.8
+
+[bans]
+# Multiple versions of the same crate get a warning, not a failure —
+# duplicate transitives are common in the Rust ecosystem and we already
+# allow `multiple_crate_versions` at the clippy lint level.
+multiple-versions = "warn"
+# Wildcard version requirements are a supply-chain footgun (one yanked
+# release can break the build). Hard-deny **on external** crates;
+# workspace-internal `path = "..."` deps are exempt because they are
+# resolved against the local checkout, not crates.io.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+# Denylist: crypto-bearing crates that would compete with or shadow
+# Pangolin's locked primitives. Adding any of these would re-introduce
+# an FFI / unaudited path that the locked allowlist (in
+# `Cargo.toml [workspace.dependencies]`) deliberately avoids.
+#
+# If a future plan revision needs one of these crates, the entry must
+# be removed in the same PR that adds the dependency, and the plan
+# must justify why the locked alternative is insufficient.
+deny = [
+    { name = "ring", reason = "Pangolin uses RustCrypto / dalek-cryptography crates exclusively per docs/issue-plans/P1.md; ring is FFI-laden and outside the audit surface." },
+    { name = "rust-crypto", reason = "abandoned upstream; use RustCrypto org crates." },
+    { name = "openssl", reason = "FFI surface; out of audit scope." },
+    { name = "openssl-sys", reason = "FFI surface; out of audit scope." },
+    { name = "sodiumoxide", reason = "libsodium FFI; out of audit scope." },
+    { name = "libsodium-sys", reason = "libsodium FFI; out of audit scope." },
+    { name = "rust-tls-bindings", reason = "FFI shim; not in scope." },
+    { name = "wolfssl", reason = "FFI; not in scope." },
+    { name = "boring", reason = "FFI fork of BoringSSL; not in scope." },
+    # Alternative AEADs we explicitly do not ship — re-introducing one
+    # would split the audit surface.
+    { name = "aes-gcm", reason = "Pangolin's AEAD is XChaCha20-Poly1305 only per the locked plan." },
+    { name = "aes-gcm-siv", reason = "see aes-gcm." },
+    { name = "aes-siv", reason = "see aes-gcm." },
+    # Alternative signers.
+    { name = "ed25519-zebra", reason = "Pangolin uses ed25519-dalek 2.x per the locked plan." },
+    { name = "secp256k1", reason = "out of scope; Pangolin signs with Ed25519, not k1, until further plan revision." },
+    # Alternative KDFs.
+    { name = "scrypt", reason = "Pangolin's KDF is Argon2id only per the locked plan." },
+    { name = "pbkdf2", reason = "see scrypt." },
+    { name = "balloon-hash", reason = "see scrypt." },
+    # ## Reasoning — `serde` ban for the `pangolin-crypto` audit surface.
+    #
+    # Plan success criterion #11 (`docs/issue-plans/P1.md`) requires that
+    # the secret-bearing types `VdkKey`, `AuthorityKey`, `DeviceKey` (and
+    # by extension `AeadKey`, `SigningKey`, `SecretBytes`) NEVER implement
+    # `serde::Serialize` or `serde::Deserialize`. The original
+    # `static_assertions::assert_not_impl_any!(... : Clone, Copy)` in
+    # `keys.rs` covers Clone/Copy but cannot directly assert "does not
+    # implement serde::Serialize" without taking on a `serde` dependency,
+    # which itself would be the very supply-chain footgun we are trying
+    # to prevent.
+    #
+    # Closing the gap at the dependency-graph layer is strictly stronger:
+    # if `serde` and `serde_derive` are not reachable from
+    # `pangolin-crypto`, no `Serialize` impl is even expressible — neither
+    # accidentally via a `#[derive(Serialize)]` nor via an upstream
+    # dependency that adds a blanket impl.
+    #
+    # If a future plan revision needs `serde` (e.g., for the public
+    # `WrappedVdk` / `VerifyingKey` halves), the entry must be removed
+    # in the same PR that adds the dependency, the plan must spell out
+    # the exposure, and Kelvin must approve.
+    { name = "serde", reason = "pangolin-crypto must not gain serde reachability — keys must not be serializable; see HIGH-1 / docs/issue-plans/P1.md success criterion #11." },
+    { name = "serde_derive", reason = "pangolin-crypto must not gain serde reachability — keys must not be serializable; see HIGH-1 / docs/issue-plans/P1.md success criterion #11." },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

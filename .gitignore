@@ -1,7 +1,7 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is committed for this binary-producing workspace (P1 decision).
 
 # Foundry
 contracts/out/

@@ -176,3 +176,36 @@ jobs:
       # reviewer can decide whether to address them.
       - name: slither
         run: slither src/RevisionLogV0.sol --fail-high
+
+  # -----------------------------------------------------------------
+  # P1-6: Rust supply-chain hardening
+  # -----------------------------------------------------------------
+
+  # Fails the build on RUSTSEC advisories against any crate in
+  # Cargo.lock (which is now committed for this binary-producing
+  # workspace).
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+      - name: Run cargo audit
+        run: cargo audit --deny warnings
+
+  # Dependency policy. Enforces the crypto-crate allowlist + serde ban
+  # and license / source / advisory rules defined in deny.toml.
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+      - name: Run cargo deny
+        run: cargo deny check advisories bans licenses sources
