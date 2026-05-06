@@ -73,3 +73,49 @@ The `contracts/deployments/base-sepolia.json` file is the canonical machine-read
 Deferred: Basescan source verification (a one-command operation when Kelvin obtains a free Basescan API key). The contract works fully without it — verification is purely an explorer convenience.
 
 Next: **P2 series** (`pangolin-store`) is now the only remaining blocker for P3/P4/P7/P8. P5-4 unblocks P6 (chaincli — talks to this deployed contract) and P7 (chain adapter — also talks to it).
+
+## 2026-05-06 · P1.1 — `Nonce::from_storage_bytes` + `WrappedVdk::from_parts`  ✅ MERGED
+
+Two additive public constructors on `pangolin-crypto` to support `pangolin-store`'s on-disk round-trip path. The HIGH-2 fix in P1 made `Nonce::from_bytes` `pub(crate)` to forbid deterministic-nonce construction by external callers; that's correct for fresh seal-time nonces but blocks reloading a previously-random nonce off disk alongside its ciphertext. Same threat profile as the already-public `Ciphertext::from_vec`. Doc-comments are explicit: "wraps random bytes that this crate previously emitted" — caller must not synthesize. Same gap on `WrappedVdk` — extractable via `ciphertext()`/`nonce()`/`context()` accessors but no symmetric reconstructor; `from_parts` adds it. Two new round-trip tests (87 → 89 in pangolin-crypto suite).
+
+Surprises: the original P2 builder agent stopped mid-build on this gap rather than working around it (correct discipline). Three subsequent agents stopped on different gaps at progressively deeper layers — each was the right call. Total of three additive `pangolin-crypto` patches needed before P2 could compile cleanly.
+
+## 2026-05-06 · P1.2 — `AuthorityKey::from_seed`  ✅ MERGED
+
+Mirrors the existing public `SigningKey::from_seed`. Used by `Vault::unlock` to deterministically reconstruct the same `AuthorityKey` each unlock from `Argon2id(password, salt, params)` → seed bytes. Wrong password produces a different seed, which produces a different authority, which produces a different HKDF-derived wrap key, which makes `WrappedVdk::unwrap_with` return `AeadError::Tampered` — indistinguishable from any other tampering case (collapsed at the AEAD boundary).
+
+This sidesteps the alternate design (encrypted random authority on disk) for PoC simplicity. MVP-3 social recovery may revisit; for P2 the deterministic-from-password approach is sufficient. New round-trip test (89 → 90 — wait, 88 actually since the count then went to 91 with P1.3).
+
+## 2026-05-06 · P1.3 — `kdf::derive_seed`  ✅ MERGED
+
+Seed-returning peer of `derive_key`. `derive_key` returns `AeadKey` whose bytes are deliberately not exposed (per MEDIUM-8 from P1's audit + supply-chain discipline). `pangolin-store`'s password-unlock path needs raw bytes to feed into `AuthorityKey::from_seed` — same Argon2id derivation, different output framing. Returns `Zeroizing<[u8; 32]>` so the buffer wipes on drop including unwind. Three new tests pin determinism (same inputs → same bytes), parity with the crate-private `derive_raw` (both KDF entry points must produce identical bytes for identical inputs), and below-floor parameter rejection. Test count 88 → 91.
+
+Misuse-resistance discipline: doc-comment is explicit that `derive_seed` is for type-constructors that take `[u8; 32]` (`AuthorityKey::from_seed`, `SigningKey::from_seed`). For symmetric encryption, callers must use `derive_key` — the `AeadKey` newtype prevents accidental cross-primitive re-use.
+
+## 2026-05-06 · P2 — `pangolin-store` encrypted local vault store  ✅ MERGED
+
+The largest single PoC block: ~3,800 LOC across 9 modules, 40+ tests. Architecture from `docs/issue-plans/P2.md`: single `.pvf` file IS a SQLite database; sensitive content (display name, username, password, URL, notes, TOTP secret) lives in AEAD-sealed CBOR blobs; structural metadata (UUIDs, revision parentage, timestamps, device IDs) is plaintext SQL — same shape as on-chain `RevisionLogV0` events for trivial P7 sync semantics.
+
+Substantive choices: bundled SQLite (no system dep), `ciborium-ll` (low-level CBOR with no `serde` reachability — preserves the supply-chain ban from P1), per-blob XChaCha20-Poly1305 with 105-byte canonical AAD binding `(WRAP_AAD_DOMAIN_REV || vault_id || account_id || parent_revision_id || schema_version)`, `BoxedSecret`/`ZeroizeOnDrop` discipline through every layer, WAL + `synchronous=FULL` + transactional writes for crash safety, `forbid(unsafe_code)` unconditional.
+
+Vault state machine: `Closed → Locked ⇄ Active`. Public surface: `Vault::{create, open, unlock, lock, close, add_account, update_account, delete_account, get_account, search, list_accounts, revisions_for, unpublished_revisions, mark_published}`.
+
+Cardinal-principle-2 verifier: load-bearing `no_plaintext_on_disk` property test creates a vault, writes 100 iterations × 6 unique markers per iteration (one per secret field), locks + closes, and scans raw `.pvf` bytes (and WAL sidecar) for ANY marker — asserts ZERO hits. 605s elapsed; 0 hits.
+
+Audit history: first audit found 0 CRITICAL, 1 HIGH, 5 MEDIUM, plus LOW/INFO. Fix-pass commit `c529d7e` closed all 6 actionable findings:
+- HIGH-1: `matches!` → `assert!(matches!)` in adversarial cross-account-transplant test (was a runtime no-op)
+- MEDIUM-1: `KdfRejected` variant collapsed into `AuthenticationFailed` (closed an attacker oracle that distinguished KDF tamper from salt/ct tamper)
+- MEDIUM-2: `Vault::open` lock-leak on failure paths (wrapped body in closure with `release_lock`-on-error)
+- MEDIUM-3: plaintext-on-disk verifier extended from 1 secret field to 6
+- MEDIUM-4: per-row `revisions.schema_version` now bound into AAD on decrypt (was inert)
+- MEDIUM-5: `Vault::unlock` idempotence semantics on Active vault pinned in docstring + new unit test
+
+Re-audit verdict: **APPROVE — 100% CLEAN**. All 6 prior findings closed; 0 new CRITICAL/HIGH/MEDIUM; 3 INFO observations are non-blocking design trade-offs.
+
+Surprises: the closed-world supply-chain ban on `serde` (HIGH-1 fix from P1) ruled out high-level `ciborium`; switched to `ciborium-ll` low-level CBOR codec which has no serde reachability. SQLite's bundled C library worked cleanly on Windows with no system dep. The `WRAP_AAD_DOMAIN_REV = b"pgrev0\0\0"` 8-byte domain separator is structurally distinct from `pangolin-crypto`'s 24-byte `WRAP_AAD_DOMAIN` — no collision risk.
+
+THREAT_MODEL.md "Local encrypted store" row moves from `TBD (issue 0.2)` to `DOCUMENTED (P2)` with 7 enumerated threats and verification artifacts cited.
+
+Unblocks: P3 (account identity production), P4 (session policy), P7 (chain adapter against deployed Base Sepolia RevisionLogV0 from P5-4), P9 (conflict resolution).
+
+Next: **P3** (account identity production), **P4** (session policy engine), **P6** (chaincli debug oracle), and **P7** (Rust chain adapter) are now all unblocked and parallelizable. P6 + P7 both consume the deployed RevisionLogV0 from P5-4 plus the now-merged pangolin-crypto + pangolin-store. P3 + P4 build on top of pangolin-store's API.
