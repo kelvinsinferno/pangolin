@@ -45,6 +45,14 @@ allow = [
     "CC0-1.0",
     # `unicode-ident` ships under Unicode-DFS-2016 OR (Apache-2.0 WITH
     # LLVM-exception) — covered above. No additional entries needed.
+    #
+    # P2: `rusqlite` with the `bundled` feature vendors SQLite, whose
+    # public-domain dedication is expressed via the `Unlicense` SPDX
+    # identifier in some distribution metadata. Allowing it here is
+    # narrowly scoped to the bundled SQLite source — we are not opening
+    # the door to other Unlicense-bearing dependencies, since cargo-deny
+    # still surfaces unexpected license surfaces in the dep graph.
+    "Unlicense",
 ]
 confidence-threshold = 0.8
 

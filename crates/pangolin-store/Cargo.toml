@@ -11,3 +11,20 @@ description = "Encrypted local store — SQLite + encrypted blobs. Corruption-sa
 
 [lints]
 workspace = true
+
+[dependencies]
+# Encrypted-blob crypto consumed only through pangolin-crypto's public
+# API surface — this crate never invents primitives.
+pangolin-crypto = { path = "../pangolin-crypto" }
+
+rusqlite    = { workspace = true }
+ciborium-ll = { workspace = true }
+ciborium-io = { workspace = true }
+thiserror   = { workspace = true }
+zeroize     = { workspace = true }
+subtle      = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
+hex      = { workspace = true }
