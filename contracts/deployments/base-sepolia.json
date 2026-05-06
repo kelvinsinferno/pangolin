@@ -1,0 +1,93 @@
+{
+  "$schema": "./README.md (no formal schema yet; field set is canonical until v1)",
+  "chain": {
+    "name": "base-sepolia",
+    "chain_id": 84532,
+    "explorer": "https://sepolia.basescan.org",
+    "rpc_default": "https://sepolia.base.org"
+  },
+  "contracts": {
+    "RevisionLogV0": {
+      "address": "0x8566D3de653ee55775783bD7918Fe91b66373896",
+      "deployer": "0x89e720238A3913688CB0E025ef03a64539575c54",
+      "deploy_tx": "0x0569d60324c504bdacba08c309b85a54793b9002c97c4de22c9f8598e5e54b6a",
+      "deploy_block": 41133000,
+      "deploy_timestamp_unix": 1778034288,
+      "deploy_timestamp_iso": "2026-05-05T21:38:08Z",
+      "gas_used": 149135,
+      "gas_price_gwei": 0.006,
+      "deploy_cost_eth": 0.00000089481,
+      "compiler": {
+        "name": "solc",
+        "version": "0.8.24",
+        "evm_version": "shanghai",
+        "optimizer": true,
+        "optimizer_runs": 200,
+        "bytecode_hash": "none"
+      },
+      "bytecode": {
+        "runtime_size_bytes": 443,
+        "initcode_size_bytes": 472,
+        "deployed_runtime_keccak256": "0xaeff0a8fc34b478cb4c93b6f5bfd293cc12dd5f0a65a997c7c022b23f3e4e2d0",
+        "matches_audited_artifact": true,
+        "audited_at": "P5-1 SIGNOFF (commit 303dc19)",
+        "comment": "443-byte runtime size matches the audited artifact exactly; all 12 fix-pass and re-audit cycles preserved the bytecode size."
+      },
+      "abi": "../abi/RevisionLogV0.json",
+      "source": "../src/RevisionLogV0.sol",
+      "verified_on_explorer": false,
+      "verification": {
+        "status": "deferred",
+        "manual_command": "forge verify-contract --chain-id 84532 --etherscan-api-key $BASESCAN_API_KEY 0x8566D3de653ee55775783bD7918Fe91b66373896 src/RevisionLogV0.sol:RevisionLogV0",
+        "comment": "Get a free Basescan API key at https://basescan.org/myapikey, then run the manual command above. Verification just makes the source viewable on Basescan; deployed contract works regardless."
+      },
+      "smoke_tests": {
+        "test_1_initial_state": {
+          "command": "cast call 0x8566D3de653ee55775783bD7918Fe91b66373896 \"nextSequence()\" --rpc-url https://sepolia.base.org",
+          "expected": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "passed": true,
+          "passed_at": "2026-05-05T21:38:30Z"
+        },
+        "test_2_write_revision": {
+          "command": "cast send 0x8566D3de653ee55775783bD7918Fe91b66373896 \"publishRevision(bytes32,bytes32,bytes32,bytes32,uint8,bytes)\" 0xaaaa000000000000000000000000000000000000000000000000000000000000 0xbbbb000000000000000000000000000000000000000000000000000000000000 0x0000000000000000000000000000000000000000000000000000000000000000 0xcccc000000000000000000000000000000000000000000000000000000000000 0 0xdeadbeefdeadbeefdeadbeefdeadbeef --rpc-url https://sepolia.base.org --account pangolin-dev",
+          "tx_hash": "0x5cb4a7f4242838303964a7196b5326380b72d803d5d2e8f73d2c9d46664f7ba6",
+          "block": 41133109,
+          "gas_used": 48781,
+          "status": 1,
+          "event_emitted": {
+            "topics": [
+              "0x6562412104cd03f86bf4f5184aa68e9d47cdb237b31b1de9d2fe1904eddcae8f",
+              "0xaaaa000000000000000000000000000000000000000000000000000000000000",
+              "0xbbbb000000000000000000000000000000000000000000000000000000000000",
+              "0x0000000000000000000000000000000000000000000000000000000000000000"
+            ],
+            "topic_0_decoded": "keccak256(\"RevisionPublished(bytes32,bytes32,bytes32,bytes32,uint8,uint256,bytes)\")",
+            "data_decoded": {
+              "deviceId": "0xcccc000000000000000000000000000000000000000000000000000000000000",
+              "schemaVersion": 0,
+              "sequence": 0,
+              "encPayload": "0xdeadbeefdeadbeefdeadbeefdeadbeef"
+            }
+          },
+          "passed": true
+        },
+        "test_3_state_mutated": {
+          "command": "cast call 0x8566D3de653ee55775783bD7918Fe91b66373896 \"nextSequence()\" --rpc-url https://sepolia.base.org",
+          "expected": "0x0000000000000000000000000000000000000000000000000000000000000001",
+          "passed": true,
+          "passed_at": "2026-05-05T21:39:00Z"
+        }
+      },
+      "explorer_links": {
+        "contract": "https://sepolia.basescan.org/address/0x8566D3de653ee55775783bD7918Fe91b66373896",
+        "deploy_tx": "https://sepolia.basescan.org/tx/0x0569d60324c504bdacba08c309b85a54793b9002c97c4de22c9f8598e5e54b6a",
+        "smoke_test_tx": "https://sepolia.basescan.org/tx/0x5cb4a7f4242838303964a7196b5326380b72d803d5d2e8f73d2c9d46664f7ba6"
+      },
+      "notes": [
+        "Deployer wallet 0x89e7...c54 is Kelvin's dev/testing wallet only. It is NOT a user-facing device wallet. Per D-006, real user device wallets are generated client-side at install time and are unrelated to this address.",
+        "This is the canonical PoC RevisionLog reference until P5-1 is replaced by MVP-2 issue 2.1 (RevisionLog v1 on mainnet). v1 will live at a separate address with signature verification.",
+        "Contract is append-only by design: no admin, no upgrade, no pause, no selfdestruct. If broken, deploy v2 at a new address per the locked decision in §2 of the master plan."
+      ]
+    }
+  }
+}

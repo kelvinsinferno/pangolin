@@ -82,6 +82,12 @@
 **Decision:** `C:\Users\kelvi\Projects\pangolin` (Windows host).
 **Why:** Consistent with Kelvin's Mammoth-pattern of code in `Projects/`. Spec assets remain in `C:\Users\kelvi\Desktop\Kelvinsinferno studio\Pangolin\`.
 
+## D-014 · PoC RevisionLog deployed address (Base Sepolia)
+**Date locked:** 2026-05-05
+**Decision:** `RevisionLogV0` deployed at `0x8566D3de653ee55775783bD7918Fe91b66373896` on Base Sepolia (chain id `84532`). Deploy tx `0x0569d60324c504bdacba08c309b85a54793b9002c97c4de22c9f8598e5e54b6a` in block `41133000`. Deployer: `0x89e720238A3913688CB0E025ef03a64539575c54` (Kelvin dev wallet). Runtime keccak256: `0xaeff0a8fc34b478cb4c93b6f5bfd293cc12dd5f0a65a997c7c022b23f3e4e2d0`. Smoke-tested end-to-end: read + write + state mutation + event emission all verified.
+**Why:** Per master plan §3.7 (P5-4) and D-005 (Base is the testnet target). Recording here so downstream PoC issues (P6 chaincli, P7 chain adapter, P8 sync) point at a single canonical address. v1 (MVP-2 issue 2.1) will live at a separate address with signature verification; this v0 stays append-only-immutable wherever it currently sits on chain.
+**Spec ref:** Whitepaper §D1; master plan §3.7 EPIC: Contract; full metadata in `contracts/deployments/base-sepolia.json`.
+
 ---
 
 ## Decision template (for future entries)
