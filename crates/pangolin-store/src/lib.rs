@@ -39,7 +39,7 @@ pub(crate) mod search;
 
 pub use account::{AccountId, AccountSnapshot};
 pub use error::{Result, StoreError};
-pub use revision::{ChainAnchor, DeviceId, RevisionId, RevisionMeta};
+pub use revision::{ChainAnchor, DeviceId, RevisionGraph, RevisionId, RevisionMeta};
 pub use vault::{Vault, VaultState};
 
 /// Returns the crate name. Useful for diagnostics and version reporting.

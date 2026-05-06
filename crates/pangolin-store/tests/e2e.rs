@@ -616,6 +616,110 @@ fn adversarial_kdf_param_tampering_fails() {
 }
 
 // ---------------------------------------------------------------------
+// P3 / Plan §"Test plan": fork_detection_round_trip integration test.
+// Synthesizes a fork via the crate's __test_ helper, walks the graph,
+// confirms multi-head detection survives a lock+reopen+unlock cycle,
+// and verifies all_forked_accounts() reports the forked account.
+// ---------------------------------------------------------------------
+#[test]
+fn fork_detection_round_trip() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("fork_e2e.pvf");
+    let pwd = fresh_password();
+    Vault::create(&path, &pwd).unwrap();
+
+    let id;
+    let r0;
+    let r1;
+    let r2;
+    let r2_alt;
+    {
+        let mut v = Vault::open(&path).unwrap();
+        v.unlock(&pwd).unwrap();
+        // Genesis (R0) -> R1 -> R2 (linear so far).
+        id = v.add_account(snapshot_with_marker("genesis")).unwrap();
+        r0 = v.account_heads(id).unwrap()[0];
+        r1 = v.update_account(id, snapshot_with_marker("r1")).unwrap();
+        r2 = v.update_account(id, snapshot_with_marker("r2")).unwrap();
+        assert!(
+            !v.is_forked(id).unwrap(),
+            "linear edits must not look forked"
+        );
+
+        // Synthesize a sibling of R2 by inserting another revision
+        // whose parent is R1. Cardinal-principle 4 — the storage
+        // layer DETECTS this; resolution is the user's call (P9).
+        r2_alt = v
+            .__test_synthesize_sibling_revision(id, r1, snapshot_with_marker("r2-alt"))
+            .unwrap();
+
+        // Heads: { R2, R2_alt }.
+        let heads_set: std::collections::HashSet<_> =
+            v.account_heads(id).unwrap().into_iter().collect();
+        assert_eq!(heads_set.len(), 2);
+        assert!(heads_set.contains(&r2));
+        assert!(heads_set.contains(&r2_alt));
+        assert!(v.is_forked(id).unwrap());
+
+        // Common ancestor of the two heads is R1 (the fork point).
+        let g = v.revision_graph(id).unwrap();
+        let lca = g.common_ancestor(&r2, &r2_alt).unwrap();
+        assert_eq!(lca, r1, "fork point must be R1");
+        // Genesis is detected.
+        assert_eq!(g.genesis(), Some(&r0));
+
+        v.lock();
+        v.close().unwrap();
+    }
+
+    // Lock+reopen+unlock cycle: the fork persists across a full
+    // disk round-trip. Cardinal-principle 4 ("never silent merge")
+    // is enforced by storage shape, not in-memory state.
+    let mut v = Vault::open(&path).unwrap();
+    v.unlock(&pwd).unwrap();
+    assert!(
+        v.is_forked(id).unwrap(),
+        "fork must still be visible after lock+reopen+unlock"
+    );
+    let heads_set: std::collections::HashSet<_> =
+        v.account_heads(id).unwrap().into_iter().collect();
+    assert_eq!(heads_set.len(), 2);
+    assert!(heads_set.contains(&r2));
+    assert!(heads_set.contains(&r2_alt));
+
+    // all_forked_accounts is the "needs attention" set for P9's UI.
+    let forked = v.all_forked_accounts().unwrap();
+    assert_eq!(forked.len(), 1);
+    assert_eq!(forked[0], id);
+
+    // Graph round-trip: same shape, same fork-point.
+    let g = v.revision_graph(id).unwrap();
+    assert_eq!(g.len(), 4); // R0 + R1 + R2 + R2_alt
+    assert!(g.is_forked());
+    assert_eq!(g.common_ancestor(&r2, &r2_alt), Some(r1));
+
+    // The canonical head pointer (account_identities.head_revision_id,
+    // which add_account/update_account maintain) still points at R2 —
+    // the synthesized sibling is a NON-canonical head. The plan §
+    // "Schema implications" anchors this: head_revision_id is the
+    // "most recently chosen canonical head" rather than "the only
+    // head." Read raw via SQL so the assertion is unambiguous.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let canonical_head: Vec<u8> = conn
+        .query_row(
+            "SELECT head_revision_id FROM account_identities WHERE account_id = ?1",
+            rusqlite::params![id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        canonical_head.as_slice(),
+        r2.as_bytes(),
+        "canonical head pointer should remain at R2 (the production-path head)"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Adversarial test §"Bit-flip in wrapped_vdk":
 // Flip one bit of the wrapped ciphertext; unlock must fail Tampered.
 // ---------------------------------------------------------------------
