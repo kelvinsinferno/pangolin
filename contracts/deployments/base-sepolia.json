@@ -28,10 +28,10 @@
       "bytecode": {
         "runtime_size_bytes": 443,
         "initcode_size_bytes": 472,
-        "deployed_runtime_keccak256": "0xaeff0a8fc34b478cb4c93b6f5bfd293cc12dd5f0a65a997c7c022b23f3e4e2d0",
+        "deployed_runtime_keccak256": "0xdbab504e86eca48cbedf61bb1fbc04ab17a5bb880d5a468cbb64e4b64e95c6fe",
         "matches_audited_artifact": true,
         "audited_at": "P5-1 SIGNOFF (commit 303dc19)",
-        "comment": "443-byte runtime size matches the audited artifact exactly; all 12 fix-pass and re-audit cycles preserved the bytecode size."
+        "comment": "443-byte runtime size matches the audited artifact exactly. P6 audit (M-1) corrected an earlier value — P5-4's recording script used hashlib.sha3_256 (NIST SHA3-256) instead of Ethereum's Keccak-256; padding rules differ between the two so they produce different hashes for the same input. The hash recorded here now is Keccak-256 (the Ethereum primitive), independently verified via `cast keccak $(cast code 0x8566... --rpc-url ...)`. Live bytecode unchanged; only the recorded hash was wrong."
       },
       "abi": "../abi/RevisionLogV0.json",
       "source": "../src/RevisionLogV0.sol",

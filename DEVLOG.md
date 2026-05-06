@@ -61,7 +61,7 @@ Plan at `docs/issue-plans/P5-4.md` Kelvin-approved. Deployed by Kelvin from loca
 - Deploy tx: `0x0569d60324c504bdacba08c309b85a54793b9002c97c4de22c9f8598e5e54b6a` (block 41133000)
 - Gas used: 149,135 (matches `GAS.md` baseline exactly — no chain-specific surprises)
 - Cost: 0.00000089 ETH at 0.006 gwei
-- Runtime keccak256: `0xaeff0a8fc34b478cb4c93b6f5bfd293cc12dd5f0a65a997c7c022b23f3e4e2d0` (matches the audited 443-byte artifact bytewise)
+- Runtime keccak256: `0xdbab504e86eca48cbedf61bb1fbc04ab17a5bb880d5a468cbb64e4b64e95c6fe` (Ethereum Keccak-256 of the 443-byte deployed bytecode; corrected from `0xaeff0a8f...` recorded at deploy time, which was Python's `hashlib.sha3_256` — wrong primitive. P6 audit M-1 caught this when `chaincli status` added live-bytecode cross-checking. Live bytecode unchanged; only the recorded hash was wrong.)
 - Verification on Basescan: deferred (Kelvin will add API key later; `forge verify-contract` command documented in deployment metadata)
 
 All five pre-flights passed before broadcast: chain id == 84532, deployer balance > 0.001 ETH (had 0.118), runtime size == 443 B, gas estimate within budget. End-to-end smoke test recorded as E2E-001 in `E2E_TESTS.md`: `nextSequence()` initial 0; `publishRevision(0xaaaa…, 0xbbbb…, 0x0, 0xcccc…, 0, 0xdeadbeef…)` mined with status 1 in tx `0x5cb4a7f4242838303964a7196b5326380b72d803d5d2e8f73d2c9d46664f7ba6`; emitted event with topic[0] = `keccak256(RevisionPublished signature)` confirmed; `nextSequence()` after = 1. The chain integration write-path is proven on a real EVM testnet.

@@ -1,0 +1,49 @@
+[package]
+name = "chaincli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "chaincli — debug oracle CLI for the deployed RevisionLogV0 contract. The 'truth serum' for verifying what the chain actually has when sync looks wrong from inside the Rust core."
+
+[[bin]]
+name = "chaincli"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[features]
+# Network-dependent end-to-end tests are gated behind this feature so
+# that the default `cargo test --workspace --lib` does not attempt to
+# reach `https://sepolia.base.org`. CI runs without this feature; humans
+# enable it for manual smoke verification.
+integration-tests = []
+
+[dependencies]
+# alloy — modern async EVM client. The single `alloy` crate pulls in
+# `alloy-primitives`, `alloy-provider`, `alloy-rpc-client`,
+# `alloy-rpc-types`, `alloy-sol-types`, `alloy-network`, `alloy-transport`,
+# `alloy-contract`, and `alloy-signer-local` via the `essentials` feature.
+# `alloy-signer-local` is pulled separately with the `keystore` feature
+# enabled so chaincli can decrypt Foundry-format keystores.
+alloy              = { workspace = true }
+alloy-signer-local = { workspace = true }
+
+tokio      = { workspace = true }
+clap       = { workspace = true }
+serde_json = { workspace = true }
+anyhow     = { workspace = true }
+hex        = { workspace = true }
+rpassword  = { workspace = true }
+# zeroize wraps the keystore-password `String` so its heap buffer is
+# overwritten on drop rather than merely deallocated. The `alloc`
+# feature on the workspace pin enables `Zeroize for String`. Used only
+# by `commands/publish.rs`.
+zeroize    = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -25,7 +25,27 @@ all-features = false
 # RUSTSEC database advisories are hard failures.
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # `paste` (RUSTSEC-2024-0436) is flagged as unmaintained, not
+    # vulnerable. It is reachable only as a transitive dependency of
+    # `alloy-primitives` (used by `tools/chaincli/`); there is no
+    # currently-published alloy release that drops the dependency. The
+    # advisory does not describe an exploitable bug, only that the
+    # upstream repo was archived. Removing this ignore is a follow-up
+    # when alloy publishes a `paste`-free release; tracked at
+    # https://github.com/alloy-rs/core (search "paste").
+    { id = "RUSTSEC-2024-0436", reason = "Unmaintained (not vulnerable). Transitive of alloy-primitives via chaincli; no upstream replacement is available without a major alloy bump." },
+    # `derivative` (RUSTSEC-2024-0388) is flagged as unmaintained, not
+    # vulnerable. It reaches the workspace exclusively as a transitive
+    # build-dependency of `coins-bip32` / `coins-bip39` / `eth-keystore`
+    # via `alloy-signer-local` — the same `tools/chaincli/` keystore
+    # path that pulls `paste` (above). The advisory describes only an
+    # archived upstream repo; no exploitable bug. Removing this ignore
+    # is a follow-up when alloy/coins publishes a `derivative`-free
+    # release; tracked at https://github.com/alloy-rs/core (search
+    # "derivative") and https://github.com/alloy-rs/signer-local.
+    { id = "RUSTSEC-2024-0388", reason = "Unmaintained (not vulnerable). Transitive of alloy-signer-local via chaincli (coins-bip32 / coins-bip39 / eth-keystore); no upstream replacement is available without a major alloy bump." },
+]
 
 [licenses]
 version = 2
@@ -53,6 +73,16 @@ allow = [
     # the door to other Unlicense-bearing dependencies, since cargo-deny
     # still surfaces unexpected license surfaces in the dep graph.
     "Unlicense",
+    # P6: `webpki-root-certs` (a transitive of `rustls-platform-verifier`
+    # via `reqwest`, used by `tools/chaincli/` for HTTPS RPC) ships
+    # under the Mozilla CA root-certificate Community Data License
+    # Agreement (Permissive 2.0). The CDLA-Permissive-2.0 license is a
+    # permissive, attribution-only license used specifically for
+    # data-set distributions like CA root bundles; it does not impose
+    # copyleft and is compatible with Apache-2.0 distribution. Narrowly
+    # scoped to the CA cert bundle — same reasoning as the `Unlicense`
+    # allowance above.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 
@@ -95,33 +125,47 @@ deny = [
     { name = "ed25519-zebra", reason = "Pangolin uses ed25519-dalek 2.x per the locked plan." },
     { name = "secp256k1", reason = "out of scope; Pangolin signs with Ed25519, not k1, until further plan revision." },
     # Alternative KDFs.
-    { name = "scrypt", reason = "Pangolin's KDF is Argon2id only per the locked plan." },
-    { name = "pbkdf2", reason = "see scrypt." },
-    { name = "balloon-hash", reason = "see scrypt." },
-    # ## Reasoning — `serde` ban for the `pangolin-crypto` audit surface.
+    #
+    # P6 lift: `scrypt` and `pbkdf2` are removed from the deny list
+    # because `tools/chaincli/` legitimately needs them — the Foundry
+    # keystore format (Web3 Secret Storage Definition v3) encrypts the
+    # signing key with scrypt-then-AES-CTR, and chaincli decrypts the
+    # keystore at runtime via `alloy-signer-local`'s `keystore` feature.
+    # The KDF discipline for **Pangolin's own secret material** is still
+    # Argon2id only — this is enforced by the dep set of
+    # `pangolin-crypto` itself (which does not pull `scrypt`/`pbkdf2`),
+    # not by this banlist. `balloon-hash` remains denied because no
+    # workspace path needs it.
+    { name = "balloon-hash", reason = "Pangolin's KDF for its own secret material is Argon2id only per the locked plan; no workspace path needs balloon-hash." },
+    # ## Reasoning — `serde` ban (lifted in P6, scope preserved by the
+    # ## `pangolin-crypto` dep set itself).
     #
     # Plan success criterion #11 (`docs/issue-plans/P1.md`) requires that
     # the secret-bearing types `VdkKey`, `AuthorityKey`, `DeviceKey` (and
     # by extension `AeadKey`, `SigningKey`, `SecretBytes`) NEVER implement
-    # `serde::Serialize` or `serde::Deserialize`. The original
-    # `static_assertions::assert_not_impl_any!(... : Clone, Copy)` in
-    # `keys.rs` covers Clone/Copy but cannot directly assert "does not
-    # implement serde::Serialize" without taking on a `serde` dependency,
-    # which itself would be the very supply-chain footgun we are trying
-    # to prevent.
-    #
-    # Closing the gap at the dependency-graph layer is strictly stronger:
+    # `serde::Serialize` or `serde::Deserialize`. P1 closed that gap at
+    # the dependency-graph layer by banning `serde` workspace-wide, since
     # if `serde` and `serde_derive` are not reachable from
-    # `pangolin-crypto`, no `Serialize` impl is even expressible — neither
-    # accidentally via a `#[derive(Serialize)]` nor via an upstream
-    # dependency that adds a blanket impl.
+    # `pangolin-crypto`, no `Serialize` impl is even expressible.
     #
-    # If a future plan revision needs `serde` (e.g., for the public
-    # `WrappedVdk` / `VerifyingKey` halves), the entry must be removed
-    # in the same PR that adds the dependency, the plan must spell out
-    # the exposure, and Kelvin must approve.
-    { name = "serde", reason = "pangolin-crypto must not gain serde reachability — keys must not be serializable; see HIGH-1 / docs/issue-plans/P1.md success criterion #11." },
-    { name = "serde_derive", reason = "pangolin-crypto must not gain serde reachability — keys must not be serializable; see HIGH-1 / docs/issue-plans/P1.md success criterion #11." },
+    # P6 lifts the workspace-wide ban because `tools/chaincli/` needs
+    # `serde_json` for JSON-Lines output and `alloy` pulls in `serde` as
+    # a transitive of its RPC types. The HIGH-1 protection is preserved
+    # by a stricter rule: `pangolin-crypto`'s own `Cargo.toml` does not
+    # name `serde` and does not depend on any crate that does. CI's
+    # `cargo tree -p pangolin-crypto -i serde` returns no rows; the audit
+    # checklist for security-critical crates includes that grep.
+    #
+    # In other words: P1's defense moved from "serde does not exist in
+    # the workspace" to "serde does not reach pangolin-crypto's audit
+    # surface." Both defenses are valid; the second is the one we can
+    # maintain now that chain code needs RPC types.
+    #
+    # The chaincli surface itself is forbidden from `#[derive(Serialize,
+    # Deserialize)]` on any type that carries on-chain payload bytes —
+    # see `docs/issue-plans/P6.md` Goal section + the `format.rs` /
+    # `commands/dump.rs` modules, which print payloads as raw hex/base64
+    # rather than parsing them through `serde`. (No CBOR decode path.)
 ]
 
 [sources]

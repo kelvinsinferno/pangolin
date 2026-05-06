@@ -8,6 +8,7 @@ members = [
     "crates/pangolin-indexer",
     "crates/pangolin-funder-client",
     "crates/pangolin-cli",
+    "tools/chaincli",
 ]
 
 # Workspace-wide dependency pins. Crypto-bearing crates are restricted to the
@@ -40,6 +41,45 @@ thiserror         = "=2.0.18"
 proptest          = "=1.7.0"
 hex               = "=0.4.3"
 tempfile          = "=3.13.0"
+
+# P6 — chaincli debug oracle CLI. These crates are reachable ONLY from
+# `tools/chaincli/` and are NOT used by any pangolin-* crate. The
+# isolation is enforced by `tools/chaincli/Cargo.toml` (which is the only
+# crate that names these workspace deps) and by the workspace member
+# list above (`tools/chaincli` is the sole consumer).
+#
+# Pinning rationale (`=X.Y.Z`):
+#   - `alloy = "=2.0.4"` — modern async EVM client; pinned to the
+#     latest 2.x release. The 1.x line carries an internal version-skew
+#     issue (`alloy-rpc-types-eth = 1.0.9` does not compile against
+#     transitively-resolved `alloy-consensus = 1.8.x` — the
+#     `BlobTransactionSidecarVariant` symbol moved); 2.0.4 has all
+#     `alloy-*` family crates aligned and is what crates.io flags as
+#     "latest stable" at the time of the P6 build.
+#   - `alloy-signer-local = "=2.0.4"` — same family; the `keystore`
+#     feature is opted in so chaincli can decrypt Foundry-format
+#     keystores. Foundry's keystore is the Web3 Secret Storage v3
+#     format (scrypt-then-AES-CTR); chaincli does not invent crypto
+#     here, it delegates to alloy's vetted keystore path.
+#   - `tokio = "=1.52.2"` — async runtime; chaincli only uses
+#     `rt-multi-thread` + `macros`. Pinned past RUSTSEC-2025-0023
+#     (broadcast-channel `Sync`-bound unsoundness fixed in 1.44.2+).
+#   - `clap = "=4.5.21"` — `derive` + `env` features; CLI framing.
+#   - `serde_json = "=1.0.133"` — JSON-Lines output. Read-only;
+#     chaincli does NOT deserialize attacker-controlled bytes (the on-chain
+#     `encPayload` is printed raw as hex/base64; never parsed structurally).
+#   - `anyhow = "=1.0.95"` — error propagation in this binary-only crate.
+alloy             = { version = "=2.0.4", features = ["json", "rpc-types", "signer-local", "signers"] }
+alloy-signer-local = { version = "=2.0.4", default-features = false, features = ["keystore"] }
+tokio             = { version = "=1.52.2", default-features = false, features = ["rt-multi-thread", "macros"] }
+clap              = { version = "=4.5.21", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
+serde_json        = { version = "=1.0.133", default-features = false, features = ["std"] }
+anyhow            = "=1.0.95"
+# Reads a password from a terminal without echoing keystrokes, falling
+# back to plain stdin when not a TTY. Used by `tools/chaincli/`
+# `publish` for the Foundry-keystore prompt. Pure Rust + std only;
+# license Apache-2.0; no FFI; no crypto.
+rpassword         = "=7.4.0"
 
 [workspace.package]
 version = "0.0.0"
