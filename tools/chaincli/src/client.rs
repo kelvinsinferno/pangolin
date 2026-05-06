@@ -236,8 +236,14 @@ fn parse_address_field(contract: &serde_json::Value, field: &str) -> Result<Addr
                  (string)"
             )
         })?;
-    s.parse::<Address>()
-        .with_context(|| format!("{field} is not a valid 0x-prefixed EVM address: {s}"))
+    // P7 audit MED-1 (carried back to chaincli for consistency):
+    // validate the EIP-55 (mixed-case) checksum, not just hex shape.
+    // Pass `None` for chain id so we accept plain EIP-55 — the form
+    // Foundry / Etherscan / the rest of the EVM toolchain emit by
+    // default. EIP-1191 (chain-id-bound) is for RSK-style deployments
+    // and is not what the Pangolin deployment file records.
+    Address::parse_checksummed(s, None)
+        .with_context(|| format!("{field} is not a valid EIP-55 checksummed EVM address: {s}"))
 }
 
 /// Resolve the RPC URL with the documented priority: `--rpc-url` flag,
@@ -427,7 +433,22 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(r#"{ "address": "not-an-address" }"#).unwrap();
         let err = parse_address_field(&v, "address").expect_err("bad address rejected");
-        assert!(format!("{err:#}").contains("not a valid 0x-prefixed"));
+        assert!(format!("{err:#}").contains("not a valid EIP-55"));
+    }
+
+    /// P7 audit MED-1: an address whose hex bytes are valid but
+    /// whose EIP-55 checksum is wrong (e.g., all-lowercase variant of
+    /// a mixed-case canonical address) must be rejected. Plain
+    /// `parse::<Address>()` would accept this; the upgraded
+    /// `Address::parse_checksummed` rejects it.
+    #[test]
+    fn parse_address_field_rejects_mis_checksummed() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{ "address": "0x8566d3de653ee55775783bd7918fe91b66373896" }"#)
+                .unwrap();
+        let err = parse_address_field(&v, "address").expect_err("mis-checksummed address rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("EIP-55"), "expected EIP-55 error, got: {msg}");
     }
 
     #[test]

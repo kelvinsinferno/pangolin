@@ -42,11 +42,14 @@ proptest          = "=1.7.0"
 hex               = "=0.4.3"
 tempfile          = "=3.13.0"
 
-# P6 — chaincli debug oracle CLI. These crates are reachable ONLY from
-# `tools/chaincli/` and are NOT used by any pangolin-* crate. The
-# isolation is enforced by `tools/chaincli/Cargo.toml` (which is the only
-# crate that names these workspace deps) and by the workspace member
-# list above (`tools/chaincli` is the sole consumer).
+# P6 + P7 — alloy-rs ecosystem. Originally landed for P6's `chaincli`
+# debug oracle CLI; P7 (`pangolin-chain`) extends the consumer set
+# beyond `tools/chaincli/` to include the workspace's library chain
+# adapter. The isolation discipline preserved from P6 is unchanged: the
+# only crates that name these workspace deps are `tools/chaincli/` and
+# `crates/pangolin-chain/` — `pangolin-crypto` does NOT reach the alloy
+# transitive set (HIGH-1: `cargo tree -p pangolin-crypto | grep serde`
+# stays 0).
 #
 # Pinning rationale (`=X.Y.Z`):
 #   - `alloy = "=2.0.4"` — modern async EVM client; pinned to the
@@ -80,6 +83,15 @@ anyhow            = "=1.0.95"
 # `publish` for the Foundry-keystore prompt. Pure Rust + std only;
 # license Apache-2.0; no FFI; no crypto.
 rpassword         = "=7.4.0"
+
+# P7 — `pangolin-chain` consumes the same alloy/tokio pins as `chaincli`
+# above. `async-trait` is added because Rust's stable async-fn-in-trait
+# (RPITIT) does not yet support the dyn-compatible `ChainAdapter: Send +
+# Sync` shape that `pangolin-store` will hold via `&dyn ChainAdapter`.
+# Pinned to the latest 0.1.x release at the time of P7. The crate is a
+# proc-macro that expands `async fn` in trait position to
+# `Pin<Box<dyn Future + Send>>`; no runtime dep, no FFI.
+async-trait       = "=0.1.89"
 
 [workspace.package]
 version = "0.0.0"

@@ -110,19 +110,16 @@ pub struct RevisionMeta {
     pub chain_anchor: Option<ChainAnchor>,
 }
 
-/// Recorded position of a revision on chain. Filled by P7 once the
-/// revision is observed in a confirmed `RevisionPublished` event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChainAnchor {
-    /// 32-byte transaction hash.
-    pub tx_hash: [u8; 32],
-    /// Block number (unsigned i64 — chains we target stay well below
-    /// 2^63).
-    pub block_number: i64,
-    /// Index of the `RevisionPublished` log within the block's log
-    /// stream.
-    pub log_index: i64,
-}
+/// Recorded position of a revision on chain.
+///
+/// **Re-exported from [`pangolin_chain::ChainAnchor`].** The canonical
+/// owner of the type is `pangolin-chain` per success criterion 6 of
+/// `docs/issue-plans/P7.md`; `pangolin-store` re-exports it here so
+/// consumers' import paths stay stable. The SQL layer in
+/// `vault.rs::mark_published` widens the `u64` fields to `i64` at
+/// the rusqlite boundary (rusqlite columns are signed) and narrows
+/// back on read.
+pub use pangolin_chain::ChainAnchor;
 
 // ---------------------------------------------------------------------
 // Revision graph (P3)

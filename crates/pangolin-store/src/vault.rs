@@ -1681,14 +1681,30 @@ impl Vault {
         // Soft expiry — does not error for Locked, only zeroizes if
         // Active+expired.
         self.maybe_expire_active_session();
+        // Widen the unsigned u64 fields from `pangolin_chain::ChainAnchor`
+        // to the SQLite-native i64 used by the `revisions.chain_*`
+        // columns. Both Base Sepolia block numbers and log indices stay
+        // well below 2^63 for the foreseeable future; we still
+        // `try_from` rather than cast so a future overflow surfaces as
+        // a clear error instead of silently flipping sign.
+        let block_i64 = i64::try_from(anchor.block_number).map_err(|_| {
+            StoreError::Corrupted(
+                "chain anchor block_number does not fit in i64; refusing to store".into(),
+            )
+        })?;
+        let log_index_i64 = i64::try_from(anchor.log_index).map_err(|_| {
+            StoreError::Corrupted(
+                "chain anchor log_index does not fit in i64; refusing to store".into(),
+            )
+        })?;
         let updated = self.conn.execute(
             "UPDATE revisions
              SET chain_tx_hash = ?1, chain_block_number = ?2, chain_log_index = ?3
              WHERE revision_id = ?4",
             params![
                 anchor.tx_hash.as_slice(),
-                anchor.block_number,
-                anchor.log_index,
+                block_i64,
+                log_index_i64,
                 revision_id.as_bytes().as_slice(),
             ],
         )?;
@@ -1698,6 +1714,79 @@ impl Vault {
         // Touch only if we're still Active (the soft expiry above may
         // have transitioned us to Expired).
         self.touch_session();
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Sync-state primitives (P7) — last_pulled_block checkpoint
+    // -----------------------------------------------------------------
+
+    /// Read the local `last_pulled_block` checkpoint.
+    ///
+    /// Returned value is the highest block number from which the local
+    /// vault has ingested chain events. Default for a fresh vault is
+    /// `0`; the caller (P8 sync orchestration) typically initializes
+    /// it to `deploy_block - 1` so the first sync includes the deploy
+    /// block.
+    ///
+    /// The checkpoint is stored in a single-row `sync_state` table
+    /// keyed on `id = 0`. The table is created idempotently
+    /// (`CREATE TABLE IF NOT EXISTS`) at vault open; existing P2/P3/P4
+    /// vaults pick it up on next open without a schema-version bump
+    /// (per `docs/issue-plans/P7.md` §"`last_pulled_block`
+    /// checkpoint").
+    ///
+    /// Passive accessor — does NOT touch the session timer.
+    pub fn last_pulled_block(&self) -> Result<u64> {
+        let raw: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT last_pulled_block FROM sync_state WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.map_or(Ok(0), |v| {
+            u64::try_from(v).map_err(|_| {
+                StoreError::Corrupted(
+                    "sync_state.last_pulled_block is negative; refusing to surface".into(),
+                )
+            })
+        })
+    }
+
+    /// Advance the local `last_pulled_block` checkpoint to `new_block`.
+    ///
+    /// Refuses to move backward — a backward move is symptomatic of
+    /// a reorg or operator error and is out of P7's scope (P8 will
+    /// add reorg-aware handling). Equal values are treated as no-ops
+    /// rather than errors so idempotent retry of `sync_pull` doesn't
+    /// surface spurious failures.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Corrupted` if `new_block` is strictly less than
+    /// the current checkpoint, or if it does not fit in `i64`.
+    pub fn advance_last_pulled_block(&mut self, new_block: u64) -> Result<()> {
+        let current = self.last_pulled_block()?;
+        if new_block < current {
+            return Err(StoreError::Corrupted(format!(
+                "advance_last_pulled_block: new_block {new_block} < current {current}; \
+                 backward moves are out of scope for P7 (P8 handles reorgs)"
+            )));
+        }
+        if new_block == current {
+            return Ok(());
+        }
+        let new_i64 = i64::try_from(new_block).map_err(|_| {
+            StoreError::Corrupted("last_pulled_block does not fit in i64; refusing to store".into())
+        })?;
+        // Insert OR replace on id=0; the schema constraint
+        // `CHECK (id = 0)` enforces single-row.
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sync_state (id, last_pulled_block) VALUES (0, ?1)",
+            params![new_i64],
+        )?;
         Ok(())
     }
 }
@@ -1862,16 +1951,39 @@ impl RawRevisionRow {
         let device_id = DeviceId(arr32(&self.device_id, "device_id")?);
         let schema_version = u8::try_from(self.schema_version)
             .map_err(|_| StoreError::Corrupted("schema_version out of range".into()))?;
+        // SQL columns store i64; the canonical ChainAnchor (re-exported
+        // from `pangolin_chain`) uses u64. Narrow at the boundary;
+        // `chain_block_number` / `chain_log_index` are insertable only
+        // through `mark_published` which already widens from u64 → i64
+        // via `try_from`, so a negative value here would be storage
+        // corruption.
         let chain_anchor = match (
             self.chain_tx_hash,
             self.chain_block_number,
             self.chain_log_index,
         ) {
-            (Some(tx), Some(b), Some(i)) => Some(ChainAnchor {
-                tx_hash: arr32(&tx, "chain_tx_hash")?,
-                block_number: b,
-                log_index: i,
-            }),
+            (Some(tx), Some(b), Some(i)) => {
+                let block_number = u64::try_from(b).map_err(|_| {
+                    StoreError::Corrupted(format!("chain_block_number {b} is negative"))
+                })?;
+                let log_index = u64::try_from(i).map_err(|_| {
+                    StoreError::Corrupted(format!("chain_log_index {i} is negative"))
+                })?;
+                Some(ChainAnchor {
+                    tx_hash: arr32(&tx, "chain_tx_hash")?,
+                    block_number,
+                    log_index,
+                    // The local `revisions` table does not store
+                    // `sequence`. Callers that need the on-chain
+                    // sequence value re-pull from the chain via
+                    // ChainAdapter::get_revision; this default of 0
+                    // makes the field structurally present without
+                    // claiming a meaningful value.  Documented in
+                    // `docs/issue-plans/P7.md` §"P7-7 …
+                    // pangolin-store integration".
+                    sequence: 0,
+                })
+            }
             _ => None,
         };
         Ok(RevisionMeta {
@@ -2079,6 +2191,51 @@ mod tests {
             .is_none());
     }
 
+    /// P7 success criterion 8: `last_pulled_block` checkpoint
+    /// persists across `Vault::close` + `Vault::open`. Defaults to 0
+    /// on a fresh vault; advance + read returns the new value;
+    /// reopen sees the same value.
+    #[test]
+    fn last_pulled_block_persists_across_open_close() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        {
+            let mut v = Vault::open(&p).unwrap();
+            // Default for a fresh vault is 0.
+            assert_eq!(v.last_pulled_block().unwrap(), 0);
+            // Advance to a non-zero value.
+            v.advance_last_pulled_block(1_234_567).unwrap();
+            assert_eq!(v.last_pulled_block().unwrap(), 1_234_567);
+        }
+        // Reopen the same file; the checkpoint must still be there.
+        let v = Vault::open(&p).unwrap();
+        assert_eq!(v.last_pulled_block().unwrap(), 1_234_567);
+    }
+
+    /// `advance_last_pulled_block` is monotonic — backward moves are
+    /// rejected as `Corrupted`. Equal-value advances are no-ops
+    /// (idempotent retry of a sync).
+    #[test]
+    fn advance_last_pulled_block_is_monotonic() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.advance_last_pulled_block(100).unwrap();
+        // Equal-value re-advance is a no-op, not an error.
+        v.advance_last_pulled_block(100).unwrap();
+        assert_eq!(v.last_pulled_block().unwrap(), 100);
+        // Backward move is rejected.
+        let err = v.advance_last_pulled_block(50).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Corrupted(_)),
+            "backward advance must surface Corrupted, got {err:?}"
+        );
+        // The underlying value did not change after the failed call.
+        assert_eq!(v.last_pulled_block().unwrap(), 100);
+    }
+
     /// P2-3c: chain anchor primitives — unpublished -> `mark_published`
     /// loop.
     #[test]
@@ -2095,6 +2252,7 @@ mod tests {
             tx_hash: [0xAB; 32],
             block_number: 12345,
             log_index: 7,
+            sequence: 42,
         };
         v.mark_published(unpub[0], anchor).unwrap();
         let unpub_after = v.unpublished_revisions().unwrap();
@@ -2105,6 +2263,28 @@ mod tests {
             v.mark_published(missing, anchor).unwrap_err(),
             StoreError::RevisionNotFound
         ));
+        // Round-trip read: the SQL row stores tx_hash + block + log,
+        // not sequence (the local table is intentionally lossless on
+        // those three).  Reconstructed `ChainAnchor.sequence` is 0
+        // because the SQL row doesn't carry it; callers that need the
+        // on-chain sequence re-pull from the chain.
+        let acct = v
+            .list_accounts()
+            .into_iter()
+            .next()
+            .expect("one account exists");
+        let metas = v.revisions_for(acct).expect("revisions_for");
+        let stored = metas
+            .iter()
+            .find_map(|m| m.chain_anchor.filter(|a| a.tx_hash == [0xAB; 32]))
+            .expect("the marked anchor round-trips through SQL");
+        assert_eq!(stored.tx_hash, [0xAB; 32]);
+        assert_eq!(stored.block_number, 12345);
+        assert_eq!(stored.log_index, 7);
+        assert_eq!(
+            stored.sequence, 0,
+            "sequence is intentionally not stored in SQL — see vault::mark_published docs"
+        );
     }
 
     /// Success criterion 6: revision lineage is unbroken across

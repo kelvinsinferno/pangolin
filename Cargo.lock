@@ -2746,6 +2746,22 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 [[package]]
 name = "pangolin-chain"
 version = "0.0.0"
+dependencies = [
+ "alloy",
+ "alloy-signer-local",
+ "async-trait",
+ "hex",
+ "hkdf",
+ "pangolin-chain",
+ "pangolin-crypto",
+ "pangolin-store",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "zeroize",
+]
 
 [[package]]
 name = "pangolin-cli"
@@ -2791,6 +2807,7 @@ dependencies = [
  "ciborium-io",
  "ciborium-ll",
  "hex",
+ "pangolin-chain",
  "pangolin-crypto",
  "proptest",
  "rusqlite",

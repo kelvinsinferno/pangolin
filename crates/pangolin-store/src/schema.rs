@@ -83,6 +83,17 @@ CREATE TABLE IF NOT EXISTS devices (
     added_at    INTEGER NOT NULL,
     revoked_at  INTEGER
 );
+
+-- P7: single-row sync-state table for the `last_pulled_block`
+-- checkpoint that `Vault::sync_pull` (P8) will advance.  Idempotent
+-- `CREATE TABLE IF NOT EXISTS` so existing P2/P3/P4 vaults pick it up
+-- on next open without a format-version bump.  The CHECK (id = 0)
+-- constraint enforces single-row by construction; INSERT OR REPLACE
+-- in `Vault::advance_last_pulled_block` is what writes the value.
+CREATE TABLE IF NOT EXISTS sync_state (
+    id                  INTEGER PRIMARY KEY CHECK (id = 0),
+    last_pulled_block   INTEGER NOT NULL DEFAULT 0
+);
 ";
 
 /// Apply all pragmas and the schema DDL on the supplied connection.

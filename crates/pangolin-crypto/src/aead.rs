@@ -197,7 +197,18 @@ impl Nonce {
     /// cargo feature widens the visibility to `pub` for that purpose
     /// only. Production builds of downstream crates compile without
     /// `test-vectors` and therefore see only `pub(crate)`.
-    #[cfg(not(feature = "test-vectors"))]
+    //
+    // Note (P7 audit INFO-3): this `pub(crate)` form is gated to
+    // `cfg(all(test, not(feature = "test-vectors")))` so it is removed
+    // from the default-features library build entirely. Previously the
+    // gate was just `cfg(not(feature = "test-vectors"))`, which left
+    // the function compiled into the default lib but unused, tripping
+    // `-D dead_code` on workspace clippy (P7 success criterion 2).
+    // All in-crate consumers are inside `#[cfg(test)]` modules, so the
+    // narrower gate is sound; the `feature = "test-vectors"` arm
+    // (immediately below) covers the wider-visibility case used by
+    // `tests/test_vectors.rs`.
+    #[cfg(all(test, not(feature = "test-vectors")))]
     #[must_use]
     pub(crate) const fn from_bytes(bytes: [u8; NONCE_LEN]) -> Self {
         Self(bytes)
