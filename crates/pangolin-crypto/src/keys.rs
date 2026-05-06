@@ -41,6 +41,81 @@ use crate::sign::{SigningKey, VerifyingKey};
 /// authority-derived keys must use a distinct info to prevent collision.
 pub const WRAP_KEY_INFO: &[u8] = b"pangolin-vdk-wrap-v0";
 
+/// AAD domain separator prepended to every encoded [`WrapContext`].
+///
+/// Versioned the same way as [`WRAP_KEY_INFO`]. Any future change to the
+/// AAD encoding bumps the suffix and forces a planned migration.
+const WRAP_AAD_DOMAIN: &[u8] = b"pangolin-vdk-wrap-aad-v0";
+
+/// Length of the [`WrapContext::vault_id`] field in bytes. Matches the
+/// `vault_id` shape used elsewhere in the protocol (32-byte
+/// content-addressed identifier).
+pub const VAULT_ID_LEN: usize = 32;
+
+/// Context bound into the wrap-AEAD AAD when sealing a [`VdkKey`] into a
+/// [`WrappedVdk`].
+///
+/// ### Why this exists
+///
+/// Without a per-vault binding, a `WrappedVdk` produced for vault `A`
+/// under authority `K` could be transplanted into vault `B`'s storage
+/// and would still unwrap successfully under the same authority `K`.
+/// That cross-vault replay primitive is exactly what an attacker who
+/// can write storage but not secrets would want; binding the
+/// `vault_id` (and a `schema_version` for forward compatibility) into
+/// the AEAD's AAD makes any replay between contexts produce
+/// [`AeadError::Tampered`] without revealing which field mismatched.
+///
+/// ### Encoding
+///
+/// The on-the-wire form fed to the AEAD as AAD is the deterministic
+/// concatenation
+///
+/// ```text
+/// WRAP_AAD_DOMAIN || vault_id (32 B) || schema_version (1 B)
+/// ```
+///
+/// where `WRAP_AAD_DOMAIN = "pangolin-vdk-wrap-aad-v0"`. The leading
+/// domain separator and trailing version byte ensure that any future
+/// expansion of the context structure is unambiguous.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WrapContext {
+    /// 32-byte vault identifier. Pangolin uses content-addressed vault
+    /// IDs elsewhere in the protocol; the exact derivation is an
+    /// upstream concern of `pangolin-store`.
+    pub vault_id: [u8; VAULT_ID_LEN],
+    /// On-disk wrap-format version. Bumping this is the migration
+    /// hook for future changes to the wrap layout.
+    pub schema_version: u8,
+}
+
+impl WrapContext {
+    /// Wrap-format version produced by this crate.
+    pub const SCHEMA_VERSION_V0: u8 = 0;
+
+    /// Length of the encoded AAD blob in bytes.
+    const ENCODED_LEN: usize = WRAP_AAD_DOMAIN.len() + VAULT_ID_LEN + 1;
+
+    /// Constructs a `WrapContext` at the current schema version.
+    #[must_use]
+    pub const fn new(vault_id: [u8; VAULT_ID_LEN]) -> Self {
+        Self {
+            vault_id,
+            schema_version: Self::SCHEMA_VERSION_V0,
+        }
+    }
+
+    /// Encodes this context into the AAD blob the AEAD authenticates.
+    fn encode(&self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[..WRAP_AAD_DOMAIN.len()].copy_from_slice(WRAP_AAD_DOMAIN);
+        out[WRAP_AAD_DOMAIN.len()..WRAP_AAD_DOMAIN.len() + VAULT_ID_LEN]
+            .copy_from_slice(&self.vault_id);
+        out[Self::ENCODED_LEN - 1] = self.schema_version;
+        out
+    }
+}
+
 // Compile-time guarantees on secret-bearing types.
 //
 // `assert_not_impl_any!(T: Clone)` fails the build if `T` implements
@@ -97,24 +172,24 @@ impl VdkKey {
         self.inner.ct_eq(&other.inner)
     }
 
-    /// Wraps this VDK under the supplied authority and returns a
-    /// [`WrappedVdk`] safe for at-rest storage.
+    /// Wraps this VDK under the supplied authority for storage in `ctx`'s
+    /// vault and returns a [`WrappedVdk`] safe for at-rest storage.
     ///
-    /// Calling this multiple times on the same VDK / authority pair
-    /// produces *different* `WrappedVdk` values (fresh random nonce each
-    /// time) that all unwrap to the same VDK.
-    pub fn wrap(&self, authority: &AuthorityKey) -> Result<WrappedVdk, AeadError> {
-        WrappedVdk::seal_under(self, authority, &mut OsRng)
-    }
-
-    /// Wraps this VDK using a caller-supplied CSPRNG. Used for
-    /// reproducible tests.
-    pub fn wrap_with<R: RngCore + CryptoRng>(
+    /// `ctx` (the vault binding) is encoded and passed to the AEAD as AAD,
+    /// so a wrapper produced for one vault cannot be transplanted into a
+    /// different vault's storage and unwrapped (cross-vault replay
+    /// defense — see [`WrapContext`]). The context is also stored on the
+    /// returned [`WrappedVdk`] so the unwrap path knows what to bind.
+    ///
+    /// Calling this multiple times on the same VDK / authority / context
+    /// triple produces *different* `WrappedVdk` values (fresh random
+    /// nonce each time) that all unwrap to the same VDK.
+    pub fn wrap(
         &self,
         authority: &AuthorityKey,
-        rng: &mut R,
+        ctx: &WrapContext,
     ) -> Result<WrappedVdk, AeadError> {
-        WrappedVdk::seal_under(self, authority, rng)
+        WrappedVdk::seal_under(self, authority, ctx, &mut OsRng)
     }
 }
 
@@ -131,12 +206,41 @@ impl core::fmt::Debug for VdkKey {
 /// This is the only persistent representation of the VDK. Stored alongside
 /// the rest of the vault metadata; safe to copy, log a hex digest of, and
 /// transport across processes.
-#[derive(Clone, Debug)]
+///
+/// The [`WrapContext`] (vault binding) used during sealing is stored on
+/// the wrapper itself: it is *not* secret, but it must be carried so
+/// that the unwrap path passes the same AAD that the seal path bound.
+/// `Debug` redacts the ciphertext/nonce — those are non-secret but a hex
+/// dump in logs is rarely useful and clutters diffs.
 pub struct WrappedVdk {
     /// Ciphertext including the 16-byte Poly1305 tag.
     ciphertext: Ciphertext,
     /// 24-byte nonce. Must be unique per wrap operation.
     nonce: Nonce,
+    /// Vault binding bound into the wrap-AEAD AAD. Carried so that the
+    /// unwrap path can rebuild the same AAD without the caller having to
+    /// stash it separately.
+    ctx: WrapContext,
+}
+
+impl Clone for WrappedVdk {
+    fn clone(&self) -> Self {
+        Self {
+            ciphertext: self.ciphertext.clone(),
+            nonce: self.nonce,
+            ctx: self.ctx,
+        }
+    }
+}
+
+impl core::fmt::Debug for WrappedVdk {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WrappedVdk")
+            .field("ciphertext_len", &self.ciphertext.len())
+            .field("nonce", &self.nonce)
+            .field("ctx", &self.ctx)
+            .finish()
+    }
 }
 
 impl WrappedVdk {
@@ -152,11 +256,27 @@ impl WrappedVdk {
         &self.nonce
     }
 
+    /// Returns the vault binding bound into the AEAD AAD when this
+    /// wrapper was produced.
+    #[must_use]
+    pub fn context(&self) -> &WrapContext {
+        &self.ctx
+    }
+
     /// Sealing helper. Derives the authority's wrap key, generates a fresh
-    /// nonce, and seals the VDK bytes under HKDF-derived AEAD key.
+    /// nonce, and seals the VDK bytes under the HKDF-derived AEAD key,
+    /// binding the encoded `ctx` blob as AAD.
+    ///
+    /// MEDIUM-10 decision: we bind `vault_id` via AAD here (Option A from
+    /// the audit), not by folding it into the HKDF salt (Option B).
+    /// Folding into the HKDF salt would also work and might be more
+    /// elegant for some uses, but Option A keeps the wrap-AEAD key a
+    /// simple function of the authority and lets the same authority key
+    /// re-seal into a different vault context without re-deriving.
     fn seal_under<R: RngCore + CryptoRng>(
         vdk: &VdkKey,
         authority: &AuthorityKey,
+        ctx: &WrapContext,
         rng: &mut R,
     ) -> Result<Self, AeadError> {
         let wrap_key = authority.derive_wrap_key();
@@ -164,19 +284,32 @@ impl WrappedVdk {
         // The VDK plaintext is the AEAD key bytes; we extract them through
         // the crate-private accessor and feed them into the wrap-key seal.
         let vdk_bytes = vdk.expose_aead_bytes();
-        let ciphertext = wrap_key.seal(&nonce, &*vdk_bytes, WRAP_KEY_INFO)?;
-        Ok(Self { ciphertext, nonce })
+        let aad = ctx.encode();
+        let ciphertext = wrap_key.seal(&nonce, &*vdk_bytes, &aad)?;
+        Ok(Self {
+            ciphertext,
+            nonce,
+            ctx: *ctx,
+        })
     }
 
     /// Unwraps this `WrappedVdk` using the supplied authority.
     ///
+    /// The vault binding stored on the wrapper is fed back into the
+    /// AEAD AAD; if the wrapper was produced for a different vault
+    /// (cross-vault replay) or under a different schema version, the
+    /// AEAD authentication fails and this returns
+    /// [`AeadError::Tampered`].
+    ///
     /// # Errors
     ///
     /// Returns [`AeadError::Tampered`] if the authority is wrong, the
-    /// ciphertext was modified, or the nonce/AAD don't match.
+    /// ciphertext was modified, the wrapper has been transplanted from a
+    /// different vault, or the nonce/AAD don't match.
     pub fn unwrap_with(&self, authority: &AuthorityKey) -> Result<VdkKey, AeadError> {
         let wrap_key = authority.derive_wrap_key();
-        let plaintext = wrap_key.open(&self.nonce, &self.ciphertext, WRAP_KEY_INFO)?;
+        let aad = self.ctx.encode();
+        let plaintext = wrap_key.open(&self.nonce, &self.ciphertext, &aad)?;
         if plaintext.len() != KEY_LEN {
             // VDK plaintext must be exactly KEY_LEN bytes — anything else
             // means the wrapper was forged with a different schema. Treat
@@ -192,27 +325,35 @@ impl WrappedVdk {
         })
     }
 
-    /// Re-wraps this `WrappedVdk` from `old_authority` to `new_authority`.
+    /// Re-wraps this `WrappedVdk` from `old_authority` to `new_authority`,
+    /// retargeting the wrapper at `new_ctx` (typically the same vault
+    /// binding, but may change if the schema is migrating).
     ///
     /// This is the social-recovery primitive (Whitepaper §F): the
     /// underlying VDK is preserved bit-for-bit; only the wrapper changes.
     /// After this call, `new_authority` can unwrap the VDK and
-    /// `old_authority` cannot.
+    /// `old_authority` cannot. Takes `&self` (per MEDIUM-9): callers
+    /// retain ownership of the input wrapper and only release it after
+    /// the new wrapper is durably persisted.
     ///
-    /// `rewrap(old=A, new=A)` is a valid no-op that produces a *fresh*
-    /// `WrappedVdk` with a new nonce — useful for nonce rotation.
+    /// `rewrap(old=A, new=A, new_ctx=self.ctx)` is a valid no-op that
+    /// produces a *fresh* `WrappedVdk` with a new nonce — useful for
+    /// nonce rotation.
     ///
     /// # Errors
     ///
     /// [`AeadError::Tampered`] if `old_authority` cannot unwrap this
-    /// wrapper (i.e., the caller passed the wrong old authority).
+    /// wrapper (i.e., the caller passed the wrong old authority, or the
+    /// stored ciphertext is corrupt, or the stored vault binding has
+    /// been edited).
     pub fn rewrap(
-        self,
+        &self,
         old_authority: &AuthorityKey,
         new_authority: &AuthorityKey,
+        new_ctx: &WrapContext,
     ) -> Result<Self, AeadError> {
         let vdk = self.unwrap_with(old_authority)?;
-        vdk.wrap(new_authority)
+        vdk.wrap(new_authority, new_ctx)
     }
 }
 
@@ -358,8 +499,13 @@ impl VdkKey {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthorityKey, DeviceKey, VdkKey, WrappedVdk, WRAP_KEY_INFO};
+    use super::{AuthorityKey, DeviceKey, VdkKey, WrapContext, WrappedVdk, WRAP_KEY_INFO};
     use crate::aead::AeadError;
+
+    /// Fixture vault id used across the test module so that intent
+    /// (`auth_a` wraps for `vault_a`, etc.) is obvious in failure logs.
+    const VAULT_A: [u8; 32] = [0xAA; 32];
+    const VAULT_B: [u8; 32] = [0xBB; 32];
 
     // ---------- VDK round-trip --------------------------------------
 
@@ -367,7 +513,8 @@ mod tests {
     fn vdk_round_trip() {
         let vdk = VdkKey::generate();
         let auth = AuthorityKey::generate();
-        let wrapped = vdk.wrap(&auth).unwrap();
+        let ctx = WrapContext::new(VAULT_A);
+        let wrapped = vdk.wrap(&auth, &ctx).unwrap();
         let recovered = wrapped.unwrap_with(&auth).unwrap();
         assert!(bool::from(vdk.ct_eq(&recovered)));
     }
@@ -377,7 +524,8 @@ mod tests {
         let vdk = VdkKey::generate();
         let auth_a = AuthorityKey::generate();
         let auth_b = AuthorityKey::generate();
-        let wrapped = vdk.wrap(&auth_a).unwrap();
+        let ctx = WrapContext::new(VAULT_A);
+        let wrapped = vdk.wrap(&auth_a, &ctx).unwrap();
         assert_eq!(
             wrapped.unwrap_with(&auth_b).unwrap_err(),
             AeadError::Tampered,
@@ -388,15 +536,82 @@ mod tests {
     fn vdk_tampered_ciphertext_fails() {
         let vdk = VdkKey::generate();
         let auth = AuthorityKey::generate();
-        let wrapped = vdk.wrap(&auth).unwrap();
+        let ctx = WrapContext::new(VAULT_A);
+        let wrapped = vdk.wrap(&auth, &ctx).unwrap();
         // Reconstruct a wrapper with a flipped first byte.
         let mut bytes = wrapped.ciphertext().as_bytes().to_vec();
         bytes[0] ^= 0x01;
         let bad = WrappedVdk {
             ciphertext: crate::aead::Ciphertext::from_vec(bytes),
             nonce: *wrapped.nonce(),
+            ctx: *wrapped.context(),
         };
         assert_eq!(bad.unwrap_with(&auth).unwrap_err(), AeadError::Tampered,);
+    }
+
+    /// HIGH-3 cross-vault replay regression: a `WrappedVdk` produced for
+    /// `vault_a` must NOT unwrap when its stored ctx is forged to
+    /// `vault_b`. Since the wrapper carries its own ctx, we have to
+    /// emulate the attack: take the ciphertext+nonce produced for
+    /// vault A and stitch it together with vault B's ctx — exactly the
+    /// transplant primitive an attacker who has storage write access
+    /// would attempt.
+    #[test]
+    fn vdk_cross_vault_replay_fails() {
+        let vdk = VdkKey::generate();
+        let auth = AuthorityKey::generate();
+        let ctx_a = WrapContext::new(VAULT_A);
+        let ctx_b = WrapContext::new(VAULT_B);
+        let wrapped_for_a = vdk.wrap(&auth, &ctx_a).unwrap();
+
+        let transplanted = WrappedVdk {
+            ciphertext: wrapped_for_a.ciphertext().clone(),
+            nonce: *wrapped_for_a.nonce(),
+            ctx: ctx_b,
+        };
+        assert_eq!(
+            transplanted.unwrap_with(&auth).unwrap_err(),
+            AeadError::Tampered,
+            "ciphertext sealed for vault A must not unwrap under vault B's ctx",
+        );
+    }
+
+    /// Same-vault round-trip with an explicit context — sanity peer to
+    /// the cross-vault replay test, ensuring the binding doesn't reject
+    /// legitimate same-vault unwraps.
+    #[test]
+    fn vdk_same_vault_correct_context_unwraps() {
+        let vdk = VdkKey::generate();
+        let auth = AuthorityKey::generate();
+        let ctx = WrapContext::new(VAULT_A);
+        let wrapped = vdk.wrap(&auth, &ctx).unwrap();
+        let recovered = wrapped.unwrap_with(&auth).unwrap();
+        assert!(bool::from(vdk.ct_eq(&recovered)));
+    }
+
+    /// HIGH-3 schema-version replay: a wrapper sealed at
+    /// `schema_version = 0` must not unwrap when the stored ctx claims a
+    /// future schema version. Same emulation as the cross-vault test.
+    #[test]
+    fn vdk_schema_version_mismatch_fails() {
+        let vdk = VdkKey::generate();
+        let auth = AuthorityKey::generate();
+        let ctx_v0 = WrapContext::new(VAULT_A);
+        let wrapped = vdk.wrap(&auth, &ctx_v0).unwrap();
+
+        let bumped = WrapContext {
+            vault_id: VAULT_A,
+            schema_version: 1,
+        };
+        let transplanted = WrappedVdk {
+            ciphertext: wrapped.ciphertext().clone(),
+            nonce: *wrapped.nonce(),
+            ctx: bumped,
+        };
+        assert_eq!(
+            transplanted.unwrap_with(&auth).unwrap_err(),
+            AeadError::Tampered,
+        );
     }
 
     // ---------- Rewrap correctness ----------------------------------
@@ -406,8 +621,9 @@ mod tests {
         let vdk_orig = VdkKey::generate();
         let auth_a = AuthorityKey::generate();
         let auth_b = AuthorityKey::generate();
-        let wrapped_a = vdk_orig.wrap(&auth_a).unwrap();
-        let wrapped_b = wrapped_a.rewrap(&auth_a, &auth_b).unwrap();
+        let ctx = WrapContext::new(VAULT_A);
+        let wrapped_a = vdk_orig.wrap(&auth_a, &ctx).unwrap();
+        let wrapped_b = wrapped_a.rewrap(&auth_a, &auth_b, &ctx).unwrap();
         // B can unwrap and recovers the original VDK byte-for-byte.
         let recovered = wrapped_b.unwrap_with(&auth_b).unwrap();
         assert!(bool::from(vdk_orig.ct_eq(&recovered)));
@@ -420,19 +636,26 @@ mod tests {
 
     #[test]
     fn vdk_rewrap_same_authority_is_noop() {
-        // rewrap(old=A, new=A) must succeed and produce a *fresh*
+        // rewrap(old=A, new=A, ctx=ctx) must succeed and produce a *fresh*
         // wrapper (different nonce) that still unwraps to the same VDK.
+        // Per MEDIUM-9, rewrap is `&self` so the original wrapper is
+        // retained for the caller.
         let vdk_orig = VdkKey::generate();
         let auth = AuthorityKey::generate();
-        let wrapped_a = vdk_orig.wrap(&auth).unwrap();
-        let wrapped_a2 = wrapped_a.clone().rewrap(&auth, &auth).unwrap();
+        let ctx = WrapContext::new(VAULT_A);
+        let wrapped_a = vdk_orig.wrap(&auth, &ctx).unwrap();
+        let wrapped_a2 = wrapped_a.rewrap(&auth, &auth, &ctx).unwrap();
         assert_ne!(
             wrapped_a.nonce().as_bytes(),
             wrapped_a2.nonce().as_bytes(),
             "rewrap must produce a fresh nonce, not reuse the input nonce",
         );
-        let recovered = wrapped_a2.unwrap_with(&auth).unwrap();
-        assert!(bool::from(vdk_orig.ct_eq(&recovered)));
+        // Original wrapper still unwraps after rewrap (MEDIUM-9): no
+        // data loss on caller error mid-rewrap.
+        let recovered_orig = wrapped_a.unwrap_with(&auth).unwrap();
+        let recovered_new = wrapped_a2.unwrap_with(&auth).unwrap();
+        assert!(bool::from(vdk_orig.ct_eq(&recovered_orig)));
+        assert!(bool::from(vdk_orig.ct_eq(&recovered_new)));
     }
 
     #[test]
@@ -441,12 +664,16 @@ mod tests {
         let auth_a = AuthorityKey::generate();
         let auth_b = AuthorityKey::generate();
         let auth_c = AuthorityKey::generate();
-        let wrapped = vdk.wrap(&auth_a).unwrap();
+        let ctx = WrapContext::new(VAULT_A);
+        let wrapped = vdk.wrap(&auth_a, &ctx).unwrap();
         // Rewrap claims old=B (wrong) -> must fail at unwrap step.
         assert_eq!(
-            wrapped.rewrap(&auth_b, &auth_c).unwrap_err(),
+            wrapped.rewrap(&auth_b, &auth_c, &ctx).unwrap_err(),
             AeadError::Tampered,
         );
+        // And the original wrapper is still usable (MEDIUM-9).
+        let recovered = wrapped.unwrap_with(&auth_a).unwrap();
+        assert!(bool::from(vdk.ct_eq(&recovered)));
     }
 
     // ---------- HKDF determinism + info-string sensitivity ----------
@@ -543,7 +770,8 @@ mod tests {
         // documented in `WrappedVdk::unwrap_with`.
         let vdk = VdkKey::generate();
         let auth = AuthorityKey::generate();
-        let wrapped = vdk.wrap(&auth).unwrap();
+        let ctx = WrapContext::new(VAULT_A);
+        let wrapped = vdk.wrap(&auth, &ctx).unwrap();
         let recovered = wrapped.unwrap_with(&auth).unwrap();
         assert!(bool::from(vdk.ct_eq(&recovered)));
     }
