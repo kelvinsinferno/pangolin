@@ -42,6 +42,7 @@ Per-component threat enumeration lands as part of MVP-1 issue 0.2 and is updated
 | Local encrypted store | PoC | DOCUMENTED (P2) |
 | Session policy engine | MVP-1 | TBD (issue 0.2) |
 | Revision Log v0 contract | PoC | DOCUMENTED (P5-1) |
+| Pangolin chain adapter (`pangolin-chain`) | PoC | DOCUMENTED (P7) |
 | Revision Log v1 contract | MVP-2 | TBD (issue 2.1 plan) |
 | Funder service | MVP-2 | TBD (issue 3.4 plan) |
 | Ephemeral local indexer | MVP-2 | TBD (issue 4.2 plan) |
@@ -80,6 +81,85 @@ Per-component threat enumeration lands as part of MVP-1 issue 0.2 and is updated
 5. **Concurrent corruption from two opens.** Defense: `Vault::open` takes a sidecar `.lock` file via `OpenOptions::create_new(true)`; a second open observes the file and returns `StoreError::AlreadyOpen`. Verified by the `vault::tests::double_open_fails` unit test. After a hard crash the lock file remains and operators must remove it manually before reopening — documented operational hazard, not a security failure.
 6. **Format-version downgrade attack.** Defense: `Vault::open` reads the `format_version` byte from the meta row before any AEAD work and surfaces `StoreError::UnsupportedFormatVersion` for any version newer than this build understands. Verified by the `adversarial_unknown_format_version_clean_error` integration test (which writes `99` directly to the meta column).
 7. **KDF parameter tampering on disk.** Defense: KDF params live in plaintext on the meta row (they MUST be readable before unlock to feed the same Argon2id parameters back into `derive_seed`). Sub-floor params are rejected by `KdfParams::validate` at `pangolin-crypto`'s public boundary; tampering that keeps params in-range but changes their values (e.g., shifting `time_cost`, or flipping a bit in the salt) produces a different derived seed. Both cases collapse into `StoreError::AuthenticationFailed` via the `From<KdfError>` impl in `error.rs`, which means an attacker who tampers with the KDF params cannot distinguish the result from a salt-tamper or ciphertext-tamper or wrong-password attempt — the failure variant is identical across all four cases (this collapsing is the MEDIUM-1 fix from the P2 audit; previously a separate `KdfRejected` variant let the attacker oracle the cause). Verified by the `adversarial_kdf_param_tampering_fails` integration test, which exercises both sub-floor and salt-tamper paths and asserts both surface `AuthenticationFailed`.
+
+### Pangolin chain adapter (`pangolin-chain`)
+
+> Source: `docs/issue-plans/P7.md` §"Failure modes considered" and the
+> P7 build-gate. The `pangolin-chain` crate wraps the deployed
+> `RevisionLogV0` contract behind an async `ChainAdapter` trait;
+> `BaseSepoliaAdapter` is the production impl, `MockChainAdapter` the
+> test-only impl gated behind the `test-utilities` feature.
+
+1. **Adversary-controlled RPC returns garbage logs.** Defense: alloy's
+   typed `sol!` binding decodes every `RevisionPublished` log
+   structurally; a misbehaving response that does not match the ABI
+   surfaces as `ChainError::Decode` and is never silently consumed.
+   `pull_since` additionally re-checks the emitter address per log
+   (audit MEDIUM-4 from the P6 chaincli build) — server-side filters
+   already exclude foreign emitters, but a misbehaving RPC could
+   splice in logs from other contracts that share the topic-0 hash;
+   those are dropped without surfacing.
+2. **Wrong-chain RPC redirects.** Defense: every constructor checks
+   `eth_chainId` against the deployment file's declared `chain_id`
+   at construction time and refuses to proceed on mismatch with
+   `ChainError::WrongChain`. Same fail-closed posture chaincli holds
+   (P6 audit M-3).
+3. **Tampered deployment file.** Defense: `Deployment::load` enforces
+   `chain_id == 84_532` (Base Sepolia) and the address is parsed from
+   the file with a strict `Address::parse` that rejects malformed
+   hex. The runtime-bytecode keccak cross-check is NOT mirrored from
+   chaincli into pangolin-chain because the adapter is not the
+   "truth-serum" surface — that's chaincli's role; an audit
+   follow-up could lift the keccak check into the adapter at the cost
+   of an extra `eth_getCode` per construction.
+4. **Tx revert on publish.** Defense: receipt status flag = 0
+   surfaces as `ChainError::Reverted { tx_hash }` carrying only the
+   tx hash. The caller (P8 sync orchestration) decides retry policy.
+5. **Chain reorg after a successful publish.** Defense: out of scope
+   for P7. Every successful `publish` is treated as anchored even
+   though the block could theoretically reorg out. P8 (sync
+   orchestration) is responsible for detecting reorgs by re-checking
+   `(block_number, log_index)` across pull cycles. Documented at the
+   `BaseSepoliaAdapter` level; the trait does not expose a reorg API
+   in v0.
+6. **EVM address observability.** Defense (acknowledgement, not
+   mitigation): the `evm::derive_evm_wallet` derivation produces a
+   secp256k1 wallet whose 20-byte address is the gas-paying signer
+   for every revision the device publishes. Anyone observing the
+   chain learns that all revisions paid by this address come from
+   the same device — i.e., the device's gas wallet is a stable
+   pseudonymous identifier across writes from the same device. This
+   is a known privacy tradeoff per D-006; the matching tradeoff for
+   the device-id field on each revision is documented in the
+   `RevisionLogV0` row above. Phase-2 mitigations (per-publish
+   relayed payment, address rotation) are deferred to MVP-2 issue
+   3.4.
+7. **Ed25519 → secp256k1 derivation correlation.** Defense: the
+   derivation goes Ed25519-sign over a domain message → 64-byte sig
+   → HKDF-SHA256 expand → 32-byte secp256k1 scalar (rejection-sampled
+   if it lands at zero or ≥ N). The HKDF expand is one-way: an
+   attacker who recovers the secp256k1 scalar (e.g., from a leaked
+   keystore) cannot recover the Ed25519 secret seed in polynomial
+   time. Same-seed → same-address determinism is asserted by
+   `evm::tests::derive_is_deterministic`; cryptographic separation
+   is structural via HKDF.
+8. **Signed-revision forgery (cross-device).** Defense: `signing.rs`
+   binds the canonical hash to `device_id` (= the device's Ed25519
+   verifying key bytes), and the signature is verified under that
+   embedded pubkey. An attacker who substitutes a different `device_id`
+   into a captured `SignedRevision` will not have the matching secret
+   key to re-sign, and the existing signature will fail verification.
+   Asserted by `signing::tests::substituted_device_id_fails_verification`.
+   Note: v0 contract does NOT verify signatures on-chain (P5-1 audit
+   threat #2); v1 (MVP-2 issue 2.1) will. The discipline is
+   client-side now so MVP-2 doesn't need a client-side migration.
+9. **`MockChainAdapter` substitution in production.** Defense: the
+   mock is `cfg(any(test, feature = "test-utilities"))`-gated.
+   Production downstream consumers (`pangolin-store`, `pangolin-cli`)
+   do not enable the `test-utilities` feature in their default Cargo
+   manifests; doing so would require an explicit Cargo.toml edit
+   that an audit reviewer would catch. The crate-level docstring
+   names the gate as a security boundary (P7 success criterion 11).
 
 #### Verification artifacts
 
