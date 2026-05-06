@@ -52,13 +52,11 @@ async-trait        = { workspace = true }
 # argument). NO secret material crosses out of `pangolin-crypto`; only
 # the publicly-defined accessors on `DeviceKey` are used.
 #
-# `pangolin-store` is consumed in the integration commit (P7-7) so
-# `pangolin-chain` can re-export `ChainAnchor` as the canonical type.
-# The dep is one-way (chain → store) at the type-re-export level only;
-# `pangolin-store` then re-exports `pangolin-chain::ChainAnchor` to keep
-# the existing surface stable.
+# `pangolin-chain` does NOT depend on `pangolin-store` — the dep
+# direction is reversed (pangolin-store → pangolin-chain) so
+# `ChainAnchor` can live canonically here and be re-exported by
+# pangolin-store. See `docs/issue-plans/P7.md` success criterion 6.
 pangolin-crypto = { path = "../pangolin-crypto" }
-pangolin-store  = { path = "../pangolin-store" }
 
 # Errors. `thiserror` derives `Display` + `Error`; we hand-write
 # `Debug` on every payload-bearing variant so secret material cannot

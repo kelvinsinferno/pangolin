@@ -32,6 +32,14 @@ test-utilities = []
 # API surface — this crate never invents primitives.
 pangolin-crypto = { path = "../pangolin-crypto" }
 
+# Chain-anchor types come from `pangolin-chain` (P7 unification per
+# success criterion 6 of `docs/issue-plans/P7.md`). pangolin-store
+# re-exports `pangolin_chain::ChainAnchor` so consumers' import paths
+# stay stable, but the canonical owner of the type is pangolin-chain.
+# The dep is one-way (store → chain); pangolin-chain does NOT depend
+# on pangolin-store in production code.
+pangolin-chain  = { path = "../pangolin-chain" }
+
 rusqlite          = { workspace = true }
 ciborium-ll       = { workspace = true }
 ciborium-io       = { workspace = true }

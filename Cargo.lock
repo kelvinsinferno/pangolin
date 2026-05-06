@@ -2807,6 +2807,7 @@ dependencies = [
  "ciborium-io",
  "ciborium-ll",
  "hex",
+ "pangolin-chain",
  "pangolin-crypto",
  "proptest",
  "rusqlite",
