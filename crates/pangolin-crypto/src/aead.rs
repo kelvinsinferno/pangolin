@@ -160,8 +160,30 @@ impl Nonce {
         Self(n)
     }
 
-    /// Wraps caller-supplied nonce bytes. Used only for known-answer test
-    /// vectors; production code should always use [`Nonce::random`].
+    /// Wraps caller-supplied nonce bytes.
+    ///
+    /// Crate-private: only known-answer-test vectors and the
+    /// crate-internal wrap/unwrap path may construct deterministic
+    /// nonces. External (downstream-crate) callers must always use
+    /// [`Nonce::random`] / [`Nonce::random_with`] so that the
+    /// "deterministic-nonce constructors are not exposed" invariant
+    /// (`docs/issue-plans/P1.md` § "Failure modes considered") holds at
+    /// the public-API layer.
+    ///
+    /// The crate's own integration tests in `tests/` need this
+    /// constructor for RFC known-answer vectors; the `test-vectors`
+    /// cargo feature widens the visibility to `pub` for that purpose
+    /// only. Production builds of downstream crates compile without
+    /// `test-vectors` and therefore see only `pub(crate)`.
+    #[cfg(not(feature = "test-vectors"))]
+    #[must_use]
+    pub(crate) const fn from_bytes(bytes: [u8; NONCE_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// Public-for-tests variant of [`Self::from_bytes`]. See the
+    /// `pub(crate)` definition above for the security rationale.
+    #[cfg(feature = "test-vectors")]
     #[must_use]
     pub const fn from_bytes(bytes: [u8; NONCE_LEN]) -> Self {
         Self(bytes)

@@ -90,6 +90,30 @@ deny = [
     { name = "scrypt", reason = "Pangolin's KDF is Argon2id only per the locked plan." },
     { name = "pbkdf2", reason = "see scrypt." },
     { name = "balloon-hash", reason = "see scrypt." },
+    # ## Reasoning — `serde` ban for the `pangolin-crypto` audit surface.
+    #
+    # Plan success criterion #11 (`docs/issue-plans/P1.md`) requires that
+    # the secret-bearing types `VdkKey`, `AuthorityKey`, `DeviceKey` (and
+    # by extension `AeadKey`, `SigningKey`, `SecretBytes`) NEVER implement
+    # `serde::Serialize` or `serde::Deserialize`. The original
+    # `static_assertions::assert_not_impl_any!(... : Clone, Copy)` in
+    # `keys.rs` covers Clone/Copy but cannot directly assert "does not
+    # implement serde::Serialize" without taking on a `serde` dependency,
+    # which itself would be the very supply-chain footgun we are trying
+    # to prevent.
+    #
+    # Closing the gap at the dependency-graph layer is strictly stronger:
+    # if `serde` and `serde_derive` are not reachable from
+    # `pangolin-crypto`, no `Serialize` impl is even expressible — neither
+    # accidentally via a `#[derive(Serialize)]` nor via an upstream
+    # dependency that adds a blanket impl.
+    #
+    # If a future plan revision needs `serde` (e.g., for the public
+    # `WrappedVdk` / `VerifyingKey` halves), the entry must be removed
+    # in the same PR that adds the dependency, the plan must spell out
+    # the exposure, and Kelvin must approve.
+    { name = "serde", reason = "pangolin-crypto must not gain serde reachability — keys must not be serializable; see HIGH-1 / docs/issue-plans/P1.md success criterion #11." },
+    { name = "serde_derive", reason = "pangolin-crypto must not gain serde reachability — keys must not be serializable; see HIGH-1 / docs/issue-plans/P1.md success criterion #11." },
 ]
 
 [sources]

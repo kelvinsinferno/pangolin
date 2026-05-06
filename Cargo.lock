@@ -467,6 +467,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hkdf",
+ "pangolin-crypto",
  "proptest",
  "rand_core 0.6.4",
  "sha2",
