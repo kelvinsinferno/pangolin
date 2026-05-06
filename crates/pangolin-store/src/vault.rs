@@ -212,38 +212,37 @@ impl Vault {
         // `AlreadyOpen`. `SQLite`'s WAL mode allows concurrent connections
         // by design, so we can't rely on an exclusive transaction here.
         let lock_file = acquire_lock(path)?;
-        let conn = match open_connection(path) {
-            Ok(c) => c,
-            Err(err) => {
-                release_lock(path);
-                return Err(err);
-            }
-        };
-        schema::apply_pragmas_and_schema(&conn)?;
-        schema::assert_wal_mode(&conn)?;
-        schema::assert_integrity(&conn)?;
-
-        let meta = match meta::read(&conn) {
-            Ok(Some(m)) => m,
-            Ok(None) => {
-                release_lock(path);
-                return Err(StoreError::BadMagic);
-            }
-            Err(err) => {
-                release_lock(path);
-                return Err(err);
-            }
-        };
-        let device_id = DeviceId(random_32_via_sqlite(&conn)?);
-        Ok(Self {
-            path: path.to_path_buf(),
-            conn,
-            meta,
-            device_id,
-            state: VaultState::Locked,
-            active: None,
-            _lock_file: lock_file,
-        })
+        // MEDIUM-2 (P2 audit): every `open` failure path beyond
+        // `acquire_lock` MUST release the sidecar `.lock` file, otherwise
+        // a stale lock blocks all subsequent legitimate `open` attempts
+        // with `AlreadyOpen` until manual cleanup. The previous
+        // implementation released on `open_connection` and `meta::read`
+        // failure but propagated through `?` on
+        // `apply_pragmas_and_schema`, `assert_wal_mode`,
+        // `assert_integrity`, and `random_32_via_sqlite`, leaking the
+        // lock on those paths. Wrapping the construction in a closure
+        // and calling `release_lock` on any `Err` plugs all of them.
+        let result = (|| -> Result<Self> {
+            let conn = open_connection(path)?;
+            schema::apply_pragmas_and_schema(&conn)?;
+            schema::assert_wal_mode(&conn)?;
+            schema::assert_integrity(&conn)?;
+            let meta = meta::read(&conn)?.ok_or(StoreError::BadMagic)?;
+            let device_id = DeviceId(random_32_via_sqlite(&conn)?);
+            Ok(Self {
+                path: path.to_path_buf(),
+                conn,
+                meta,
+                device_id,
+                state: VaultState::Locked,
+                active: None,
+                _lock_file: lock_file,
+            })
+        })();
+        if result.is_err() {
+            release_lock(path);
+        }
+        result
     }
 
     /// Vault id (32-byte content-addressed identifier).
@@ -269,14 +268,39 @@ impl Vault {
     /// Derives the password-AEAD-key via Argon2id at the stored params,
     /// unwraps the [`pangolin_crypto::keys::WrappedVdk`], decrypts every
     /// live account head, builds the in-memory cache, and transitions
-    /// to `Active`. Idempotent on a vault that's already `Active` — but
-    /// re-derives the VDK (noop on success, useful if the caller wants
-    /// to re-validate the password mid-session).
+    /// to `Active`.
+    ///
+    /// # Behavior on a vault that is already `Active`
+    ///
+    /// MEDIUM-5 (P2 audit): the precise semantics of calling `unlock`
+    /// twice in a row are worth pinning down because they're not what a
+    /// casual reader might assume.
+    ///
+    /// 1. **Re-call with the same (correct) password while `Active`:**
+    ///    succeeds. The full Argon2id derivation runs again (~1–2 s
+    ///    burned), the VDK is re-unwrapped, the in-memory cache is
+    ///    rebuilt from disk, and the previous `ActiveState` is dropped
+    ///    (its secrets zeroize). Useful for re-validating the password
+    ///    mid-session, but expensive — callers that just want a fresh
+    ///    cache should consider exposing a cheaper "refresh" surface in
+    ///    a future version.
+    /// 2. **Re-call with the *wrong* password while `Active`:** fails
+    ///    with `AuthenticationFailed`, but the existing `ActiveState`
+    ///    is **NOT** modified — the prior unlock remains in effect and
+    ///    the cache is intact. The vault does NOT auto-lock on a failed
+    ///    `unlock`. Callers that want fail-then-lock semantics must
+    ///    follow a failed `unlock` with an explicit [`Self::lock`].
+    ///
+    /// In both cases the Argon2id derivation runs to completion before
+    /// any AEAD work (constant-time on the wrong-password vs. tampered-
+    /// metadata distinction).
     ///
     /// # Errors
     ///
     /// `StoreError::AuthenticationFailed` for any crypto-class failure
-    /// (wrong password, tampered meta, schema-version drift).
+    /// (wrong password, tampered meta, schema-version drift, KDF param
+    /// tamper, etc. — all collapse into the single variant per the
+    /// MEDIUM-1 fix).
     pub fn unlock(&mut self, password: &SecretBytes) -> Result<()> {
         let seed = kdf::derive_seed(password, &self.meta.kdf_salt, &self.meta.kdf_params)?;
         let authority = AuthorityKey::from_seed(*seed);
@@ -725,8 +749,14 @@ fn build_decrypted_cache(
     vdk_aead: &AeadKey,
 ) -> Result<DecryptedCache> {
     let mut cache = DecryptedCache::new();
+    // MEDIUM-4 (P2 audit): include the per-row `schema_version` in the
+    // SELECT so we can bind the row's claimed schema version into the
+    // AAD on decrypt. If an attacker edits this column on disk the
+    // reconstructed AAD diverges from the seal-time AAD and the AEAD
+    // open fails → AuthenticationFailed. Without binding the per-row
+    // value, the column was inert (writes set it, reads ignored it).
     let mut stmt = conn.prepare(
-        "SELECT ai.account_id, r.parent_revision_id, r.enc_payload, r.enc_nonce
+        "SELECT ai.account_id, r.parent_revision_id, r.enc_payload, r.enc_nonce, r.schema_version
          FROM account_identities ai
          JOIN revisions r ON ai.head_revision_id = r.revision_id
          WHERE ai.tombstoned = 0",
@@ -736,11 +766,12 @@ fn build_decrypted_cache(
         let parent: Vec<u8> = row.get(1)?;
         let payload: Vec<u8> = row.get(2)?;
         let nonce: Vec<u8> = row.get(3)?;
-        Ok((account_id, parent, payload, nonce))
+        let schema_version_i: i64 = row.get(4)?;
+        Ok((account_id, parent, payload, nonce, schema_version_i))
     })?;
 
     for raw in rows {
-        let (account_id_blob, parent_blob, payload, nonce_blob) = raw?;
+        let (account_id_blob, parent_blob, payload, nonce_blob, schema_version_i) = raw?;
         let account_id_arr: [u8; ACCOUNT_ID_LEN] = account_id_blob
             .as_slice()
             .try_into()
@@ -753,15 +784,17 @@ fn build_decrypted_cache(
             .as_slice()
             .try_into()
             .map_err(|_| StoreError::Corrupted("enc_nonce length mismatch".into()))?;
+        // The per-row schema_version column is u8 in spirit; an out-of-
+        // range value indicates row-level corruption (or a deliberate
+        // tamper attempting to inject a value too large to fit). Either
+        // way, surface it as Corrupted rather than silently truncating.
+        let row_schema_version = u8::try_from(schema_version_i).map_err(|_| {
+            StoreError::Corrupted("revisions.schema_version out of u8 range".into())
+        })?;
 
         let account_id = AccountId::from_bytes(account_id_arr);
         let parent = RevisionId::from_bytes(parent_arr);
-        let aad = build_aad(
-            &meta.vault_id,
-            &account_id,
-            &parent,
-            meta.wrap_context.schema_version,
-        );
+        let aad = build_aad(&meta.vault_id, &account_id, &parent, row_schema_version);
         let ct = Ciphertext::from_vec(payload);
         let nonce = Nonce::from_storage_bytes(nonce_arr);
         match open_payload(vdk_aead, &nonce, &ct, &aad)? {
@@ -894,6 +927,50 @@ mod tests {
         let err = v.unlock(&bad).unwrap_err();
         assert!(matches!(err, StoreError::AuthenticationFailed));
         assert_eq!(v.state(), VaultState::Locked);
+    }
+
+    /// MEDIUM-5 (P2 audit): pin the documented behavior of `unlock`
+    /// being called a second time on a vault that is already `Active`.
+    /// A wrong-password retry must NOT auto-lock the vault — the prior
+    /// `ActiveState` survives, accounts remain queryable, and only an
+    /// explicit `lock()` clears the cache.
+    #[test]
+    fn second_unlock_with_wrong_password_does_not_lock_vault() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "second-unlock.pvf");
+        let pwd = fresh_password();
+        Vault::create(&p, &pwd).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+
+        // First unlock (correct password) — vault enters Active.
+        v.unlock(&pwd).unwrap();
+        assert_eq!(v.state(), VaultState::Active);
+        let snap = AccountSnapshot::new(
+            SecretBytes::new(b"d".to_vec()),
+            SecretBytes::new(b"u".to_vec()),
+            SecretBytes::new(b"p".to_vec()),
+            SecretBytes::new(b"https://x".to_vec()),
+            SecretBytes::new(b"".to_vec()),
+            SecretBytes::new(b"".to_vec()),
+        );
+        let id = v.add_account(snap).unwrap();
+        assert!(v.get_account(id).is_some());
+
+        // Second unlock with WRONG password — must fail
+        // AuthenticationFailed and must NOT lock the vault.
+        let bad = SecretBytes::new(b"wrong".to_vec());
+        let err = v.unlock(&bad).unwrap_err();
+        assert!(matches!(err, StoreError::AuthenticationFailed));
+        assert_eq!(
+            v.state(),
+            VaultState::Active,
+            "wrong-password unlock-on-Active must not auto-lock the vault",
+        );
+        // Cache remains intact: account is still queryable.
+        assert!(
+            v.get_account(id).is_some(),
+            "decrypted cache must survive a failed second unlock",
+        );
     }
 
     /// Success criterion 7: tombstone visibility.

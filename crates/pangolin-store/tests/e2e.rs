@@ -11,7 +11,7 @@ use pangolin_store::{AccountSnapshot, Vault};
 
 /// Helper — convenience constructor for a snapshot whose password
 /// field carries a unique marker, used by the plaintext-on-disk
-/// property test.
+/// property test (legacy; prefer [`snapshot_with_per_field_markers`]).
 fn snapshot_with_marker(marker: &str) -> AccountSnapshot {
     AccountSnapshot::new(
         SecretBytes::new(b"display".to_vec()),
@@ -20,6 +20,34 @@ fn snapshot_with_marker(marker: &str) -> AccountSnapshot {
         SecretBytes::new(b"https://example.com".to_vec()),
         SecretBytes::new(b"some notes".to_vec()),
         SecretBytes::new(b"".to_vec()),
+    )
+}
+
+/// MEDIUM-3 (P2 audit): place a unique marker in EVERY secret-bearing
+/// field so the cardinal-principle-2 verifier scans for leaks across
+/// `display_name`, `username`, `password`, `url`, `notes`, AND
+/// `totp_secret` rather than just `password`. A regression that, e.g.,
+/// started persisting `display_name` outside the AEAD-sealed payload
+/// would be caught by the same scan.
+fn snapshot_with_per_field_markers(seed: &str) -> [String; 6] {
+    [
+        format!("display-{seed}-secret-bytes"),
+        format!("user-{seed}-secret-bytes"),
+        format!("pwd-{seed}-secret-bytes"),
+        format!("url-{seed}-secret-bytes"),
+        format!("notes-{seed}-secret-bytes"),
+        format!("totp-{seed}-secret-bytes"),
+    ]
+}
+
+fn snapshot_from_markers(markers: &[String; 6]) -> AccountSnapshot {
+    AccountSnapshot::new(
+        SecretBytes::new(markers[0].as_bytes().to_vec()),
+        SecretBytes::new(markers[1].as_bytes().to_vec()),
+        SecretBytes::new(markers[2].as_bytes().to_vec()),
+        SecretBytes::new(markers[3].as_bytes().to_vec()),
+        SecretBytes::new(markers[4].as_bytes().to_vec()),
+        SecretBytes::new(markers[5].as_bytes().to_vec()),
     )
 }
 
@@ -32,10 +60,12 @@ fn fresh_password() -> SecretBytes {
 // Plaintext-on-disk verification (cardinal principle 2 enforcement).
 // ---------------------------------------------------------------------
 //
-// Create a vault, add an account whose `password` field carries a
-// unique marker bytestring, lock + close the vault, then read the raw
-// `.pvf` bytes and assert the marker appears ZERO times anywhere in
-// the file. ≥100 random markers per the plan.
+// Create a vault, add an account with a unique marker in EACH of its
+// six secret-bearing fields, lock + close the vault, then read the raw
+// `.pvf` bytes and assert NO marker appears anywhere in the file.
+// ≥100 random markers per the plan; MEDIUM-3 (P2 audit) extends the
+// per-iteration coverage from "just password" to all six fields:
+// display_name, username, password, url, notes, totp_secret.
 #[test]
 fn no_plaintext_on_disk() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -43,46 +73,56 @@ fn no_plaintext_on_disk() {
 
     Vault::create(&path, &fresh_password()).unwrap();
     let mut total_bytes_scanned: u64 = 0;
-    let n_markers: usize = 100;
+    let n_iterations: usize = 100;
     let pwd = fresh_password();
 
-    for i in 0..n_markers {
-        let marker = format!("marker-{i:08}-{}-secret-bytes", random_suffix(i));
+    for i in 0..n_iterations {
+        let seed = format!("{i:08}-{}", random_suffix(i));
+        let markers = snapshot_with_per_field_markers(&seed);
         // Open + unlock + add + lock + close in each iteration so the
         // file is fully flushed between writes.
         {
             let mut v = Vault::open(&path).unwrap();
             v.unlock(&pwd).unwrap();
-            v.add_account(snapshot_with_marker(&marker)).unwrap();
+            v.add_account(snapshot_from_markers(&markers)).unwrap();
             v.lock();
             v.close().unwrap();
         }
         let bytes = std::fs::read(&path).unwrap();
         total_bytes_scanned += bytes.len() as u64;
-        let needle = marker.as_bytes();
-        let hits = bytes.windows(needle.len()).filter(|w| *w == needle).count();
-        assert_eq!(
-            hits, 0,
-            "marker {marker:?} found in raw vault bytes — plaintext leaked!"
-        );
+        for marker in &markers {
+            let needle = marker.as_bytes();
+            let hits = bytes.windows(needle.len()).filter(|w| *w == needle).count();
+            assert_eq!(
+                hits, 0,
+                "marker {marker:?} found in raw vault bytes — plaintext leaked! \
+                 (cardinal principle 2 violation; iteration {i})",
+            );
+        }
         // Also scan the WAL sidecar if it exists.
         let wal = path.with_extension("pvf-wal");
         if wal.exists() {
             let wal_bytes = std::fs::read(&wal).unwrap();
             total_bytes_scanned += wal_bytes.len() as u64;
-            let wal_hits = wal_bytes
-                .windows(needle.len())
-                .filter(|w| *w == needle)
-                .count();
-            assert_eq!(
-                wal_hits, 0,
-                "marker {marker:?} found in WAL sidecar — plaintext leaked!"
-            );
+            for marker in &markers {
+                let needle = marker.as_bytes();
+                let wal_hits = wal_bytes
+                    .windows(needle.len())
+                    .filter(|w| *w == needle)
+                    .count();
+                assert_eq!(
+                    wal_hits, 0,
+                    "marker {marker:?} found in WAL sidecar — plaintext leaked! \
+                     (cardinal principle 2 violation; iteration {i})",
+                );
+            }
         }
     }
 
+    let total_markers = n_iterations * 6;
     eprintln!(
-        "[no_plaintext_on_disk] {n_markers} markers scanned across {total_bytes_scanned} bytes; 0 hits"
+        "[no_plaintext_on_disk] {total_markers} markers across 6 secret fields × {n_iterations} \
+         iterations scanned over {total_bytes_scanned} bytes; 0 hits"
     );
 }
 
@@ -401,7 +441,52 @@ fn adversarial_cross_account_row_transplant_fails() {
     // built from the SQL row.
     let mut v = Vault::open(&path).unwrap();
     let err = v.unlock(&pwd).unwrap_err();
-    matches!(err, pangolin_store::StoreError::AuthenticationFailed);
+    assert!(
+        matches!(err, pangolin_store::StoreError::AuthenticationFailed),
+        "expected AuthenticationFailed for cross-account row transplant; got {err:?}",
+    );
+}
+
+// ---------------------------------------------------------------------
+// MEDIUM-4 (P2 audit): the per-row `revisions.schema_version` column
+// is bound into the AAD on decrypt. Tampering with it diverges the
+// reconstructed AAD from the seal-time AAD, so `Vault::unlock` (which
+// decrypts current heads to populate the cache) returns
+// `AuthenticationFailed`. Without this binding the column was inert.
+// ---------------------------------------------------------------------
+#[test]
+fn adversarial_per_row_schema_version_tamper_fails() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("schema.pvf");
+    let pwd = fresh_password();
+
+    Vault::create(&path, &pwd).unwrap();
+    {
+        let mut v = Vault::open(&path).unwrap();
+        v.unlock(&pwd).unwrap();
+        v.add_account(snapshot_with_marker("schema-tamper"))
+            .unwrap();
+        v.lock();
+        v.close().unwrap();
+    }
+
+    // Edit the head revision's schema_version from 0 to 1 directly in
+    // the SQLite row. The wrapped/sealed AAD was built with 0; the
+    // re-derived AAD on read will be built with 1; AEAD must reject.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let n = conn
+            .execute("UPDATE revisions SET schema_version = 1", [])
+            .unwrap();
+        assert_eq!(n, 1, "expected exactly one revision row to update");
+    }
+
+    let mut v = Vault::open(&path).unwrap();
+    let err = v.unlock(&pwd).unwrap_err();
+    assert!(
+        matches!(err, pangolin_store::StoreError::AuthenticationFailed),
+        "expected AuthenticationFailed for tampered per-row schema_version; got {err:?}",
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -483,9 +568,12 @@ fn adversarial_kdf_param_tampering_fails() {
     let pwd = fresh_password();
     Vault::create(&path, &pwd).unwrap();
     // Edit memory_kib BELOW the validation floor — derive_seed will
-    // reject and StoreError::KdfRejected surfaces. The key invariant
-    // is that the user's correct password no longer "works" after
-    // tampering.
+    // reject. Per MEDIUM-1 of the P2 audit, this collapses into
+    // AuthenticationFailed (not a distinct KdfRejected variant) so a
+    // tamper of the KDF params is indistinguishable from a tamper of
+    // the salt or wrapped ciphertext from the user's POV. The key
+    // invariant is that the user's correct password no longer "works"
+    // after tampering.
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute("UPDATE meta SET kdf_memory_kib = 1024 WHERE id = 0", [])
@@ -494,8 +582,8 @@ fn adversarial_kdf_param_tampering_fails() {
     let mut v = Vault::open(&path).unwrap();
     let err = v.unlock(&pwd).unwrap_err();
     assert!(
-        matches!(err, pangolin_store::StoreError::KdfRejected),
-        "expected KdfRejected for sub-floor params; got {err:?}"
+        matches!(err, pangolin_store::StoreError::AuthenticationFailed),
+        "expected AuthenticationFailed for sub-floor KDF params; got {err:?}",
     );
 
     // Now tamper differently: keep params valid but flip the salt's

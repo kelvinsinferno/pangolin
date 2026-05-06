@@ -58,8 +58,15 @@ pub enum StoreError {
     Cbor(String),
 
     /// Authentication-class failure. Wrong password, tampered ciphertext,
-    /// transplanted row, schema-version mismatch — all collapse here.
+    /// transplanted row, schema-version mismatch, weakened-on-disk KDF
+    /// parameters, internal Argon2 rejection — **all** collapse here.
     /// Callers MUST NOT branch on the underlying cause.
+    ///
+    /// MEDIUM-1 of the P2 audit: a previously-distinct `KdfRejected`
+    /// variant let an attacker who tampered with `kdf_memory_kib` /
+    /// `time_cost` / `parallelism` distinguish "I weakened the KDF
+    /// params" from "I tampered with the salt or wrapped ciphertext."
+    /// Both now collapse here.
     #[error("authentication failed")]
     AuthenticationFailed,
 
@@ -99,14 +106,6 @@ pub enum StoreError {
     /// `PRAGMA integrity_check` returning anything other than "ok").
     #[error("storage corruption detected: {0}")]
     Corrupted(String),
-
-    /// KDF parameter rejection from `pangolin-crypto`. Most often
-    /// surfaces when the on-disk meta KDF params have been edited below
-    /// the validation floor. Treated as a tamper signal — opening a
-    /// vault file with weakened params is indistinguishable from any
-    /// other meta-tamper from the user's POV.
-    #[error("KDF parameters rejected by pangolin-crypto")]
-    KdfRejected,
 }
 
 impl From<AeadError> for StoreError {
@@ -122,10 +121,12 @@ impl From<AeadError> for StoreError {
 
 impl From<KdfError> for StoreError {
     fn from(_: KdfError) -> Self {
-        // Same reasoning as `AeadError`: weakened on-disk KDF params or
-        // an internal Argon2 rejection should not turn into separate
-        // user-visible errors. Map to `KdfRejected` so test code can
-        // observe the structural class without distinguishing the cause.
-        Self::KdfRejected
+        // MEDIUM-1: Same reasoning as `AeadError`. Weakened on-disk KDF
+        // params or an internal Argon2 rejection collapse into the same
+        // `AuthenticationFailed` variant so an attacker who tampers
+        // with the meta row's KDF parameters cannot distinguish that
+        // tamper from a salt or ciphertext tamper. Indistinguishability
+        // is the explicit promise of `THREAT_MODEL.md` row #7.
+        Self::AuthenticationFailed
     }
 }
