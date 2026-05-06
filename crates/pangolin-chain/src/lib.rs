@@ -57,6 +57,9 @@ pub mod mock;
 
 pub use adapter::ChainAdapter;
 pub use error::ChainError;
+pub use signing::{
+    build_signed_revision, canonical_hash, verify_signed_revision, SignatureInvalid,
+};
 pub use types::{ChainAnchor, EventLocation, RevisionEvent, SignedRevision, VaultId};
 
 /// Returns the crate name. Useful for diagnostics and version reporting.
