@@ -63,6 +63,9 @@ pub use signing::{
 };
 pub use types::{ChainAnchor, EventLocation, RevisionEvent, SignedRevision, VaultId};
 
+#[cfg(any(test, feature = "test-utilities"))]
+pub use mock::MockChainAdapter;
+
 /// Returns the crate name. Useful for diagnostics and version reporting.
 #[must_use]
 pub fn name() -> &'static str {

@@ -83,6 +83,12 @@ zeroize            = { workspace = true }
 # Test fixtures need `tempfile` for keystore decryption tests and
 # `pangolin-store` integration tests with on-disk vault files.
 tempfile           = { workspace = true }
+# `#[tokio::test]` for async test cases. Workspace-pinned at the same
+# version chaincli/pangolin-chain use; full-features off (we only need
+# `macros` for the attribute and `rt` for the single-thread executor
+# default). The `rt-multi-thread` + `macros` features inherited from
+# the workspace pin cover both.
+tokio              = { workspace = true }
 # `pangolin-store` test-utilities feature exposes the deterministic-
 # clock and presence-proof helpers we need to drive a `Vault` through
 # the chain anchor flow without a real session prompt.
