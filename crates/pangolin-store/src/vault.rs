@@ -915,6 +915,149 @@ impl Vault {
         }
     }
 
+    // -----------------------------------------------------------------
+    // P4: high-risk operations — presence escalation
+    // -----------------------------------------------------------------
+    //
+    // Per Pangolin §5.3 ("High-Risk Action Escalation"):
+    //   "For high-risk actions, explicit presence MUST be required"
+    //
+    // Even on an active session, ops that surface secret material to
+    // the host UI (reveal_password, export_payload) require the user
+    // to perform an explicit presence confirmation. This is the
+    // "step-up" pattern — the active 1-proof session authorizes
+    // routine credential access, but secrecy-revealing or vault-
+    // migrating ops re-prompt for presence.
+    //
+    // Order of operations (security-critical):
+    //   1. check_session_freshness — session-state structural check.
+    //      If the session is locked / expired, return immediately
+    //      WITHOUT touching the supplied presence proof. The proof's
+    //      single-use flag is preserved for the caller to retry after
+    //      reauth. (PressYPresenceProof::Confirmed is single-use; we
+    //      MUST NOT burn it on a freshness failure that the caller
+    //      can recover from.)
+    //   2. presence.verify() — actually check the proof. Single-use
+    //      replay rejection + freshness rejection live here. Burns
+    //      the proof's one-shot flag.
+    //   3. Perform the high-risk op against the cache / disk.
+    //   4. touch_session — extend the idle deadline.
+
+    /// Reveal the plaintext password for an account.
+    ///
+    /// **High-risk operation** (Pangolin §5.3). Requires:
+    /// - Active session (1-proof maintain, per the routine session
+    ///   policy).
+    /// - PLUS an explicit fresh presence proof passed in `presence`.
+    ///
+    /// Returns a freshly-allocated [`SecretBytes`] cloned from the
+    /// in-memory cache. The original cache entry is untouched; the
+    /// caller is responsible for the lifetime of the returned bytes
+    /// (which zero on drop).
+    ///
+    /// # Errors
+    ///
+    /// - [`StoreError::SessionExpired`] / [`StoreError::NotUnlocked`]
+    ///   if the session is not active (cache is zeroized as a
+    ///   side-effect of `check_session_freshness` if expiry was
+    ///   detected).
+    /// - [`StoreError::AuthenticationFailed`] if the supplied presence
+    ///   proof fails to verify (replayed, stale, or generic failure).
+    /// - [`StoreError::AccountNotFound`] if `id` is unknown to the
+    ///   cache (either truly unknown or tombstoned).
+    pub fn reveal_password(
+        &mut self,
+        id: AccountId,
+        presence: &dyn PresenceProof,
+    ) -> Result<SecretBytes> {
+        // Step 1: structural session check. If this fails, the
+        // presence proof is NOT consumed — the caller can retry after
+        // reauthing.
+        self.check_session_freshness()?;
+        // Step 2: verify presence proof (consumes single-use flag).
+        presence.verify()?;
+        // Step 3: read from the in-memory cache. The cache entry's
+        // password field is a SecretBytes — clone its bytes into a
+        // fresh allocation for the caller. The original stays in the
+        // cache; both copies zero on drop.
+        let active = self.require_active()?;
+        let snapshot = active.cache.get(id).ok_or(StoreError::AccountNotFound)?;
+        let password_bytes = snapshot.password.expose().to_vec();
+        let out = SecretBytes::new(password_bytes);
+        // Step 4: touch the session (extends the idle deadline).
+        self.touch_session();
+        Ok(out)
+    }
+
+    /// Export an account's sealed payload for future key migration /
+    /// backup.
+    ///
+    /// **High-risk operation** (Pangolin §5.3). Same proof discipline
+    /// as [`Self::reveal_password`]: active session + fresh presence
+    /// proof.
+    ///
+    /// Returns the on-disk AEAD ciphertext + nonce concatenation for
+    /// the account's current head revision: `[nonce (24B)] || [ct]`.
+    /// The bytes remain AEAD-sealed under the vault's VDK and require
+    /// the same vault to decrypt — this primitive is for downstream
+    /// migration tooling (P9 vault key rotation, MVP-1 multi-device
+    /// re-wrap) rather than direct plaintext export. Plaintext export
+    /// requires a separate, even-more-dangerous primitive (deferred
+    /// to MVP-1).
+    ///
+    /// # Errors
+    ///
+    /// Same set as [`Self::reveal_password`], plus
+    /// [`StoreError::AccountTombstoned`] if the account is tombstoned
+    /// and [`StoreError::Sqlite`] for any storage-level issue.
+    pub fn export_payload(
+        &mut self,
+        id: AccountId,
+        presence: &dyn PresenceProof,
+    ) -> Result<Vec<u8>> {
+        self.check_session_freshness()?;
+        presence.verify()?;
+
+        // Look up the account's current head and read its sealed
+        // payload directly from the revisions table. We deliberately
+        // do NOT re-seal: the on-disk ciphertext is already AEAD-bound
+        // to (vault_id, account_id, parent_revision_id, schema_version)
+        // via the AAD; downstream migration tooling reconstructs the
+        // same AAD and re-decrypts under the same VDK. Re-sealing
+        // here would just burn entropy and break round-trip
+        // re-import.
+        let head_row = self
+            .conn
+            .query_row(
+                "SELECT ai.tombstoned, r.enc_nonce, r.enc_payload
+                 FROM account_identities ai
+                 JOIN revisions r ON ai.head_revision_id = r.revision_id
+                 WHERE ai.account_id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| {
+                    let tombstoned: i64 = row.get(0)?;
+                    let nonce: Vec<u8> = row.get(1)?;
+                    let payload: Vec<u8> = row.get(2)?;
+                    Ok((tombstoned != 0, nonce, payload))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::AccountNotFound)?;
+        if head_row.0 {
+            return Err(StoreError::AccountTombstoned);
+        }
+        let (_, nonce_blob, payload_blob) = head_row;
+
+        // Concat: [nonce (24)] || [ciphertext (variable)]. Caller
+        // splits at 24 bytes on import.
+        let mut out = Vec::with_capacity(nonce_blob.len() + payload_blob.len());
+        out.extend_from_slice(&nonce_blob);
+        out.extend_from_slice(&payload_blob);
+
+        self.touch_session();
+        Ok(out)
+    }
+
     /// Walk the revision history for `id` from genesis to head. Returns
     /// in chronological order (oldest first). Includes the tombstone
     /// revision when the account is tombstoned.
