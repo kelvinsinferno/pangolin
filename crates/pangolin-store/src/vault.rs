@@ -1,21 +1,41 @@
 //! `Vault` — the only public credential-bearing handle on a `.pvf` file.
 //!
-//! State machine:
+//! State machine (P4 session policy):
 //!
 //! ```text
-//!     ┌──────────┐  open(path)    ┌──────────┐  unlock(pwd)   ┌──────────┐
+//!     ┌──────────┐  open(path)    ┌──────────┐  unlock(P,I)   ┌──────────┐
 //!     │  Closed  │ ─────────────▶ │  Locked  │ ─────────────▶ │  Active  │
 //!     │ (no SQL) │                │ (handle) │ ◀───────────── │ (cache)  │
 //!     └──────────┘                └──────────┘   lock()        └──────────┘
-//!           ▲                          ▲                            │
-//!           │                          │   create(path, pwd)         │
-//!           └─────  close(self) ───────┴─────────────────────────────┘
+//!           ▲                          ▲ ▲                          │
+//!           │                          │ └── idle/abs-max expiry ───┘
+//!           │  close(self)             │     (cache zeroized, then
+//!           └──────────────────────────┘      lock from Expired)
 //! ```
 //!
 //! Only `Active` permits credential operations. `Locked` is structurally
 //! observable (vault id, account count) but reveals no plaintext;
 //! `Closed` releases the `SQLite` handle.
+//!
+//! P4 (session policy) extends P2's two-state machine:
+//!
+//! - `unlock` requires both a [`crate::session::PresenceProof`] AND a
+//!   [`crate::session::IdentityProof`]. Either failing surfaces as
+//!   [`StoreError::AuthenticationFailed`] — the indistinguishability
+//!   discipline from MEDIUM-1 collapses every proof-class failure
+//!   (wrong PIN, replayed presence, KDF rejection, AEAD tamper) into a
+//!   single variant.
+//! - Active sessions auto-expire on idle ([`crate::session::IDLE_TIMEOUT_DEFAULT`]
+//!   = 15 min) or absolute max
+//!   ([`crate::session::ABSOLUTE_MAX_DEFAULT`] = 4 h). Every credential
+//!   op runs `check_session_freshness()` at the top and `touch_session()`
+//!   on success; expiry zeroizes the cache.
+//! - High-risk ops (`reveal_password`, `export_payload`) require an
+//!   explicit fresh presence proof EVEN during an active session
+//!   (Session spec §5.3).
+//! - The mid-action prompt/resume primitive is `Vault::with_session`.
 
+use core::time::Duration;
 use std::fs::{File, OpenOptions};
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
@@ -36,6 +56,9 @@ use crate::revision::{
 };
 use crate::schema;
 use crate::search::DecryptedCache;
+use crate::session::{
+    Clock, IdentityProof, PresenceProof, SessionState, SystemClock, IDLE_TIMEOUT_DEFAULT,
+};
 
 /// Public state observable on a [`Vault`] handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,11 +82,26 @@ pub struct Vault {
     /// with the device's `pangolin_crypto::keys::DeviceKey` verifying
     /// key bytes.
     device_id: DeviceId,
-    state: VaultState,
-    /// `Some` only while `state == Active`. Owns the unwrapped VDK and
-    /// the decrypted-snapshot cache. `lock()` drops this; `Drop` does
-    /// the same.
+    /// P4 session-policy state. Source of truth; the public
+    /// [`VaultState`] view (returned by [`Self::state`]) is derived
+    /// from this. Transitions:
+    ///
+    /// - `Locked` → `Active` on successful 2-proof unlock.
+    /// - `Active` → `Expired` (then immediately `Locked`) when
+    ///   `check_session_freshness` detects expiry.
+    /// - `Active` → `Locked` on explicit `lock()`.
+    session_state: SessionState,
+    /// `Some` only while `session_state` is `Active`. Owns the
+    /// unwrapped VDK and the decrypted-snapshot cache. `lock()` drops
+    /// this; `Drop` does the same; idle/absolute-max expiry drops it
+    /// inside `check_session_freshness` before returning
+    /// [`StoreError::SessionExpired`].
     active: Option<ActiveState>,
+    /// Time source. Production uses [`SystemClock`]; tests inject a
+    /// mockable clock via [`Self::with_clock`] so the idle-timer +
+    /// absolute-max behaviors can be driven deterministically without
+    /// actually waiting 4 hours.
+    clock: Box<dyn Clock>,
     /// Sidecar lock file held open for the lifetime of the `Vault`.
     /// The file is created with `create_new(true)` so a second `open`
     /// attempt on the same vault path observes its presence and
@@ -179,8 +217,9 @@ impl Vault {
                 conn,
                 meta: meta_row,
                 device_id,
-                state: VaultState::Locked,
+                session_state: SessionState::Locked,
                 active: None,
+                clock: Box::new(SystemClock),
                 _lock_file: lock_file,
             })
         })();
@@ -236,8 +275,9 @@ impl Vault {
                 conn,
                 meta,
                 device_id,
-                state: VaultState::Locked,
+                session_state: SessionState::Locked,
                 active: None,
+                clock: Box::new(SystemClock),
                 _lock_file: lock_file,
             })
         })();
@@ -247,16 +287,71 @@ impl Vault {
         result
     }
 
+    /// Override the time source. Used by tests to drive the idle-timer
+    /// + absolute-max behaviors deterministically. Production callers
+    /// never need this — `Vault::open` and `Vault::create` install a
+    /// [`SystemClock`] by default.
+    ///
+    /// # Visibility
+    ///
+    /// Public so the integration test in `tests/e2e.rs` can install a
+    /// long-window test clock if needed. The `Box<dyn Clock>` requires
+    /// `'static` so callers cannot accidentally tie the clock's
+    /// lifetime to a stack frame.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_clock(mut self, clock: Box<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
     /// Vault id (32-byte content-addressed identifier).
     #[must_use]
     pub fn vault_id(&self) -> [u8; VAULT_ID_LEN] {
         self.meta.vault_id
     }
 
-    /// Current state.
+    /// Current state. Maps the richer P4 [`SessionState`] down onto
+    /// the simple two-state observable used by P2-era callers
+    /// (`Active` iff the session is active; `Locked` otherwise — i.e.
+    /// `Locked`, `PendingAuthorization`, and `Expired` all surface as
+    /// `Locked`). For P4-aware code, prefer [`Self::session_state`].
     #[must_use]
     pub fn state(&self) -> VaultState {
-        self.state
+        if self.session_state.is_active() {
+            VaultState::Active
+        } else {
+            VaultState::Locked
+        }
+    }
+
+    /// The full P4 [`SessionState`]. Distinct from [`Self::state`] —
+    /// surfaces `PendingAuthorization` and `Expired` as their own
+    /// states for P4-aware host-UI code.
+    #[must_use]
+    pub fn session_state(&self) -> SessionState {
+        self.session_state
+    }
+
+    /// `true` iff the session is currently active.
+    /// Convenience for the common case in P4-aware callers.
+    #[must_use]
+    pub fn is_session_active(&self) -> bool {
+        self.session_state.is_active()
+    }
+
+    /// Time remaining on the active session, or `None` if the session
+    /// is not active. Returns `Some(Duration::ZERO)` if the deadline
+    /// has already passed but `check_session_freshness` has not yet
+    /// run to transition the state.
+    #[must_use]
+    pub fn session_remaining(&self) -> Option<Duration> {
+        if let SessionState::Active { expires_at, .. } = self.session_state {
+            let now = self.clock.now();
+            Some(expires_at.duration_since(now).unwrap_or(Duration::ZERO))
+        } else {
+            None
+        }
     }
 
     /// On-disk path of the vault file (for diagnostics).
@@ -265,12 +360,35 @@ impl Vault {
         &self.path
     }
 
-    /// Unlock the vault using `password`.
+    /// Unlock the vault. P4 session-policy: requires both a presence
+    /// proof AND an identity proof.
     ///
-    /// Derives the password-AEAD-key via Argon2id at the stored params,
-    /// unwraps the [`pangolin_crypto::keys::WrappedVdk`], decrypts every
-    /// live account head, builds the in-memory cache, and transitions
-    /// to `Active`.
+    /// # Order of operations
+    ///
+    /// 1. `presence.verify()` — fail-fast check (single-use replay
+    ///    resistance + freshness). A second use of a `PressYPresenceProof`
+    ///    returns `AuthError::PresenceAlreadyConsumed`, which collapses
+    ///    to `StoreError::AuthenticationFailed` via the
+    ///    `From<AuthError>` impl on `StoreError`.
+    /// 2. `identity.verify()` — structural check on the identity proof
+    ///    payload (e.g., non-empty PIN). This step deliberately does
+    ///    NOT validate the PIN against any stored hash — see step 3.
+    /// 3. `identity.derive_secret()` — extract the password bytes from
+    ///    the proof.
+    /// 4. `kdf::derive_seed(...)` — Argon2id derivation runs to
+    ///    completion regardless of whether the PIN is "right" or
+    ///    "wrong". This preserves the MEDIUM-1 indistinguishability
+    ///    discipline: an attacker cannot distinguish "wrong PIN" from
+    ///    "tampered KDF params" or "tampered wrapped VDK ciphertext"
+    ///    via timing.
+    /// 5. `WrappedVdk::unwrap_with(&authority)` — AEAD verification.
+    ///    Failure surfaces as `AeadError::Tampered` and collapses to
+    ///    `StoreError::AuthenticationFailed`.
+    /// 6. `build_decrypted_cache(...)` — every live head is decrypted
+    ///    and inserted into the in-memory cache.
+    /// 7. `session_state` set to `Active{expires_at, last_proof_at,
+    ///    session_started_at}` with `expires_at = now +
+    ///    IDLE_TIMEOUT_DEFAULT`.
     ///
     /// # Behavior on a vault that is already `Active`
     ///
@@ -278,42 +396,83 @@ impl Vault {
     /// twice in a row are worth pinning down because they're not what a
     /// casual reader might assume.
     ///
-    /// 1. **Re-call with the same (correct) password while `Active`:**
+    /// 1. **Re-call with valid (correct) proofs while `Active`:**
     ///    succeeds. The full Argon2id derivation runs again (~1–2 s
     ///    burned), the VDK is re-unwrapped, the in-memory cache is
     ///    rebuilt from disk, and the previous `ActiveState` is dropped
-    ///    (its secrets zeroize). Useful for re-validating the password
-    ///    mid-session, but expensive — callers that just want a fresh
-    ///    cache should consider exposing a cheaper "refresh" surface in
-    ///    a future version.
-    /// 2. **Re-call with the *wrong* password while `Active`:** fails
-    ///    with `AuthenticationFailed`, but the existing `ActiveState`
+    ///    (its secrets zeroize). The session timer resets — `expires_at`
+    ///    is set anew from the current clock reading.
+    /// 2. **Re-call with valid presence + WRONG identity (or empty
+    ///    identity) while `Active`:** fails with
+    ///    `AuthenticationFailed`, but the existing `ActiveState`
     ///    is **NOT** modified — the prior unlock remains in effect and
     ///    the cache is intact. The vault does NOT auto-lock on a failed
-    ///    `unlock`. Callers that want fail-then-lock semantics must
-    ///    follow a failed `unlock` with an explicit [`Self::lock`].
-    ///
-    /// In both cases the Argon2id derivation runs to completion before
-    /// any AEAD work (constant-time on the wrong-password vs. tampered-
-    /// metadata distinction).
+    ///    `unlock`.
+    /// 3. **Re-call with a stale/replayed presence proof while
+    ///    `Active`:** fails with `AuthenticationFailed` BEFORE any
+    ///    Argon2id runs. This is acceptable: replay rejection is a
+    ///    structural check on the proof envelope and does not involve
+    ///    any secret-bearing material — the timing distinguishability
+    ///    here is "structural failure vs. crypto failure", not "wrong
+    ///    secret vs. right secret".
     ///
     /// # Errors
     ///
-    /// `StoreError::AuthenticationFailed` for any crypto-class failure
-    /// (wrong password, tampered meta, schema-version drift, KDF param
-    /// tamper, etc. — all collapse into the single variant per the
-    /// MEDIUM-1 fix).
-    pub fn unlock(&mut self, password: &SecretBytes) -> Result<()> {
-        let seed = kdf::derive_seed(password, &self.meta.kdf_salt, &self.meta.kdf_params)?;
+    /// `StoreError::AuthenticationFailed` for any proof-class or
+    /// crypto-class failure (wrong PIN, replayed/stale presence,
+    /// tampered meta, schema-version drift, KDF param tamper, etc. —
+    /// all collapse into the single variant per the MEDIUM-1 fix).
+    pub fn unlock(
+        &mut self,
+        presence: &dyn PresenceProof,
+        identity: &dyn IdentityProof,
+    ) -> Result<()> {
+        // Step 1+2: structural proof verification. Order matters only
+        // in that presence verify is cheaper (no secret material) and
+        // it consumes the proof's one-shot flag — running it first
+        // ensures a stale/replayed presence is caught immediately.
+        // Both verifies route through `From<AuthError> for StoreError`,
+        // collapsing to `AuthenticationFailed`.
+        presence.verify()?;
+        identity.verify()?;
+
+        // Step 3: extract the password bytes. The returned SecretBytes
+        // zeroes on drop, and we drop it explicitly after the kdf
+        // derivation so the plaintext lives the minimum lifetime.
+        let password = identity.derive_secret()?;
+
+        // Step 4: Argon2id derivation runs to completion regardless of
+        // whether the password is "right" or "wrong". The
+        // From<KdfError> for StoreError collapses any KDF rejection
+        // (e.g., tampered KDF params below the floor) into
+        // AuthenticationFailed — preserving MEDIUM-1 indistinguishability.
+        let seed = kdf::derive_seed(&password, &self.meta.kdf_salt, &self.meta.kdf_params)?;
+        // Authority lifetime: only needed for unwrap.
         let authority = AuthorityKey::from_seed(*seed);
+        // Drop the password as soon as the seed is derived so its bytes
+        // are zeroized at the earliest opportunity.
+        drop(password);
+
+        // Step 5: AEAD verification. Failure here is the wrong-password
+        // path (or tampered meta — same outcome by design).
         let wrapped = self.meta.wrapped_vdk();
         let vdk = wrapped.unwrap_with(&authority)?;
         // Authority was only needed to unwrap; drop immediately.
         drop(authority);
 
+        // Step 6: rebuild the decrypted cache.
         let cache = build_decrypted_cache(&self.conn, &self.meta, vdk.aead_key())?;
+
+        // Step 7: install the new ActiveState and session timer. If a
+        // prior ActiveState exists (case 1 above), `Option::replace`
+        // drops the old one, which zeroizes its cache + VDK.
+        let now = self.clock.now();
         self.active = Some(ActiveState { vdk, cache });
-        self.state = VaultState::Active;
+        self.session_state = SessionState::Active {
+            expires_at: now + IDLE_TIMEOUT_DEFAULT,
+            last_proof_at: now,
+            session_started_at: now,
+        };
         Ok(())
     }
 
@@ -323,7 +482,7 @@ impl Vault {
         if let Some(active) = self.active.take() {
             drop(active); // ZeroizeOnDrop on every snapshot in cache.
         }
-        self.state = VaultState::Locked;
+        self.session_state = SessionState::Locked;
     }
 
     /// Close the vault. Locks if necessary, then drops the `SQLite`
@@ -1012,7 +1171,7 @@ impl core::fmt::Debug for Vault {
         f.debug_struct("Vault")
             .field("path", &self.path)
             .field("vault_id", &hex_id)
-            .field("state", &self.state)
+            .field("session_state", &self.session_state)
             .field("cache_size", &self.active.as_ref().map(|a| a.cache.len()))
             // The `meta`, `device_id`, and `_lock_file` fields are
             // intentionally omitted from Debug — `meta` carries the
@@ -1182,12 +1341,31 @@ mod tests {
     use crate::account::AccountSnapshot;
     use crate::error::StoreError;
     use crate::meta::{FORMAT_VERSION, MAGIC};
+    use crate::session::{PinIdentityProof, PressYPresenceProof};
     use pangolin_crypto::secret::SecretBytes;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn fresh_password() -> SecretBytes {
         SecretBytes::new(b"correct horse battery staple".to_vec())
+    }
+    /// Construct a fresh PIN identity proof from `fresh_password`.
+    /// Each call produces a fresh `SecretBytes` allocation; `PoC` PIN
+    /// proofs are not single-use so the same factory can be invoked
+    /// repeatedly within a test.
+    fn fresh_pin() -> PinIdentityProof {
+        PinIdentityProof::new(fresh_password())
+    }
+    /// Wrong-password identity proof for the failure-mode tests.
+    fn wrong_pin() -> PinIdentityProof {
+        PinIdentityProof::new(SecretBytes::new(
+            b"definitely not the right password".to_vec(),
+        ))
+    }
+    /// Construct a fresh "user pressed y" presence proof. `PoC` proofs
+    /// are single-use, so each `unlock` call needs its own.
+    fn fresh_presence() -> PressYPresenceProof {
+        PressYPresenceProof::confirmed()
     }
     fn fresh_snapshot() -> AccountSnapshot {
         AccountSnapshot::new(
@@ -1236,8 +1414,7 @@ mod tests {
         let p = vault_path(&dir, "v.pvf");
         Vault::create(&p, &fresh_password()).unwrap();
         let mut v = Vault::open(&p).unwrap();
-        let bad = SecretBytes::new(b"definitely not the right password".to_vec());
-        let err = v.unlock(&bad).unwrap_err();
+        let err = v.unlock(&fresh_presence(), &wrong_pin()).unwrap_err();
         assert!(matches!(err, StoreError::AuthenticationFailed));
         assert_eq!(v.state(), VaultState::Locked);
     }
@@ -1251,12 +1428,11 @@ mod tests {
     fn second_unlock_with_wrong_password_does_not_lock_vault() {
         let dir = TempDir::new().unwrap();
         let p = vault_path(&dir, "second-unlock.pvf");
-        let pwd = fresh_password();
-        Vault::create(&p, &pwd).unwrap();
+        Vault::create(&p, &fresh_password()).unwrap();
         let mut v = Vault::open(&p).unwrap();
 
-        // First unlock (correct password) — vault enters Active.
-        v.unlock(&pwd).unwrap();
+        // First unlock (correct proofs) — vault enters Active.
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         assert_eq!(v.state(), VaultState::Active);
         let snap = AccountSnapshot::new(
             SecretBytes::new(b"d".to_vec()),
@@ -1271,8 +1447,7 @@ mod tests {
 
         // Second unlock with WRONG password — must fail
         // AuthenticationFailed and must NOT lock the vault.
-        let bad = SecretBytes::new(b"wrong".to_vec());
-        let err = v.unlock(&bad).unwrap_err();
+        let err = v.unlock(&fresh_presence(), &wrong_pin()).unwrap_err();
         assert!(matches!(err, StoreError::AuthenticationFailed));
         assert_eq!(
             v.state(),
@@ -1293,7 +1468,7 @@ mod tests {
         let p = vault_path(&dir, "v.pvf");
         Vault::create(&p, &fresh_password()).unwrap();
         let mut v = Vault::open(&p).unwrap();
-        v.unlock(&fresh_password()).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         let id = v.add_account(fresh_snapshot()).unwrap();
         assert!(v.get_account(id).is_some());
         v.delete_account(id).unwrap();
@@ -1341,7 +1516,7 @@ mod tests {
         let p = vault_path(&dir, "v.pvf");
         Vault::create(&p, &fresh_password()).unwrap();
         let mut v = Vault::open(&p).unwrap();
-        v.unlock(&fresh_password()).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         v.add_account(fresh_snapshot()).unwrap();
         assert_eq!(v.state(), VaultState::Active);
         assert_eq!(v.list_accounts().len(), 1);
@@ -1361,7 +1536,7 @@ mod tests {
         let p = vault_path(&dir, "v.pvf");
         Vault::create(&p, &fresh_password()).unwrap();
         let mut v = Vault::open(&p).unwrap();
-        v.unlock(&fresh_password()).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         v.add_account(fresh_snapshot()).unwrap();
         let unpub = v.unpublished_revisions().unwrap();
         assert_eq!(unpub.len(), 1);
@@ -1389,7 +1564,7 @@ mod tests {
         let p = vault_path(&dir, "v.pvf");
         Vault::create(&p, &fresh_password()).unwrap();
         let mut v = Vault::open(&p).unwrap();
-        v.unlock(&fresh_password()).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         let id = v.add_account(fresh_snapshot()).unwrap();
         for _ in 0..5 {
             v.update_account(id, fresh_snapshot()).unwrap();
@@ -1428,7 +1603,7 @@ mod tests {
         let p = vault_path(&dir, "linear.pvf");
         Vault::create(&p, &fresh_password()).unwrap();
         let mut v = Vault::open(&p).unwrap();
-        v.unlock(&fresh_password()).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         let id = v.add_account(fresh_snapshot()).unwrap();
         for _ in 0..5 {
             v.update_account(id, fresh_snapshot()).unwrap();
@@ -1457,7 +1632,7 @@ mod tests {
         let p = vault_path(&dir, "fork.pvf");
         Vault::create(&p, &fresh_password()).unwrap();
         let mut v = Vault::open(&p).unwrap();
-        v.unlock(&fresh_password()).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         let id = v.add_account(fresh_snapshot()).unwrap();
         // Linear: genesis (R0) -> R1 -> R2.
         let r1 = v.update_account(id, fresh_snapshot()).unwrap();
@@ -1494,7 +1669,7 @@ mod tests {
         let p = vault_path(&dir, "mixed.pvf");
         Vault::create(&p, &fresh_password()).unwrap();
         let mut v = Vault::open(&p).unwrap();
-        v.unlock(&fresh_password()).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         // Two accounts, only the second one will be forked.
         let id_clean = v.add_account(fresh_snapshot()).unwrap();
         v.update_account(id_clean, fresh_snapshot()).unwrap();
@@ -1522,7 +1697,7 @@ mod tests {
         let p = vault_path(&dir, "unknown.pvf");
         Vault::create(&p, &fresh_password()).unwrap();
         let mut v = Vault::open(&p).unwrap();
-        v.unlock(&fresh_password()).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         let bogus = crate::account::AccountId::from_bytes([0x99; 32]);
         let err = v.account_heads(bogus).unwrap_err();
         assert!(matches!(err, StoreError::AccountNotFound));
@@ -1541,7 +1716,7 @@ mod tests {
         let id;
         {
             let mut v = Vault::open(&p).unwrap();
-            v.unlock(&fresh_password()).unwrap();
+            v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
             id = v.add_account(fresh_snapshot()).unwrap();
             v.update_account(id, fresh_snapshot()).unwrap();
             v.lock();
@@ -1576,14 +1751,14 @@ mod tests {
         let id;
         {
             let mut v = Vault::open(&p).unwrap();
-            v.unlock(&fresh_password()).unwrap();
+            v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
             id = v.add_account(fresh_snapshot()).unwrap();
             v.lock();
             v.close().unwrap();
         }
         // Reopen cycle.
         let mut v = Vault::open(&p).unwrap();
-        v.unlock(&fresh_password()).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         let reloaded = v.get_account(id).expect("missing on reopen");
         assert!(bool::from(fresh_snapshot().ct_eq(reloaded)));
     }
