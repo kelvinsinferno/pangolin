@@ -50,11 +50,20 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 CREATE TABLE IF NOT EXISTS account_identities (
-    account_id        BLOB PRIMARY KEY,
-    created_at        INTEGER NOT NULL,
-    last_modified_at  INTEGER NOT NULL,
-    tombstoned        INTEGER NOT NULL DEFAULT 0,
-    head_revision_id  BLOB    NOT NULL
+    account_id              BLOB PRIMARY KEY,
+    created_at              INTEGER NOT NULL,
+    last_modified_at        INTEGER NOT NULL,
+    tombstoned              INTEGER NOT NULL DEFAULT 0,
+    head_revision_id        BLOB    NOT NULL,
+    -- P8 fix CRIT-1: defensive sentinel set to 1 inside
+    -- Vault::ingest_chain_revision when a foreign-device chain event
+    -- lands via the genuine-foreign-INSERT path (none of the three
+    -- idempotency-merge arms matched). User-facing reads and edits
+    -- refuse on this account until the upcoming pangolin-cli resolve
+    -- (P9) clears the flag. Existing vault files predating this
+    -- column have it added via migrate_frozen_pending_resolve_column
+    -- at open time; default 0 so pre-migration accounts are unfrozen.
+    frozen_pending_resolve  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS revisions (
@@ -140,6 +149,47 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     // leave us with some-but-not-all tables on a fresh-vault path.
     conn.execute_batch(&format!("BEGIN IMMEDIATE; {SCHEMA_DDL} COMMIT;"))?;
 
+    // P8 fix-pass migration: the `frozen_pending_resolve` column on
+    // `account_identities` was added to address CRIT-1 (tombstone-flag
+    // non-propagation). Existing vault files predating this fix have
+    // an `account_identities` table that does NOT include the column;
+    // we ALTER TABLE … ADD COLUMN at open if it's missing so legacy
+    // files keep opening cleanly. The default 0 means pre-migration
+    // accounts are unfrozen — exactly the right semantics, since they
+    // had no opportunity to be foreign-ingested under the old code
+    // path (the old `ingest_chain_revision` had no flag to set).
+    migrate_frozen_pending_resolve_column(conn)?;
+
+    Ok(())
+}
+
+/// Add the `frozen_pending_resolve` column to `account_identities` on
+/// vaults that predate the P8 fix-pass schema. Idempotent — checks
+/// `PRAGMA table_info` first and only runs the `ALTER TABLE` when the
+/// column is absent. Existing rows pick up the column's
+/// `DEFAULT 0`.
+fn migrate_frozen_pending_resolve_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(account_identities)")?;
+    let rows = stmt.query_map([], |row| {
+        let name: String = row.get(1)?;
+        Ok(name)
+    })?;
+    let mut has_column = false;
+    for r in rows {
+        let name = r?;
+        if name == "frozen_pending_resolve" {
+            has_column = true;
+            break;
+        }
+    }
+    drop(stmt);
+    if !has_column {
+        conn.execute(
+            "ALTER TABLE account_identities
+             ADD COLUMN frozen_pending_resolve INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 

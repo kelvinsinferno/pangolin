@@ -59,6 +59,8 @@ pub async fn run(global: &GlobalArgs, args: PublishArgs) -> Result<()> {
     // keystore.
     let rpc_url_default = read_deployment_default_rpc(&deployment_path)?;
     let rpc_url = cfg.rpc_url_or_default(&rpc_url_default);
+    // P8 fix MED-2: refuse non-https RPC URLs unless --allow-insecure-rpc.
+    cfg.enforce_rpc_scheme(&rpc_url)?;
     let adapter = BaseSepoliaAdapter::new_with_keystore(
         &rpc_url,
         &deployment_path,

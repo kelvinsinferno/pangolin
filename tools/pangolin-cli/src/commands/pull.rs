@@ -35,6 +35,8 @@ pub async fn run(global: &GlobalArgs, args: PullArgs) -> Result<()> {
 
     let rpc_url_default = read_deployment_default_rpc(&deployment_path)?;
     let rpc_url = cfg.rpc_url_or_default(&rpc_url_default);
+    // P8 fix MED-2: refuse non-https RPC URLs unless --allow-insecure-rpc.
+    cfg.enforce_rpc_scheme(&rpc_url)?;
     let adapter = BaseSepoliaAdapter::new_read_only(&rpc_url, &deployment_path)
         .await
         .context("failed to construct read-only BaseSepoliaAdapter")?;
@@ -59,15 +61,21 @@ pub async fn run(global: &GlobalArgs, args: PullArgs) -> Result<()> {
                         .collect::<Vec<_>>(),
                 }))
                 .collect::<Vec<_>>(),
+            "frozen": report
+                .frozen
+                .iter()
+                .map(|id| hex::encode(id.as_bytes()))
+                .collect::<Vec<_>>(),
         });
         println!("{summary}");
     } else {
         eprintln!(
             "pull summary: {} new events ingested; last_pulled_block = {}; \
-             {} forked account(s)",
+             {} forked account(s); {} frozen account(s)",
             report.applied,
             report.last_pulled_block,
             report.forks.len(),
+            report.frozen.len(),
         );
         for fork in &report.forks {
             eprintln!(
@@ -79,9 +87,19 @@ pub async fn run(global: &GlobalArgs, args: PullArgs) -> Result<()> {
                 eprintln!("    {}", hex::encode(h.as_bytes()));
             }
         }
+        for frozen in &report.frozen {
+            // P8 fix CRIT-1: surface the frozen set so the user
+            // knows which accounts to address with `pangolin-cli
+            // resolve` (P9). We list the accounts individually so
+            // a structured tool can grep them out.
+            eprintln!(
+                "  frozen: account {} is frozen pending resolve",
+                hex::encode(frozen.as_bytes()),
+            );
+        }
     }
-    // Forks are NOT an error — exit 0 regardless. P9 owns
-    // resolution.
+    // Forks and frozen accounts are NOT errors — exit 0 regardless.
+    // P9 owns resolution.
     Ok(())
 }
 

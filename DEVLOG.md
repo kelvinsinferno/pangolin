@@ -172,7 +172,7 @@ Plan at `docs/issue-plans/P8.md` Kelvin-approved (Q4–Q6 answered: two-key PoC 
 - **P8-6** ships the integration suite. `tests/two_vault_roundtrip.rs` runs three plan-required scenarios (`convergence`, `symmetric_fork`, `idempotent_repeat_pull`) using two vaults that share identity by file-copy. `tests/integration_base_sepolia.rs` is gated `#[cfg(feature = "integration-tests")]`. Adds `src/lib.rs` so integration tests can import the orchestration core (binary crates can't be imported by integration tests under `tests/*.rs` without a lib path).
 - **P8-7** documentation (this commit): THREAT_MODEL.md row (9 enumerated threats covering forged publish, replay, partition during chunked pull, dirty-entry leak, cross-vault replay, pre-publish check race, MockChainAdapter substitution, two-key gas-wallet correlation, forged-event-stream); E2E-003 entry (automated MockChainAdapter path + manual Base Sepolia path with funded keystore); this DEVLOG entry; surface table updated.
 
-**Test count delta:** 195 → 248 (53 new tests). Breakdown:
+**Test count delta:** 195 → 242 lib tests + 6 integration tests = 248 total. The standard gate command `cargo test --workspace --lib` runs the 242 lib tests; the 6 integration tests live under `tools/pangolin-cli/tests/*.rs` and run when `cargo test --workspace` (no `--lib`) is invoked. Breakdown:
 - pangolin-store: 75 → 90 (+15 = 12 dirty + 3 ingest_chain_revision)
 - pangolin-cli unit (lib): 0 → 32 (cli, config, keystore, sync publish + pull, status, vault_open)
 - pangolin-cli integration: 0 → 6 (3 cli_arg_parsing + 3 two_vault_roundtrip)
@@ -204,3 +204,56 @@ Plan at `docs/issue-plans/P8.md` Kelvin-approved (Q4–Q6 answered: two-key PoC 
 - Master plan §16.8 layout table needs to record `tools/pangolin-cli/` (was `crates/pangolin-cli/` in the original layout; deviation per Q5 / §A8 of the P8 plan).
 
 Unblocks **P9** (conflict resolution UX — `pangolin-cli resolve <account-id> --keep <revision-id>`), **P10** (tombstone-aware deletes), **P11** (E2E recorded screencast).
+
+## 2026-05-06 · P8 fix-pass — §16.5 audit findings (CRIT-1, MED-1, MED-2, MED-3, MED-4, LOW-1, LOW-2)  ✅ SIGNOFF
+
+Single fix-pass commit on top of the P8-7 tip. Addresses every actionable finding from the §16.5 security audit; HIGH-1 + INFO-1/2/3 are no-code-change per auditor (bounded by Cardinal Principle 3 / observation-class).
+
+**CRIT-1 — Tombstone-flag non-propagation.** Closed via a `frozen_pending_resolve` sentinel column on `account_identities` (additive `ALTER TABLE … ADD COLUMN` migration at `Vault::open` so existing P0..P7+P8-pre-fix vault files keep opening cleanly). `Vault::ingest_chain_revision` sets the flag to `1` when the ingest takes the genuine-foreign-INSERT path (none of the three idempotency-merge arms matched). User-facing read paths (`get_account`, `list_accounts`, `search`, `reveal_password`, `reveal_notes`, `reveal_totp_secret`, `export_payload`) refuse on frozen accounts: `Option`-returning APIs filter the row out; the explicit `Result`-returning ops surface a new `StoreError::AccountFrozenPendingResolve { account_id }` variant. Edit paths (`update_account`, `delete_account`, `mark_dirty`) refuse with the same error so a user editing their stale plaintext copy of a chain-modified account cannot create a silent fork. The flag is cleared by the upcoming `pangolin-cli resolve` (P9). The new `Vault::list_frozen_accounts` exposes the set; `pangolin-cli pull` includes the count in its summary, and `pangolin-cli status` reports per-account ids.
+
+**MED-1 — Spoofed chain anchor on local pre-publish row.** The third merge arm of `Vault::ingest_chain_revision` (the `(account_id, parent_revision, enc_payload, schema_version, chain_tx_hash IS NULL)` content merge) now ALSO requires `device_id` to match. The auditor's preferred re-fetch-via-`get_revision` approach was rejected because under attacker-controlled-RPC both directions of the conversation are spoofable; the `device_id` binding is a content-bound check that doesn't depend on the transport. Trade-off: under the PoC two-key model the legitimate own-publish round-trip ALSO fails the `device_id` match (publish generates an ephemeral signing `DeviceKey` per call whose pubkey differs from the local row's random `device_id` from `Vault::open`), so it routes through idempotency arm #2 `(account_id, chain_tx_hash, block, log)` after `mark_published` has stamped the local row's chain anchor. Cross-vault round-trips (vault B pulling vault A's publishes) intentionally trigger CRIT-1's freeze. MVP-1's switch to D-006's derived wallet aligns local-row and chain-event `device_id`, restoring silent cross-device merge under the non-attack case while preserving the new defense.
+
+**MED-2 — HTTP RPC URL accepted.** Added `--allow-insecure-rpc` global flag and `ResolvedConfig::enforce_rpc_scheme` helper. Default behavior: any URL whose scheme is not `https` (case-insensitive) is refused with a clear remediation hint mentioning the override flag. Both `pangolin-cli publish` and `pangolin-cli pull` call `enforce_rpc_scheme` immediately after `rpc_url_or_default` and before the chain adapter is constructed.
+
+**MED-3 — `--vault-path` not canonicalized.** Added `vault_open::canonicalize_vault_path` and routed every `Vault::open` callsite (status, publish, pull) through it. The status output now includes a `vault_path` row showing the resolved absolute path; the password prompt also references the canonical path so a user with a confused working directory sees what they're actually unlocking.
+
+**MED-4 — `forbid(unsafe_code)` not unconditional.** Replaced the `cfg_attr`-guarded variants in `tools/pangolin-cli/src/{main,lib}.rs` with a single unconditional `#![forbid(unsafe_code)]`. `forbid` cannot be relaxed by a downstream `allow`, so a future test annotating a block with `#[allow(unsafe_code)]` would fail the build.
+
+**LOW-1.** Updated `tools/pangolin-cli/Cargo.toml` comment to reflect the bin+lib hybrid added in P8-6.
+
+**LOW-2.** Updated DEVLOG line on test count attribution to clarify "242 lib tests + 6 integration tests = 248 total" before the fix-pass.
+
+**HIGH-1, INFO-1/2/3.** No code change per auditor. THREAT_MODEL.md rows #1 and #9 reaffirmed as honest framing (verified read-through; no prose-tightening needed — the rows already explicitly call out v0 contract not transporting signature bytes and the bound by Cardinal Principle 3).
+
+**Threat model additions.** Rows #10 (CRIT-1's `frozen_pending_resolve` sentinel) and #11 (MED-1's `device_id`-binding tightening) appended to `THREAT_MODEL.md`'s pangolin-cli section.
+
+**Test count delta:** 242 → 253 lib tests (+11). New tests:
+
+- `pangolin-store::vault::tests::frozen_after_foreign_ingest_blocks_reveal_password`
+- `pangolin-store::vault::tests::own_publish_roundtrip_does_not_freeze`
+- `pangolin-store::vault::tests::frozen_account_blocks_mark_dirty`
+- `pangolin-store::vault::tests::frozen_account_listed_separately_in_pull_result`
+- `pangolin-store::vault::tests::legacy_vault_picks_up_frozen_column_on_open`
+- `pangolin-cli::config::tests::http_rpc_rejected_without_flag`
+- `pangolin-cli::config::tests::http_rpc_accepted_with_flag`
+- `pangolin-cli::config::tests::https_rpc_always_accepted`
+- `pangolin-cli::config::tests::https_scheme_match_is_case_insensitive`
+- `pangolin-cli::commands::status::tests::vault_path_canonicalized_in_status_output`
+- `pangolin-cli::cli::tests::allow_insecure_rpc_flag_parses`
+
+Plus `tests/two_vault_roundtrip.rs::convergence` updated to assert that B's pull triggers the CRIT-1 freeze sentinel (its previous "merge succeeds silently" assertion is no longer the post-fix expected behavior under PoC two-key — see the inline comment on the test for the MVP-1 path that restores the silent merge).
+
+**Critical invariants verified at the fix-pass tip:**
+
+1. `cargo tree -p pangolin-crypto | grep -ci serde` → 0 (HIGH-1 holds)
+2. No new `unsafe`; `forbid(unsafe_code)` is now unconditional (MED-4 strengthens this)
+3. No plaintext on disk
+4. Per-chunk all-or-nothing in pull (CRIT-1's freeze sentinel doesn't change this)
+5. Per-account atomicity in publish; frozen accounts refuse `mark_dirty` cleanly
+6. `cargo fmt --all --check` clean
+7. `cargo clippy --workspace --all-targets -- -D warnings` clean
+8. `cargo test --workspace --lib` — 253/253 passing (242 baseline + 11 new)
+9. `cargo audit` clean (the 2 pre-existing unmaintained-warning entries documented in `deny.toml` remain unchanged)
+10. `cargo deny check` — advisories ok, bans ok, licenses ok, sources ok
+11. `cargo build --workspace --release` clean
+12. `pangolin-cli --help` lists `status`, `publish`, `pull` and the new `--allow-insecure-rpc` flag

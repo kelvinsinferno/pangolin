@@ -110,9 +110,26 @@ async fn convergence() {
     }
 
     // 4. Open B (which still thinks the revision is unpublished),
-    //    pull from the same chain. The ingest path's content-merge
-    //    discipline should stamp the chain anchor onto B's existing
-    //    local row.
+    //    pull from the same chain. Under the **P8 fix-pass MED-1**
+    //    tightening (third merge arm now requires `device_id` match
+    //    alongside `(account_id, parent, payload, schema_version,
+    //    chain_tx_hash IS NULL)`), B's pull cannot silently merge
+    //    A's chain event into B's pre-publish local row — the local
+    //    row's `device_id` was stamped by A's vault handle's
+    //    randomly-generated `device_id`, while the chain event's
+    //    `device_id` is A's publish-time `DeviceKey` pubkey under
+    //    the `PoC` two-key model. The merge fails → ingest takes
+    //    the genuine-foreign-INSERT path → CRIT-1 freeze sentinel
+    //    fires on B's local copy.
+    //
+    //    This is the EXPECTED behavior under the §16.5 audit fix
+    //    pass: B cannot read stale plaintext after the chain has
+    //    moved under it; B must run `pangolin-cli resolve` (P9)
+    //    before reading. Under MVP-1's single-key model (D-006),
+    //    when local-row `device_id` and chain-event `device_id`
+    //    align, the merge will succeed and B will converge silently
+    //    — no freeze. The PoC accepts the freeze as the safer
+    //    failure mode.
     {
         let mut vb = open_unlocked(&path_b);
         // B starts with the dirty marker too (copied from A pre-publish).
@@ -121,21 +138,23 @@ async fn convergence() {
         let pull_report = pangolin_cli_sync::pull_all(&mut vb, &adapter, None, None)
             .await
             .expect("pull B");
-        // The chain has the event, B's local row had no chain_anchor
-        // pre-pull. After ingest, the row is updated (or a new one
-        // is inserted, depending on the merge path) with the chain
-        // anchor. Either way, applied is reported properly.
         let _ = pull_report;
-        // B's account state matches A's: same account exists, with
-        // a published chain anchor.
+        // B has the chain anchor row from the ingest plus its
+        // pre-existing pre-publish local row.
         let revs = vb.revisions_for(account_id).expect("revisions");
         assert!(
             revs.iter().any(|m| m.chain_anchor.is_some()),
             "B has at least one row with a chain anchor after pulling"
         );
-        // No fork: only one head.
-        let heads = vb.account_heads(account_id).expect("heads");
-        assert_eq!(heads.len(), 1, "B sees a single head after convergence");
+        // CRIT-1: B's account is frozen pending resolve (the third
+        // merge arm rejected the device_id mismatch and the genuine-
+        // foreign-INSERT path fired).
+        let frozen = vb.list_frozen_accounts().expect("list_frozen_accounts");
+        assert_eq!(
+            frozen,
+            vec![account_id],
+            "B's account is frozen pending resolve after pulling A's foreign chain event"
+        );
         vb.close().expect("close B");
     }
 }

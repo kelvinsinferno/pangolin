@@ -29,8 +29,13 @@ integration-tests = []
 # Local crates — pangolin-cli is the orchestrator binary that wires the
 # encrypted local store (pangolin-store) to the chain transport
 # (pangolin-chain) plus the device-key signing path (pangolin-crypto).
-# pangolin-cli is intentionally a binary-only crate with zero library
-# exports (see `lib.rs` absence — there is no lib).
+# pangolin-cli ships both `src/main.rs` (the binary entry point) and
+# `src/lib.rs` (an internal-use library surface) as of P8-6 — Cargo's
+# binary-crate model does not let integration tests under `tests/*.rs`
+# import a binary's modules, so the same source files compile as both
+# library AND binary. The library is intentionally NOT a public API —
+# external consumers should depend on `pangolin-store` + `pangolin-chain`
+# directly. See the `lib.rs` module-doc for details.
 pangolin-store  = { path = "../../crates/pangolin-store" }
 pangolin-chain  = { path = "../../crates/pangolin-chain" }
 pangolin-crypto = { path = "../../crates/pangolin-crypto" }

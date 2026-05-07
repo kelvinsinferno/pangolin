@@ -257,6 +257,17 @@ pub struct PullReport {
     pub applied: usize,
     /// Forked-account summaries detected during this run.
     pub forks: Vec<ForkSummary>,
+    /// **P8 fix CRIT-1.** Account ids that are in the
+    /// `frozen_pending_resolve` state after this pull run. These
+    /// accounts had a foreign-device chain event ingested under
+    /// them; user-facing reads + edits refuse on them until the
+    /// upcoming `pangolin-cli resolve` (P9) clears the flag. The
+    /// list is the union of accounts frozen during this run AND
+    /// accounts that were already frozen before — `pull_all`
+    /// surfaces the full snapshot so the caller knows what the
+    /// vault's frozen-set looks like after the pull, regardless of
+    /// when each entry was set.
+    pub frozen: Vec<AccountId>,
     /// Final value of `last_pulled_block` after the run (the
     /// chain head at the time of the call, advanced per-chunk).
     pub last_pulled_block: u64,
@@ -316,6 +327,7 @@ pub async fn pull_all<A: ChainAdapter + ?Sized>(
     let mut report = PullReport {
         applied: 0,
         forks: Vec::new(),
+        frozen: Vec::new(),
         last_pulled_block: starting_checkpoint,
     };
 
@@ -429,6 +441,16 @@ pub async fn pull_all<A: ChainAdapter + ?Sized>(
             });
         }
     }
+
+    // **P8 fix CRIT-1.** Snapshot the vault's frozen-account set
+    // AFTER the chunk loop has run so the caller sees a stable
+    // post-pull view. We surface the full set rather than just
+    // accounts frozen-during-this-run because a user reading the
+    // pull summary cares about "what's blocking my next read?",
+    // not which run set each freeze.
+    report.frozen = vault
+        .list_frozen_accounts()
+        .map_err(|e| anyhow::anyhow!("list_frozen_accounts: {e}"))?;
 
     Ok(report)
 }

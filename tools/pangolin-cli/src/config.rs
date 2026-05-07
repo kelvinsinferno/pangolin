@@ -46,6 +46,11 @@ pub struct ResolvedConfig {
     /// the moment the chain adapter is built — see
     /// [`Self::rpc_url_or_default`].
     pub rpc_url_flag: Option<String>,
+    /// **P8 fix MED-2.** When `true`, `enforce_rpc_scheme` permits
+    /// non-`https` RPC URLs (e.g., `http://localhost:8545` for
+    /// local-anvil testing). Default `false` — production callers
+    /// should never need to flip this on.
+    pub allow_insecure_rpc: bool,
     /// `--json` toggle.
     pub json: bool,
 }
@@ -73,6 +78,7 @@ impl ResolvedConfig {
         Ok(Self {
             deployment_file,
             rpc_url_flag: global.rpc_url.clone(),
+            allow_insecure_rpc: global.allow_insecure_rpc,
             json: global.json,
         })
     }
@@ -87,6 +93,32 @@ impl ResolvedConfig {
             Some(s) if !s.is_empty() => s.to_owned(),
             _ => deployment_default.to_owned(),
         }
+    }
+
+    /// **P8 fix MED-2.** Refuse a non-`https` RPC URL unless the
+    /// caller explicitly opted in via `--allow-insecure-rpc`. Should
+    /// be called by every subcommand that constructs a chain
+    /// adapter immediately after `rpc_url_or_default`.
+    ///
+    /// Errors carry a clear remediation hint so a user pointing
+    /// `pangolin-cli` at `http://localhost:8545` for local anvil
+    /// testing knows the exact flag to add.
+    pub fn enforce_rpc_scheme(&self, url: &str) -> Result<()> {
+        // Treat `https://...` (any case) as the only acceptable
+        // scheme by default. The check is scheme-prefix-only — the
+        // adapter does its own URL-parse validation downstream;
+        // this is a defense-in-depth gate that fails fast before
+        // any keystore prompt or RPC dial.
+        let lower = url.to_ascii_lowercase();
+        if lower.starts_with("https://") {
+            return Ok(());
+        }
+        if self.allow_insecure_rpc {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "RPC URL must use https; pass --allow-insecure-rpc to override (use only for local development). got: {url}"
+        ))
     }
 
     /// Require the deployment-file path; fail with a clear error if
@@ -111,6 +143,7 @@ mod tests {
         GlobalArgs {
             deployment_file: None,
             rpc_url: rpc_flag.map(ToOwned::to_owned),
+            allow_insecure_rpc: false,
             json: false,
         }
     }
@@ -121,6 +154,7 @@ mod tests {
         let cfg = ResolvedConfig {
             deployment_file: None,
             rpc_url_flag: Some("https://flag.test/rpc".into()),
+            allow_insecure_rpc: false,
             json: false,
         };
         assert_eq!(
@@ -136,6 +170,7 @@ mod tests {
         let cfg = ResolvedConfig {
             deployment_file: None,
             rpc_url_flag: None,
+            allow_insecure_rpc: false,
             json: false,
         };
         assert_eq!(
@@ -151,6 +186,7 @@ mod tests {
         let cfg = ResolvedConfig {
             deployment_file: None,
             rpc_url_flag: Some(String::new()),
+            allow_insecure_rpc: false,
             json: false,
         };
         assert_eq!(
@@ -165,6 +201,7 @@ mod tests {
         let cfg = ResolvedConfig {
             deployment_file: None,
             rpc_url_flag: None,
+            allow_insecure_rpc: false,
             json: false,
         };
         let err = cfg.require_deployment_file().unwrap_err();
@@ -183,5 +220,75 @@ mod tests {
         let g = args(Some("https://flag.test/rpc"));
         let cfg = ResolvedConfig::from_args(&g).expect("from_args ok");
         assert_eq!(cfg.rpc_url_flag.as_deref(), Some("https://flag.test/rpc"));
+        assert!(!cfg.allow_insecure_rpc, "default is secure");
+    }
+
+    /// **P8 fix MED-2.** An `http://` RPC URL is refused by default.
+    #[test]
+    fn http_rpc_rejected_without_flag() {
+        let cfg = ResolvedConfig {
+            deployment_file: None,
+            rpc_url_flag: Some("http://localhost:8545".into()),
+            allow_insecure_rpc: false,
+            json: false,
+        };
+        let err = cfg
+            .enforce_rpc_scheme("http://localhost:8545")
+            .expect_err("non-https must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("https"),
+            "error message must mention https; got: {msg}"
+        );
+        assert!(
+            msg.contains("--allow-insecure-rpc"),
+            "error must mention the override flag; got: {msg}"
+        );
+    }
+
+    /// **P8 fix MED-2.** With `--allow-insecure-rpc`, an `http://`
+    /// URL is accepted (for local-anvil testing).
+    #[test]
+    fn http_rpc_accepted_with_flag() {
+        let cfg = ResolvedConfig {
+            deployment_file: None,
+            rpc_url_flag: Some("http://localhost:8545".into()),
+            allow_insecure_rpc: true,
+            json: false,
+        };
+        cfg.enforce_rpc_scheme("http://localhost:8545")
+            .expect("with --allow-insecure-rpc, http is permitted");
+    }
+
+    /// `https://` is always accepted, regardless of the
+    /// `allow_insecure_rpc` flag.
+    #[test]
+    fn https_rpc_always_accepted() {
+        for allow_insecure_rpc in [false, true] {
+            let cfg = ResolvedConfig {
+                deployment_file: None,
+                rpc_url_flag: Some("https://example.test/rpc".into()),
+                allow_insecure_rpc,
+                json: false,
+            };
+            cfg.enforce_rpc_scheme("https://example.test/rpc")
+                .expect("https is always accepted");
+        }
+    }
+
+    /// HTTPS-scheme matching is case-insensitive (per RFC 3986
+    /// scheme-name canonicalization).
+    #[test]
+    fn https_scheme_match_is_case_insensitive() {
+        let cfg = ResolvedConfig {
+            deployment_file: None,
+            rpc_url_flag: None,
+            allow_insecure_rpc: false,
+            json: false,
+        };
+        cfg.enforce_rpc_scheme("HTTPS://example.test/rpc")
+            .expect("HTTPS:// is accepted");
+        cfg.enforce_rpc_scheme("Https://example.test/rpc")
+            .expect("Https:// is accepted");
     }
 }

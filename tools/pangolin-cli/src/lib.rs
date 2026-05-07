@@ -18,8 +18,9 @@
 //! library; if you need pangolin orchestration in a different
 //! binary, lift the relevant code into a `pangolin-sync` crate first.
 
-#![cfg_attr(not(test), forbid(unsafe_code))]
-#![cfg_attr(test, deny(unsafe_code))]
+// **P8 fix MED-4.** `forbid(unsafe_code)` is now unconditional —
+// see `main.rs` for the same fix and rationale.
+#![forbid(unsafe_code)]
 
 // `sync` is the orchestration core that integration tests drive
 // directly.

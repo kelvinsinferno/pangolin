@@ -330,3 +330,58 @@ the PR.
    at the device boundary. v0 contract has no signature semantics;
    this client-side check is the load-bearing defense until v1
    records the signature on-chain (MVP-2 issue 2.1).
+10. **Tombstone / foreign-edit non-propagation across vault file
+    copies (P8 fix-pass CRIT-1).** Defense: when
+    `Vault::ingest_chain_revision` lands an event that does not
+    match any of the three idempotency-merge arms, the
+    `account_identities.frozen_pending_resolve` sentinel column
+    is set to `1` for the affected account. Once set, every
+    user-facing read (`get_account`, `list_accounts`, `search`,
+    `reveal_password`, `reveal_notes`, `reveal_totp_secret`,
+    `export_payload`) refuses on the account — `get_account`
+    returns `None`; `list_accounts` and `search` filter the row
+    out; the reveal/export ops surface
+    `StoreError::AccountFrozenPendingResolve { account_id }`.
+    Edits (`update_account`, `delete_account`, `mark_dirty`)
+    refuse with the same error, so a user editing their stale
+    plaintext copy of a chain-modified account cannot create a
+    silent fork. The flag is cleared by the upcoming
+    `pangolin-cli resolve` subcommand (P9). The defense closes
+    the "vault A creates account, vault B copies the file, vault
+    A tombstones on chain, vault B's `reveal_password` still
+    returns plaintext" attack the §16.5 audit identified. The
+    schema column is added at vault open via
+    `migrate_frozen_pending_resolve_column` so existing
+    P0..P7+P8-pre-fix vault files keep opening cleanly.
+11. **Spoofed chain anchor on local pre-publish row (P8 fix-pass
+    MED-1).** Defense: the third merge arm of
+    `Vault::ingest_chain_revision` (the content-merge that stamps
+    a chain anchor onto an existing local pre-publish row) now
+    requires `device_id` to match alongside `(account_id,
+    parent_revision, enc_payload, schema_version)` and
+    `chain_tx_hash IS NULL`. An attacker controlling the RPC
+    would have to produce an event whose `device_id` matches the
+    victim's locally-stored row's `device_id` — under the PoC
+    two-key model that field is set from `Vault.device_id`
+    (random per vault-handle bytes generated at `Vault::open`),
+    not visible on the chain. A forged event with a different
+    `device_id` falls through to the genuine-foreign-INSERT path,
+    which sets the CRIT-1 freeze sentinel — i.e., a forgery
+    surfaces as a refused-read rather than a silent merge. The
+    audit's preferred re-fetch-via-`get_revision` approach was
+    rejected because under attacker-controlled-RPC both
+    directions of the conversation are spoofable; the device_id
+    binding is a content-bound check that doesn't depend on the
+    transport. Trade-off: the legitimate own-publish round-trip
+    under PoC two-key model also fails the device_id match
+    (publish generates an ephemeral signing `DeviceKey` per call
+    whose pubkey differs from the local row's random
+    `device_id`), so it routes through idempotency arm #2
+    `(account_id, chain_tx_hash, block, log)` after
+    `mark_published` has stamped the local row's chain anchor.
+    Cross-vault round-trips (vault B pulling vault A's
+    publishes) intentionally trigger the freeze under threat #10
+    above. MVP-1's switch to the derived wallet (D-006) aligns
+    local-row and chain-event `device_id`, restoring silent
+    cross-device merge under the non-attack case while
+    preserving the device_id binding's defense.

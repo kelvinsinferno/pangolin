@@ -6,23 +6,54 @@
 //! returned `Vault` is in `Active` state; the caller can run any
 //! credential or metadata op on it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use pangolin_crypto::secret::SecretBytes;
 use pangolin_store::session::{PinIdentityProof, PressYPresenceProof};
 use pangolin_store::Vault;
 
-/// Open the `.pvf` at `path` and unlock it. Prompts for the password
-/// without echo if `flag_value` is `None`.
-pub fn open_and_unlock(path: &Path, flag_value: Option<&str>) -> Result<Vault> {
-    let mut vault = Vault::open(path).with_context(|| {
+/// **P8 fix MED-3.** Canonicalize a `--vault-path` argument.
+///
+/// The vault file path is fully resolved before any open/unlock work
+/// runs — relative-path traversal or symlink redirection surfaces at
+/// the boundary so the user's prompt + status output show the exact
+/// absolute path being acted on.
+///
+/// `canonicalize` is the right primitive when the file already
+/// exists (every subcommand of P8 expects a pre-existing `.pvf` —
+/// `pangolin-cli` does not yet ship a `create` subcommand). If the
+/// file is missing, `canonicalize` returns `Err` with a `NotFound`
+/// kind, which we re-package with a friendly hint.
+///
+/// The returned `PathBuf` is always absolute and free of `.` /
+/// `..` components.
+pub fn canonicalize_vault_path(path: &Path) -> Result<PathBuf> {
+    path.canonicalize().with_context(|| {
         format!(
-            "failed to open vault at {} (file missing? wrong format?)",
+            "could not canonicalize vault path {} (file missing? broken symlink?)",
             path.display()
         )
+    })
+}
+
+/// Open the `.pvf` at `path` and unlock it. Prompts for the password
+/// without echo if `flag_value` is `None`.
+///
+/// **P8 fix MED-3.** The supplied `path` is canonicalized before
+/// open; the prompt + any error messages reference the absolute
+/// path so a user passing `./vault.pvf` from a working directory
+/// other than the one they think sees the actual file location
+/// being acted on.
+pub fn open_and_unlock(path: &Path, flag_value: Option<&str>) -> Result<Vault> {
+    let canonical = canonicalize_vault_path(path)?;
+    let mut vault = Vault::open(&canonical).with_context(|| {
+        format!(
+            "failed to open vault at {} (file missing? wrong format?)",
+            canonical.display()
+        )
     })?;
-    let password = read_vault_password(path, flag_value)?;
+    let password = read_vault_password(&canonical, flag_value)?;
     let presence = PressYPresenceProof::confirmed();
     let identity = PinIdentityProof::new(password);
     vault
@@ -35,15 +66,19 @@ pub fn open_and_unlock(path: &Path, flag_value: Option<&str>) -> Result<Vault> {
 /// when the user just wants the metadata-only counters
 /// (`last_pulled_block`, dirty count, etc.) without typing the
 /// password.
+///
+/// **P8 fix MED-3.** Same canonicalization discipline as
+/// `open_and_unlock`.
 //
 // P8-3: defined here for use by `status` (P8-5). Marked
 // `#[allow(dead_code)]` until that consumer lands.
 #[allow(dead_code)]
 pub fn open_locked(path: &Path) -> Result<Vault> {
-    let vault = Vault::open(path).with_context(|| {
+    let canonical = canonicalize_vault_path(path)?;
+    let vault = Vault::open(&canonical).with_context(|| {
         format!(
             "failed to open vault at {} (file missing? wrong format?)",
-            path.display()
+            canonical.display()
         )
     })?;
     Ok(vault)

@@ -35,8 +35,13 @@
 //! keystore strategy because the dev's existing Coinbase Base Sepolia
 //! faucet drips into the keystore address, not the derived address.
 
-#![cfg_attr(not(test), forbid(unsafe_code))]
-#![cfg_attr(test, deny(unsafe_code))]
+// **P8 fix MED-4.** `forbid(unsafe_code)` is now unconditional —
+// the previous `cfg_attr`-guarded variants made the lint a `deny`
+// inside `#[cfg(test)]` blocks, which lets a future test annotate a
+// block with `#[allow(unsafe_code)]` and bypass the check. `forbid`
+// cannot be relaxed by a downstream `allow`, so this satisfies the
+// audit checklist literally and at compile time.
+#![forbid(unsafe_code)]
 
 use anyhow::Result;
 use clap::Parser;

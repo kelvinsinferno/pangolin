@@ -55,9 +55,19 @@ pub struct GlobalArgs {
     pub deployment_file: Option<PathBuf>,
 
     /// Override the RPC URL. Otherwise uses `$BASE_SEPOLIA_RPC_URL` or
-    /// the deployment file's `chain.rpc_default`.
+    /// the deployment file's `chain.rpc_default`. Must use `https://`
+    /// unless `--allow-insecure-rpc` is set (the latter is for local
+    /// anvil testing only).
     #[arg(long, global = true, env = RPC_URL_ENV_VAR)]
     pub rpc_url: Option<String>,
+
+    /// **P8 fix MED-2.** Allow `http://` (or other non-`https`)
+    /// scheme RPC URLs. Default refuses non-HTTPS URLs to defeat
+    /// passive eavesdroppers and active MITM attackers on the
+    /// transport layer. Toggle this on only for local development
+    /// against a local anvil node — never in production.
+    #[arg(long, global = true)]
+    pub allow_insecure_rpc: bool,
 
     /// Emit JSON-Lines summary output where supported (`status` and
     /// the per-run summaries of `publish` / `pull`). Errors and
@@ -287,5 +297,28 @@ mod tests {
         ])
         .expect("--json parses");
         assert!(cli.global.json);
+    }
+
+    /// **P8 fix MED-2.** `--allow-insecure-rpc` is recognized as a
+    /// global flag and defaults to false.
+    #[test]
+    fn allow_insecure_rpc_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "pangolin-cli",
+            "--allow-insecure-rpc",
+            "status",
+            "--vault-path",
+            "/tmp/v.pvf",
+        ])
+        .expect("--allow-insecure-rpc parses");
+        assert!(cli.global.allow_insecure_rpc);
+
+        let cli_default =
+            Cli::try_parse_from(["pangolin-cli", "status", "--vault-path", "/tmp/v.pvf"])
+                .expect("default parses");
+        assert!(
+            !cli_default.global.allow_insecure_rpc,
+            "default is secure (HTTPS-only)"
+        );
     }
 }

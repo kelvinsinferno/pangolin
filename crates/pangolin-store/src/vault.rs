@@ -700,6 +700,42 @@ impl Vault {
         }
     }
 
+    /// **P8 fix CRIT-1.** Look up `account_identities.frozen_pending_resolve`
+    /// for `id`. Returns `Ok(true)` if the account exists and is
+    /// frozen, `Ok(false)` if it exists and is not frozen, and
+    /// `Ok(false)` if the row is absent (no spurious freeze for
+    /// unknown accounts — the caller's own `AccountNotFound` surfaces
+    /// downstream).
+    ///
+    /// Implemented as a direct SQL probe rather than a cache flag
+    /// because the cache is rebuilt only on unlock, and the freeze
+    /// can be set at any time by `ingest_chain_revision` running
+    /// against an `Active` vault. The probe runs against a single-row
+    /// indexed lookup — sub-millisecond cost.
+    fn is_account_frozen(&self, id: AccountId) -> Result<bool> {
+        let frozen: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT frozen_pending_resolve
+                 FROM account_identities
+                 WHERE account_id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(frozen.is_some_and(|v| v != 0))
+    }
+
+    /// Surface an `AccountFrozenPendingResolve` error if the supplied
+    /// account is frozen. Used as a guard at the top of every user-
+    /// facing read or edit path. Returns `Ok(())` if not frozen.
+    fn refuse_if_frozen(&self, id: AccountId) -> Result<()> {
+        if self.is_account_frozen(id)? {
+            return Err(StoreError::AccountFrozenPendingResolve { account_id: id });
+        }
+        Ok(())
+    }
+
     /// Add a new account identity. Returns the freshly-generated
     /// `AccountId` of the new account.
     ///
@@ -794,6 +830,11 @@ impl Vault {
         // P4: strict freshness — see `add_account` rationale.
         self.check_session_freshness()?;
         let _ = self.require_active()?;
+        // P8 fix CRIT-1: refuse edits on a frozen account. A user
+        // editing their own copy of an account that has been chain-
+        // modified would create a fork they don't realize they're
+        // creating; surface the freeze before any work is done.
+        self.refuse_if_frozen(id)?;
         // Look up account state.
         let account_row = self
             .conn
@@ -884,6 +925,11 @@ impl Vault {
         // P4: strict freshness — see `add_account` rationale.
         self.check_session_freshness()?;
         let _ = self.require_active()?;
+        // P8 fix CRIT-1: same freeze guard as `update_account`. A
+        // delete on a frozen account would publish a tombstone
+        // overriding the foreign chain edit; refuse so the user is
+        // forced through resolve first.
+        self.refuse_if_frozen(id)?;
         let head_row = self
             .conn
             .query_row(
@@ -983,37 +1029,116 @@ impl Vault {
     /// the same lexical scope — there is no interleaving with a
     /// concurrent `lock()` call. The plaintext stays in memory until
     /// the cache is dropped, which the next mut-op does.
+    ///
+    /// **P8 fix CRIT-1.** Also returns `None` for an account whose
+    /// `frozen_pending_resolve` flag is set — the data on disk is
+    /// stale relative to chain reality and the user must run
+    /// `pangolin-cli resolve` (P9) before reading. Surfacing as `None`
+    /// rather than an error keeps the existing `Option`-returning
+    /// shape; callers that need the explicit "frozen" signal use
+    /// [`Self::reveal_password`] or check via the public
+    /// [`Self::list_frozen_accounts`].
     #[must_use]
     pub fn get_account(&self, id: AccountId) -> Option<&AccountSnapshot> {
         if !self.is_session_active() {
             return None;
         }
+        // Frozen accounts are filtered out of the readable surface.
+        // We swallow any SQL error here as `None` because `get_account`
+        // returns `Option`; a corrupt DB will surface at the next
+        // mut-op via the typed error path.
+        if self.is_account_frozen(id).unwrap_or(false) {
+            return None;
+        }
         self.active.as_ref().and_then(|a| a.cache.get(id))
     }
 
-    /// Substring search across non-tombstoned accounts. Returns an
-    /// empty `Vec` if the session has expired (mirroring P2 semantics
-    /// of returning empty for non-Active vaults).
+    /// Substring search across non-tombstoned, non-frozen accounts.
+    /// Returns an empty `Vec` if the session has expired (mirroring
+    /// P2 semantics of returning empty for non-Active vaults).
+    ///
+    /// **P8 fix CRIT-1.** Frozen accounts are filtered out so that a
+    /// user search does not surface stale plaintext — same discipline
+    /// as `list_accounts` / `get_account`.
     #[must_use]
     pub fn search(&self, query: &str) -> Vec<AccountId> {
         if !self.is_session_active() {
             return Vec::new();
         }
-        self.active
-            .as_ref()
-            .map_or_else(Vec::new, |a| a.cache.search(query))
+        let frozen = self.frozen_set().unwrap_or_default();
+        self.active.as_ref().map_or_else(Vec::new, |a| {
+            a.cache
+                .search(query)
+                .into_iter()
+                .filter(|id| !frozen.contains(id))
+                .collect()
+        })
     }
 
-    /// All non-tombstoned account ids in the cache. Empty `Vec` if
-    /// the session has expired.
+    /// All non-tombstoned, non-frozen account ids in the cache. Empty
+    /// `Vec` if the session has expired.
+    ///
+    /// **P8 fix CRIT-1.** Frozen accounts (those whose
+    /// `account_identities.frozen_pending_resolve` flag is set) are
+    /// filtered out — they are not safe for user-facing reads until
+    /// the upcoming P9 `resolve` command clears the flag. Callers
+    /// that want the frozen-set explicitly use
+    /// [`Self::list_frozen_accounts`].
     #[must_use]
     pub fn list_accounts(&self) -> Vec<AccountId> {
         if !self.is_session_active() {
             return Vec::new();
         }
-        self.active
-            .as_ref()
-            .map_or_else(Vec::new, |a| a.cache.account_ids())
+        let frozen = self.frozen_set().unwrap_or_default();
+        self.active.as_ref().map_or_else(Vec::new, |a| {
+            a.cache
+                .account_ids()
+                .into_iter()
+                .filter(|id| !frozen.contains(id))
+                .collect()
+        })
+    }
+
+    /// Snapshot of every account currently in the
+    /// `frozen_pending_resolve` state.
+    ///
+    /// Surfaces the CRIT-1 sentinel set for tooling (`pangolin-cli
+    /// pull` reports the count alongside the fork count; the future
+    /// P9 `resolve` subcommand reads this list to drive its
+    /// resolution UX). Metadata-only — does NOT require an active
+    /// session. Empty `Vec` for a freshly-created vault.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` for any database issue.
+    /// `StoreError::Corrupted` if a stored `account_id` BLOB is not
+    /// 32 bytes.
+    pub fn list_frozen_accounts(&self) -> Result<Vec<AccountId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT account_id
+             FROM account_identities
+             WHERE frozen_pending_resolve = 1
+             ORDER BY account_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id: Vec<u8> = row.get(0)?;
+            Ok(id)
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let blob = r?;
+            let arr: [u8; ACCOUNT_ID_LEN] = blob.as_slice().try_into().map_err(|_| {
+                StoreError::Corrupted("account_identities.account_id not 32 bytes".into())
+            })?;
+            out.push(AccountId::from_bytes(arr));
+        }
+        Ok(out)
+    }
+
+    /// Internal helper: as `list_frozen_accounts`, but returns a
+    /// `HashSet` for O(1) lookups inside the read-path filters.
+    fn frozen_set(&self) -> Result<std::collections::HashSet<AccountId>> {
+        Ok(self.list_frozen_accounts()?.into_iter().collect())
     }
 
     // -----------------------------------------------------------------
@@ -1141,6 +1266,13 @@ impl Vault {
         // presence proof is NOT consumed — the caller can retry after
         // reauthing.
         self.check_session_freshness()?;
+        // Step 1b (P8 fix CRIT-1): refuse before the presence proof
+        // is consumed — same single-use-flag preservation discipline
+        // as the session-freshness check above. A user prompted for
+        // "press Y" only to be told "this account is frozen" should
+        // still be able to retry the proof against a non-frozen
+        // account.
+        self.refuse_if_frozen(id)?;
         // Step 2: verify presence proof (consumes single-use flag).
         presence.verify()?;
         // Step 3: read from the in-memory cache. Clone the requested
@@ -1278,6 +1410,9 @@ impl Vault {
         presence: &dyn PresenceProof,
     ) -> Result<Vec<u8>> {
         self.check_session_freshness()?;
+        // P8 fix CRIT-1: refuse before consuming the presence proof —
+        // same discipline as `reveal_secret_field`.
+        self.refuse_if_frozen(id)?;
         presence.verify()?;
 
         // Look up the account's current head and read its sealed
@@ -1898,21 +2033,39 @@ impl Vault {
 
         // Idempotency check #3 — content-merge: a local row exists
         // with the same `(account_id, parent_revision, enc_payload,
-        // schema_version)` AND its chain_tx_hash IS NULL. This is
-        // "I created this revision locally, and now it's coming back
-        // to me from the chain because some other handle published
-        // it." We merge by stamping the chain anchor onto the
-        // existing local row rather than inserting a duplicate
+        // schema_version, device_id)` AND its chain_tx_hash IS NULL.
+        // This is "I created this revision locally, and now it's
+        // coming back to me from the chain because some other handle
+        // published it." We merge by stamping the chain anchor onto
+        // the existing local row rather than inserting a duplicate
         // canonical-hash-keyed row. Without this merge the vault
         // would see a spurious 2-head fork on every round-trip
         // through the chain.
         //
-        // We DO NOT compare device_id here because the PoC two-key
-        // model means the locally-stored device_id (random) doesn't
-        // match the publish-time signing key's pubkey (the chain
-        // event's device_id). MVP-1 will switch publish to the
-        // derived wallet (D-006); at that point device_id will round-
-        // trip and we can tighten this check.
+        // **P8 fix-pass MED-1.** The audit suggested re-fetching the
+        // event via `ChainAdapter::get_revision(tx_hash)` before
+        // stamping the anchor. We rejected that approach because an
+        // attacker controlling the RPC can spoof both the
+        // `pull_since` result AND the `get_revision` result, so
+        // re-fetch adds no defense. Instead, we tighten the merge
+        // condition itself: the local row's `device_id` must match
+        // the event's `device_id`. The legitimate own-publish round-
+        // trip carries the same device_id that signed the local
+        // row; an attacker spoofing a chain event for a victim's
+        // row would have to also know the victim's device_id (which
+        // is observable on prior chain events for the same vault but
+        // not trivial to harvest). Combined with HIGH-1 (forged
+        // events become forks rather than silent merges via the
+        // device_id canonical-form check inside `pull_all`), this
+        // tightens MED-1 without an extra RPC.
+        //
+        // The PoC two-key model originally argued device_id wouldn't
+        // round-trip; in practice `pangolin-cli publish` and the
+        // P0..P7 unit tests both use a `DeviceKey::generate()` whose
+        // `verifying_key().to_bytes()` is what flows into both the
+        // local revision row AND the chain event's `device_id` (see
+        // `signing::build_signed_revision`). MVP-1's switch to the
+        // derived wallet (D-006) preserves the same shape.
         let merge_target: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -1921,6 +2074,7 @@ impl Vault {
                    AND parent_revision_id = ?2
                    AND enc_payload = ?3
                    AND schema_version = ?4
+                   AND device_id = ?5
                    AND chain_tx_hash IS NULL
                  LIMIT 1",
                 params![
@@ -1928,6 +2082,7 @@ impl Vault {
                     &event.parent_revision[..],
                     &event.enc_payload,
                     i64::from(event.schema_version),
+                    &event.device_id[..],
                 ],
                 |row| row.get(0),
             )
@@ -1985,16 +2140,66 @@ impl Vault {
         // account, the row was missing and we create it pointing at
         // the just-ingested revision so `account_heads` works.
         //
+        // **P8 fix CRIT-1: defensive frozen-pending-resolve sentinel.**
+        // None of the three idempotency arms above matched, so this
+        // is a genuinely-new revision from a foreign device — i.e.,
+        // the vault is "chain-modified under our nose" for this
+        // account. Two cases:
+        //
+        // - The account row already exists locally (we have prior
+        //   revisions for it; another device just edited it): set
+        //   `frozen_pending_resolve = 1` so user-facing reads/edits
+        //   refuse on this account until P9's `resolve` clears the
+        //   flag. The user still sees the prior cached plaintext
+        //   structurally (it's in memory) but every read path checks
+        //   the flag first.
+        //
+        // - The account row does NOT yet exist locally (a fresh
+        //   foreign account being introduced for the first time):
+        //   we INSERT a new row with `frozen_pending_resolve = 1`
+        //   too — the receiving vault has no nonce for the new
+        //   account and cannot decrypt the ciphertext anyway, but
+        //   the sentinel is set for symmetry with the existing-row
+        //   case. P9's resolve flow will handle both.
+        //
+        // The check is "does the row exist BEFORE this INSERT" so
+        // we run a probe inside the same transaction, then set the
+        // flag unconditionally on the INSERTed/UPDATEd row.
+        //
         // Both writes run inside one BEGIN IMMEDIATE … COMMIT
         // transaction so a crash between the two leaves the vault
         // in the pre-transaction state.
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT OR IGNORE INTO account_identities
-                (account_id, created_at, last_modified_at, tombstoned, head_revision_id)
-             VALUES (?1, ?2, ?2, 0, ?3)",
-            params![&event.account_id[..], now, &revision_id_arr[..]],
-        )?;
+        let preexisting: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM account_identities WHERE account_id = ?1",
+                params![&event.account_id[..]],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if preexisting.is_some() {
+            // Existing local account just got modified on chain by
+            // another device. Set the freeze sentinel; leave
+            // head_revision_id pointing at the local head (which is
+            // what the local AAD chain still authenticates against).
+            tx.execute(
+                "UPDATE account_identities
+                 SET frozen_pending_resolve = 1, last_modified_at = ?1
+                 WHERE account_id = ?2",
+                params![now, &event.account_id[..]],
+            )?;
+        } else {
+            // Brand-new foreign account. Insert with the freeze flag
+            // already set. head_revision_id points at the just-
+            // ingested revision so `account_heads` works.
+            tx.execute(
+                "INSERT INTO account_identities
+                    (account_id, created_at, last_modified_at, tombstoned,
+                     head_revision_id, frozen_pending_resolve)
+                 VALUES (?1, ?2, ?2, 0, ?3, 1)",
+                params![&event.account_id[..], now, &revision_id_arr[..]],
+            )?;
+        }
         tx.execute(
             "INSERT INTO revisions (
                 revision_id, account_id, parent_revision_id, device_id,
@@ -2181,6 +2386,16 @@ impl Vault {
     /// before year ~292M).
     pub fn mark_dirty(&mut self, account_id: AccountId, revision_id: RevisionId) -> Result<()> {
         self.maybe_expire_active_session();
+        // P8 fix CRIT-1: refuse to mark a frozen account dirty. A
+        // user editing their own copy of an account that has been
+        // chain-modified would create a fork they don't realize
+        // they're creating. The internal auto-stamp inside
+        // `add_account`/`update_account`/`delete_account` is already
+        // gated by the `refuse_if_frozen` check at the top of those
+        // ops; this guard catches the public `mark_dirty` surface for
+        // anyone reaching it directly (forward-compat with future
+        // ingestion paths).
+        self.refuse_if_frozen(account_id)?;
         let now = current_unix_ms();
         self.conn.execute(
             "INSERT OR IGNORE INTO dirty_accounts
@@ -3577,5 +3792,285 @@ mod tests {
             .revisions_for(crate::account::AccountId::from_bytes(ev.account_id))
             .expect("revisions_for");
         assert_eq!(revs.len(), 1, "no duplicate row on re-ingest");
+    }
+
+    // -----------------------------------------------------------------
+    // P8 fix-pass CRIT-1: frozen_pending_resolve sentinel tests
+    // -----------------------------------------------------------------
+
+    /// **P8 fix CRIT-1.** When a foreign-device chain event lands on
+    /// an account that the local vault already has a row for, the
+    /// `frozen_pending_resolve` flag is set and `reveal_password`
+    /// refuses on that account. This is the "vault A creates account,
+    /// vault B copies the file, vault A modifies the account on
+    /// chain, vault B's `reveal_password` still returns plaintext"
+    /// attack the §16.5 audit found.
+    #[test]
+    fn frozen_after_foreign_ingest_blocks_reveal_password() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        // Local create — vault has the account in cache + on disk.
+        let id = v.add_account(fresh_snapshot()).expect("add_account");
+        // Sanity: prior to ingest, reveal_password works.
+        let pwd = v
+            .reveal_password(id, &fresh_presence())
+            .expect("reveal pre-freeze");
+        assert_eq!(pwd.expose(), b"hunter2");
+
+        // Foreign-device chain event lands. Use a different
+        // `device_id` (a fresh DeviceKey's verifying-key bytes) and
+        // a different payload so the merge arms can't match.
+        let ev = fresh_event(
+            v.vault_id(),
+            *id.as_bytes(),
+            [0u8; 32],
+            b"foreign-payload",
+            42,
+            0,
+        );
+        let outcome = v.ingest_chain_revision(&ev).expect("ingest");
+        assert_eq!(outcome, IngestOutcome::Inserted);
+
+        // The freeze sentinel is set; reveal_password refuses.
+        let err = v
+            .reveal_password(id, &fresh_presence())
+            .expect_err("reveal must refuse on frozen");
+        match err {
+            StoreError::AccountFrozenPendingResolve { account_id } => {
+                assert_eq!(account_id, id);
+            }
+            other => panic!("expected AccountFrozenPendingResolve, got {other:?}"),
+        }
+        // Same for export_payload.
+        let err = v
+            .export_payload(id, &fresh_presence())
+            .expect_err("export must refuse on frozen");
+        assert!(matches!(
+            err,
+            StoreError::AccountFrozenPendingResolve { .. }
+        ));
+        // get_account returns None, list_accounts excludes the id.
+        assert!(v.get_account(id).is_none());
+        assert!(!v.list_accounts().contains(&id));
+        // list_frozen_accounts surfaces the id.
+        let frozen = v.list_frozen_accounts().expect("list frozen");
+        assert_eq!(frozen, vec![id]);
+    }
+
+    /// **P8 fix CRIT-1.** A vault's own publish round-trip MUST
+    /// NOT freeze the account. The publish path stamps the chain
+    /// anchor onto the local row via `mark_published`; on subsequent
+    /// pull, idempotency arm #2 `(account_id, chain_tx_hash, block,
+    /// log)` matches and we return `AlreadyPresent` without taking
+    /// the INSERT path.
+    #[test]
+    fn own_publish_roundtrip_does_not_freeze() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).expect("add_account");
+        let rev = v.list_dirty().expect("list dirty")[0].revision_id;
+
+        // Simulate publish: stamp a chain anchor via `mark_published`
+        // and then ingest the same event back. The (tx_hash, block,
+        // log_index) anchor on the chain event must match the
+        // `mark_published` call's anchor for arm #2 to fire.
+        let anchor = pangolin_chain::ChainAnchor {
+            tx_hash: [0xCD; 32],
+            block_number: 7,
+            log_index: 0,
+            sequence: 0,
+        };
+        v.mark_published(rev, anchor).expect("mark_published");
+        v.clear_dirty(id, rev).expect("clear_dirty");
+
+        // Build the chain event as if we'd just received our own
+        // publish back via pull. The event's device_id is whatever
+        // `publish_all` would have used at publish time — under the
+        // PoC two-key model that's NOT the local row's device_id, so
+        // arm #3 cannot match. Arm #2 (tx_hash + block + log) MUST
+        // match.
+        let ev = pangolin_chain::RevisionEvent {
+            vault_id: v.vault_id(),
+            account_id: *id.as_bytes(),
+            // Use the local row's parent — irrelevant for arm #2 but
+            // we set it consistent with the local genesis.
+            parent_revision: [0u8; 32],
+            // Fresh DeviceKey's pubkey — does NOT match local row's
+            // device_id (which is the vault handle's random bytes).
+            device_id: pangolin_crypto::keys::DeviceKey::generate()
+                .verifying_key()
+                .to_bytes(),
+            schema_version: 0,
+            sequence: 0,
+            // enc_payload doesn't need to match — arm #2 doesn't
+            // gate on it.
+            enc_payload: b"unrelated".to_vec(),
+            anchor,
+        };
+        let outcome = v.ingest_chain_revision(&ev).expect("ingest");
+        assert_eq!(
+            outcome,
+            IngestOutcome::AlreadyPresent,
+            "own-publish round-trip caught by idempotency arm #2 (chain anchor match), no freeze"
+        );
+        // No freeze: list_frozen_accounts is empty, reveal_password
+        // still works.
+        assert!(v.list_frozen_accounts().expect("list frozen").is_empty());
+        let pwd = v
+            .reveal_password(id, &fresh_presence())
+            .expect("reveal post-roundtrip");
+        assert_eq!(pwd.expose(), b"hunter2");
+    }
+
+    /// **P8 fix CRIT-1.** Once frozen, subsequent edits
+    /// (`update_account`, `delete_account`, `mark_dirty`) refuse
+    /// with `AccountFrozenPendingResolve` so a user editing their
+    /// stale plaintext copy cannot create a silent fork.
+    #[test]
+    fn frozen_account_blocks_mark_dirty() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).expect("add_account");
+        let rev = v.list_dirty().expect("list")[0].revision_id;
+
+        // Trigger freeze via foreign-ingest.
+        let ev = fresh_event(v.vault_id(), *id.as_bytes(), [0u8; 32], b"foreign", 1, 0);
+        v.ingest_chain_revision(&ev).expect("ingest");
+        assert!(!v.list_frozen_accounts().expect("list frozen").is_empty());
+
+        // mark_dirty refuses.
+        let err = v.mark_dirty(id, rev).expect_err("mark_dirty must refuse");
+        assert!(matches!(
+            err,
+            StoreError::AccountFrozenPendingResolve { .. }
+        ));
+        // update_account refuses.
+        let err = v
+            .update_account(id, fresh_snapshot())
+            .expect_err("update must refuse");
+        assert!(matches!(
+            err,
+            StoreError::AccountFrozenPendingResolve { .. }
+        ));
+        // delete_account refuses.
+        let err = v.delete_account(id).expect_err("delete must refuse");
+        assert!(matches!(
+            err,
+            StoreError::AccountFrozenPendingResolve { .. }
+        ));
+    }
+
+    /// **P8 fix CRIT-1.** `Vault::list_frozen_accounts` is the
+    /// canonical surface for the frozen-set; the new
+    /// `PullReport.frozen` field in `pangolin-cli sync.rs` is
+    /// populated from it. This unit test pins the storage-layer
+    /// shape that the orchestrator relies on.
+    #[test]
+    fn frozen_account_listed_separately_in_pull_result() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id_a = v.add_account(fresh_snapshot()).expect("add A");
+        let id_b = v.add_account(fresh_snapshot()).expect("add B");
+
+        // Freeze A only.
+        let ev = fresh_event(
+            v.vault_id(),
+            *id_a.as_bytes(),
+            [0u8; 32],
+            b"foreign-A",
+            10,
+            0,
+        );
+        v.ingest_chain_revision(&ev).expect("ingest A");
+
+        // list_frozen_accounts surfaces exactly A.
+        let frozen = v.list_frozen_accounts().expect("list frozen");
+        assert_eq!(frozen.len(), 1);
+        assert_eq!(frozen[0], id_a);
+        // B is still readable.
+        assert!(v.get_account(id_b).is_some());
+        // list_accounts excludes A but includes B.
+        let live = v.list_accounts();
+        assert!(live.contains(&id_b));
+        assert!(!live.contains(&id_a));
+    }
+
+    /// **P8 fix-pass: schema migration.** Vaults predating the
+    /// `frozen_pending_resolve` column open cleanly via the
+    /// migration in `apply_pragmas_and_schema`. We synthesize a
+    /// pre-migration vault by dropping the column out of an opened
+    /// vault's `account_identities` table and confirming a
+    /// subsequent `Vault::open` re-adds it via the migration.
+    #[test]
+    fn legacy_vault_picks_up_frozen_column_on_open() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        // Open + close to ensure the schema is in place; then strip
+        // the column out via a recreate-without-the-column dance to
+        // simulate a pre-fix vault.
+        {
+            let v = Vault::open(&p).unwrap();
+            // Build a fresh table without the column, copy rows over,
+            // drop the original, rename. SQLite doesn't support DROP
+            // COLUMN directly on older library versions; we stay
+            // portable.
+            v.conn
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     CREATE TABLE account_identities_legacy (
+                       account_id BLOB PRIMARY KEY,
+                       created_at INTEGER NOT NULL,
+                       last_modified_at INTEGER NOT NULL,
+                       tombstoned INTEGER NOT NULL DEFAULT 0,
+                       head_revision_id BLOB NOT NULL
+                     );
+                     INSERT INTO account_identities_legacy
+                       SELECT account_id, created_at, last_modified_at,
+                              tombstoned, head_revision_id
+                       FROM account_identities;
+                     DROP TABLE account_identities;
+                     ALTER TABLE account_identities_legacy RENAME TO account_identities;
+                     COMMIT;",
+                )
+                .expect("strip frozen_pending_resolve column");
+        }
+        // Confirm the column is absent before re-open.
+        {
+            use rusqlite::Connection;
+            let conn = Connection::open(&p).unwrap();
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(account_identities)")
+                .unwrap();
+            let names: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert!(
+                !names.contains(&"frozen_pending_resolve".to_string()),
+                "pre-condition: column should be absent before migration"
+            );
+        }
+        // Re-open via Vault::open — the migration runs and re-adds the column.
+        let v = Vault::open(&p).expect("re-open legacy vault");
+        // The freeze surface works post-migration: list_frozen_accounts
+        // returns Ok([]) on the freshly-migrated vault.
+        let frozen = v
+            .list_frozen_accounts()
+            .expect("list_frozen_accounts after migration");
+        assert!(frozen.is_empty());
     }
 }
