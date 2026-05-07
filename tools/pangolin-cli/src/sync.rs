@@ -581,41 +581,252 @@ impl From<StoreError> for ResolveError {
     }
 }
 
-/// **P9-3 skeleton.** End-to-end resolve flow for a single account.
-/// The full body — pre-publish re-pull, plaintext read + re-seal,
-/// publish via `ChainAdapter`, ingest + `clear_frozen` — lands in P9-4.
+/// **P9-4.** End-to-end resolve flow for a single account.
 ///
-/// For now this returns a stub `DryRun` outcome regardless of the
-/// `dry_run` flag so the binary compiles end-to-end and the clap
-/// surface is exercisable; P9-4 swaps in the real implementation.
-#[allow(clippy::missing_errors_doc, clippy::unused_async)]
+/// Per the P9 plan §A2 / §A3 / Q7 discipline:
+///
+/// 1. Validate the user's chosen revision is a current head of the
+///    account (refuse with `NotAHead` otherwise).
+/// 2. **Pre-publish re-pull (Q7 — APPROVED).** Run `pull_all` to
+///    bring the local view current. If the chain has moved (a NEW
+///    head appeared since validation), abort cleanly with
+///    `ChainMovedDuringResolve`.
+/// 3. Read the chosen revision's plaintext via the freeze-guard
+///    bypass and re-seal under the merge revision's AAD with a
+///    fresh nonce — `Vault::build_merge_payload_for_resolve`
+///    encapsulates both steps so plaintext stays inside the store
+///    crate.
+/// 4. Build a `SignedRevision` (per the P8 `PoC` two-key model — the
+///    `device_key` argument is the ephemeral signing key generated
+///    by the caller).
+/// 5. **A3 pre-publish check.** Scan the chain view from step 2
+///    for an event with the same canonical hash. If present, skip
+///    the on-chain publish and fall through to ingest +
+///    `clear_frozen` (recovery path).
+/// 6. Otherwise call `adapter.publish(&signed)`.
+/// 7. Ingest the resulting event back into the local store via
+///    `ingest_chain_revision` — under the genuine-foreign-INSERT
+///    path this re-arms the freeze flag (CRIT-1), which step 8
+///    immediately clears.
+/// 8. `clear_frozen(account_id, merge_revision_id)` advances the
+///    head pointer + clears the freeze in one transaction.
+///
+/// `dry_run = true` short-circuits at step 5 — the canonical hash
+/// is computed and returned; no on-chain publish, no ingest, no
+/// `clear_frozen`. The plaintext IS materialised in memory
+/// transiently to compute the seal (per §A2).
+///
+/// The merge revision's `revision_id` (returned in the
+/// `Published` / `AlreadyOnChain` outcomes) is the canonical hash
+/// of the signed revision (`pangolin_chain::canonical_hash`),
+/// which `ingest_chain_revision` also computes and uses as the
+/// local row's `revision_id`.
+///
+/// # Errors
+///
+/// Returns the typed [`ResolveError`] variants documented on the
+/// enum.
+#[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
 pub async fn resolve_one<A: ChainAdapter + ?Sized>(
     vault: &mut Vault,
-    _adapter: &A,
-    _device_key: &DeviceKey,
+    adapter: &A,
+    device_key: &DeviceKey,
     account_id: AccountId,
     chosen_revision_id: RevisionId,
-    _dry_run: bool,
+    dry_run: bool,
 ) -> Result<ResolveOutcome, ResolveError> {
-    // P9-3: skeleton returns a placeholder DryRun outcome. P9-4
-    // replaces this stub with the full publish + ingest + clear
-    // flow. The validation below is the same as the production path
-    // so the clap-test-driven "resolve_rejects_non_head_revision"
-    // already passes against the skeleton.
-    let heads = vault.account_heads(account_id).map_err(|e| match e {
+    // ---- Step 1: validate `--keep` is a current head. ----
+    let pre_pull_heads = vault.account_heads(account_id).map_err(|e| match e {
         StoreError::AccountNotFound => ResolveError::AccountNotFound { account_id },
         other => ResolveError::Store(other),
     })?;
-    if !heads.contains(&chosen_revision_id) {
+    if !pre_pull_heads.contains(&chosen_revision_id) {
         return Err(ResolveError::NotAHead {
             account_id,
             chosen: chosen_revision_id,
-            current_heads: heads,
+            current_heads: pre_pull_heads,
         });
     }
-    Ok(ResolveOutcome::DryRun {
-        planned_revision_id: [0u8; 32],
-    })
+
+    // ---- Step 2: pre-publish re-pull (Q7). ----
+    //
+    // Bring the local view current with the chain. Capture the
+    // chain view AFTER the pull so step 5's A3 idempotency check
+    // can scan it for our canonical hash without an extra RPC. The
+    // pull also ingests any events the chain has that we don't —
+    // including a possible NEW head for `account_id` published by
+    // some other device since the user invoked resolve.
+    pull_all(vault, adapter, None, None)
+        .await
+        .map_err(|e| ResolveError::Chain(format!("pre-publish pull_all failed: {e}")))?;
+
+    // Re-read heads after the pull. If the head set CHANGED (a NEW
+    // head id is present that wasn't there before), abort cleanly —
+    // the user's `--keep` was made against a stale view of the
+    // chain. Per P9 plan Q7 / A7 the recovery is "re-run resolve
+    // against the freshest heads".
+    let post_pull_heads = vault.account_heads(account_id).map_err(|e| match e {
+        StoreError::AccountNotFound => ResolveError::AccountNotFound { account_id },
+        other => ResolveError::Store(other),
+    })?;
+    let chain_moved = post_pull_heads.iter().any(|h| !pre_pull_heads.contains(h));
+    if chain_moved {
+        return Err(ResolveError::ChainMovedDuringResolve {
+            account_id,
+            previous_heads: pre_pull_heads,
+            new_heads: post_pull_heads,
+        });
+    }
+    // Defensive: even if no NEW head appeared, re-confirm the
+    // chosen one is STILL a head. (A tombstone or merge from
+    // another device could have demoted it from head status.)
+    if !post_pull_heads.contains(&chosen_revision_id) {
+        return Err(ResolveError::NotAHead {
+            account_id,
+            chosen: chosen_revision_id,
+            current_heads: post_pull_heads,
+        });
+    }
+
+    // Capture the post-pull chain view ONCE (for the A3
+    // idempotency check below). A chain-side error here drops the
+    // optimisation and pushes us to the unconditional publish path.
+    let vault_id_arr: VaultId = vault.vault_id();
+    let last_pulled = vault.last_pulled_block().map_err(ResolveError::Store)?;
+    let chain_view: Option<Vec<RevisionEvent>> = adapter
+        .pull_since(&vault_id_arr, last_pulled, None)
+        .await
+        .ok();
+
+    // ---- Step 3: read chosen plaintext + re-seal under merge AAD. ----
+    let (enc_payload, schema_version, _is_tombstone) = vault
+        .build_merge_payload_for_resolve(account_id, chosen_revision_id)
+        .map_err(ResolveError::Store)?;
+
+    // ---- Step 4: build SignedRevision. ----
+    //
+    // The merge revision's `parent_revision` is the chosen head's
+    // `revision_id`. The `device_id` is the ephemeral signing
+    // key's public bytes (PoC two-key model — same as `publish`).
+    let signed: SignedRevision = build_signed_revision(
+        device_key,
+        vault_id_arr,
+        *account_id.as_bytes(),
+        *chosen_revision_id.as_bytes(),
+        schema_version,
+        enc_payload,
+    );
+    let canonical = pangolin_chain::canonical_hash(
+        &signed.vault_id,
+        &signed.account_id,
+        &signed.parent_revision,
+        &signed.device_id,
+        signed.schema_version,
+        &signed.enc_payload,
+    );
+
+    // ---- Step 5 (early-exit): dry-run prints the canonical hash. ----
+    if dry_run {
+        return Ok(ResolveOutcome::DryRun {
+            planned_revision_id: canonical,
+        });
+    }
+
+    // ---- Step 5: A3 pre-publish check. ----
+    //
+    // If the merge revision's canonical hash already appears on
+    // chain (recovery from a kill between publish + ingest +
+    // clear_frozen), skip the publish and run only the local
+    // commit.
+    let mut already_on_chain_anchor: Option<ChainAnchor> = None;
+    if let Some(events) = &chain_view {
+        for ev in events {
+            let ev_hash = pangolin_chain::canonical_hash(
+                &ev.vault_id,
+                &ev.account_id,
+                &ev.parent_revision,
+                &ev.device_id,
+                ev.schema_version,
+                &ev.enc_payload,
+            );
+            if ev_hash == canonical {
+                already_on_chain_anchor = Some(ev.anchor);
+                break;
+            }
+        }
+    }
+
+    // ---- Step 6: publish (or skip per A3). ----
+    let (anchor, was_already_on_chain): (ChainAnchor, bool) =
+        if let Some(a) = already_on_chain_anchor {
+            (a, true)
+        } else {
+            let a = adapter
+                .publish(&signed)
+                .await
+                .map_err(|e: ChainError| ResolveError::Chain(format!("publish failed: {e}")))?;
+            (a, false)
+        };
+
+    // ---- Step 7: ingest the merge revision into the local store. ----
+    //
+    // Build a `RevisionEvent` from the just-published `signed` +
+    // the returned anchor and feed it through
+    // `ingest_chain_revision`. Under the genuine-foreign-INSERT
+    // path this sets `frozen_pending_resolve = 1` for the account
+    // (CRIT-1 sentinel — the local row's device_id differs from
+    // the merge event's device_id under PoC two-key); step 8
+    // clears it.
+    let merge_event = RevisionEvent {
+        vault_id: signed.vault_id,
+        account_id: signed.account_id,
+        parent_revision: signed.parent_revision,
+        device_id: signed.device_id,
+        schema_version: signed.schema_version,
+        sequence: anchor.sequence,
+        enc_payload: signed.enc_payload.clone(),
+        anchor,
+    };
+    vault
+        .ingest_chain_revision(&merge_event)
+        .map_err(ResolveError::Store)?;
+
+    // ---- Step 8: clear_frozen + advance head to the merge revision. ----
+    //
+    // The merge revision's local revision_id IS the canonical
+    // hash (ingest_chain_revision uses canonical_hash as the row
+    // key). clear_frozen takes that id and advances
+    // head_revision_id + clears the flag in one transaction.
+    let merge_rev_id = RevisionId::from_bytes(canonical);
+    vault
+        .clear_frozen(account_id, merge_rev_id)
+        .map_err(ResolveError::Store)?;
+
+    // Advance last_pulled_block to capture the just-published
+    // event's block (so a subsequent pull doesn't re-fetch it). We
+    // use the anchor's block as the new checkpoint; if it's lower
+    // than the current checkpoint (impossible in practice), the
+    // store-level call returns Ok no-op.
+    if let Err(e) = vault.advance_last_pulled_block(anchor.block_number) {
+        // Non-fatal: the next pull will catch it. Log but don't
+        // abort — clear_frozen has already succeeded.
+        eprintln!(
+            "warning: advance_last_pulled_block({}): {e}",
+            anchor.block_number
+        );
+    }
+
+    if was_already_on_chain {
+        Ok(ResolveOutcome::AlreadyOnChain {
+            revision_id: canonical,
+            anchor,
+        })
+    } else {
+        Ok(ResolveOutcome::Published {
+            revision_id: canonical,
+            anchor,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1148,5 +1359,401 @@ mod tests {
         // `publish` would have errored if not. So this is implicitly
         // proven by reaching this assertion.
         let _ = verify_signed_revision; // pull into scope for the doc.
+    }
+
+    // ---------------------------------------------------------------
+    // P9-4: resolve_one tests
+    // ---------------------------------------------------------------
+
+    /// Helper: drive a vault into a forked + frozen state so the
+    /// resolve flow has work to do. Steps:
+    ///
+    /// 1. Local vault adds an account (genesis revision).
+    /// 2. Publish the genesis to chain via the supplied adapter.
+    /// 3. Inject a foreign chain event (different `device_id`) under
+    ///    the same `account_id` with parent = local genesis. After
+    ///    pull this lands as the second head AND fires the freeze.
+    ///
+    /// Returns `(account_id, local_head_revision_id)` — the local
+    /// head is the genesis revision (now one of two heads after the
+    /// foreign event lands).
+    async fn drive_into_forked_and_frozen(
+        v: &mut Vault,
+        adapter: &MockChainAdapter,
+        device: &DeviceKey,
+    ) -> (AccountId, RevisionId) {
+        let account_id = v.add_account(snap("forked-and-frozen")).expect("add");
+        let _ = publish_all(v, adapter, device).await.expect("publish");
+        // Local head is the genesis revision — read it back.
+        let local_head = v
+            .revisions_for(account_id)
+            .expect("revisions")
+            .first()
+            .map(|m| m.revision_id)
+            .expect("genesis present");
+
+        // Inject a foreign event sharing the genesis as parent (so
+        // the resulting graph has TWO heads: local genesis and the
+        // foreign event). The foreign event's parent is the local
+        // genesis revision_id, NOT the genesis-parent sentinel —
+        // this makes it a sibling of the genesis-parent's ONLY
+        // child (genesis itself), giving us a 2-head fork.
+        //
+        // Wait — the genesis revision IS a head (no children). To
+        // create a 2-head fork we need TWO revisions with no
+        // children. Both can have parent = genesis-parent (genesis
+        // already has parent = genesis-parent), so the foreign
+        // event also uses parent = genesis-parent.
+        let foreign_dev = DeviceKey::generate();
+        let foreign_signed = build_signed_revision(
+            &foreign_dev,
+            v.vault_id(),
+            *account_id.as_bytes(),
+            [0u8; 32], // genesis-parent sentinel — same parent as the local genesis
+            0,
+            b"foreign-content".to_vec(),
+        );
+        adapter
+            .publish(&foreign_signed)
+            .await
+            .expect("foreign publish");
+        // Now pull on the local vault to ingest the foreign event
+        // — under PoC two-key the device_id mismatches the local
+        // row's device_id so the genuine-foreign-INSERT path runs:
+        // freeze fires + the foreign event lands as a sibling of
+        // the local genesis (both have parent = genesis-parent).
+        let _ = pull_all(v, adapter, None, None)
+            .await
+            .expect("pull foreign");
+
+        let heads = v.account_heads(account_id).expect("heads");
+        assert!(heads.len() >= 2, "drive must produce a fork (≥2 heads)");
+        assert!(
+            v.list_frozen_accounts()
+                .expect("list frozen")
+                .contains(&account_id),
+            "drive must produce a freeze"
+        );
+        (account_id, local_head)
+    }
+
+    /// **P9-4 happy path.** `resolve_one` builds a merge revision
+    /// pointing at the chosen head and publishes it through the
+    /// adapter. After resolve, the chain has one more event and the
+    /// local store has the merge revision ingested with the chain
+    /// anchor populated.
+    #[tokio::test]
+    async fn resolve_publishes_merge_revision() {
+        let (mut v, _d) = fresh_vault();
+        let device = DeviceKey::generate();
+        let adapter = MockChainAdapter::new();
+        let (account_id, local_head) =
+            drive_into_forked_and_frozen(&mut v, &adapter, &device).await;
+        let pre_event_count = adapter.event_count();
+
+        let resolve_dev = DeviceKey::generate();
+        let outcome = resolve_one(
+            &mut v,
+            &adapter,
+            &resolve_dev,
+            account_id,
+            local_head,
+            false,
+        )
+        .await
+        .expect("resolve_one ok");
+
+        // Outcome = Published with a fresh canonical hash.
+        let revision_id = match outcome {
+            ResolveOutcome::Published { revision_id, .. } => revision_id,
+            other => panic!("expected Published, got {other:?}"),
+        };
+        assert_ne!(revision_id, [0u8; 32]);
+        assert_eq!(
+            adapter.event_count(),
+            pre_event_count + 1,
+            "exactly ONE new on-chain event from the resolve"
+        );
+
+        // The merge revision is in the local store with a chain
+        // anchor populated.
+        let revs = v.revisions_for(account_id).expect("revisions");
+        let merge_row = revs
+            .iter()
+            .find(|m| m.revision_id == RevisionId::from_bytes(revision_id))
+            .expect("merge revision present locally");
+        assert!(
+            merge_row.chain_anchor.is_some(),
+            "merge row has chain anchor"
+        );
+    }
+
+    /// **P9-4 A3.** `resolve_one` clears the freeze flag on success.
+    #[tokio::test]
+    async fn resolve_clears_freeze_on_success() {
+        let (mut v, _d) = fresh_vault();
+        let device = DeviceKey::generate();
+        let adapter = MockChainAdapter::new();
+        let (account_id, local_head) =
+            drive_into_forked_and_frozen(&mut v, &adapter, &device).await;
+        assert!(v
+            .list_frozen_accounts()
+            .expect("list frozen")
+            .contains(&account_id));
+
+        let resolve_dev = DeviceKey::generate();
+        let _ = resolve_one(
+            &mut v,
+            &adapter,
+            &resolve_dev,
+            account_id,
+            local_head,
+            false,
+        )
+        .await
+        .expect("resolve ok");
+
+        assert!(
+            !v.list_frozen_accounts()
+                .expect("list frozen")
+                .contains(&account_id),
+            "freeze flag must be cleared after successful resolve"
+        );
+    }
+
+    /// **P9-4.** Failed publish leaves the freeze flag intact (so
+    /// the user can retry).
+    #[tokio::test]
+    async fn resolve_fails_cleanly_on_publish_error() {
+        let (mut v, _d) = fresh_vault();
+        let device = DeviceKey::generate();
+        let real_adapter = MockChainAdapter::new();
+        let (account_id, local_head) =
+            drive_into_forked_and_frozen(&mut v, &real_adapter, &device).await;
+
+        // Wrap the real adapter in one that proxies pull_since (so
+        // pre-publish re-pull works) but fails on `publish`.
+        let failing = ResolvePublishFailingAdapter {
+            inner: real_adapter.clone(),
+        };
+
+        let resolve_dev = DeviceKey::generate();
+        let err = resolve_one(
+            &mut v,
+            &failing,
+            &resolve_dev,
+            account_id,
+            local_head,
+            false,
+        )
+        .await
+        .expect_err("publish-failure path must surface");
+        assert!(
+            matches!(err, ResolveError::Chain(_)),
+            "publish failure must surface as ResolveError::Chain, got {err:?}"
+        );
+
+        // Freeze flag still set; chain has no extra event.
+        assert!(v
+            .list_frozen_accounts()
+            .expect("list frozen")
+            .contains(&account_id));
+    }
+
+    /// **P9-4 A3 idempotency.** A second `resolve_one` invocation
+    /// after a successful first run is robustly handled — even
+    /// though the partial-failure-mid-resolve case is hard to
+    /// simulate without process-kill primitives, this test pins the
+    /// closely-related "user accidentally re-runs resolve" case:
+    /// the second invocation MUST NOT corrupt the local store.
+    ///
+    /// After the first resolve, the chosen `local_head` is no
+    /// longer a head (the merge superseded it) so a re-run with
+    /// the same `--keep` surfaces `NotAHead` — the resolver's
+    /// fast-path local validation rejects the request before any
+    /// chain side effects. This is the documented re-entry contract
+    /// from P9 plan §A3.
+    #[tokio::test]
+    async fn resolve_idempotent_after_partial_failure() {
+        let (mut v, _d) = fresh_vault();
+        let device = DeviceKey::generate();
+        let adapter = MockChainAdapter::new();
+        let (account_id, local_head) =
+            drive_into_forked_and_frozen(&mut v, &adapter, &device).await;
+
+        // Run resolve once successfully.
+        let dev_a = DeviceKey::generate();
+        let outcome_first = resolve_one(&mut v, &adapter, &dev_a, account_id, local_head, false)
+            .await
+            .expect("first resolve ok");
+        assert!(matches!(outcome_first, ResolveOutcome::Published { .. }));
+        let post_first_event_count = adapter.event_count();
+
+        // Re-running with the SAME `--keep` (the now-superseded
+        // local_head) surfaces NotAHead because local_head is no
+        // longer in `account_heads(...)` — the merge revision
+        // ate it as parent. NO chain side-effects.
+        let dev_b = DeviceKey::generate();
+        let err = resolve_one(&mut v, &adapter, &dev_b, account_id, local_head, false)
+            .await
+            .expect_err("re-run with stale --keep must reject");
+        assert!(
+            matches!(err, ResolveError::NotAHead { .. }),
+            "expected NotAHead on re-run with stale --keep, got {err:?}"
+        );
+        // No NEW publish on the chain.
+        assert_eq!(
+            adapter.event_count(),
+            post_first_event_count,
+            "stale-key re-run must not produce a new chain event"
+        );
+        // Local store still in clean post-first-resolve state:
+        // freeze flag still cleared.
+        assert!(!v
+            .list_frozen_accounts()
+            .expect("list frozen")
+            .contains(&account_id));
+    }
+
+    /// **P9-4 Q7.** If the chain moves between the user's
+    /// invocation and the pre-publish re-pull (a NEW head appears
+    /// for the same account), `resolve_one` aborts cleanly with
+    /// `ChainMovedDuringResolve`.
+    #[tokio::test]
+    async fn resolve_chain_moved_during_resolve_aborts_cleanly() {
+        let (mut v, _d) = fresh_vault();
+        let device = DeviceKey::generate();
+        let adapter = MockChainAdapter::new();
+        let (account_id, local_head) =
+            drive_into_forked_and_frozen(&mut v, &adapter, &device).await;
+
+        // Inject an additional foreign event under the SAME account
+        // BEFORE we call resolve_one. The pre-publish pull inside
+        // resolve_one will ingest it and detect the new head;
+        // resolve_one must abort.
+        let foreign_dev = DeviceKey::generate();
+        let new_signed = build_signed_revision(
+            &foreign_dev,
+            v.vault_id(),
+            *account_id.as_bytes(),
+            *local_head.as_bytes(), // child of the local genesis
+            0,
+            b"chain-moved-content".to_vec(),
+        );
+        adapter
+            .publish(&new_signed)
+            .await
+            .expect("inject new event");
+
+        let resolve_dev = DeviceKey::generate();
+        let err = resolve_one(
+            &mut v,
+            &adapter,
+            &resolve_dev,
+            account_id,
+            local_head,
+            false,
+        )
+        .await
+        .expect_err("chain-moved must abort");
+        assert!(
+            matches!(err, ResolveError::ChainMovedDuringResolve { .. }),
+            "expected ChainMovedDuringResolve, got {err:?}"
+        );
+    }
+
+    /// **P9-4 dry-run.** `--dry-run` returns a canonical hash but
+    /// does NOT publish on chain or clear the freeze flag.
+    #[tokio::test]
+    async fn dry_run_does_not_publish_or_clear() {
+        let (mut v, _d) = fresh_vault();
+        let device = DeviceKey::generate();
+        let adapter = MockChainAdapter::new();
+        let (account_id, local_head) =
+            drive_into_forked_and_frozen(&mut v, &adapter, &device).await;
+        let pre_event_count = adapter.event_count();
+
+        let resolve_dev = DeviceKey::generate();
+        let outcome = resolve_one(
+            &mut v,
+            &adapter,
+            &resolve_dev,
+            account_id,
+            local_head,
+            true, // dry_run
+        )
+        .await
+        .expect("dry_run ok");
+
+        match outcome {
+            ResolveOutcome::DryRun {
+                planned_revision_id,
+            } => {
+                assert_ne!(planned_revision_id, [0u8; 32]);
+            }
+            other => panic!("expected DryRun, got {other:?}"),
+        }
+        // No new chain events.
+        assert_eq!(adapter.event_count(), pre_event_count);
+        // Freeze flag still set.
+        assert!(v
+            .list_frozen_accounts()
+            .expect("list frozen")
+            .contains(&account_id));
+    }
+
+    /// **P9-4 `NotAHead`.** A `--keep` revision id that is not a
+    /// current head surfaces `ResolveError::NotAHead` cleanly
+    /// before any chain call.
+    #[tokio::test]
+    async fn resolve_rejects_non_head_revision() {
+        let (mut v, _d) = fresh_vault();
+        let device = DeviceKey::generate();
+        let adapter = MockChainAdapter::new();
+        let (account_id, _local_head) =
+            drive_into_forked_and_frozen(&mut v, &adapter, &device).await;
+        let bogus = RevisionId::from_bytes([0xCC; 32]);
+        let resolve_dev = DeviceKey::generate();
+        let err = resolve_one(&mut v, &adapter, &resolve_dev, account_id, bogus, false)
+            .await
+            .expect_err("non-head must reject");
+        assert!(
+            matches!(err, ResolveError::NotAHead { .. }),
+            "expected NotAHead, got {err:?}"
+        );
+    }
+
+    /// Adapter that proxies `pull_since` (so the pre-publish re-pull
+    /// inside `resolve_one` succeeds) but errors on every `publish`
+    /// call. Used to test the publish-failure path of
+    /// `resolve_fails_cleanly_on_publish_error`.
+    struct ResolvePublishFailingAdapter {
+        inner: MockChainAdapter,
+    }
+
+    #[async_trait::async_trait]
+    impl ChainAdapter for ResolvePublishFailingAdapter {
+        async fn publish(&self, _signed: &SignedRevision) -> Result<ChainAnchor, ChainError> {
+            Err(ChainError::Rpc("simulated publish failure".into()))
+        }
+        async fn pull_since(
+            &self,
+            vault_id: &VaultId,
+            from_block: u64,
+            until_block: Option<u64>,
+        ) -> Result<Vec<RevisionEvent>, ChainError> {
+            self.inner
+                .pull_since(vault_id, from_block, until_block)
+                .await
+        }
+        async fn get_revision(
+            &self,
+            location: &pangolin_chain::EventLocation,
+        ) -> Result<Option<RevisionEvent>, ChainError> {
+            self.inner.get_revision(location).await
+        }
+        async fn current_block(&self) -> Result<u64, ChainError> {
+            self.inner.current_block().await
+        }
     }
 }

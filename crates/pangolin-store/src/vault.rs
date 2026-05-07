@@ -1412,6 +1412,132 @@ impl Vault {
         Ok(snapshot)
     }
 
+    /// **P9-4.** Build the merge revision's `enc_payload` for the
+    /// resolve flow.
+    ///
+    /// Reads the chosen revision's plaintext via the freeze-guard
+    /// bypass (same proof-of-intent argument as
+    /// [`Self::read_payload_plaintext_for_resolve`] — the user typed
+    /// `--keep <id>`, we trust the read for that one revision) and
+    /// re-seals it under a fresh nonce + the merge revision's own
+    /// AAD (`parent_revision_id` = `chosen_revision_id`,
+    /// `account_id` and `vault_id` unchanged, `schema_version`
+    /// inherited from the chosen revision).
+    ///
+    /// Returns `(enc_payload, schema_version, is_tombstone)` —
+    /// plaintext NEVER leaves the store crate; the cli crate only
+    /// sees the new ciphertext + the chain-relevant fields.
+    ///
+    /// If the chosen revision is a tombstone, re-seals via
+    /// [`crate::blob::seal_tombstone`] so the merge revision is
+    /// structurally a tombstone too (per P9 plan §A5 — resolving to
+    /// a tombstone ratifies the deletion).
+    ///
+    /// Requires the vault to be [`VaultState::Active`].
+    ///
+    /// # Errors
+    ///
+    /// Same set as [`Self::read_payload_plaintext_for_resolve`].
+    /// Additionally surfaces [`StoreError::AuthenticationFailed`] if
+    /// the freshly-derived re-seal fails (theoretically impossible
+    /// for AEAD with a 24-byte random nonce on a payload below the
+    /// 256-GB ceiling, but the typed surface is preserved).
+    pub fn build_merge_payload_for_resolve(
+        &mut self,
+        account_id: AccountId,
+        chosen_revision_id: RevisionId,
+    ) -> Result<(Vec<u8>, u8, bool)> {
+        // Strict freshness — same as the plaintext reader (this
+        // method composes that reader's discipline).
+        self.check_session_freshness()?;
+        let _ = self.require_active()?;
+
+        // Read the schema_version + is_tombstone for the chosen
+        // revision FIRST. We need them regardless of whether this is
+        // a live snapshot (for AAD) or a tombstone (for re-seal
+        // dispatch). The cross-check on `account_id` matches the
+        // discipline in `read_payload_plaintext_for_resolve`.
+        let row: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT schema_version, is_tombstone
+                 FROM revisions
+                 WHERE account_id = ?1 AND revision_id = ?2",
+                params![
+                    account_id.as_bytes().as_slice(),
+                    chosen_revision_id.as_bytes().as_slice(),
+                ],
+                |row| {
+                    let sv: i64 = row.get(0)?;
+                    let ts: i64 = row.get(1)?;
+                    Ok((sv, ts))
+                },
+            )
+            .optional()?;
+        let (sv_i64, is_tombstone_i64) = row.ok_or(StoreError::AccountNotFound)?;
+        let schema_version = u8::try_from(sv_i64).map_err(|_| {
+            StoreError::Corrupted("revisions.schema_version out of u8 range".into())
+        })?;
+        let is_tombstone = is_tombstone_i64 != 0;
+
+        // Build the merge revision's AAD. The merge row's
+        // parent_revision_id IS the chosen head's revision_id. This
+        // is the load-bearing AAD discipline from P9 plan §A2 — a
+        // byte-copy of the source ciphertext would carry the source
+        // row's parent_revision_id baked in, which differs from the
+        // merge row's parent and would render the merge row
+        // unopenable.
+        let merge_aad = build_aad(
+            &self.meta.vault_id,
+            &account_id,
+            &chosen_revision_id,
+            schema_version,
+        );
+
+        let active = self.require_active()?;
+        let aead_key = active.vdk.aead_key();
+
+        let (ct, _nonce) = if is_tombstone {
+            // Tombstone-resolve: re-seal the tombstone sentinel
+            // payload under the merge AAD.
+            seal_tombstone(aead_key, &merge_aad)?
+        } else {
+            // Live snapshot: read plaintext via the bypass-aware
+            // helper, then re-seal under the merge AAD with a fresh
+            // random nonce. The snapshot is AccountSnapshot with
+            // ZeroizeOnDrop on every secret field — it wipes when
+            // it falls out of scope at the end of this block.
+            let snapshot =
+                self.read_payload_plaintext_for_resolve(account_id, chosen_revision_id)?;
+            // Re-acquire the active borrow because
+            // read_payload_plaintext_for_resolve takes &mut self
+            // and may have invalidated our prior `active` borrow.
+            let active = self.require_active()?;
+            seal_snapshot(active.vdk.aead_key(), &snapshot, &merge_aad)?
+        };
+
+        // Note on the `_nonce` discard: the cli crate doesn't need
+        // the nonce because the merge revision's payload, once
+        // published on chain and pulled back, will be ingested via
+        // `ingest_chain_revision` which uses a placeholder zeroed
+        // nonce for foreign-ingested rows (the chain doesn't carry
+        // the AEAD nonce). The vault that originated the publish
+        // recognises its own publish via the chain-anchor merge
+        // arm and stamps the anchor onto the row directly — which
+        // means the original local row (with the real nonce) is
+        // what survives. The current resolve flow doesn't INSERT a
+        // pre-publish local row before publish; it goes straight to
+        // the on-chain submit, so the nonce is lost on this device.
+        // This is acceptable for PoC because the resolve flow's
+        // post-publish ingest call carries the chain anchor, and
+        // the chosen-head's own row (which DOES have the original
+        // plaintext-recoverable nonce) is the one the local cache
+        // continues to read from.
+
+        self.touch_session();
+        Ok((ct.into_vec(), schema_version, is_tombstone))
+    }
+
     // -----------------------------------------------------------------
     // P4: high-risk operations — presence escalation
     // -----------------------------------------------------------------
