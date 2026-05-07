@@ -43,7 +43,7 @@ Per-component threat enumeration lands as part of MVP-1 issue 0.2 and is updated
 | Session policy engine | MVP-1 | TBD (issue 0.2) |
 | Revision Log v0 contract | PoC | DOCUMENTED (P5-1) |
 | Pangolin chain adapter (`pangolin-chain`) | PoC | DOCUMENTED (P7) |
-| Pangolin sync orchestrator (`pangolin-cli`) | PoC | DOCUMENTED (P8) |
+| Pangolin sync orchestrator (`pangolin-cli`) | PoC | DOCUMENTED (P8 + P9) |
 | Revision Log v1 contract | MVP-2 | TBD (issue 2.1 plan) |
 | Funder service | MVP-2 | TBD (issue 3.4 plan) |
 | Ephemeral local indexer | MVP-2 | TBD (issue 4.2 plan) |
@@ -385,3 +385,104 @@ the PR.
     local-row and chain-event `device_id`, restoring silent
     cross-device merge under the non-attack case while
     preserving the device_id binding's defense.
+
+12. **Forged resolve (foreign device claiming to be the user's,
+    publishing a merge revision under the user's account).**
+    Defense: the merge revision is signed by the device's
+    Ed25519 `DeviceKey` via `signing::build_signed_revision`,
+    same path as `publish`. The canonical hash binds
+    `parent_revision` (= the chosen head's `revision_id`),
+    `account_id`, `vault_id`, `device_id`, and `enc_payload`. v0
+    contract does not verify on-chain; v1 will (MVP-2 issue 2.1).
+    Per Q6 defense-in-depth, the receiving device's `pull_all`
+    runs `VerifyingKey::from_bytes` on the merge event's
+    `device_id` before invoking `Vault::ingest_chain_revision`
+    — same gate that catches forged publish events. The PoC
+    two-key model carries forward unchanged: resolve generates
+    an ephemeral `DeviceKey` per run.
+13. **Replay of an old resolve.** Defense: the canonical hash
+    binds `parent_revision`. A resolve replay against a
+    moved-on head (someone else has published a descendant in
+    the meantime, advancing the head past the chosen one) lands
+    as another fork rather than a duplicate, surfacing on the
+    next pull as the concurrent-resolve race described in P9
+    plan §A7. Re-publishing the same merge revision with a
+    stale parent is additionally guarded by the resolve flow's
+    pre-publish check (Q7-APPROVED): `pull_all` runs first and
+    then re-validates `account_heads`; if the chosen revision
+    is no longer a head OR a NEW head appeared,
+    `ResolveError::ChainMovedDuringResolve` aborts the resolve
+    cleanly. The A3-style canonical-hash scan inside
+    `resolve_one` additionally detects an already-on-chain
+    merge revision and skips the redundant publish (recovery
+    from a kill between publish + ingest + clear_frozen).
+14. **Frozen flag cleared without publish.** Defense: the
+    `Vault::clear_frozen` API takes `chosen_revision_id` as a
+    parameter and atomically advances `head_revision_id` to it;
+    the resolve flow ALWAYS calls `clear_frozen` only after a
+    successful publish + ingest of the merge revision. There is
+    no API path that clears the freeze flag without a
+    corresponding revision row in the local store —
+    `clear_frozen` errors with `StoreError::RevisionNotFound`
+    if the supplied `chosen_revision_id` does not exist as a
+    `revisions` row for the account. A malicious local actor
+    with vault-file access could `UPDATE account_identities SET
+    frozen_pending_resolve = 0` directly via sqlite tooling,
+    but that's the same as them tampering with any other row —
+    not a defense the application layer can mount.
+15. **User keeps an attacker-controlled head (HIGH-1 from P8
+    audit).** Defense (acknowledgement, UX-only): under the
+    threat model where a malicious RPC injects events with
+    garbage `device_id`, P8 fix CRIT-1 freezes the account so
+    the user cannot read the stale plaintext. If the user then
+    runs `pangolin-cli resolve --keep <id>` where `<id>`
+    references one of the attacker-injected events, they have
+    explicitly adopted attacker-controlled state. The
+    mitigation is UX: `pangolin-cli resolve` prints the
+    metadata of each candidate head so the user can spot an
+    unfamiliar `device_id` (a foreign device they don't
+    recognise). Full defense requires v1 contract on-chain
+    signature verification (MVP-2 issue 2.1); PoC ships with
+    the UX surfacing as the only defense against this class.
+    Documented as a known UX-bound gap.
+16. **`Vault::read_payload_plaintext_for_resolve` as a
+    documented freeze-guard bypass.** The resolve flow needs
+    to read the chosen revision's plaintext to re-seal it
+    under the merge revision's AAD (per P9 plan §A2 — a
+    byte-copy of the source ciphertext would carry the source
+    row's `parent_revision_id` baked into the AAD, producing
+    an unopenable merge row). The bypass is gated by the
+    user's `--keep <id>` argument as proof-of-intent: the user
+    has named the specific revision they want to ratify, so we
+    trust the read for that one revision for the duration of
+    one resolve invocation. The accessor is loudly documented
+    (`DOCUMENTED FREEZE-GUARD BYPASS — DO NOT CALL FROM ANY
+    PATH EXCEPT pangolin-cli resolve`) and has a single
+    in-process caller. Cross-account substitution is blocked:
+    supplying a `revision_id` that belongs to a different
+    account collapses to `StoreError::AccountNotFound` so the
+    method is not an oracle. Per P9 plan Q6 / §A8, this is the
+    accepted design trade-off; an alternative
+    "user re-supplies password as fresh proof" model has
+    higher UX friction without measurable security gain
+    (the user is already past the unlock proof at the
+    `--keep` step). MVP-1 may revisit if audit feedback
+    surfaces a stronger bypass discipline.
+17. **Concurrent-resolve race (P9 plan §A7 — Q2 APPROVED to
+    ship without a guard).** Defense (acknowledgement):
+    devices A and B running `pangolin-cli resolve` on the same
+    forked account concurrently both pass their pre-publish
+    re-pull (each sees the chain without the other's merge
+    yet) and both successfully publish. The result is yet
+    another fork: parent = chosen_head, two children (A's
+    merge and B's merge). The next pull from any device
+    surfaces the new fork; the user resolves it again. This is
+    the same class of race as P8 threat #6 (concurrent edits
+    by independent devices fork; the fork surfaces on next
+    pull). The recovery is mechanical (re-resolve) and the
+    race window is small (concurrent resolve attempts on the
+    same fork require both devices to be online and aware of
+    the fork at the same instant). P11 may add an interactive
+    freshness guard ("verify chosen head is still a head as of
+    right now"); P9 ships without it per Kelvin's locked
+    answer Q2.

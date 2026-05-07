@@ -257,3 +257,138 @@ Plus `tests/two_vault_roundtrip.rs::convergence` updated to assert that B's pull
 10. `cargo deny check` — advisories ok, bans ok, licenses ok, sources ok
 11. `cargo build --workspace --release` clean
 12. `pangolin-cli --help` lists `status`, `publish`, `pull` and the new `--allow-insecure-rpc` flag
+
+## 2026-05-07 · P9 — pangolin-cli resolve (Conflicts & Resolve EPIC)  ✅ SIGNOFF
+
+Plan at `docs/issue-plans/P9.md` Kelvin-approved with seven locked
+answers (Q1: multi-resolve for N-way forks APPROVED, no
+`demote_orphan_heads`; Q2: ship without concurrent-resolve race
+guard; Q6: `read_payload_plaintext_for_resolve` documented bypass
+APPROVED; Q7: pre-publish chain re-pull APPROVED; Q3/Q4/Q5: full
+hex revision-id, tombstone-of-tombstone, `--dry-run` ships).
+Ship six commits on `issue/P9-resolve` branch from baseline tip
+`101c1c3`.
+
+**P9-1.** `Vault::clear_frozen(account_id, chosen_revision_id)`
+clears `frozen_pending_resolve` AND advances `head_revision_id`
+in one `BEGIN IMMEDIATE … COMMIT` transaction.
+`Vault::read_payload_plaintext_for_resolve(account_id,
+revision_id)` is the documented freeze-guard bypass for the
+resolve flow's plaintext re-seal step (loud docstring; single
+in-process caller). Cross-account substitution collapses to
+`AccountNotFound` (no oracle). 7 tests added.
+
+**P9-2.** New `crate::conflict` module hosts `ConflictReport {
+account_id, heads, frozen }`. `Vault::list_conflicts()` joins
+fork state and freeze state via union-then-dedup, sorted by
+`account_id` byte-order ASC. Surfaces all four state combinations
+(forked / frozen / both / neither). 6 tests added.
+
+**P9-3.** clap surface for `pangolin-cli resolve --account-id
+<hex> --keep <hex> [--yes] [--dry-run] [--account|--keystore-path]
+[--vault-password] [--keystore-password]`. Custom value parsers
+`HexAccountId` / `HexRevisionId` reject non-64-char or non-hex
+input at clap-validation time per Q3 (full hex, no prefix).
+`commands/resolve.rs` handler opens the vault, validates the
+chosen head locally, prompts for confirmation (skippable via
+`--yes`), builds the adapter, dispatches to
+`sync::resolve_one`. 9 clap-shape tests added.
+
+**P9-4.** Full `sync::resolve_one` body. Flow: validate `--keep`
+is a current head → pre-publish re-pull (Q7) → re-validate heads
+(`ChainMovedDuringResolve` if a NEW head appeared) →
+`Vault::build_merge_payload_for_resolve` (the new helper that
+composes `read_payload_plaintext_for_resolve` + `seal_snapshot` /
+`seal_tombstone` per A2/A5; plaintext NEVER leaves the store
+crate) → `build_signed_revision` → A3 pre-publish canonical-hash
+scan → publish (or skip per A3 already-on-chain) →
+`ingest_chain_revision` → `clear_frozen` → advance
+`last_pulled_block`. `--dry-run` short-circuits at the canonical
+hash and prints `would publish revision <hex>`. 7 tests added.
+
+**P9-5.** Renames the existing `convergence` integration test to
+`convergence_freezes_on_pull` (the post-P8-CRIT-1 freeze remains
+the expected pre-resolve PoC behavior). New
+`convergence_after_resolve` test pins the simple two-handle
+convergence flow per P9 plan §A4: A publishes → B pulls
+(frozen) → B runs `resolve` against B's local genesis (the only
+locally-decryptable head) → B's freeze is CLEAR. Adds E2E-004
+entry to `E2E_TESTS.md` with both automated + manual paths.
+
+**P9-6.** This DEVLOG entry. `THREAT_MODEL.md` rows 12–17 added
+to the `pangolin-cli` section: 12 (forged resolve), 13 (replay
+of an old resolve), 14 (frozen flag cleared without publish),
+15 (HIGH-1 attacker-controlled head adoption — UX-only mitigation
+acknowledged), 16 (`read_payload_plaintext_for_resolve` bypass —
+loud-docstring mitigation per Q6), 17 (concurrent-resolve race
+per A7 / Q2 — ship without).
+
+**Test count delta:** 253 → 282 lib tests (+29). New tests:
+
+- `pangolin-store::vault::tests::clear_frozen_advances_head_and_clears_flag`
+- `pangolin-store::vault::tests::clear_frozen_idempotent_on_already_clean`
+- `pangolin-store::vault::tests::clear_frozen_rejects_unknown_revision`
+- `pangolin-store::vault::tests::clear_frozen_rejects_unknown_account`
+- `pangolin-store::vault::tests::read_payload_plaintext_for_resolve_bypasses_freeze_guard`
+- `pangolin-store::vault::tests::read_payload_plaintext_for_resolve_requires_unlocked_vault`
+- `pangolin-store::vault::tests::read_payload_plaintext_for_resolve_rejects_wrong_account_id`
+- `pangolin-store::conflict::tests::list_conflicts_empty_on_clean_vault`
+- `pangolin-store::conflict::tests::list_conflicts_lists_only_forked`
+- `pangolin-store::conflict::tests::list_conflicts_lists_only_frozen`
+- `pangolin-store::conflict::tests::list_conflicts_lists_forked_and_frozen`
+- `pangolin-store::conflict::tests::list_conflicts_handles_frozen_with_single_head`
+- `pangolin-store::conflict::tests::list_conflicts_dedup_when_account_is_both_forked_and_frozen`
+- `pangolin-cli::cli::tests::resolve_parses_with_minimum_args`
+- `pangolin-cli::cli::tests::resolve_requires_account_id`
+- `pangolin-cli::cli::tests::resolve_requires_keep`
+- `pangolin-cli::cli::tests::resolve_account_id_must_be_64_hex_chars`
+- `pangolin-cli::cli::tests::resolve_keep_must_be_64_hex_chars`
+- `pangolin-cli::cli::tests::resolve_account_id_rejects_non_hex`
+- `pangolin-cli::cli::tests::resolve_dry_run_flag_parses`
+- `pangolin-cli::cli::tests::resolve_yes_flag_parses`
+- `pangolin-cli::cli::tests::resolve_account_and_keystore_path_conflict`
+- `pangolin-cli::sync::tests::resolve_publishes_merge_revision`
+- `pangolin-cli::sync::tests::resolve_clears_freeze_on_success`
+- `pangolin-cli::sync::tests::resolve_fails_cleanly_on_publish_error`
+- `pangolin-cli::sync::tests::resolve_idempotent_after_partial_failure`
+- `pangolin-cli::sync::tests::resolve_chain_moved_during_resolve_aborts_cleanly`
+- `pangolin-cli::sync::tests::dry_run_does_not_publish_or_clear`
+- `pangolin-cli::sync::tests::resolve_rejects_non_head_revision`
+
+Plus integration: `tests/two_vault_roundtrip.rs::convergence_after_resolve` (new) + `convergence_freezes_on_pull` (rename of `convergence`).
+
+**Critical invariants verified at the SIGNOFF tip:**
+
+1. `cargo tree -p pangolin-crypto | grep -ci serde` → 0 (HIGH-1 holds)
+2. No new `unsafe`; `forbid(unsafe_code)` unconditional in pangolin-cli (P8 MED-4)
+3. No plaintext on disk — `read_payload_plaintext_for_resolve` returns plaintext to RAM only; `build_merge_payload_for_resolve` re-seals in RAM and returns ciphertext
+4. Append-only state — `clear_frozen` UPDATEs only the freeze flag + head_revision_id; no revision row is ever mutated
+5. Per-account atomicity — resolve = "publish then ingest+clear"; failed clear after publish is recoverable (the next pull's arm-2 catches via tx_hash) and re-running resolve with the stale `--keep` surfaces `NotAHead` cleanly
+6. `cargo fmt --all --check` clean
+7. `cargo clippy --workspace --all-targets -- -D warnings` clean
+8. `cargo test --workspace --lib` — 282/282 passing (253 baseline + 29 new)
+9. `cargo test --workspace --tests` — integration tests pass (4 in two_vault_roundtrip; the rest unchanged)
+10. `cargo audit` — 2 pre-existing unmaintained advisories documented in `deny.toml` (RUSTSEC-2024-0388 etc.) — no new advisories
+11. `cargo deny check` — advisories ok, bans ok, licenses ok, sources ok
+12. `cargo build --workspace --release` clean
+
+**Open questions / acknowledged gaps:**
+
+- The convergence test's full multi-device single-head pattern
+  requires N resolves under PoC two-key (one per device that has
+  ingested the foreign chain row but cannot decrypt it because the
+  AEAD nonce isn't on chain). MVP-1's switch to D-006's single-key
+  model + nonce-on-chain semantics closes the multi-resolve gap.
+  The test pins the simple two-handle case where ONE resolve
+  clears B's freeze; the multi-resolve N-way case is documented
+  as expected PoC behavior per Q1.
+- Concurrent-resolve race ships without an interactive freshness
+  guard per Q2 — recovery is mechanical (re-resolve on next pull).
+- `read_payload_plaintext_for_resolve` is documented as the only
+  freeze-guard bypass; alternatives (re-supply password as fresh
+  proof) were rejected per the rationale in P9 plan §A8.
+
+Unblocks **P10** (tombstone-aware deletes — P9 ships the
+structural is_tombstone round-trip; P10 owns full semantics) and
+**P11** (E2E recorded screencast). The `pangolin-cli` binary is
+now at four subcommands: `status`, `publish`, `pull`, `resolve`.
