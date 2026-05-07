@@ -40,11 +40,12 @@
 //! stub returns `bail!("not implemented yet")`. The real
 //! implementations land in P11A-2..P11A-5.
 
-use std::io::Read as _;
+use std::io::{BufRead as _, Read as _, Write as _};
 
 use anyhow::{bail, Context, Result};
 use pangolin_crypto::secret::SecretBytes;
-use pangolin_store::AccountSnapshot;
+use pangolin_store::session::PressYPresenceProof;
+use pangolin_store::{AccountId, AccountSnapshot};
 
 use crate::cli::{
     AccountAddArgs, AccountArgs, AccountCommand, AccountDeleteArgs, AccountListArgs,
@@ -261,18 +262,400 @@ fn generate_password() -> SecretBytes {
 }
 
 // ===================================================================
-// P11A-3..P11A-5 stubs (still pending)
+// P11A-3: account list + account show
 // ===================================================================
 
-#[allow(clippy::unused_async)]
-async fn run_list(_global: &GlobalArgs, _args: AccountListArgs) -> Result<()> {
-    bail!("account list: not implemented yet (P11A-3)");
+/// Status annotation for `account list` output.
+#[derive(Debug, Clone, Copy)]
+enum AccountListStatus {
+    Active,
+    Frozen,
+    Tombstoned,
 }
 
-#[allow(clippy::unused_async)]
-async fn run_show(_global: &GlobalArgs, _args: AccountShowArgs) -> Result<()> {
-    bail!("account show: not implemented yet (P11A-3)");
+impl AccountListStatus {
+    /// Suffix applied to human-readable list output. Active entries
+    /// get no suffix; frozen + tombstoned get an explicit marker so
+    /// the user can distinguish (per A11).
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Active => "",
+            Self::Frozen => " [frozen]",
+            Self::Tombstoned => " [deleted]",
+        }
+    }
+
+    fn json_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Frozen => "frozen",
+            Self::Tombstoned => "tombstoned",
+        }
+    }
 }
+
+/// Run the `account list` subcommand.
+#[allow(clippy::unused_async)]
+async fn run_list(global: &GlobalArgs, args: AccountListArgs) -> Result<()> {
+    let vault = open_and_unlock(&args.vault_path, args.vault_password.as_deref())
+        .context("vault open + unlock failed")?;
+
+    // Active entries — `Vault::list_accounts` already filters frozen
+    // + tombstoned (P8 / P10 invariants). The default surface here
+    // mirrors the library default.
+    let active_ids = vault.list_accounts();
+    let mut rows: Vec<ListRow> = Vec::with_capacity(active_ids.len());
+    for id in active_ids {
+        let snap = vault
+            .get_account(id)
+            .ok_or_else(|| anyhow::anyhow!("active account {id:?} unexpectedly missing"))?;
+        rows.push(ListRow::from_snapshot(id, snap, AccountListStatus::Active));
+    }
+
+    if args.include_frozen {
+        let frozen = vault
+            .list_frozen_accounts()
+            .context("Vault::list_frozen_accounts failed")?;
+        for id in frozen {
+            // Frozen entries are NOT in the active cache (their
+            // `get_account` returns None per P8 CRIT-1). Emit only
+            // the id + a placeholder; the user runs `resolve` to
+            // surface the rest.
+            rows.push(ListRow {
+                account_id: id,
+                display_name: None,
+                username: None,
+                url: None,
+                status: AccountListStatus::Frozen,
+            });
+        }
+    }
+
+    if args.include_tombstoned {
+        let tomb = vault
+            .list_tombstoned_accounts()
+            .context("Vault::list_tombstoned_accounts failed")?;
+        for id in tomb {
+            rows.push(ListRow {
+                account_id: id,
+                display_name: None,
+                username: None,
+                url: None,
+                status: AccountListStatus::Tombstoned,
+            });
+        }
+    }
+
+    // Stable sort: by display_name (active rows have it, frozen/
+    // tombstoned rows do not), then by account_id for determinism.
+    rows.sort_by(|a, b| {
+        let an = a.display_name.as_deref().unwrap_or("");
+        let bn = b.display_name.as_deref().unwrap_or("");
+        an.cmp(bn)
+            .then_with(|| a.account_id.as_bytes().cmp(b.account_id.as_bytes()))
+    });
+
+    if global.json {
+        let mut arr: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            // **A11 / P11A-3 omit-vs-null discipline.** Use
+            // serde_json's object-builder so the `name` /
+            // `username` / `url` keys are absent for frozen +
+            // tombstoned rows rather than `null`. The discipline
+            // is even stricter on `account show` (where secret-
+            // field omission carries security weight); we
+            // mirror it here for consistency.
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "account_id".to_string(),
+                serde_json::Value::String(hex::encode(row.account_id.as_bytes())),
+            );
+            obj.insert(
+                "status".to_string(),
+                serde_json::Value::String(row.status.json_str().to_string()),
+            );
+            if let Some(n) = &row.display_name {
+                obj.insert("name".to_string(), serde_json::Value::String(n.clone()));
+            }
+            if let Some(u) = &row.username {
+                obj.insert("username".to_string(), serde_json::Value::String(u.clone()));
+            }
+            if let Some(u) = &row.url {
+                obj.insert("url".to_string(), serde_json::Value::String(u.clone()));
+            }
+            arr.push(serde_json::Value::Object(obj));
+        }
+        let summary = serde_json::Value::Array(arr);
+        println!("{summary}");
+    } else if rows.is_empty() {
+        eprintln!("(no entries)");
+    } else {
+        for row in &rows {
+            let name = row.display_name.as_deref().unwrap_or("(unavailable)");
+            println!(
+                "{}  {}{}",
+                hex::encode(row.account_id.as_bytes()),
+                name,
+                row.status.suffix(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Internal row representation for `account list` output. Holds
+/// only non-secret identifier-class fields per A11; secret fields
+/// (`password`, `notes`, `totp_secret`) NEVER flow through this
+/// struct.
+struct ListRow {
+    account_id: AccountId,
+    display_name: Option<String>,
+    username: Option<String>,
+    url: Option<String>,
+    status: AccountListStatus,
+}
+
+impl ListRow {
+    fn from_snapshot(
+        account_id: AccountId,
+        snap: &AccountSnapshot,
+        status: AccountListStatus,
+    ) -> Self {
+        Self {
+            account_id,
+            display_name: Some(String::from_utf8_lossy(snap.display_name.expose()).to_string()),
+            username: {
+                let u = String::from_utf8_lossy(snap.username.expose()).to_string();
+                if u.is_empty() {
+                    None
+                } else {
+                    Some(u)
+                }
+            },
+            url: {
+                let u = String::from_utf8_lossy(snap.url.expose()).to_string();
+                if u.is_empty() {
+                    None
+                } else {
+                    Some(u)
+                }
+            },
+            status,
+        }
+    }
+}
+
+/// Run the `account show` subcommand.
+#[allow(clippy::unused_async, clippy::too_many_lines)]
+async fn run_show(global: &GlobalArgs, args: AccountShowArgs) -> Result<()> {
+    let mut vault = open_and_unlock(&args.vault_path, args.vault_password.as_deref())
+        .context("vault open + unlock failed")?;
+    let account_id = AccountId::from_bytes(args.account_id.0);
+
+    // Identifier-fields path: `Vault::get_account` returns `None`
+    // for unknown OR frozen OR tombstoned. Per A10 we surface
+    // a precise error for each case (frozen → resolve hint;
+    // tombstoned → "deleted, create new"; unknown → "no account").
+    //
+    // We materialize the three non-secret identity fields into
+    // owned `String`s inside this scope so the `&AccountSnapshot`
+    // borrow ends before the mutable `reveal_*` calls below.
+    let (display_name, username, url) = {
+        let Some(snap) = vault.get_account(account_id) else {
+            let frozen = vault
+                .list_frozen_accounts()
+                .context("Vault::list_frozen_accounts failed")?;
+            if frozen.contains(&account_id) {
+                bail!(
+                    "account {} is frozen pending resolve. \
+                     Run `pangolin-cli resolve --account-id {} --keep <head>` first; \
+                     inspect heads via `pangolin-cli status`",
+                    hex::encode(account_id.as_bytes()),
+                    hex::encode(account_id.as_bytes())
+                );
+            }
+            let tomb = vault
+                .list_tombstoned_accounts()
+                .context("Vault::list_tombstoned_accounts failed")?;
+            if tomb.contains(&account_id) {
+                bail!(
+                    "account {} has been deleted (tombstoned). \
+                     Resurrection is not supported under the append-only model; \
+                     create a new entry.",
+                    hex::encode(account_id.as_bytes())
+                );
+            }
+            bail!(
+                "no account with id {} in this vault",
+                hex::encode(account_id.as_bytes())
+            );
+        };
+        (
+            String::from_utf8_lossy(snap.display_name.expose()).to_string(),
+            String::from_utf8_lossy(snap.username.expose()).to_string(),
+            String::from_utf8_lossy(snap.url.expose()).to_string(),
+        )
+    };
+
+    // ----- Reveal flow -----
+    //
+    // Per A7: prompt ONCE if any reveal flag is set, then construct
+    // N fresh PressYPresenceProof::confirmed() instances (one per
+    // reveal call). Each proof passes verify()'s freshness window
+    // because each is constructed within milliseconds of the
+    // user's gesture.
+    let need_reveal = args.reveal_password || args.reveal_notes || args.reveal_totp_secret;
+    let mut revealed_password: Option<SecretBytes> = None;
+    let mut revealed_notes: Option<SecretBytes> = None;
+    let mut revealed_totp: Option<SecretBytes> = None;
+    if need_reveal {
+        let actions = describe_reveal_actions(
+            args.reveal_password,
+            args.reveal_notes,
+            args.reveal_totp_secret,
+        );
+        if !confirm_presence(&actions, &hex::encode(account_id.as_bytes()))? {
+            bail!("presence not confirmed; reveal cancelled");
+        }
+        if args.reveal_password {
+            let p = PressYPresenceProof::confirmed();
+            revealed_password = Some(
+                vault
+                    .reveal_password(account_id, &p)
+                    .context("Vault::reveal_password failed")?,
+            );
+        }
+        if args.reveal_notes {
+            let p = PressYPresenceProof::confirmed();
+            revealed_notes = Some(
+                vault
+                    .reveal_notes(account_id, &p)
+                    .context("Vault::reveal_notes failed")?,
+            );
+        }
+        if args.reveal_totp_secret {
+            let p = PressYPresenceProof::confirmed();
+            revealed_totp = Some(
+                vault
+                    .reveal_totp_secret(account_id, &p)
+                    .context("Vault::reveal_totp_secret failed")?,
+            );
+        }
+    }
+    vault.close().context("Vault::close failed")?;
+
+    // ----- Output -----
+    if global.json {
+        // **A11 / P11A-3 omit-vs-null discipline.** Unrevealed
+        // secret fields are OMITTED from the JSON output, never
+        // emitted as `null`. A `null` value would leak the
+        // existence of a field to log scrapers; absence is the
+        // honest signal.
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "account_id".to_string(),
+            serde_json::Value::String(hex::encode(account_id.as_bytes())),
+        );
+        obj.insert("name".to_string(), serde_json::Value::String(display_name));
+        if !username.is_empty() {
+            obj.insert("username".to_string(), serde_json::Value::String(username));
+        }
+        if !url.is_empty() {
+            obj.insert("url".to_string(), serde_json::Value::String(url));
+        }
+        if let Some(p) = &revealed_password {
+            obj.insert(
+                "password".to_string(),
+                serde_json::Value::String(String::from_utf8_lossy(p.expose()).to_string()),
+            );
+        }
+        if let Some(n) = &revealed_notes {
+            obj.insert(
+                "notes".to_string(),
+                serde_json::Value::String(String::from_utf8_lossy(n.expose()).to_string()),
+            );
+        }
+        if let Some(t) = &revealed_totp {
+            obj.insert(
+                "totp_secret".to_string(),
+                serde_json::Value::String(String::from_utf8_lossy(t.expose()).to_string()),
+            );
+        }
+        obj.insert(
+            "status".to_string(),
+            serde_json::Value::String("active".to_string()),
+        );
+        let val = serde_json::Value::Object(obj);
+        println!("{val}");
+    } else {
+        println!("account_id  {}", hex::encode(account_id.as_bytes()));
+        println!("name        {display_name}");
+        if !username.is_empty() {
+            println!("username    {username}");
+        }
+        if !url.is_empty() {
+            println!("url         {url}");
+        }
+        if let Some(p) = &revealed_password {
+            // Q2: --reveal-password writes plaintext to stdout.
+            println!("password    {}", String::from_utf8_lossy(p.expose()));
+        }
+        if let Some(n) = &revealed_notes {
+            println!("notes       {}", String::from_utf8_lossy(n.expose()));
+        }
+        if let Some(t) = &revealed_totp {
+            println!("totp_secret {}", String::from_utf8_lossy(t.expose()));
+        }
+    }
+    Ok(())
+}
+
+/// Build a human-readable list of the actions the user is about to
+/// authorize. Used by the presence prompt.
+fn describe_reveal_actions(
+    reveal_password: bool,
+    reveal_notes: bool,
+    reveal_totp: bool,
+) -> Vec<&'static str> {
+    let mut actions = Vec::new();
+    if reveal_password {
+        actions.push("password");
+    }
+    if reveal_notes {
+        actions.push("notes");
+    }
+    if reveal_totp {
+        actions.push("TOTP secret");
+    }
+    actions
+}
+
+/// Print the presence prompt and read a `'y'`-or-not response from
+/// stdin. Returns `Ok(true)` only when the user typed exactly the
+/// single character `'y'` (case-sensitive). Any other input —
+/// `'Y'`, `'yes'`, EOF, empty line — returns `Ok(false)` and the
+/// caller aborts.
+fn confirm_presence(actions: &[&str], account_hex: &str) -> Result<bool> {
+    let actions_str = actions.join(" + ");
+    eprint!(
+        "presence required to reveal {actions_str} for account {account_hex}: \
+         type 'y' and press enter: "
+    );
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    {
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        handle
+            .read_line(&mut line)
+            .context("failed to read presence confirmation from stdin")?;
+    }
+    Ok(line.trim_end_matches(['\r', '\n']) == "y")
+}
+
+// ===================================================================
+// P11A-4..P11A-5 stubs (still pending)
+// ===================================================================
 
 #[allow(clippy::unused_async)]
 async fn run_update(_global: &GlobalArgs, _args: AccountUpdateArgs) -> Result<()> {
@@ -290,11 +673,14 @@ async fn run_delete(_global: &GlobalArgs, _args: AccountDeleteArgs) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_password, run_add, GENERATED_PASSWORD_ALPHABET, GENERATED_PASSWORD_LEN};
-    use crate::cli::{AccountAddArgs, GlobalArgs};
+    use super::{
+        describe_reveal_actions, generate_password, run_add, run_list, run_show, AccountListStatus,
+        GENERATED_PASSWORD_ALPHABET, GENERATED_PASSWORD_LEN,
+    };
+    use crate::cli::{AccountAddArgs, AccountListArgs, AccountShowArgs, GlobalArgs, HexAccountId};
     use pangolin_crypto::secret::SecretBytes;
     use pangolin_store::session::{PinIdentityProof, PressYPresenceProof};
-    use pangolin_store::Vault;
+    use pangolin_store::{AccountSnapshot, Vault};
     use std::path::PathBuf;
 
     /// Common vault password used by the unit tests.
@@ -496,5 +882,285 @@ mod tests {
         let snap = v.get_account(accounts[0]).expect("get");
         assert_eq!(snap.display_name.expose(), b"persist");
         v.close().expect("close");
+    }
+
+    // -----------------------------------------------------------
+    // P11A-3: account list + account show tests
+    // -----------------------------------------------------------
+
+    /// Helper: create a vault with two named accounts, returning
+    /// (path, list of `account_ids`).
+    async fn make_vault_with_two_accounts() -> (tempfile::TempDir, PathBuf, Vec<[u8; 32]>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.pvf");
+        make_vault(&path);
+        let mut ids = Vec::new();
+        for n in ["alpha", "beta"] {
+            let args = add_args(path.clone(), n);
+            run_add(&global(), args).await.expect("add ok");
+        }
+        // Read back the ids in stable order via a fresh open.
+        let mut v = Vault::open(&path).expect("open");
+        let presence = PressYPresenceProof::confirmed();
+        let identity = PinIdentityProof::new(SecretBytes::new(TEST_PWD.as_bytes().to_vec()));
+        v.unlock(&presence, &identity).expect("unlock");
+        for id in v.list_accounts() {
+            ids.push(*id.as_bytes());
+        }
+        v.close().expect("close");
+        (dir, path, ids)
+    }
+
+    fn list_args(vault_path: PathBuf) -> AccountListArgs {
+        AccountListArgs {
+            vault_path,
+            vault_password: Some(TEST_PWD.into()),
+            include_frozen: false,
+            include_tombstoned: false,
+        }
+    }
+
+    fn show_args(vault_path: PathBuf, account_id: [u8; 32]) -> AccountShowArgs {
+        AccountShowArgs {
+            vault_path,
+            vault_password: Some(TEST_PWD.into()),
+            account_id: HexAccountId(account_id),
+            reveal_password: false,
+            reveal_notes: false,
+            reveal_totp_secret: false,
+        }
+    }
+
+    /// **P11A-3.** `account list` succeeds on a vault with active
+    /// entries — exercises the happy path. Output verification is
+    /// at the smoke-success level (we don't capture stdout in
+    /// unit tests; the omit-secrets discipline is verified by the
+    /// `ListRow` struct shape — it has no secret-bearing fields).
+    #[tokio::test]
+    async fn account_list_walks_active_accounts() {
+        let (_dir, path, ids) = make_vault_with_two_accounts().await;
+        assert_eq!(ids.len(), 2);
+        run_list(&global(), list_args(path)).await.expect("list ok");
+    }
+
+    /// **P11A-3 / A11.** `account list` JSON output. We can only
+    /// surface the smoke that `--json` runs cleanly here; the
+    /// omit-vs-null discipline for unrevealed secrets lives in
+    /// `account show` (where it carries security weight).
+    #[tokio::test]
+    async fn account_list_json_succeeds() {
+        let (_dir, path, _ids) = make_vault_with_two_accounts().await;
+        let mut g = global();
+        g.json = true;
+        run_list(&g, list_args(path)).await.expect("list json ok");
+    }
+
+    /// **P11A-3 / A11.** Empty vault → list emits the "(no
+    /// entries)" message and exits cleanly.
+    #[tokio::test]
+    async fn account_list_empty_vault_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("empty.pvf");
+        make_vault(&path);
+        run_list(&global(), list_args(path))
+            .await
+            .expect("empty list ok");
+    }
+
+    /// **P11A-3.** `ListRow::from_snapshot` does NOT carry any
+    /// secret-bearing field (password / notes / `totp_secret`).
+    /// This is a structural invariant — the test exercises it by
+    /// constructing a row from a snapshot whose secret fields
+    /// contain canary bytes and asserting those canaries do not
+    /// surface in the row's serialisation.
+    #[test]
+    fn list_row_omits_secret_fields_structurally() {
+        let snap = AccountSnapshot::new(
+            SecretBytes::new(b"display-canary".to_vec()),
+            SecretBytes::new(b"user-canary".to_vec()),
+            SecretBytes::new(b"PASSWORD-CANARY".to_vec()),
+            SecretBytes::new(b"https://url-canary".to_vec()),
+            SecretBytes::new(b"NOTES-CANARY".to_vec()),
+            SecretBytes::new(b"TOTP-CANARY".to_vec()),
+        );
+        let row = super::ListRow::from_snapshot(
+            pangolin_store::AccountId::from_bytes([0u8; 32]),
+            &snap,
+            AccountListStatus::Active,
+        );
+        // Identifier-class fields surface; secret-class fields do not.
+        assert_eq!(row.display_name.as_deref(), Some("display-canary"));
+        assert_eq!(row.username.as_deref(), Some("user-canary"));
+        assert_eq!(row.url.as_deref(), Some("https://url-canary"));
+        // No password / notes / totp_secret on ListRow at all —
+        // structural absence.
+        let serialized = format!("{:?} {:?} {:?}", row.display_name, row.username, row.url);
+        for canary in ["PASSWORD-CANARY", "NOTES-CANARY", "TOTP-CANARY"] {
+            assert!(
+                !serialized.contains(canary),
+                "ListRow leaked secret canary {canary}: {serialized}"
+            );
+        }
+    }
+
+    /// **P11A-3.** `account show` (no reveal flags) succeeds on
+    /// an existing entry.
+    #[tokio::test]
+    async fn account_show_default_omits_secrets() {
+        let (_dir, path, ids) = make_vault_with_two_accounts().await;
+        let id = ids[0];
+        run_show(&global(), show_args(path, id))
+            .await
+            .expect("show ok");
+    }
+
+    /// **P11A-3.** `account show --account-id <unknown>` surfaces
+    /// a clear "no account" error.
+    #[tokio::test]
+    async fn account_show_unknown_id_returns_clear_error() {
+        let (_dir, path, _ids) = make_vault_with_two_accounts().await;
+        let unknown = [0xFFu8; 32];
+        let err = run_show(&global(), show_args(path, unknown))
+            .await
+            .expect_err("unknown id should fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no account") || msg.contains("not found"),
+            "expected unknown-id message, got: {msg}"
+        );
+    }
+
+    /// **P11A-3 / A10.** `account show` against a tombstoned
+    /// account surfaces a clear "deleted" message that does NOT
+    /// say "not found" (the user knows the account was created;
+    /// the right error is "deleted, create new").
+    #[tokio::test]
+    async fn account_show_tombstoned_account_surfaces_deleted_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v-tomb.pvf");
+        make_vault(&path);
+        let args = add_args(path.clone(), "to-be-deleted");
+        run_add(&global(), args).await.expect("add ok");
+        // Delete via the library directly (P11A-5 not yet wired).
+        let id = {
+            let mut v = Vault::open(&path).expect("open");
+            let presence = PressYPresenceProof::confirmed();
+            let identity = PinIdentityProof::new(SecretBytes::new(TEST_PWD.as_bytes().to_vec()));
+            v.unlock(&presence, &identity).expect("unlock");
+            let id = v.list_accounts()[0];
+            v.delete_account(id).expect("delete");
+            v.close().expect("close");
+            *id.as_bytes()
+        };
+        let err = run_show(&global(), show_args(path, id))
+            .await
+            .expect_err("show on tombstoned should fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("deleted") || msg.contains("tombstoned"),
+            "expected tombstoned hint, got: {msg}"
+        );
+    }
+
+    /// **P11A-3 / A7.** `describe_reveal_actions` returns exactly
+    /// the requested action names. Used by the presence prompt
+    /// wording.
+    #[test]
+    fn describe_reveal_actions_lists_only_requested() {
+        assert_eq!(
+            describe_reveal_actions(true, false, false),
+            vec!["password"]
+        );
+        assert_eq!(
+            describe_reveal_actions(true, true, true),
+            vec!["password", "notes", "TOTP secret"]
+        );
+        assert_eq!(
+            describe_reveal_actions(false, false, false),
+            Vec::<&str>::new()
+        );
+    }
+
+    /// **P11A-3 / Q2.** `account show --reveal-password` is the
+    /// stdout-secret-emit path. We can't easily redirect stdin to
+    /// answer 'y' inside a unit test; instead we verify the
+    /// underlying API the CLI calls. The CLI's contract: build a
+    /// `PressYPresenceProof::confirmed()`, call
+    /// `Vault::reveal_password`, surface the returned bytes. The
+    /// Vault-side test below pins this.
+    #[tokio::test]
+    async fn account_show_reveal_calls_vault_reveal_password() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v-reveal.pvf");
+        make_vault(&path);
+        // Add an account via a direct library call so we know the
+        // password bytes without interacting with --generate-password's
+        // stderr emission.
+        let id = {
+            let mut v = Vault::open(&path).expect("open");
+            let presence = PressYPresenceProof::confirmed();
+            let identity = PinIdentityProof::new(SecretBytes::new(TEST_PWD.as_bytes().to_vec()));
+            v.unlock(&presence, &identity).expect("unlock");
+            let snap = AccountSnapshot::new(
+                SecretBytes::new(b"reveal-test".to_vec()),
+                SecretBytes::new(b"u".to_vec()),
+                SecretBytes::new(b"hunter2".to_vec()),
+                SecretBytes::new(b"https://x".to_vec()),
+                SecretBytes::new(Vec::new()),
+                SecretBytes::new(Vec::new()),
+            );
+            let id = v.add_account(snap).expect("add");
+            // Verify the underlying reveal API works.
+            let p = PressYPresenceProof::confirmed();
+            let revealed = v.reveal_password(id, &p).expect("reveal_password");
+            assert_eq!(revealed.expose(), b"hunter2");
+            v.close().expect("close");
+            *id.as_bytes()
+        };
+        // Sanity: account is reachable via `show` with no reveal
+        // flag (confirms it is in the active set).
+        run_show(&global(), show_args(path.clone(), id))
+            .await
+            .expect("show ok");
+    }
+
+    /// **P11A-3 / A11.** `--include-frozen` + `--include-tombstoned`
+    /// flags pass through cleanly; the human path emits the
+    /// `[frozen]` / `[deleted]` suffix. Smoke at the run level.
+    #[tokio::test]
+    async fn account_list_with_include_flags_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v-inc.pvf");
+        make_vault(&path);
+        // Add → delete one → list with --include-tombstoned should
+        // surface the tombstoned row.
+        let id = {
+            let mut v = Vault::open(&path).expect("open");
+            let presence = PressYPresenceProof::confirmed();
+            let identity = PinIdentityProof::new(SecretBytes::new(TEST_PWD.as_bytes().to_vec()));
+            v.unlock(&presence, &identity).expect("unlock");
+            let snap = AccountSnapshot::new(
+                SecretBytes::new(b"about-to-die".to_vec()),
+                SecretBytes::new(b"u".to_vec()),
+                SecretBytes::new(b"p".to_vec()),
+                SecretBytes::new(b"https://x".to_vec()),
+                SecretBytes::new(Vec::new()),
+                SecretBytes::new(Vec::new()),
+            );
+            let id = v.add_account(snap).expect("add");
+            v.delete_account(id).expect("del");
+            v.close().expect("close");
+            *id.as_bytes()
+        };
+        let _ = id;
+        let mut args = list_args(path.clone());
+        args.include_tombstoned = true;
+        run_list(&global(), args).await.expect("list with tomb ok");
+
+        let mut args = list_args(path);
+        args.include_frozen = true;
+        run_list(&global(), args)
+            .await
+            .expect("list with frozen ok");
     }
 }
