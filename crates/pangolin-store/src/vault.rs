@@ -1142,6 +1142,277 @@ impl Vault {
     }
 
     // -----------------------------------------------------------------
+    // P9: conflict-resolution primitives (clear_frozen +
+    //      read_payload_plaintext_for_resolve)
+    // -----------------------------------------------------------------
+
+    /// **P9-1.** Clear `frozen_pending_resolve` and advance
+    /// `head_revision_id` to `chosen_revision_id` in one transaction.
+    ///
+    /// The natural caller pattern is "the resolve flow has just
+    /// published a merge revision under `account_id` whose canonical
+    /// `revision_id` is `chosen_revision_id`; ingest brought the row
+    /// into the local store; now finalize the conflict-resolved state
+    /// by clearing the freeze flag and pointing the canonical head at
+    /// the merge."
+    ///
+    /// Idempotency: a non-frozen account whose `head_revision_id` is
+    /// already `chosen_revision_id` is a no-op (zero rows updated; no
+    /// error). This makes recovery from a kill between
+    /// `ingest_chain_revision` and `clear_frozen` straightforward —
+    /// re-run the resolve flow with the same `--keep` choice; the
+    /// pre-publish check sees the merge revision is already on chain,
+    /// `ingest_chain_revision` recognises it via idempotency arm #1
+    /// (no-op), and `clear_frozen` either clears the still-set flag or
+    /// is a no-op if the prior call had already cleared it.
+    ///
+    /// Both writes (clearing the freeze flag + advancing the head
+    /// pointer) run inside one `BEGIN IMMEDIATE … COMMIT` so a crash
+    /// between them leaves the vault in the pre-transaction state.
+    ///
+    /// Metadata-only — does NOT require [`VaultState::Active`]. The
+    /// caller (`pangolin-cli resolve`) holds the vault unlocked because
+    /// it had to decrypt the chosen revision's plaintext via
+    /// [`Self::read_payload_plaintext_for_resolve`], but `clear_frozen`
+    /// itself touches no plaintext.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::AccountNotFound` if `account_id` has no
+    /// `account_identities` row. `StoreError::RevisionNotFound` if
+    /// `chosen_revision_id` does not exist in the `revisions` table for
+    /// this `account_id`. `StoreError::Sqlite` for any database issue.
+    pub fn clear_frozen(
+        &mut self,
+        account_id: AccountId,
+        chosen_revision_id: RevisionId,
+    ) -> Result<()> {
+        // Soft-expiry: this is metadata-only, so a Locked vault still
+        // works. Active+expired transitions to Expired and zeroizes
+        // the cache before we proceed.
+        self.maybe_expire_active_session();
+
+        // Cross-check the account exists. Distinct error for unknown
+        // account so the caller can distinguish "you typed the wrong
+        // account_id" from "you typed the wrong revision_id".
+        let account_exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM account_identities WHERE account_id = ?1",
+                params![account_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if account_exists.is_none() {
+            return Err(StoreError::AccountNotFound);
+        }
+
+        // Cross-check the revision exists for this account. Both
+        // checks (account_id AND revision_id) — defense in depth
+        // against an attacker-supplied revision_id from a different
+        // vault's account.
+        let revision_exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM revisions
+                 WHERE account_id = ?1 AND revision_id = ?2",
+                params![
+                    account_id.as_bytes().as_slice(),
+                    chosen_revision_id.as_bytes().as_slice(),
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if revision_exists.is_none() {
+            return Err(StoreError::RevisionNotFound);
+        }
+
+        // Apply both writes atomically: clear the freeze flag AND
+        // advance the head pointer. `BEGIN IMMEDIATE` so a concurrent
+        // writer (which the lock file already prevents at the OS
+        // boundary, but defense in depth) cannot interleave.
+        let tx = self.conn.unchecked_transaction()?;
+        let now = current_unix_ms();
+        tx.execute(
+            "UPDATE account_identities
+             SET frozen_pending_resolve = 0,
+                 head_revision_id = ?1,
+                 last_modified_at = ?2
+             WHERE account_id = ?3",
+            params![
+                chosen_revision_id.as_bytes().as_slice(),
+                now,
+                account_id.as_bytes().as_slice(),
+            ],
+        )?;
+        tx.commit()?;
+
+        self.touch_session();
+        Ok(())
+    }
+
+    /// **P9-1.** Read the plaintext of an arbitrary revision belonging
+    /// to `account_id`, bypassing the
+    /// `frozen_pending_resolve` read guard.
+    ///
+    /// **DOCUMENTED FREEZE-GUARD BYPASS — DO NOT CALL FROM ANY PATH
+    /// EXCEPT `pangolin-cli resolve`.** The frozen-account guard on
+    /// every other read surface ([`Self::get_account`],
+    /// [`Self::reveal_password`], [`Self::reveal_notes`],
+    /// [`Self::reveal_totp_secret`], [`Self::export_payload`]) refuses
+    /// to surface plaintext for an account in the
+    /// `frozen_pending_resolve` state. The resolve flow needs to read
+    /// the chosen head's plaintext exactly once, in memory only, to
+    /// re-seal it under the merge revision's AAD with a fresh nonce
+    /// (per P9 plan §A2 — a byte-copy of the ciphertext would carry
+    /// the source revision's `parent_revision_id` in its baked-in AAD,
+    /// producing an unopenable merge row).
+    ///
+    /// The user's explicit `--keep <revision-id>` flag is the
+    /// proof-of-intent that authorizes this single bypass: the user
+    /// has named the specific revision they want to ratify, so we
+    /// trust the read for that one revision, for the duration of one
+    /// resolve invocation. The returned [`AccountSnapshot`] zeroizes
+    /// on drop; the caller is expected to consume it immediately into
+    /// the re-seal pipeline and discard.
+    ///
+    /// Both `account_id` AND `revision_id` are cross-checked so that
+    /// supplying a `revision_id` from a different account's history
+    /// (or a different vault's account) does NOT decrypt — the AAD
+    /// bind matches `account_id` and the SQL row lookup matches both.
+    /// Mismatches collapse into `AccountNotFound` so this method does
+    /// not become an oracle on which `(account, revision)` pairs are
+    /// known locally.
+    ///
+    /// Requires the vault to be [`VaultState::Active`] — the AEAD
+    /// `open` path needs the unwrapped VDK in the active cache.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] / [`StoreError::SessionExpired`] if
+    /// the session is not active.
+    /// [`StoreError::AccountNotFound`] if `account_id` is unknown OR
+    /// if `revision_id` is not a row for this account (collapsed —
+    /// see above).
+    /// [`StoreError::AuthenticationFailed`] if the AEAD open fails
+    /// (tampered ciphertext, wrong AAD, schema-version drift).
+    /// [`StoreError::Cbor`] if the decrypted payload's CBOR shape is
+    /// not a live `AccountSnapshot` map (e.g., the revision is a
+    /// tombstone — A5 of P9 plan; the resolve flow checks the
+    /// `is_tombstone` flag separately and re-seals via
+    /// [`crate::blob::seal_tombstone`] instead of calling this method).
+    pub fn read_payload_plaintext_for_resolve(
+        &mut self,
+        account_id: AccountId,
+        revision_id: RevisionId,
+    ) -> Result<AccountSnapshot> {
+        // Cache-bearing op (uses VDK). Strict freshness check.
+        self.check_session_freshness()?;
+        let _ = self.require_active()?;
+
+        // Cross-check account exists. Collapse "unknown account" and
+        // "unknown revision for this account" into the SAME error
+        // variant to deny an oracle.
+        let account_row: Option<(i64,)> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM account_identities WHERE account_id = ?1",
+                params![account_id.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?,)),
+            )
+            .optional()?;
+        if account_row.is_none() {
+            return Err(StoreError::AccountNotFound);
+        }
+
+        // Read the chosen revision's `(parent, schema_version,
+        // enc_payload, enc_nonce)` cross-checked on `account_id` so
+        // a `revision_id` from a different account does NOT match.
+        let row: Option<RawRevisionPayload> = self
+            .conn
+            .query_row(
+                "SELECT parent_revision_id, schema_version, enc_payload, enc_nonce
+                 FROM revisions
+                 WHERE account_id = ?1 AND revision_id = ?2",
+                params![
+                    account_id.as_bytes().as_slice(),
+                    revision_id.as_bytes().as_slice(),
+                ],
+                |row| {
+                    let parent: Vec<u8> = row.get(0)?;
+                    let sv: i64 = row.get(1)?;
+                    let payload: Vec<u8> = row.get(2)?;
+                    let nonce: Vec<u8> = row.get(3)?;
+                    Ok(RawRevisionPayload {
+                        parent,
+                        schema_version: sv,
+                        enc_payload: payload,
+                        enc_nonce: nonce,
+                    })
+                },
+            )
+            .optional()?;
+        // Per docstring: collapse "wrong account_id for this
+        // revision" into the same error variant as "unknown
+        // account" so the method is not an oracle.
+        let RawRevisionPayload {
+            parent: parent_blob,
+            schema_version: sv_i64,
+            enc_payload,
+            enc_nonce,
+        } = row.ok_or(StoreError::AccountNotFound)?;
+
+        let parent_arr: [u8; REVISION_ID_LEN] = parent_blob
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Corrupted("parent_revision_id not 32 bytes".into()))?;
+        let parent = RevisionId::from_bytes(parent_arr);
+        let schema_version = u8::try_from(sv_i64).map_err(|_| {
+            StoreError::Corrupted("revisions.schema_version out of u8 range".into())
+        })?;
+
+        // Reconstruct the AAD that was baked in at seal time. Same
+        // build_aad call shape as add_account / update_account.
+        let aad = build_aad(&self.meta.vault_id, &account_id, &parent, schema_version);
+
+        // The nonce must be 24 bytes (NONCE_LEN). A pre-existing row
+        // could have a placeholder zeroed nonce if it was inserted via
+        // ingest_chain_revision (foreign chain event without the
+        // original nonce — see ingest_chain_revision body). In that
+        // case open_payload returns AuthenticationFailed because
+        // the AEAD won't decrypt under the placeholder; the resolve
+        // flow surfaces that as a clean error to the user.
+        let nonce_arr: [u8; NONCE_LEN] = enc_nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Corrupted("revisions.enc_nonce not 24 bytes".into()))?;
+        let nonce = Nonce::from_storage_bytes(nonce_arr);
+        let ciphertext = Ciphertext::from_vec(enc_payload);
+
+        let active = self.require_active()?;
+        let decoded = open_payload(active.vdk.aead_key(), &nonce, &ciphertext, &aad)?;
+
+        let snapshot = match decoded {
+            DecodedPayload::Live(s) => s,
+            // Tombstone: the resolve flow detects is_tombstone via
+            // revisions metadata and uses seal_tombstone directly
+            // (per P9 plan §A5). If the caller passed a tombstone
+            // revision into THIS method, surface a CBOR-class error
+            // — the API contract is "live snapshot only".
+            DecodedPayload::Tombstone => {
+                return Err(StoreError::Cbor(
+                    "read_payload_plaintext_for_resolve called on tombstone revision; \
+                     resolve flow must use seal_tombstone for tombstone heads"
+                        .into(),
+                ));
+            }
+        };
+
+        self.touch_session();
+        Ok(snapshot)
+    }
+
+    // -----------------------------------------------------------------
     // P4: high-risk operations — presence escalation
     // -----------------------------------------------------------------
     //
@@ -2620,6 +2891,16 @@ fn build_decrypted_cache(
     Ok(cache)
 }
 
+/// **P9-1.** Helper struct factored out so the `query_row` body in
+/// [`Vault::read_payload_plaintext_for_resolve`] avoids the
+/// `clippy::type_complexity` rule on a 4-tuple of varied types.
+struct RawRevisionPayload {
+    parent: Vec<u8>,
+    schema_version: i64,
+    enc_payload: Vec<u8>,
+    enc_nonce: Vec<u8>,
+}
+
 /// Helper to read a revisions-row into [`RevisionMeta`].
 struct RawRevisionRow {
     revision_id: Vec<u8>,
@@ -4072,5 +4353,189 @@ mod tests {
             .list_frozen_accounts()
             .expect("list_frozen_accounts after migration");
         assert!(frozen.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // P9-1: clear_frozen + read_payload_plaintext_for_resolve tests
+    // -----------------------------------------------------------------
+
+    /// **P9-1.** Happy path — `clear_frozen` clears the
+    /// `frozen_pending_resolve` flag AND advances `head_revision_id`
+    /// to the supplied revision in one transaction. Verified post-
+    /// call by reading both columns directly.
+    #[test]
+    fn clear_frozen_advances_head_and_clears_flag() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).expect("add");
+
+        // Trigger the freeze via a foreign chain event under the same
+        // account_id but a different device_id + payload (genuine-
+        // foreign-INSERT path).
+        let ev = fresh_event(v.vault_id(), *id.as_bytes(), [0u8; 32], b"foreign", 1, 0);
+        v.ingest_chain_revision(&ev).expect("ingest");
+        assert!(v.list_frozen_accounts().unwrap().contains(&id));
+
+        // The local genesis revision is still in the table; we use it
+        // as the chosen head for the resolve test (its content is
+        // arbitrary — we're testing clear_frozen's mechanics, not the
+        // resolve flow's full publish path).
+        let revs = v.revisions_for(id).expect("revisions");
+        let chosen = revs[0].revision_id;
+
+        v.clear_frozen(id, chosen).expect("clear_frozen ok");
+
+        // Flag is clear.
+        assert!(
+            !v.list_frozen_accounts().unwrap().contains(&id),
+            "frozen flag must be cleared"
+        );
+        // Head pointer advanced.
+        let head: Vec<u8> = v
+            .conn
+            .query_row(
+                "SELECT head_revision_id FROM account_identities WHERE account_id = ?1",
+                rusqlite::params![id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("read head");
+        assert_eq!(head.as_slice(), chosen.as_bytes().as_slice());
+    }
+
+    /// **P9-1.** Idempotent — clearing a non-frozen account whose
+    /// head already equals `chosen_revision_id` is a no-op.
+    #[test]
+    fn clear_frozen_idempotent_on_already_clean() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).expect("add");
+        let revs = v.revisions_for(id).expect("revisions");
+        let head = revs[0].revision_id;
+
+        // No freeze; head already at the expected revision. Idempotent.
+        v.clear_frozen(id, head).expect("first clear");
+        v.clear_frozen(id, head).expect("idempotent second clear");
+        assert!(!v.list_frozen_accounts().unwrap().contains(&id));
+    }
+
+    /// **P9-1.** Unknown `revision_id` surfaces `RevisionNotFound`.
+    #[test]
+    fn clear_frozen_rejects_unknown_revision() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).expect("add");
+        let bogus = crate::revision::RevisionId::from_bytes([0xCC; 32]);
+        let err = v.clear_frozen(id, bogus).expect_err("must reject");
+        assert!(
+            matches!(err, StoreError::RevisionNotFound),
+            "unknown revision_id should return RevisionNotFound, got {err:?}"
+        );
+    }
+
+    /// **P9-1.** Unknown `account_id` surfaces `AccountNotFound`.
+    #[test]
+    fn clear_frozen_rejects_unknown_account() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let bogus_acct = crate::account::AccountId::from_bytes([0xAB; 32]);
+        let bogus_rev = crate::revision::RevisionId::from_bytes([0xCC; 32]);
+        let err = v
+            .clear_frozen(bogus_acct, bogus_rev)
+            .expect_err("must reject");
+        assert!(
+            matches!(err, StoreError::AccountNotFound),
+            "unknown account_id should return AccountNotFound, got {err:?}"
+        );
+    }
+
+    /// **P9-1.** `read_payload_plaintext_for_resolve` decrypts the
+    /// chosen revision's payload EVEN when the account is frozen.
+    /// This is the documented bypass — see the loud docstring on
+    /// the method.
+    #[test]
+    fn read_payload_plaintext_for_resolve_bypasses_freeze_guard() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).expect("add");
+        let revs = v.revisions_for(id).expect("revisions");
+        let local_head = revs[0].revision_id;
+
+        // Trigger freeze.
+        let ev = fresh_event(v.vault_id(), *id.as_bytes(), [0u8; 32], b"foreign", 1, 0);
+        v.ingest_chain_revision(&ev).expect("ingest");
+
+        // Sanity: get_account refuses on the frozen row.
+        assert!(v.get_account(id).is_none());
+
+        // The bypass succeeds — we can still read the LOCAL revision's
+        // plaintext (which the resolve flow needs for re-seal).
+        let snapshot = v
+            .read_payload_plaintext_for_resolve(id, local_head)
+            .expect("bypass must succeed for the resolve flow");
+        assert!(bool::from(snapshot.ct_eq(&fresh_snapshot())));
+    }
+
+    /// **P9-1.** Requires an active session — a Locked vault refuses.
+    #[test]
+    fn read_payload_plaintext_for_resolve_requires_unlocked_vault() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).expect("add");
+        let revs = v.revisions_for(id).expect("revisions");
+        let head = revs[0].revision_id;
+        v.lock();
+
+        let err = v
+            .read_payload_plaintext_for_resolve(id, head)
+            .expect_err("locked vault must refuse");
+        assert!(
+            matches!(err, StoreError::NotUnlocked),
+            "locked vault should return NotUnlocked, got {err:?}"
+        );
+    }
+
+    /// **P9-1.** Cross-account safety — supplying a `revision_id`
+    /// that belongs to a different account collapses to
+    /// `AccountNotFound` (no oracle).
+    #[test]
+    fn read_payload_plaintext_for_resolve_rejects_wrong_account_id() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id_a = v.add_account(fresh_snapshot()).expect("add A");
+        let id_b = v.add_account(fresh_snapshot()).expect("add B");
+
+        // Take A's head revision and try to read it under B's
+        // account_id. Cross-account substitution must fail.
+        let revs_a = v.revisions_for(id_a).expect("revisions A");
+        let head_a = revs_a[0].revision_id;
+
+        let err = v
+            .read_payload_plaintext_for_resolve(id_b, head_a)
+            .expect_err("cross-account read must refuse");
+        assert!(
+            matches!(err, StoreError::AccountNotFound),
+            "cross-account substitution must collapse to AccountNotFound, got {err:?}"
+        );
     }
 }
