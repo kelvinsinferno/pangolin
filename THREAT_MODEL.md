@@ -715,7 +715,10 @@ the PR.
     passwords. The `account show --reveal-password`
     output prints to stdout; shell-history capture is the
     user's risk to manage (no different from
-    `pass show <name>`).
+    `pass show <name>`). An additional vector is `2>file`
+    redirect of `--generate-password` output, which would
+    persist the generated password to disk; document in
+    user-facing help text and treat as user responsibility.
 24. **Account-show plaintext leak via shell history /
     terminal scrollback.** Defense (acknowledgement, UX-
     bound): the `--reveal-password` / `--reveal-notes` /
@@ -738,7 +741,12 @@ the PR.
     non-secret fields only and emits no presence prompt.
     JSON output omits (rather than `null`-fills) the
     unrevealed secret fields — verified by inspection of
-    `run_show`'s JSON-building branch.
+    `run_show`'s JSON-building branch. An additional risk
+    is attacker-controlled display names containing
+    terminal escape sequences; sanitization via
+    `sanitize_for_display` strips C0/DEL control
+    characters before printing in delete confirmation
+    prompts and other display contexts.
 25. **Tombstone replay via `account delete`.** Defense:
     same protection as P10's tombstone discipline (rows
     #20, #22) — the tombstone revision's canonical hash

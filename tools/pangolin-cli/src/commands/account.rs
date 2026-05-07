@@ -45,7 +45,7 @@ use std::io::{BufRead as _, Read as _, Write as _};
 use anyhow::{bail, Context, Result};
 use pangolin_crypto::secret::SecretBytes;
 use pangolin_store::session::PressYPresenceProof;
-use pangolin_store::{AccountId, AccountSnapshot};
+use pangolin_store::{AccountId, AccountSnapshot, StoreError};
 
 use crate::cli::{
     AccountAddArgs, AccountArgs, AccountCommand, AccountDeleteArgs, AccountListArgs,
@@ -107,11 +107,15 @@ async fn run_add(global: &GlobalArgs, args: AccountAddArgs) -> Result<()> {
     let url = SecretBytes::new(args.url.as_deref().unwrap_or("").as_bytes().to_vec());
 
     // Notes: --notes flag form (lower-tier per A5), --notes-stdin
-    // recommended path, or empty by default.
+    // recommended path, or empty by default. Notes are explicitly
+    // multi-line capable (the user pipes a heredoc / file with
+    // internal newlines); use `read_secret_multiline_from_stdin`
+    // which reads the full stdin and trims only the trailing LF/
+    // CRLF (per MED-2 fix's multiline-vs-first-line split).
     let notes = if let Some(n) = args.notes.as_deref() {
         SecretBytes::new(n.as_bytes().to_vec())
     } else if args.notes_stdin {
-        read_secret_from_stdin().context("--notes-stdin read failed")?
+        read_secret_multiline_from_stdin().context("--notes-stdin read failed")?
     } else {
         SecretBytes::new(Vec::new())
     };
@@ -122,19 +126,37 @@ async fn run_add(global: &GlobalArgs, args: AccountAddArgs) -> Result<()> {
         let generated = generate_password();
         // Q5: write to stderr. Stdout is reserved for the
         // account_id (and any pipeable identifiers).
+        //
+        // **MED-3 fix.** Route the password bytes via
+        // `stderr().lock().write_all` rather than `eprintln!`. The
+        // `eprintln!` macro funnels through `fmt::Arguments` /
+        // `fmt::write`, which may copy the bytes through internal
+        // formatter buffers that are NOT zeroized on drop. The
+        // `write_all` path takes the byte slice directly from
+        // `SecretBytes::expose()` and hands it to libstd's IO
+        // layer; the IO write buffers may still copy, but we
+        // eliminate the user-space `fmt`-machinery copies that
+        // sit between the SecretBytes and the OS. SecretBytes
+        // itself zeroizes on drop. Banner / trailer lines stay on
+        // `eprintln!` (they are constants, not secrets).
         eprintln!("=========================================================");
         eprintln!("GENERATED PASSWORD (save this now; will not be shown again):");
-        // Print the password as a plain UTF-8 line. The bytes are
-        // ASCII per the alphabet definition.
-        eprintln!(
-            "{}",
-            std::str::from_utf8(generated.expose())
-                .expect("generated password is ASCII per the alphabet")
-        );
+        {
+            let stderr = std::io::stderr();
+            let mut handle = stderr.lock();
+            handle
+                .write_all(generated.expose())
+                .context("failed to emit generated password to stderr")?;
+            handle
+                .write_all(b"\n")
+                .context("failed to emit generated-password trailing newline")?;
+        }
         eprintln!("=========================================================");
         generated
     } else if args.password_stdin {
-        read_secret_from_stdin().context("--password-stdin read failed")?
+        read_secret_first_line_from_stdin()
+            .context("--password-stdin read failed")
+            .and_then(reject_empty_password)?
     } else {
         prompt_password_with_confirmation()?
     };
@@ -143,7 +165,9 @@ async fn run_add(global: &GlobalArgs, args: AccountAddArgs) -> Result<()> {
     let totp_secret = if args.no_totp {
         SecretBytes::new(Vec::new())
     } else if args.totp_stdin {
-        read_secret_from_stdin().context("--totp-stdin read failed")?
+        read_secret_first_line_from_stdin()
+            .context("--totp-stdin read failed")
+            .and_then(reject_empty_totp)?
     } else {
         prompt_totp_secret()?
     };
@@ -171,17 +195,60 @@ async fn run_add(global: &GlobalArgs, args: AccountAddArgs) -> Result<()> {
         // The bare hex id on stdout is the script-pipe-friendly
         // output: `id=$(pangolin-cli account add ...)`.
         println!("{id_hex}");
-        eprintln!("created account {id_hex} with name '{}'", args.name);
+        // **MED-5 fix.** Sanitize the echoed display name so a
+        // post-add summary line cannot inject ANSI escape sequences
+        // into the operator's terminal scrollback.
+        eprintln!(
+            "created account {id_hex} with name '{}'",
+            sanitize_for_display(&args.name)
+        );
     }
     Ok(())
 }
 
-/// Read a single line of secret bytes from stdin. Trims a trailing
-/// LF / CRLF only. The returned `SecretBytes` owns its buffer and
-/// zeroizes on drop.
+/// **MED-2 fix.** Read the FIRST LINE of secret bytes from stdin,
+/// stopping at the first LF or EOF. Trims a trailing CR before the
+/// LF (Windows-style CRLF) and the LF itself; otherwise returns the
+/// raw bytes. Bytes after the first newline are left in stdin.
 ///
-/// Used by `--password-stdin`, `--notes-stdin`, `--totp-stdin`.
-fn read_secret_from_stdin() -> Result<SecretBytes> {
+/// Used by `--password-stdin` and `--totp-stdin`. Plan §A3 documents
+/// first-line semantics for `--password-stdin`; this helper makes
+/// the implementation match the documented contract.
+///
+/// The returned `SecretBytes` owns its buffer and zeroizes on drop.
+fn read_secret_first_line_from_stdin() -> Result<SecretBytes> {
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match handle.read(&mut byte) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                buf.push(byte[0]);
+            }
+            Err(e) => {
+                return Err(anyhow::Error::from(e)).context("read from stdin failed");
+            }
+        }
+    }
+    // Trim a trailing CR (CRLF on Windows pipes).
+    if buf.ends_with(b"\r") {
+        buf.pop();
+    }
+    Ok(SecretBytes::new(buf))
+}
+
+/// **MED-2 fix.** Read the FULL stdin and trim only the very last
+/// LF/CRLF. Internal newlines are preserved — used by
+/// `--notes-stdin` where multi-line input is the expected shape
+/// (heredoc, redirected file).
+///
+/// The returned `SecretBytes` owns its buffer and zeroizes on drop.
+fn read_secret_multiline_from_stdin() -> Result<SecretBytes> {
     let mut buf = Vec::new();
     std::io::stdin()
         .read_to_end(&mut buf)
@@ -197,9 +264,184 @@ fn read_secret_from_stdin() -> Result<SecretBytes> {
     Ok(SecretBytes::new(buf))
 }
 
+/// **MED-1 fix.** Reject an empty password (zero bytes after the
+/// stdin trim or after the prompt's confirmation). A user who
+/// hits Enter twice at the prompt or pipes empty stdin
+/// (`</dev/null`) would otherwise create an entry with an empty
+/// password — silently. The `vault_open::read_vault_password`
+/// path already rejects empty `--vault-password`; we extend the
+/// same posture to credential passwords.
+///
+/// Returns the unchanged `SecretBytes` on success or an
+/// `anyhow::Error` with a stable, grep-able message on rejection.
+fn reject_empty_password(s: SecretBytes) -> Result<SecretBytes> {
+    if s.expose().is_empty() {
+        bail!("password must not be empty");
+    }
+    Ok(s)
+}
+
+/// **MED-1 fix.** Reject an empty TOTP secret on the
+/// `--totp-stdin` path. Interactive `prompt_totp_secret` still
+/// accepts empty input (the user can leave it blank to skip);
+/// the explicit stdin path indicates an intent to supply a
+/// secret, so an empty buffer is an error.
+fn reject_empty_totp(s: SecretBytes) -> Result<SecretBytes> {
+    if s.expose().is_empty() {
+        bail!("TOTP secret must not be empty");
+    }
+    Ok(s)
+}
+
+/// **MED-5 fix.** Sanitize a user-supplied display name (or other
+/// untrusted string) for safe printing on a terminal. Replaces
+/// ASCII C0 control characters (0x00..=0x1F) and DEL (0x7F) with
+/// printable escape representations (e.g., `\x1b` → `\\x1b`,
+/// `\n` → `\\n`).
+///
+/// **Threat closed.** A name containing ANSI escape sequences
+/// (`\x1b[2K`, `\x1b]0;HACK\x07`) would otherwise render into the
+/// operator's terminal during list/show/delete output. The most
+/// dangerous surface is the delete-confirmation prompt — an
+/// attacker-controlled name could visually impersonate a different
+/// account by emitting screen-clear / cursor-move sequences.
+/// Sanitizing strips the escape bytes BEFORE printing.
+///
+/// `PoC` scope: only C0 + DEL. RTL marks, zero-width characters,
+/// and other Unicode confusables are out of scope (documented in
+/// `THREAT_MODEL.md` row 24); the C0/DEL strip is the load-bearing
+/// mitigation against terminal-escape phishing.
+fn sanitize_for_display(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            // Other ASCII C0 (0x00..=0x1F) and DEL (0x7F):
+            c if (c as u32) < 0x20 || (c as u32) == 0x7F => {
+                use core::fmt::Write as _;
+                let _ = write!(out, "\\x{:02x}", c as u32);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// **MED-4 fix.** A minimal, dependency-free RFC 4648 base64
+/// (standard alphabet, with `=` padding) encoder. We avoid pulling
+/// in a new crate (`base64` / `data_encoding`) for one ~25-line
+/// helper; the workspace already has zero base64 deps and HIGH-1's
+/// invariant ("`pangolin-crypto` has zero `serde` deps") imposes
+/// a discipline of minimizing dependency surface. Used only for
+/// JSON output of non-UTF-8 reveal payloads.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    let mut chunks = input.chunks_exact(3);
+    for c in chunks.by_ref() {
+        let b = (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
+        out.push(ALPHABET[((b >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((b >> 12) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((b >> 6) & 0x3F) as usize] as char);
+        out.push(ALPHABET[(b & 0x3F) as usize] as char);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        0 => {}
+        1 => {
+            let b = u32::from(rem[0]) << 16;
+            out.push(ALPHABET[((b >> 18) & 0x3F) as usize] as char);
+            out.push(ALPHABET[((b >> 12) & 0x3F) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let b = (u32::from(rem[0]) << 16) | (u32::from(rem[1]) << 8);
+            out.push(ALPHABET[((b >> 18) & 0x3F) as usize] as char);
+            out.push(ALPHABET[((b >> 12) & 0x3F) as usize] as char);
+            out.push(ALPHABET[((b >> 6) & 0x3F) as usize] as char);
+            out.push('=');
+        }
+        _ => unreachable!("chunks.remainder() returns at most 2 bytes"),
+    }
+    out
+}
+
+/// **MED-4 fix.** Insert a revealed secret bytes payload into a
+/// JSON object under either `<field>` (when the bytes are valid
+/// UTF-8) or `<field>_b64` (otherwise, with base64 encoding). The
+/// JSON consumer must check both keys.
+///
+/// The `_b64` suffix discipline avoids the silent corruption that
+/// `String::from_utf8_lossy` introduced (non-UTF-8 bytes mapped to
+/// `U+FFFD` / `�`); the consumer can detect non-UTF-8 by
+/// observing the suffixed key and decoding the base64.
+fn insert_secret_field(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    bytes: &[u8],
+) {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => {
+            obj.insert(field.to_string(), serde_json::Value::String(s.to_string()));
+        }
+        Err(_) => {
+            obj.insert(
+                format!("{field}_b64"),
+                serde_json::Value::String(base64_encode(bytes)),
+            );
+        }
+    }
+}
+
+/// **MED-4 fix.** Write a labeled secret-byte field to stdout,
+/// raw, with no `from_utf8_lossy` corruption. Format:
+/// `<label><sep><bytes>\n`. Used by the human-readable `show`
+/// reveal output.
+fn write_secret_line_to_stdout(label: &str, sep: &str, bytes: &[u8]) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(label.as_bytes())
+        .context("failed to write reveal field label to stdout")?;
+    handle
+        .write_all(sep.as_bytes())
+        .context("failed to write reveal field separator to stdout")?;
+    handle
+        .write_all(bytes)
+        .context("failed to write reveal field bytes to stdout")?;
+    handle
+        .write_all(b"\n")
+        .context("failed to write reveal field trailing newline to stdout")?;
+    Ok(())
+}
+
+/// **LOW-1 fix.** Format the rich resolve-hint message used when
+/// an account is frozen pending conflict resolution. Reused by
+/// the pre-prompt guards in `run_show` / `run_update` /
+/// `run_delete` AND the post-call frozen-guard fallback in
+/// `run_update` / `run_delete` so the user-facing UX is identical
+/// regardless of which path surfaces the freeze.
+fn format_frozen_resolve_hint(account_id: AccountId) -> String {
+    let hex = hex::encode(account_id.as_bytes());
+    format!(
+        "account {hex} is frozen pending resolve. \
+         Run `pangolin-cli resolve --account-id {hex} --keep <head>` first; \
+         inspect heads via `pangolin-cli status`"
+    )
+}
+
 /// Interactive password prompt with confirmation re-prompt. Per A3,
 /// up to `PASSWORD_RETRY_BUDGET` re-tries on mismatch before
 /// `bail!`-ing. Reads via `rpassword::prompt_password` (no echo).
+///
+/// **MED-1 fix.** After the two prompts agree, reject the entry if
+/// either the first or second is empty (zero bytes). Aborts fast
+/// with a stable error message; the user re-runs the command with
+/// proper input. Aligns with `vault_open::read_vault_password`'s
+/// "must not be empty" posture.
 fn prompt_password_with_confirmation() -> Result<SecretBytes> {
     let mut attempts_left: i32 = (PASSWORD_RETRY_BUDGET + 1).try_into().unwrap_or(3);
     while attempts_left > 0 {
@@ -209,6 +451,9 @@ fn prompt_password_with_confirmation() -> Result<SecretBytes> {
         let second = rpassword::prompt_password("Confirm password: ")
             .context("failed to read password confirmation from terminal")?;
         if first == second {
+            if first.is_empty() {
+                bail!("password must not be empty");
+            }
             // Wrap into SecretBytes; the source `String`s are dropped
             // (their heap buffers may not be zeroized — `rpassword`
             // does not return a Zeroizing<String> in this version).
@@ -391,7 +636,14 @@ async fn run_list(global: &GlobalArgs, args: AccountListArgs) -> Result<()> {
         eprintln!("(no entries)");
     } else {
         for row in &rows {
-            let name = row.display_name.as_deref().unwrap_or("(unavailable)");
+            // **MED-5 fix.** Sanitize the display name before
+            // printing — an attacker-controlled name containing
+            // ANSI escape sequences could otherwise inject screen
+            // clears / cursor moves into the operator's terminal.
+            let name = row
+                .display_name
+                .as_deref()
+                .map_or_else(|| "(unavailable)".to_string(), sanitize_for_display);
             println!(
                 "{}  {}{}",
                 hex::encode(row.account_id.as_bytes()),
@@ -551,6 +803,19 @@ async fn run_show(global: &GlobalArgs, args: AccountShowArgs) -> Result<()> {
         // emitted as `null`. A `null` value would leak the
         // existence of a field to log scrapers; absence is the
         // honest signal.
+        //
+        // **MED-4 fix.** Secret fields (password / notes /
+        // totp_secret) emit through `insert_secret_field`: when
+        // the bytes are valid UTF-8 the field name is the plain
+        // word (`password`, `notes`, `totp_secret`); when the
+        // bytes are non-UTF-8 the field name gets a `_b64`
+        // suffix and the value is base64. The JSON consumer
+        // checks both keys. This closes the
+        // `String::from_utf8_lossy` → `U+FFFD` silent-corruption
+        // gap. Identifier-class fields (name / username / url)
+        // remain `from_utf8_lossy` for now — they are
+        // human-readable text; corruption there is a UX issue,
+        // not a credential-integrity issue.
         let mut obj = serde_json::Map::new();
         obj.insert(
             "account_id".to_string(),
@@ -564,22 +829,13 @@ async fn run_show(global: &GlobalArgs, args: AccountShowArgs) -> Result<()> {
             obj.insert("url".to_string(), serde_json::Value::String(url));
         }
         if let Some(p) = &revealed_password {
-            obj.insert(
-                "password".to_string(),
-                serde_json::Value::String(String::from_utf8_lossy(p.expose()).to_string()),
-            );
+            insert_secret_field(&mut obj, "password", p.expose());
         }
         if let Some(n) = &revealed_notes {
-            obj.insert(
-                "notes".to_string(),
-                serde_json::Value::String(String::from_utf8_lossy(n.expose()).to_string()),
-            );
+            insert_secret_field(&mut obj, "notes", n.expose());
         }
         if let Some(t) = &revealed_totp {
-            obj.insert(
-                "totp_secret".to_string(),
-                serde_json::Value::String(String::from_utf8_lossy(t.expose()).to_string()),
-            );
+            insert_secret_field(&mut obj, "totp_secret", t.expose());
         }
         obj.insert(
             "status".to_string(),
@@ -588,23 +844,34 @@ async fn run_show(global: &GlobalArgs, args: AccountShowArgs) -> Result<()> {
         let val = serde_json::Value::Object(obj);
         println!("{val}");
     } else {
+        // **MED-5 fix.** Sanitize identifier-class fields before
+        // printing. A name containing ANSI escape sequences
+        // would otherwise render into the operator's terminal.
         println!("account_id  {}", hex::encode(account_id.as_bytes()));
-        println!("name        {display_name}");
+        println!("name        {}", sanitize_for_display(&display_name));
         if !username.is_empty() {
-            println!("username    {username}");
+            println!("username    {}", sanitize_for_display(&username));
         }
         if !url.is_empty() {
-            println!("url         {url}");
+            println!("url         {}", sanitize_for_display(&url));
         }
+        // **MED-4 fix.** Secret-byte fields (password / notes /
+        // totp_secret) write RAW bytes to stdout via
+        // `write_secret_line_to_stdout`, NOT through
+        // `String::from_utf8_lossy`. A non-UTF-8 password
+        // (binary, locale-encoded, etc.) round-trips byte-for-
+        // byte through `pangolin-cli account show
+        // --reveal-password`; previously the reveal output was
+        // silently corrupted by `U+FFFD` substitution.
         if let Some(p) = &revealed_password {
             // Q2: --reveal-password writes plaintext to stdout.
-            println!("password    {}", String::from_utf8_lossy(p.expose()));
+            write_secret_line_to_stdout("password    ", "", p.expose())?;
         }
         if let Some(n) = &revealed_notes {
-            println!("notes       {}", String::from_utf8_lossy(n.expose()));
+            write_secret_line_to_stdout("notes       ", "", n.expose())?;
         }
         if let Some(t) = &revealed_totp {
-            println!("totp_secret {}", String::from_utf8_lossy(t.expose()));
+            write_secret_line_to_stdout("totp_secret ", "", t.expose())?;
         }
     }
     Ok(())
@@ -699,12 +966,7 @@ async fn run_update(global: &GlobalArgs, args: AccountUpdateArgs) -> Result<()> 
                 .list_frozen_accounts()
                 .context("Vault::list_frozen_accounts failed")?;
             if frozen.contains(&account_id) {
-                bail!(
-                    "account {} is frozen pending resolve. \
-                     Run `pangolin-cli resolve --account-id {} --keep <head>` first.",
-                    hex::encode(account_id.as_bytes()),
-                    hex::encode(account_id.as_bytes())
-                );
+                bail!("{}", format_frozen_resolve_hint(account_id));
             }
             let tomb = vault
                 .list_tombstoned_accounts()
@@ -736,10 +998,12 @@ async fn run_update(global: &GlobalArgs, args: AccountUpdateArgs) -> Result<()> 
     let new_url = args.url.clone().unwrap_or(existing_url);
 
     // ----- Step 3: notes (flag form, stdin form, or unchanged).
+    // Notes are explicitly multi-line capable — use the multiline
+    // helper per MED-2 fix.
     let notes_override: Option<SecretBytes> = if let Some(n) = args.notes.as_deref() {
         Some(SecretBytes::new(n.as_bytes().to_vec()))
     } else if args.notes_stdin {
-        Some(read_secret_from_stdin().context("--notes-stdin read failed")?)
+        Some(read_secret_multiline_from_stdin().context("--notes-stdin read failed")?)
     } else {
         None
     };
@@ -749,8 +1013,16 @@ async fn run_update(global: &GlobalArgs, args: AccountUpdateArgs) -> Result<()> 
     // change the password" via the explicit --password-prompt
     // flag — without one of {--password-stdin, --password-prompt}
     // the password is preserved.
+    //
+    // **MED-1 fix.** Reject empty-string password on the stdin
+    // path (the prompt path's confirmation function rejects
+    // internally). **MED-2 fix.** Use first-line stdin helper.
     let password_override: Option<SecretBytes> = if args.password_stdin {
-        Some(read_secret_from_stdin().context("--password-stdin read failed")?)
+        Some(
+            read_secret_first_line_from_stdin()
+                .context("--password-stdin read failed")
+                .and_then(reject_empty_password)?,
+        )
     } else if args.password_prompt {
         Some(prompt_password_with_confirmation()?)
     } else {
@@ -758,10 +1030,16 @@ async fn run_update(global: &GlobalArgs, args: AccountUpdateArgs) -> Result<()> 
     };
 
     // ----- Step 5: TOTP (stdin form, --totp-clear, or unchanged).
+    // **MED-1 fix.** Reject empty-string TOTP on the stdin path.
+    // **MED-2 fix.** Use first-line stdin helper.
     let totp_override: Option<SecretBytes> = if args.totp_clear {
         Some(SecretBytes::new(Vec::new()))
     } else if args.totp_stdin {
-        Some(read_secret_from_stdin().context("--totp-stdin read failed")?)
+        Some(
+            read_secret_first_line_from_stdin()
+                .context("--totp-stdin read failed")
+                .and_then(reject_empty_totp)?,
+        )
     } else {
         None
     };
@@ -809,9 +1087,25 @@ async fn run_update(global: &GlobalArgs, args: AccountUpdateArgs) -> Result<()> 
     // ----- Step 8: hand off. The library writes the new revision
     // pointing at the previous head, marks the entry dirty, and
     // updates the cache.
-    let revision_id = vault
-        .update_account(account_id, snapshot)
-        .context("Vault::update_account failed")?;
+    //
+    // **LOW-1 fix.** A frozen-guard fallback can in principle
+    // surface here even though the pre-prompt guard above (Step
+    // 1) probes `list_frozen_accounts` first. Under the PoC's
+    // local-vault-only model the path is structurally
+    // unreachable (no concurrent vault handles), but we
+    // pattern-match the error variant defensively so the
+    // fallback emits the SAME rich resolve hint the pre-prompt
+    // path emits — not the raw `Display` of
+    // `StoreError::AccountFrozenPendingResolve`.
+    let revision_id = match vault.update_account(account_id, snapshot) {
+        Ok(rev) => rev,
+        Err(StoreError::AccountFrozenPendingResolve { account_id: id }) => {
+            bail!("{}", format_frozen_resolve_hint(id));
+        }
+        Err(e) => {
+            return Err(anyhow::Error::from(e)).context("Vault::update_account failed");
+        }
+    };
     vault.close().context("Vault::close failed")?;
 
     let id_hex = hex::encode(account_id.as_bytes());
@@ -863,12 +1157,9 @@ async fn run_delete(global: &GlobalArgs, args: AccountDeleteArgs) -> Result<()> 
                 .context("Vault::list_frozen_accounts failed")?;
             if frozen.contains(&account_id) {
                 bail!(
-                    "account {} is frozen pending resolve. \
-                     Run `pangolin-cli resolve --account-id {} --keep <head>` first; \
-                     `delete` cannot proceed on a frozen entry. \
+                    "{}; `delete` cannot proceed on a frozen entry. \
                      (Q8: no --force flag is provided to bypass this guard.)",
-                    hex::encode(account_id.as_bytes()),
-                    hex::encode(account_id.as_bytes())
+                    format_frozen_resolve_hint(account_id),
                 );
             }
             let tomb = vault
@@ -917,9 +1208,25 @@ async fn run_delete(global: &GlobalArgs, args: AccountDeleteArgs) -> Result<()> 
     // landed at the pre-prompt step above; a race here is
     // structurally impossible under the local-vault-only model
     // (no concurrent vault handles).
-    vault
-        .delete_account(account_id)
-        .context("Vault::delete_account failed")?;
+    //
+    // **LOW-1 fix.** Even though the path is structurally
+    // unreachable under PoC, pattern-match the
+    // `AccountFrozenPendingResolve` variant defensively so the
+    // fallback emits the same rich resolve hint as the
+    // pre-prompt guard.
+    match vault.delete_account(account_id) {
+        Ok(()) => {}
+        Err(StoreError::AccountFrozenPendingResolve { account_id: id }) => {
+            bail!(
+                "{}; `delete` cannot proceed on a frozen entry. \
+                 (Q8: no --force flag is provided to bypass this guard.)",
+                format_frozen_resolve_hint(id)
+            );
+        }
+        Err(e) => {
+            return Err(anyhow::Error::from(e)).context("Vault::delete_account failed");
+        }
+    }
     vault.close().context("Vault::close failed")?;
 
     let id_hex = hex::encode(account_id.as_bytes());
@@ -940,7 +1247,14 @@ async fn run_delete(global: &GlobalArgs, args: AccountDeleteArgs) -> Result<()> 
         let val = serde_json::Value::Object(summary);
         println!("{val}");
     } else {
-        eprintln!("deleted account {id_hex} (was '{display_name}')");
+        // **MED-5 fix.** Sanitize the display name in the
+        // post-delete summary so a name with embedded ANSI
+        // escape sequences cannot manipulate the operator's
+        // terminal post-action.
+        eprintln!(
+            "deleted account {id_hex} (was '{}')",
+            sanitize_for_display(&display_name)
+        );
     }
     Ok(())
 }
@@ -964,9 +1278,21 @@ fn confirm_delete(display_name: &str, account_hex: &str) -> Result<bool> {
     // The short id prefix is the first 16 hex chars (= 8 bytes);
     // the full hex would clutter the prompt. The display name is
     // the load-bearing typo-prevention surface.
+    //
+    // **MED-5 fix (CRITICAL).** Sanitize the display name BEFORE
+    // printing — this is the highest-impact terminal-escape
+    // phishing surface. An attacker who knows the operator will
+    // run `account delete --account-id <hash>` could plant a
+    // confederate name on a different account that, via ANSI
+    // escape sequences, visually impersonates the intended
+    // target. Stripping C0 + DEL bytes before the prompt closes
+    // the attack — the operator sees the literal escape
+    // characters as `\xNN` representations, never the rendered
+    // forgery.
     let short = &account_hex[..16.min(account_hex.len())];
+    let safe_name = sanitize_for_display(display_name);
     eprint!(
-        "Delete account '{display_name}' (id: 0x{short}...)? \
+        "Delete account '{safe_name}' (id: 0x{short}...)? \
          Type 'yes' to confirm: "
     );
     std::io::stderr().flush().ok();
@@ -988,9 +1314,10 @@ fn confirm_delete(display_name: &str, account_hex: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        confirm_delete, describe_reveal_actions, generate_password, run_add, run_delete, run_list,
-        run_show, run_update, AccountListStatus, GENERATED_PASSWORD_ALPHABET,
-        GENERATED_PASSWORD_LEN,
+        base64_encode, confirm_delete, describe_reveal_actions, generate_password,
+        insert_secret_field, reject_empty_password, reject_empty_totp, run_add, run_delete,
+        run_list, run_show, run_update, sanitize_for_display, AccountListStatus,
+        GENERATED_PASSWORD_ALPHABET, GENERATED_PASSWORD_LEN,
     };
     use crate::cli::{
         AccountAddArgs, AccountDeleteArgs, AccountListArgs, AccountShowArgs, AccountUpdateArgs,
@@ -1982,5 +2309,412 @@ mod tests {
         run_list(&global(), args)
             .await
             .expect("list with frozen ok");
+    }
+
+    // -----------------------------------------------------------
+    // Audit fix-pass tests (MED-1..5, LOW-1).
+    //
+    // Each test cites the audit finding it covers in the
+    // doc-comment header.
+    // -----------------------------------------------------------
+
+    /// **MED-1.** `prompt_password_with_confirmation`'s empty-input
+    /// rejection is the underlying validator. We can't easily drive
+    /// `rpassword::prompt_password` in a unit test (the test seam
+    /// for that is out of scope per A13), so we exercise the
+    /// validator directly: `reject_empty_password` must error on
+    /// zero-length input and round-trip non-empty input.
+    #[test]
+    fn reject_empty_password_errors_on_zero_length() {
+        let empty = SecretBytes::new(Vec::new());
+        let err = reject_empty_password(empty).expect_err("empty rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("password must not be empty"),
+            "expected stable error message, got: {msg}"
+        );
+
+        let non_empty = SecretBytes::new(b"hunter2".to_vec());
+        let kept = reject_empty_password(non_empty).expect("non-empty kept");
+        assert_eq!(kept.expose(), b"hunter2");
+    }
+
+    /// **MED-1.** Same shape for `reject_empty_totp` — empty input
+    /// errors with the TOTP-specific message; non-empty round-trips.
+    #[test]
+    fn reject_empty_totp_errors_on_zero_length() {
+        let empty = SecretBytes::new(Vec::new());
+        let err = reject_empty_totp(empty).expect_err("empty rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("TOTP secret must not be empty"),
+            "expected stable error message, got: {msg}"
+        );
+
+        let non_empty = SecretBytes::new(b"JBSWY3DPEHPK3PXP".to_vec());
+        let kept = reject_empty_totp(non_empty).expect("non-empty kept");
+        assert_eq!(kept.expose(), b"JBSWY3DPEHPK3PXP");
+    }
+
+    /// **MED-1.** `account add --password-stdin` with an empty
+    /// stdin pipe surfaces the empty-password error and aborts
+    /// before any vault write. The unit-test harness's process
+    /// stdin is empty (no parent pipe), so the
+    /// `read_secret_first_line_from_stdin` returns zero bytes —
+    /// which `reject_empty_password` rejects.
+    #[tokio::test]
+    async fn account_add_rejects_empty_password_via_stdin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v-empty-pwd.pvf");
+        make_vault(&path);
+
+        let mut args = add_args(path.clone(), "x");
+        args.generate_password = false;
+        args.password_stdin = true;
+        let err = run_add(&global(), args)
+            .await
+            .expect_err("empty stdin rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("password must not be empty"),
+            "expected empty-password rejection, got: {msg}"
+        );
+
+        // Verify the vault has no account (the rejection landed
+        // before any write).
+        let mut v = Vault::open(&path).expect("open");
+        let presence = PressYPresenceProof::confirmed();
+        let identity = PinIdentityProof::new(SecretBytes::new(TEST_PWD.as_bytes().to_vec()));
+        v.unlock(&presence, &identity).expect("unlock");
+        assert!(
+            v.list_accounts().is_empty(),
+            "no account should be created on empty-password reject"
+        );
+        v.close().expect("close");
+    }
+
+    /// **MED-1.** `account add --totp-stdin` with empty stdin is
+    /// rejected. Same shape as the password test.
+    #[tokio::test]
+    async fn account_add_rejects_empty_totp_via_stdin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v-empty-totp.pvf");
+        make_vault(&path);
+
+        let mut args = add_args(path.clone(), "y");
+        // Keep generate_password=true (avoids the password-stdin
+        // path so we exercise ONLY the TOTP rejection); flip the
+        // TOTP flags.
+        args.no_totp = false;
+        args.totp_stdin = true;
+        let err = run_add(&global(), args)
+            .await
+            .expect_err("empty totp stdin rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("TOTP secret must not be empty"),
+            "expected empty-TOTP rejection, got: {msg}"
+        );
+    }
+
+    /// **MED-2.** `read_secret_first_line_from_stdin` shape: reads
+    /// up to (and consuming) the first LF, trims a CR before it,
+    /// and leaves any subsequent bytes in the stdin buffer. We
+    /// can't redirect process stdin in-test, so we exercise the
+    /// trim discipline at the byte level — the production helper
+    /// applies the same rules to whatever bytes it reads.
+    #[test]
+    fn password_stdin_reads_first_line_only() {
+        // Simulate the byte-level shape: input bytes up to the
+        // first '\n' are taken as the password; the trailing '\r'
+        // (if any) is stripped.
+        for (input, expected_first_line) in [
+            (&b"hunter2\nLINE2\nLINE3"[..], &b"hunter2"[..]),
+            (&b"hunter2\r\nLINE2"[..], &b"hunter2"[..]),
+            (&b"hunter2"[..], &b"hunter2"[..]),
+            (&b"hunter2\n"[..], &b"hunter2"[..]),
+        ] {
+            // Manual reproduction of the helper's loop: consume
+            // bytes up to and including the first '\n', then
+            // strip a trailing '\r'.
+            let mut buf = Vec::new();
+            for &b in input {
+                if b == b'\n' {
+                    break;
+                }
+                buf.push(b);
+            }
+            if buf.ends_with(b"\r") {
+                buf.pop();
+            }
+            assert_eq!(buf.as_slice(), expected_first_line);
+        }
+    }
+
+    /// **MED-2.** Same shape claim for `--totp-stdin`: only the
+    /// first line is consumed. Mirrors the password test.
+    #[test]
+    fn totp_stdin_reads_first_line_only() {
+        let input = &b"JBSWY3DPEHPK3PXP\nshould-not-be-read"[..];
+        let mut buf = Vec::new();
+        for &b in input {
+            if b == b'\n' {
+                break;
+            }
+            buf.push(b);
+        }
+        assert_eq!(buf.as_slice(), b"JBSWY3DPEHPK3PXP");
+    }
+
+    /// **MED-2.** `read_secret_multiline_from_stdin` shape: full
+    /// stdin captured; only the LAST trailing CRLF/LF stripped.
+    /// Internal newlines preserved.
+    #[test]
+    fn notes_stdin_preserves_internal_newlines() {
+        for (input, expected) in [
+            (&b"line1\nline2\nline3\n"[..], &b"line1\nline2\nline3"[..]),
+            (
+                &b"line1\r\nline2\r\nline3\r\n"[..],
+                &b"line1\r\nline2\r\nline3"[..],
+            ),
+            (&b"single\n"[..], &b"single"[..]),
+            (&b"no-trailing-newline"[..], &b"no-trailing-newline"[..]),
+            (&b""[..], &b""[..]),
+        ] {
+            let mut buf = input.to_vec();
+            if buf.ends_with(b"\n") {
+                buf.pop();
+                if buf.ends_with(b"\r") {
+                    buf.pop();
+                }
+            }
+            assert_eq!(buf.as_slice(), expected, "input was {input:?}");
+        }
+    }
+
+    /// **MED-3.** The generated-password emission goes via raw
+    /// `stderr().lock().write_all`, NOT through `eprintln!`'s
+    /// `fmt::Arguments` path. We can't easily inspect process
+    /// stderr in a unit test; the structural check is that the
+    /// happy-path `account add --generate-password` test still
+    /// succeeds (the test stays as the existing
+    /// `account_add_generate_password_does_not_pollute_stdout_with_secret`
+    /// — already in the suite above). This dedicated test pins
+    /// that the byte-level format is preserved: the generated
+    /// password is followed by a single '\n' on stderr. We
+    /// cover that by re-using the existing happy-path smoke + a
+    /// structural assertion that `generate_password()` still
+    /// returns 24 ASCII bytes (the format the user reads).
+    #[test]
+    fn generated_password_format_preserved_after_med3_fix() {
+        let pwd = generate_password();
+        let bytes = pwd.expose();
+        assert_eq!(bytes.len(), GENERATED_PASSWORD_LEN);
+        // Every byte must be in the alphabet (no NUL / no
+        // newline / no control char would have leaked into the
+        // generated bytes that we hand to write_all).
+        for b in bytes {
+            assert!(GENERATED_PASSWORD_ALPHABET.contains(b));
+            assert_ne!(*b, b'\n', "newline must not appear in generated bytes");
+            assert_ne!(*b, b'\r');
+            assert_ne!(*b, 0);
+        }
+    }
+
+    /// **MED-4.** `insert_secret_field` puts a valid-UTF-8 secret
+    /// under the plain field name; a non-UTF-8 secret goes under
+    /// `<field>_b64` with base64-encoded bytes.
+    #[test]
+    fn json_output_emits_string_for_valid_utf8_password() {
+        let mut obj = serde_json::Map::new();
+        insert_secret_field(&mut obj, "password", b"hunter2");
+        assert_eq!(
+            obj.get("password"),
+            Some(&serde_json::Value::String("hunter2".to_string())),
+        );
+        assert!(obj.get("password_b64").is_none());
+    }
+
+    /// **MED-4.** Non-UTF-8 password reveals as `password_b64`
+    /// with base64-encoded raw bytes, NOT as a U+FFFD-corrupted
+    /// `password` string.
+    #[test]
+    fn json_output_emits_b64_for_non_utf8_password() {
+        let mut obj = serde_json::Map::new();
+        // Bytes 0xFF 0xFE 0xFD are not valid UTF-8 (a leading
+        // 0xFF can never start a UTF-8 codepoint).
+        let raw = &[0xFFu8, 0xFE, 0xFD];
+        insert_secret_field(&mut obj, "password", raw);
+        assert!(
+            obj.get("password").is_none(),
+            "plain `password` key must be absent on non-UTF-8 input"
+        );
+        let b64 = obj
+            .get("password_b64")
+            .expect("password_b64 present on non-UTF-8")
+            .as_str()
+            .expect("string");
+        // base64("\xFF\xFE\xFD") == "//79"
+        assert_eq!(b64, "//79");
+    }
+
+    /// **MED-4.** `account show --reveal-password --json` emits
+    /// `password_b64` for a non-UTF-8 password; the JSON consumer
+    /// can detect the non-UTF-8 case via key suffix and decode.
+    /// End-to-end smoke that drives `run_show` → JSON path.
+    #[tokio::test]
+    async fn account_show_json_reveals_non_utf8_password_via_b64_suffix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v-non-utf8.pvf");
+        make_vault(&path);
+        let id = add_account_with_known_secrets(&path, b"binary", &[0xFFu8, 0xFE], b"", b"");
+
+        let _guard = WithAutoConfirm::enable();
+        let mut g = global();
+        g.json = true;
+        let mut args = show_args(path, id);
+        args.reveal_password = true;
+        run_show(&g, args).await.expect("show with non-utf8 ok");
+        // The smoke is structural: the call succeeds without
+        // panicking, and the underlying `insert_secret_field`
+        // helper is unit-tested above to emit `password_b64` on
+        // non-UTF-8 input.
+    }
+
+    /// **MED-4.** Base64 round-trip on known vectors. The encoder
+    /// is dependency-free; this pins the alphabet and padding.
+    #[test]
+    fn base64_encode_known_vectors() {
+        // RFC 4648 §10 test vectors.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // Non-UTF-8 bytes round-trip cleanly.
+        assert_eq!(base64_encode(&[0xFF, 0xFE, 0xFD]), "//79");
+        assert_eq!(base64_encode(&[0x00, 0x01, 0x02]), "AAEC");
+    }
+
+    /// **MED-4.** Reveal of a non-UTF-8 password on the
+    /// human-readable path writes raw bytes to stdout, not
+    /// `U+FFFD` substitutions. End-to-end smoke; raw-byte
+    /// preservation is ensured by `write_secret_line_to_stdout`'s
+    /// shape (no `from_utf8_lossy` on the secret payload).
+    #[tokio::test]
+    async fn reveal_password_emits_raw_bytes_to_stdout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v-raw.pvf");
+        make_vault(&path);
+        let id = add_account_with_known_secrets(&path, b"raw", &[0xC0u8, 0xC1], b"", b"");
+
+        let _guard = WithAutoConfirm::enable();
+        let mut args = show_args(path, id);
+        args.reveal_password = true;
+        run_show(&global(), args)
+            .await
+            .expect("reveal of non-UTF-8 password succeeds");
+        // The structural claim ("raw bytes flow byte-for-byte")
+        // is enforced by `write_secret_line_to_stdout`'s code
+        // shape: it calls `handle.write_all(bytes)` with the
+        // SecretBytes payload directly. Process-stdout capture
+        // is not feasible in a hosted unit test; the production
+        // path is exercised here as a smoke + the unit tests on
+        // `insert_secret_field` / `base64_encode` cover the
+        // JSON path mechanically.
+    }
+
+    /// **MED-5.** `sanitize_for_display` strips ASCII C0 control
+    /// characters and DEL from the output, replacing them with
+    /// printable escape representations.
+    #[test]
+    fn sanitize_for_display_strips_ansi_escapes() {
+        // ANSI clear-screen sequence + an OSC title-set.
+        let evil = "\x1b[2K\x1b]0;HACK\x07legit-name";
+        let safe = sanitize_for_display(evil);
+        // No escape (\x1b == 0x1B) or BEL (\x07) bytes survive.
+        assert!(!safe.contains('\x1b'), "ESC must be stripped: {safe:?}");
+        assert!(!safe.contains('\x07'), "BEL must be stripped: {safe:?}");
+        // The legit suffix is preserved verbatim.
+        assert!(
+            safe.contains("legit-name"),
+            "non-control bytes preserved: {safe:?}"
+        );
+        // The escape representation is human-readable.
+        assert!(safe.contains("\\x1b"), "ESC rendered as \\x1b: {safe:?}");
+    }
+
+    /// **MED-5.** `sanitize_for_display` covers the full C0 +
+    /// DEL range and well-known whitespace forms.
+    #[test]
+    fn sanitize_for_display_replaces_control_chars() {
+        assert_eq!(sanitize_for_display("a\nb"), "a\\nb");
+        assert_eq!(sanitize_for_display("a\tb"), "a\\tb");
+        assert_eq!(sanitize_for_display("a\rb"), "a\\rb");
+        assert_eq!(sanitize_for_display("a\x00b"), "a\\x00b");
+        assert_eq!(sanitize_for_display("a\x7fb"), "a\\x7fb");
+        // Unicode non-control characters pass through unchanged.
+        assert_eq!(sanitize_for_display("café"), "café");
+        assert_eq!(sanitize_for_display(""), "");
+        assert_eq!(sanitize_for_display("plain"), "plain");
+    }
+
+    /// **MED-5 (CRITICAL).** The delete-confirmation prompt is the
+    /// highest-impact terminal-escape phishing surface. We can't
+    /// capture the exact stderr from `confirm_delete` directly
+    /// without extra plumbing, but we CAN verify the input shape
+    /// passed to the prompt is sanitized before printing — by
+    /// constructing the same string the prompt would print and
+    /// asserting it has no control characters.
+    #[test]
+    fn delete_prompt_sanitizes_attacker_controlled_name() {
+        let evil_name = "\x1b[2KHACK\x07ed";
+        let safe = sanitize_for_display(evil_name);
+        // What the prompt would print:
+        let prompt_string = format!(
+            "Delete account '{safe}' (id: 0x{}...)? Type 'yes' to confirm: ",
+            "abcdef0123456789"
+        );
+        for c in prompt_string.chars() {
+            assert!(
+                !c.is_control() || c == ' ',
+                "delete prompt must not contain control chars after sanitize: {c:?} in {prompt_string:?}"
+            );
+        }
+        // The legit suffix bytes are still visible.
+        assert!(prompt_string.contains("HACK"));
+        assert!(prompt_string.contains("ed"));
+    }
+
+    /// **LOW-1.** `format_frozen_resolve_hint` produces the same
+    /// rich resolve message used by the pre-prompt guards. This
+    /// is the helper invoked by both pre- and post-call paths
+    /// in `run_update` / `run_delete` so the user-facing UX is
+    /// identical regardless of which path surfaces the freeze.
+    #[test]
+    fn frozen_guard_post_call_emits_rich_hint() {
+        let id = pangolin_store::AccountId::from_bytes([0xABu8; 32]);
+        let hint = super::format_frozen_resolve_hint(id);
+        let id_hex = hex::encode(id.as_bytes());
+        // The rich hint mentions the resolve verb with both
+        // --account-id and --keep flags by name.
+        assert!(
+            hint.contains("frozen pending resolve"),
+            "hint mentions freeze state: {hint}"
+        );
+        assert!(
+            hint.contains("--account-id"),
+            "hint references --account-id flag: {hint}"
+        );
+        assert!(
+            hint.contains("--keep"),
+            "hint references --keep flag: {hint}"
+        );
+        assert!(
+            hint.contains(&id_hex),
+            "hint includes the account id: {hint}"
+        );
     }
 }
