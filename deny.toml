@@ -35,16 +35,13 @@ ignore = [
     # when alloy publishes a `paste`-free release; tracked at
     # https://github.com/alloy-rs/core (search "paste").
     { id = "RUSTSEC-2024-0436", reason = "Unmaintained (not vulnerable). Transitive of alloy-primitives via chaincli; no upstream replacement is available without a major alloy bump." },
-    # `derivative` (RUSTSEC-2024-0388) is flagged as unmaintained, not
-    # vulnerable. It reaches the workspace exclusively as a transitive
-    # build-dependency of `coins-bip32` / `coins-bip39` / `eth-keystore`
-    # via `alloy-signer-local` — the same `tools/chaincli/` keystore
-    # path that pulls `paste` (above). The advisory describes only an
-    # archived upstream repo; no exploitable bug. Removing this ignore
-    # is a follow-up when alloy/coins publishes a `derivative`-free
-    # release; tracked at https://github.com/alloy-rs/core (search
-    # "derivative") and https://github.com/alloy-rs/signer-local.
-    { id = "RUSTSEC-2024-0388", reason = "Unmaintained (not vulnerable). Transitive of alloy-signer-local via chaincli (coins-bip32 / coins-bip39 / eth-keystore); no upstream replacement is available without a major alloy bump." },
+    # P10 fix-pass L-1: `RUSTSEC-2024-0388` (`derivative` unmaintained)
+    # ignore was REMOVED — the alloy version bump that landed in P9
+    # dropped `derivative` from the dep graph, so the ignore began
+    # firing `advisory-not-detected` warnings and `cargo deny check`
+    # was no longer fully clean. If a future alloy/coins churn
+    # re-introduces the path, re-add the entry verbatim with a fresh
+    # tracker URL.
 ]
 
 [licenses]

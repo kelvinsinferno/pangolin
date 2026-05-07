@@ -3305,6 +3305,24 @@ impl Vault {
     /// already does (none here). The caller writes the same row with
     /// the same column set in either case (the freeze sentinel still
     /// fires regardless, for foreign-ingest UX safety).
+    ///
+    /// **Defense-in-depth payload-vs-event `account_id` cross-check.**
+    /// After a successful AEAD-open + CBOR-decode that yields a
+    /// `TombstonePayload`, the plaintext-level `payload.account_id()`
+    /// is compared against `event_account_id` (the AAD-bound id) using
+    /// [`subtle::ConstantTimeEq::ct_eq`]. A mismatch silently collapses
+    /// to `is_tombstone = 0` (the same bucket as AEAD failure / CBOR
+    /// failure / locked-vault), preserving the non-oracle property —
+    /// the only observable difference between "valid tombstone for
+    /// this row" and "valid tombstone for *some other* account that
+    /// somehow reused our AAD components" is the persisted bit. No
+    /// error variant escapes, no log line fires, and the freeze
+    /// sentinel still fires for the row's INSERT regardless.
+    /// Constant-time comparison forecloses any timing side-channel on
+    /// the byte-prefix-match position. This closes the documentation
+    /// drift previously flagged as audit M-1 + M-2 (`THREAT_MODEL`
+    /// row 18 and `docs/issue-plans/P10.md` §A1/§C used to claim the
+    /// cross-check existed before the code shipped it).
     fn detect_tombstone_bit_at_ingest(
         &self,
         event_account_id: &[u8; ACCOUNT_ID_LEN],
@@ -3331,9 +3349,19 @@ impl Vault {
 
         // Swallow every error variant (AEAD failure, CBOR decode
         // failure, malformed-payload, etc.) into a single `0` return
-        // for non-oracle discipline.
+        // for non-oracle discipline. On decode success, gate the
+        // bit-set on a constant-time payload-vs-event account_id
+        // comparison; mismatch collapses to the same `0` bucket
+        // (M-1 + M-2 defense-in-depth). The `Choice::unwrap_u8`
+        // returns 0 or 1 by masking, NOT by branching — a
+        // mismatched cross-account payload silently lands in the
+        // same 0 bucket as AEAD failure, NOT a distinct error
+        // variant.
         match open_payload(active.vdk.aead_key(), &nonce, &ciphertext, &aad) {
-            Ok(DecodedPayload::Tombstone(p)) if p.is_deleted() => 1,
+            Ok(DecodedPayload::Tombstone(p)) if p.is_deleted() => {
+                use subtle::ConstantTimeEq;
+                i64::from(p.account_id().ct_eq(event_account_id).unwrap_u8())
+            }
             Ok(_) | Err(_) => 0,
         }
     }
@@ -6432,5 +6460,142 @@ mod tests {
         );
         let revs2 = v.revisions_for(acct2).expect("revs 2");
         assert!(!revs2[0].is_tombstone, "path 2: bit=0");
+    }
+
+    // ---------------------------------------------------------------
+    // P10 fix-pass: M-1 + M-2 — payload-vs-event account_id
+    // cross-check inside detect_tombstone_bit_at_ingest.
+    //
+    // The audit flagged a documentation drift: THREAT_MODEL row 18 +
+    // docs/issue-plans/P10.md §A1/§C claimed the cross-check existed
+    // before the code shipped it. The fix-pass implements the check
+    // (constant-time via subtle::ConstantTimeEq) and silently rejects
+    // mismatches by returning is_tombstone = 0 — the same bucket as
+    // AEAD failure / CBOR failure / locked vault, preserving the
+    // non-oracle property of the ingest decoder.
+    // ---------------------------------------------------------------
+
+    /// Helper: seal a tombstone payload whose **internal**
+    /// `payload.account_id` is `inner_account_id` while the AEAD AAD
+    /// is bound to `outer_account_id` (the row/event's
+    /// `account_id`). When `inner != outer`, this constructs a
+    /// synthetic "cross-account injection" — a ciphertext that
+    /// authenticates under the row's AAD but whose plaintext claims
+    /// to tombstone a different account.
+    ///
+    /// Sealed under the placeholder zero nonce, so the ingest path's
+    /// opportunistic AEAD-open succeeds.
+    fn seal_tombstone_with_payload_account_mismatch(
+        v: &Vault,
+        outer_account_id: AccountId,
+        inner_account_id: AccountId,
+        parent: RevisionId,
+        schema_version: u8,
+        ts_ms: u64,
+    ) -> Vec<u8> {
+        use crate::blob::build_aad;
+        use ciborium_io::Write as _;
+        use ciborium_ll::{Encoder, Header};
+        use pangolin_crypto::aead::{Nonce, NONCE_LEN};
+        let aad = build_aad(&v.meta.vault_id, &outer_account_id, &parent, schema_version);
+        let active = v.require_active().expect("vault active");
+        // Encode the three-field tombstone CBOR map with the SUPPLIED
+        // `inner_account_id` as the plaintext field — NOT the
+        // outer/event id. This is the structurally-honest way to
+        // exercise the cross-check (the encoder accepts any valid id;
+        // the cross-check rejects a mismatched one at ingest).
+        let mut out: Vec<u8> = Vec::with_capacity(64);
+        {
+            let mut enc = Encoder::from(&mut out);
+            enc.push(Header::Map(Some(3))).unwrap();
+            enc.text("account_id", None).unwrap();
+            enc.push(Header::Bytes(Some(ACCOUNT_ID_LEN))).unwrap();
+            enc.write_all(inner_account_id.as_bytes()).unwrap();
+            enc.text("deleted", None).unwrap();
+            enc.push(Header::Simple(ciborium_ll::simple::TRUE)).unwrap();
+            enc.text("tombstoned_at_ms", None).unwrap();
+            enc.push(Header::Positive(ts_ms)).unwrap();
+        }
+        let nonce = Nonce::from_storage_bytes([0u8; NONCE_LEN]);
+        let ct = active
+            .vdk
+            .aead_key()
+            .seal(&nonce, &out, &aad)
+            .expect("seal");
+        ct.as_bytes().to_vec()
+    }
+
+    /// **P10 fix-pass M-1 + M-2 negative case.** A synthetic event
+    /// whose AAD-bound `account_id` is X but whose decrypted
+    /// `TombstonePayload::account_id` is Y != X. The decode succeeds
+    /// (AEAD valid; CBOR well-formed) but the cross-check inside
+    /// `detect_tombstone_bit_at_ingest` rejects the mismatch in
+    /// constant time and the row lands with `is_tombstone = 0`.
+    /// Crucially, no error variant surfaces — the rejection is
+    /// silent, in the same bucket as AEAD failure (non-oracle
+    /// property strengthened).
+    #[test]
+    fn detect_tombstone_bit_rejects_cross_account_payload() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "p10-fix-cross-account.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let outer = AccountId::from_bytes([0xAA; 32]);
+        let inner = AccountId::from_bytes([0xBB; 32]); // DIFFERENT id
+        let parent = RevisionId::from_bytes([0u8; 32]);
+        let ct = seal_tombstone_with_payload_account_mismatch(
+            &v,
+            outer,
+            inner,
+            parent,
+            0,
+            1_700_000_000_000,
+        );
+        let ev = synth_event(v.vault_id(), *outer.as_bytes(), [0u8; 32], ct, 99, 0);
+        // The ingest itself MUST succeed (no error variant escapes).
+        let outcome = v.ingest_chain_revision(&ev).expect("ingest must not error");
+        assert_eq!(outcome, IngestOutcome::Inserted);
+        let revs = v.revisions_for(outer).expect("revisions_for");
+        assert_eq!(revs.len(), 1);
+        // The bit MUST be 0 even though decode succeeded — the
+        // cross-check rejected the mismatched account_id.
+        assert!(
+            !revs[0].is_tombstone,
+            "cross-account tombstone payload must be silently rejected (bit=0)"
+        );
+    }
+
+    /// **P10 fix-pass M-1 + M-2 positive case.** Same setup as above
+    /// but `payload.account_id == event.account_id`. The cross-check
+    /// passes; the bit is set to 1 (regression coverage that the
+    /// constant-time comparison doesn't false-reject the valid case).
+    #[test]
+    fn detect_tombstone_bit_accepts_matching_payload() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "p10-fix-matching.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let acct = AccountId::from_bytes([0xCC; 32]);
+        let parent = RevisionId::from_bytes([0u8; 32]);
+        // outer == inner — the matching case.
+        let ct = seal_tombstone_with_payload_account_mismatch(
+            &v,
+            acct,
+            acct,
+            parent,
+            0,
+            1_700_000_000_000,
+        );
+        let ev = synth_event(v.vault_id(), *acct.as_bytes(), [0u8; 32], ct, 100, 0);
+        let outcome = v.ingest_chain_revision(&ev).expect("ingest");
+        assert_eq!(outcome, IngestOutcome::Inserted);
+        let revs = v.revisions_for(acct).expect("revisions_for");
+        assert_eq!(revs.len(), 1);
+        assert!(
+            revs[0].is_tombstone,
+            "matching payload account_id must yield is_tombstone = 1"
+        );
     }
 }

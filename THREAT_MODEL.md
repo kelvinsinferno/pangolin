@@ -584,12 +584,15 @@ the PR.
     `account_id` field added in P10-1 is a defense-in-depth
     cross-check against the AAD-bound `account_id`: an attacker
     who has somehow constructed a valid AEAD seal under the
-    user's VDK but with a wrong-account_id payload triggers
-    `StoreError::Cbor("tombstone account_id wrong length")` or
-    a similar Cbor-class error at decode time, and the
-    opportunistic-decode path (P10-2) silently falls back to
-    bit=0 + freeze sentinel — the same non-oracle bucket as
-    AEAD failure.
+    user's VDK but with a wrong-account_id payload is rejected
+    inside `detect_tombstone_bit_at_ingest`. The cross-check is
+    constant-time via `subtle::ConstantTimeEq::ct_eq`; mismatch
+    silently returns `is_tombstone = 0`, preserving the
+    non-oracle property of the ingest decoder (the same bucket
+    as AEAD failure / CBOR failure / locked vault — no error
+    variant escapes). The freeze sentinel still fires for the
+    row's INSERT, so the user-facing safety property is
+    unaffected.
 19. **Tombstone-bit non-propagation under PoC two-key
     foreign-ingest (P8 audit CRIT-1 origin, structurally
     closed by P10-2).** Defense (acknowledged PoC limitation):

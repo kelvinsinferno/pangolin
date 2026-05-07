@@ -840,3 +840,85 @@ Integration tests added:
 - Tombstone-bit at-rest modification: defense-in-depth via
   AEAD AAD binding; full mitigation is not the application
   layer's job (Threat #22).
+
+## 2026-05-07 · P10 fix-pass — §16.5 audit findings (M-1, M-2, L-1; M-3 deferred; L-2/L-3 no-action)  ✅ SIGNOFF
+
+P10 §16.5 audit (commit `e7d9018`) flagged a documentation drift
+plus housekeeping. Fix-pass closes M-1 + M-2 with code+tests, L-1
+with a one-line `deny.toml` edit, and explicitly defers M-3 per
+auditor recommendation.
+
+**M-1 + M-2 — payload-vs-event `account_id` cross-check (CLOSED).**
+THREAT_MODEL row 18 + `docs/issue-plans/P10.md` §A1/§C claimed the
+cross-check existed before the code shipped it. Implemented inside
+`Vault::detect_tombstone_bit_at_ingest` using
+`subtle::ConstantTimeEq::ct_eq` over the 32-byte arrays. Mismatch
+silently collapses to `is_tombstone = 0` — same bucket as AEAD
+failure / CBOR failure / locked vault — preserving (and
+strengthening) the non-oracle property of the ingest decoder. No
+new error variant; the decoder itself stays type-pure (the
+cross-check is in the ingest layer, not in `decode_payload`). The
+freeze sentinel still fires for the row's INSERT, so the
+user-facing safety property is unaffected. `subtle` was already a
+dep of `pangolin-store` (used in `account.rs::AccountId::ct_eq`);
+no Cargo.toml change. Verified `cargo tree -p pangolin-crypto |
+grep -ci serde` is still 0 — the new use of `subtle` is in the
+store crate, NOT crypto. Two new tests:
+- `detect_tombstone_bit_rejects_cross_account_payload` — synthetic
+  ciphertext whose AAD-bound id is X but whose plaintext
+  `account_id` is Y; bit lands at 0 silently.
+- `detect_tombstone_bit_accepts_matching_payload` — same setup
+  with X==Y; bit lands at 1 (regression coverage).
+
+THREAT_MODEL row 18 prose updated: replaced the "triggers
+`StoreError::Cbor(...)`" claim with the constant-time
+silent-rejection description. `docs/issue-plans/P10.md` §A1
+(rationale 2), §C (audit-bullet on AAD-vs-plaintext cross-checks),
+the threat-model row 14 draft (which is the eventual THREAT_MODEL
+row 18 text), and the failure-modes table all updated to align.
+
+**L-1 — stale `RUSTSEC-2024-0388` advisory ignore (CLOSED).** The
+alloy/coins version churn that landed earlier dropped `derivative`
+from the dep graph, so the ignore began firing
+`advisory-not-detected` warnings. Removed the entry from
+`deny.toml`; left a forward-comment so a future re-introduction
+re-adds it verbatim. `cargo deny check` is now fully clean.
+
+**M-3 — retry-exhaustion deterministic test (DEFERRED).** Per
+auditor's PoC-scope recommendation. The retry-loop's failure path
+needs a test-only RNG seam to drive `random_32_via_sqlite` through
+4 successive collisions; existing happy-path coverage plus the
+`~4×N/2^256` probability bound is sound for PoC. Documented in
+`docs/issue-plans/P10.md` §"Out of scope (explicit)".
+
+**L-2, L-3 — no-action observations.** L-2 (comment polish on
+`derive_fresh_account_id`) and L-3 (positive test count drift)
+are acknowledged; no code change.
+
+**Test-count delta:** 324 → 326 lib tests (+2 from M-1+M-2
+positive/negative coverage).
+
+**Critical invariants verified at the P10 fix-pass SIGNOFF tip:**
+
+1. `cargo tree -p pangolin-crypto | grep -ci serde` → 0 (HIGH-1
+   bound holds; the `subtle` dep was already in `pangolin-store`
+   and `subtle` itself does not pull `serde`).
+2. No new `unsafe`.
+3. No plaintext on disk. The constant-time compare runs on the
+   already-decrypted-and-zeroizing-on-drop plaintext inside
+   `open_payload`; nothing new is persisted beyond the same
+   one-bit `is_tombstone` derivation as P10-2.
+4. Non-oracle property STRENGTHENED. The cross-check uses
+   `subtle::ConstantTimeEq::ct_eq` (no timing-channel divergence
+   on byte-prefix-match position) AND collapses to `0` on
+   mismatch (no different error variant). Verified by both new
+   tests — the rejection is silent end-to-end.
+5. Append-only state unchanged. The cross-check only gates
+   bit-set on INSERT; no UPDATE introduced.
+6. `cargo fmt --all --check` clean.
+7. `cargo clippy --workspace --all-targets -- -D warnings` clean.
+8. `cargo test --workspace --lib` — 326/326 passing.
+9. `cargo test --workspace --tests` — integration tests
+   unchanged from P10 SIGNOFF tip (no integration test touched).
+10. `cargo deny check` fully clean (no `advisory-not-detected`
+    warnings after L-1 fix).
