@@ -3001,7 +3001,58 @@ impl Vault {
         // sharing is MVP-1.
         let placeholder_nonce = [0u8; NONCE_LEN];
         let now = current_unix_ms();
-        let is_tombstone_i64: i64 = 0; // Per Q's: P10 owns tombstone semantics.
+
+        // **P10-2: opportunistic tombstone-bit detection.** Inside the
+        // genuine-foreign-INSERT branch, attempt to AEAD-open the chain
+        // event's `enc_payload` under the local VDK using the placeholder
+        // zero nonce that we are about to persist. Three outcomes:
+        // (a) decryption succeeds AND decodes to `Tombstone` → bit=1;
+        // (b) decryption succeeds AND decodes to `Live` → bit=0;
+        // (c) decryption FAILS → bit=0; the freeze sentinel below still
+        //     fires for the foreign-event UX safety net.
+        //
+        // **Non-oracle property (P10 plan A2 audit point).** The
+        // decode-success-vs-decode-failure branches MUST NOT diverge
+        // observably from outside this function: both paths return
+        // `IngestOutcome::Inserted`, both write the same set of columns
+        // (the same row is INSERTed in either case), and the caller sees
+        // no error-variant difference. The only observable side effect of
+        // a successful decode is the `is_tombstone` bit on the inserted
+        // row (and, in P10-3, the `account_identities.tombstoned` flag).
+        // The AEAD open call's failure path is silently swallowed —
+        // every error variant collapses into "bit=0, freeze sentinel
+        // fires". No logging, no error-variant escape.
+        //
+        // **PoC-two-key reality.** The chain event ABI does not transport
+        // the AEAD nonce. In practice the seal-time nonce is random and
+        // unknown to the ingest path; the open under the placeholder
+        // zero nonce will fail except for synthetically-constructed test
+        // payloads that were sealed with the placeholder zero nonce
+        // deliberately. So under PoC, this branch is functionally a
+        // no-op (always falls through to bit=0 + freeze) — but the
+        // structurally-correct code is in place for MVP-1's
+        // nonce-on-chain to make this functional without further code
+        // changes. The audit-flagged hardcode `is_tombstone_i64 = 0`
+        // is replaced with the structurally-honest opportunistic
+        // decode. Documented in DEVLOG and THREAT_MODEL as known PoC
+        // limitation #15 (closed by MVP-1 nonce-on-chain).
+        //
+        // The decryption is gated on the vault being `Active` (we need
+        // the VDK in the session cache). On a Locked vault, the open
+        // is skipped; the row lands with bit=0 and the freeze sentinel
+        // fires. The opportunistic decode does NOT re-fire on next
+        // unlock (idempotency arm #1 by canonical hash hits) — but the
+        // resolve flow (P9) does not depend on the `is_tombstone` bit
+        // for its read path; the bit's only correctness load is on the
+        // post-resolve-merge row, which is local-write-controlled.
+        let event_schema_version = event.schema_version;
+        let is_tombstone_i64: i64 = self.detect_tombstone_bit_at_ingest(
+            &event.account_id,
+            &event.parent_revision,
+            event_schema_version,
+            &event.enc_payload,
+            &placeholder_nonce,
+        );
 
         // The revisions.account_id FOREIGN KEY references
         // account_identities(account_id), so we must insert (or
@@ -3098,6 +3149,62 @@ impl Vault {
 
         self.touch_session();
         Ok(IngestOutcome::Inserted)
+    }
+
+    /// **P10-2 helper.** Opportunistic tombstone-bit detection for the
+    /// genuine-foreign-INSERT branch of [`Self::ingest_chain_revision`].
+    ///
+    /// Returns `1` iff the chain event's `enc_payload` AEAD-decrypts
+    /// (under the local VDK + the placeholder zero nonce that ingest
+    /// will persist) AND the decoded plaintext is a [`TombstonePayload`]
+    /// whose `deleted` field is `true`. Returns `0` for every other
+    /// outcome:
+    ///
+    /// - vault is Locked (no VDK in session cache);
+    /// - AEAD open fails (the common case under `PoC` two-key — the
+    ///   chain event's seal-time nonce is unknown, so the open under
+    ///   placeholder zero nonce fails authentication);
+    /// - decoded payload is a Live snapshot;
+    /// - decoded `TombstonePayload::is_deleted()` is somehow false
+    ///   (unreachable under correct seal practice; defensive).
+    ///
+    /// **Non-oracle invariant.** Every error path collapses to `0`; the
+    /// only observable side effect of decode-success is the bit value.
+    /// No error variant escapes. No logging beyond what the workspace
+    /// already does (none here). The caller writes the same row with
+    /// the same column set in either case (the freeze sentinel still
+    /// fires regardless, for foreign-ingest UX safety).
+    fn detect_tombstone_bit_at_ingest(
+        &self,
+        event_account_id: &[u8; ACCOUNT_ID_LEN],
+        event_parent_revision: &[u8; REVISION_ID_LEN],
+        event_schema_version: u8,
+        event_enc_payload: &[u8],
+        placeholder_nonce: &[u8; NONCE_LEN],
+    ) -> i64 {
+        // Locked vault → no VDK → cannot decode → return 0.
+        let Some(active) = self.active.as_ref() else {
+            return 0;
+        };
+
+        let account_id = AccountId::from_bytes(*event_account_id);
+        let parent_revision_id = RevisionId::from_bytes(*event_parent_revision);
+        let aad = build_aad(
+            &self.meta.vault_id,
+            &account_id,
+            &parent_revision_id,
+            event_schema_version,
+        );
+        let nonce = Nonce::from_storage_bytes(*placeholder_nonce);
+        let ciphertext = Ciphertext::from_vec(event_enc_payload.to_vec());
+
+        // Swallow every error variant (AEAD failure, CBOR decode
+        // failure, malformed-payload, etc.) into a single `0` return
+        // for non-oracle discipline.
+        match open_payload(active.vdk.aead_key(), &nonce, &ciphertext, &aad) {
+            Ok(DecodedPayload::Tombstone(p)) if p.is_deleted() => 1,
+            Ok(_) | Err(_) => 0,
+        }
     }
 
     // -----------------------------------------------------------------
@@ -5642,5 +5749,301 @@ mod tests {
             .prune_orphan_pending_merges(id)
             .expect("prune ok on empty");
         assert_eq!(deleted, 0, "empty stash table → 0 deletions");
+    }
+
+    // ---------------------------------------------------------------
+    // P10-2: opportunistic tombstone-bit detection at ingest time
+    // ---------------------------------------------------------------
+
+    use crate::account::{AccountId, ACCOUNT_ID_LEN};
+    use crate::revision::RevisionId;
+
+    /// Helper: seal a tombstone payload under the supplied vault's VDK
+    /// using the **placeholder zero nonce** that the ingest path
+    /// persists for foreign events. Returns the resulting AEAD
+    /// ciphertext bytes — to be plumbed into a synthetic
+    /// `RevisionEvent.enc_payload` so the ingest path's opportunistic
+    /// open succeeds.
+    fn seal_tombstone_with_placeholder_nonce(
+        v: &Vault,
+        account_id: AccountId,
+        parent: RevisionId,
+        schema_version: u8,
+        ts_ms: u64,
+    ) -> Vec<u8> {
+        use crate::blob::{build_aad, TombstonePayload};
+        use ciborium_io::Write as _;
+        use ciborium_ll::{Encoder, Header};
+        use pangolin_crypto::aead::{Nonce, NONCE_LEN};
+        let aad = build_aad(&v.meta.vault_id, &account_id, &parent, schema_version);
+        let active = v.require_active().expect("vault active");
+        let payload = TombstonePayload::new(account_id, ts_ms);
+        // Replicate the encoder inline so we can plumb the
+        // placeholder zero nonce into the seal call (the public
+        // seal_tombstone uses Nonce::random()).
+        let mut out: Vec<u8> = Vec::with_capacity(64);
+        {
+            let mut enc = Encoder::from(&mut out);
+            enc.push(Header::Map(Some(3))).unwrap();
+            enc.text("account_id", None).unwrap();
+            enc.push(Header::Bytes(Some(ACCOUNT_ID_LEN))).unwrap();
+            enc.write_all(payload.account_id()).unwrap();
+            enc.text("deleted", None).unwrap();
+            enc.push(Header::Simple(ciborium_ll::simple::TRUE)).unwrap();
+            enc.text("tombstoned_at_ms", None).unwrap();
+            enc.push(Header::Positive(payload.tombstoned_at_ms()))
+                .unwrap();
+        }
+        let nonce = Nonce::from_storage_bytes([0u8; NONCE_LEN]);
+        let ct = active
+            .vdk
+            .aead_key()
+            .seal(&nonce, &out, &aad)
+            .expect("seal");
+        ct.as_bytes().to_vec()
+    }
+
+    /// Helper: same as `seal_tombstone_with_placeholder_nonce` but for
+    /// a live snapshot. Encodes a six-entry CBOR map in canonical
+    /// slot order (`display_name`, `username`, `password`, `url`,
+    /// `notes`, `totp_secret`) under the placeholder zero nonce.
+    fn seal_live_with_placeholder_nonce(
+        v: &Vault,
+        account_id: AccountId,
+        parent: RevisionId,
+        schema_version: u8,
+    ) -> Vec<u8> {
+        use crate::blob::build_aad;
+        use ciborium_io::Write as _;
+        use ciborium_ll::{Encoder, Header};
+        use pangolin_crypto::aead::{Nonce, NONCE_LEN};
+        let aad = build_aad(&v.meta.vault_id, &account_id, &parent, schema_version);
+        let active = v.require_active().expect("vault active");
+        let mut out: Vec<u8> = Vec::with_capacity(256);
+        {
+            let mut enc = Encoder::from(&mut out);
+            enc.push(Header::Map(Some(6))).unwrap();
+            for (k, val) in [
+                ("display_name", b"x".as_slice()),
+                ("username", b"u".as_slice()),
+                ("password", b"p".as_slice()),
+                ("url", b"https://x".as_slice()),
+                ("notes", b"".as_slice()),
+                ("totp_secret", b"".as_slice()),
+            ] {
+                enc.text(k, None).unwrap();
+                enc.push(Header::Bytes(Some(val.len()))).unwrap();
+                enc.write_all(val).unwrap();
+            }
+        }
+        let nonce = Nonce::from_storage_bytes([0u8; NONCE_LEN]);
+        let ct = active
+            .vdk
+            .aead_key()
+            .seal(&nonce, &out, &aad)
+            .expect("seal");
+        ct.as_bytes().to_vec()
+    }
+
+    /// Build a `RevisionEvent` with the supplied `enc_payload` and a
+    /// synthetic chain anchor.
+    fn synth_event(
+        vault_id: [u8; 32],
+        account_id: [u8; 32],
+        parent: [u8; 32],
+        enc_payload: Vec<u8>,
+        block: u64,
+        log: u64,
+    ) -> pangolin_chain::RevisionEvent {
+        let device = pangolin_crypto::keys::DeviceKey::generate();
+        let device_id = device.verifying_key().to_bytes();
+        pangolin_chain::RevisionEvent {
+            vault_id,
+            account_id,
+            parent_revision: parent,
+            device_id,
+            schema_version: 0,
+            sequence: 0,
+            enc_payload,
+            anchor: pangolin_chain::ChainAnchor {
+                tx_hash: [0xEA; 32],
+                block_number: block,
+                log_index: log,
+                sequence: 0,
+            },
+        }
+    }
+
+    /// **P10-2 A2 positive case.** A synthetic foreign event whose
+    /// `enc_payload` is sealed under the local VDK with the
+    /// **placeholder zero nonce** that ingest will use for the open
+    /// attempt: the opportunistic decode succeeds, the bit is set to 1.
+    #[test]
+    fn ingest_synthetic_decryptable_tombstone_event_sets_bit() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "p10-2-pos.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let acct = AccountId::from_bytes([0xAA; 32]);
+        let parent = RevisionId::from_bytes([0u8; 32]);
+        let ct = seal_tombstone_with_placeholder_nonce(&v, acct, parent, 0, 1_700_000_000_000);
+        let ev = synth_event(v.vault_id(), [0xAA; 32], [0u8; 32], ct, 12, 0);
+        let outcome = v.ingest_chain_revision(&ev).expect("ingest");
+        assert_eq!(outcome, IngestOutcome::Inserted);
+        // The inserted row's is_tombstone column is 1.
+        let revs = v.revisions_for(acct).expect("revisions_for");
+        assert_eq!(revs.len(), 1);
+        assert!(
+            revs[0].is_tombstone,
+            "opportunistic decode succeeded → is_tombstone bit must be 1"
+        );
+    }
+
+    /// **P10-2 A2 negative case (live).** A synthetic foreign event
+    /// whose payload decrypts to a Live snapshot: the bit is NOT set.
+    #[test]
+    fn ingest_own_live_revision_does_not_set_tombstone_bit() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "p10-2-live.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let acct = AccountId::from_bytes([0xBB; 32]);
+        let parent = RevisionId::from_bytes([0u8; 32]);
+        let ct = seal_live_with_placeholder_nonce(&v, acct, parent, 0);
+        let ev = synth_event(v.vault_id(), [0xBB; 32], [0u8; 32], ct, 13, 0);
+        v.ingest_chain_revision(&ev).expect("ingest");
+        let revs = v.revisions_for(acct).expect("revisions_for");
+        assert_eq!(revs.len(), 1);
+        assert!(
+            !revs[0].is_tombstone,
+            "opportunistic decode of a live payload must NOT set is_tombstone"
+        );
+    }
+
+    /// **P10-2 A3 negative case (decryption fails).** A foreign event
+    /// whose `enc_payload` does NOT AEAD-decrypt (random bytes; the
+    /// common case under `PoC` two-key when seal-time nonce is unknown)
+    /// MUST leave `is_tombstone` clear AND fire the freeze sentinel.
+    #[test]
+    fn ingest_foreign_event_with_unreadable_payload_leaves_tombstone_clear_and_freezes() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "p10-2-undec.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        // Fresh local account so the freeze sentinel UPDATE-arm fires.
+        let id = v.add_account(fresh_snapshot()).expect("add_account");
+        // Foreign event with a random enc_payload — won't decrypt.
+        let bogus_ct = vec![0xDE; 64];
+        let ev = synth_event(v.vault_id(), *id.as_bytes(), [0u8; 32], bogus_ct, 99, 0);
+        v.ingest_chain_revision(&ev).expect("ingest");
+        // Two revisions: the local genesis + the foreign-ingested row.
+        let revs = v.revisions_for(id).expect("revisions_for");
+        let ingested = revs
+            .iter()
+            .find(|m| m.chain_anchor.is_some())
+            .expect("foreign-ingested row");
+        assert!(
+            !ingested.is_tombstone,
+            "decode failed → bit must be 0; freeze sentinel handles UX"
+        );
+        // Freeze sentinel fires regardless of decode success.
+        let frozen = v.list_frozen_accounts().expect("list frozen");
+        assert!(
+            frozen.contains(&id),
+            "freeze sentinel must fire on foreign-ingest"
+        );
+    }
+
+    /// **P10-2 A2 locked-vault edge case.** Ingesting on a Locked vault
+    /// (no VDK in cache) skips the opportunistic decode and behaves as
+    /// per the unreadable-payload case: bit=0, freeze sentinel fires.
+    /// `pull_all` and `ingest_chain_revision` are explicitly metadata-
+    /// only ops that work without an active session, so this path is
+    /// reachable.
+    #[test]
+    fn ingest_locked_vault_skips_decryption_and_treats_as_unreadable() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "p10-2-locked.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        // No unlock — vault stays Locked.
+        let acct = AccountId::from_bytes([0xCC; 32]);
+        // Even if we had a magically-decryptable payload, the locked
+        // path can't construct it (no VDK access without unlock). Just
+        // pass random bytes; the test is verifying the no-panic / bit=0
+        // discipline.
+        let bogus_ct = vec![0xFF; 32];
+        let ev = synth_event(v.vault_id(), *acct.as_bytes(), [0u8; 32], bogus_ct, 1, 0);
+        let outcome = v.ingest_chain_revision(&ev).expect("ingest on locked");
+        assert_eq!(outcome, IngestOutcome::Inserted);
+        let revs = v.revisions_for(acct).expect("revisions_for");
+        assert_eq!(revs.len(), 1);
+        assert!(
+            !revs[0].is_tombstone,
+            "locked-vault ingest must leave is_tombstone clear"
+        );
+    }
+
+    /// **P10-2 A2 non-oracle property.** AEAD-failure (random bytes)
+    /// and CBOR-decode-failure (a successful AEAD open whose plaintext
+    /// is malformed CBOR) MUST take the same branch — both produce the
+    /// same `IngestOutcome::Inserted`, both leave `is_tombstone = 0`,
+    /// neither escapes any error variant. The non-oracle property is
+    /// what blocks an attacker from distinguishing "I corrupted the
+    /// AEAD ciphertext" from "I corrupted the CBOR plaintext."
+    #[test]
+    fn ingest_tombstone_bit_does_not_oracle_aead_failure_versus_decode_failure() {
+        use crate::blob::build_aad;
+        use pangolin_crypto::aead::{Nonce, NONCE_LEN};
+
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "p10-2-oracle.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+
+        // Path 1: AEAD fails (bogus bytes; opens fail).
+        let acct1 = AccountId::from_bytes([0x11; 32]);
+        let bogus_ct = vec![0xDD; 32];
+        let ev1 = synth_event(v.vault_id(), *acct1.as_bytes(), [0u8; 32], bogus_ct, 10, 0);
+        let out1 = v.ingest_chain_revision(&ev1).expect("ingest 1");
+        assert_eq!(out1, IngestOutcome::Inserted, "path 1: same outcome");
+        let revs1 = v.revisions_for(acct1).expect("revs 1");
+        assert!(!revs1[0].is_tombstone, "path 1: bit=0");
+
+        // Path 2: AEAD succeeds (we seal under the placeholder zero
+        // nonce) BUT the plaintext is malformed CBOR (not a valid
+        // map). The open succeeds; the decode fails. The bit must
+        // still be 0 with the same outcome.
+        let acct2 = AccountId::from_bytes([0x22; 32]);
+        let parent2 = RevisionId::from_bytes([0u8; 32]);
+        let aad = build_aad(&v.meta.vault_id, &acct2, &parent2, 0);
+        let active = v.require_active().expect("active");
+        let nonce = Nonce::from_storage_bytes([0u8; NONCE_LEN]);
+        // Plaintext that is NOT a valid CBOR map header.
+        let malformed_plaintext = vec![0xFFu8, 0xFF, 0xFF, 0xFF];
+        let malformed_ct = active
+            .vdk
+            .aead_key()
+            .seal(&nonce, &malformed_plaintext, &aad)
+            .expect("seal");
+        let ev2 = synth_event(
+            v.vault_id(),
+            *acct2.as_bytes(),
+            [0u8; 32],
+            malformed_ct.as_bytes().to_vec(),
+            11,
+            0,
+        );
+        let out2 = v.ingest_chain_revision(&ev2).expect("ingest 2");
+        assert_eq!(
+            out2, out1,
+            "AEAD-fail and CBOR-fail must produce indistinguishable outcomes"
+        );
+        let revs2 = v.revisions_for(acct2).expect("revs 2");
+        assert!(!revs2[0].is_tombstone, "path 2: bit=0");
     }
 }

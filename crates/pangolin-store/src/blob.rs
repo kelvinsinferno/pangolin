@@ -249,9 +249,7 @@ where
 #[derive(Debug)]
 pub enum DecodedPayload {
     Live(AccountSnapshot),
-    // The payload is read by [`crate::vault::Vault::ingest_chain_revision`]
-    // in P10-2; lint allowance until that wiring lands.
-    Tombstone(#[allow(dead_code)] TombstonePayload),
+    Tombstone(TombstonePayload),
 }
 
 /// Seal a live `AccountSnapshot` into an AEAD ciphertext + nonce pair.
