@@ -38,6 +38,7 @@ pub mod account;
 pub mod conflict;
 pub mod dirty;
 pub mod error;
+pub mod pending;
 pub mod revision;
 pub mod session;
 pub mod vault;
@@ -51,6 +52,7 @@ pub use account::{AccountId, AccountSnapshot};
 pub use conflict::ConflictReport;
 pub use dirty::{DirtyEntry, IngestOutcome, RevisionPublishPayload};
 pub use error::{Result, StoreError};
+pub use pending::{PendingMerge, PENDING_MERGE_NONCE_LEN, PENDING_MERGE_SECRET_LEN};
 pub use revision::{ChainAnchor, DeviceId, RevisionGraph, RevisionId, RevisionMeta};
 pub use session::{
     AuthError, Clock, IdentityProof, PinIdentityProof, PresenceProof, PressYPresenceProof,

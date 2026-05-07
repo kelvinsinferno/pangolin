@@ -34,7 +34,9 @@ use pangolin_chain::{
     build_signed_revision, ChainAdapter, ChainError, RevisionEvent, SignedRevision, VaultId,
 };
 use pangolin_crypto::keys::DeviceKey;
-use pangolin_store::{AccountId, ChainAnchor, DirtyEntry, RevisionId, StoreError, Vault};
+use pangolin_store::{
+    AccountId, ChainAnchor, DirtyEntry, PendingMerge, RevisionId, StoreError, Vault,
+};
 
 /// Outcome of a single publish attempt within `publish_all`.
 #[derive(Debug, Clone)]
@@ -610,11 +612,39 @@ impl From<StoreError> for ResolveError {
 ///    immediately clears.
 /// 8. `clear_frozen(account_id, merge_revision_id)` advances the
 ///    head pointer + clears the freeze in one transaction.
+/// 9. Delete the `pending_merges` stash row (P9 fix-pass HIGH-1).
+///
+/// **P9 fix-pass HIGH-1 — partial-failure recovery via stash.**
+/// Before step 6 (`adapter.publish`), the resolve flow stashes the
+/// ephemeral `DeviceKey` secret seed + AEAD nonce + ciphertext into
+/// the `pending_merges` `SQLite` table via [`Vault::stash_pending_merge`].
+/// On retry — kill mid-publish, kill between publish and
+/// `clear_frozen`, kill mid-ingest — the next invocation calls
+/// [`Vault::take_pending_merge`] FIRST and reuses the stashed bytes,
+/// so the canonical hash is identical across retries and the chain
+/// event from the prior partially-completed run can be matched via
+/// the existing A3 idempotency scan. Without this stash, every
+/// retry would generate a fresh ephemeral key + nonce, the
+/// canonical hash would differ every run, and the user would be
+/// permanently stuck with a frozen account. See `THREAT_MODEL.md`
+/// row #13.
+///
+/// **P9 fix-pass MED-4 — dry-run short-circuits the pre-publish
+/// pull.** When `dry_run = true`, the resolve flow does NOT run the
+/// `pull_all` step; the local view is left exactly as it was
+/// pre-call (`last_pulled_block` unchanged, no chain ingestion).
+/// This honours the user's "show me the canonical hash without
+/// touching anything" expectation. The dry-run path's stdout is
+/// expected to surface "pre-publish chain re-pull skipped in
+/// dry-run mode; current local state may be stale" so the user
+/// understands the chain view used for the canonical hash is the
+/// last-known-local view.
 ///
 /// `dry_run = true` short-circuits at step 5 — the canonical hash
 /// is computed and returned; no on-chain publish, no ingest, no
-/// `clear_frozen`. The plaintext IS materialised in memory
-/// transiently to compute the seal (per §A2).
+/// `clear_frozen`, no `pull_all`, no `pending_merges` stash. The
+/// plaintext IS materialised in memory transiently to compute the
+/// seal (per §A2).
 ///
 /// The merge revision's `revision_id` (returned in the
 /// `Published` / `AlreadyOnChain` outcomes) is the canonical hash
@@ -656,19 +686,30 @@ pub async fn resolve_one<A: ChainAdapter + ?Sized>(
     // pull also ingests any events the chain has that we don't —
     // including a possible NEW head for `account_id` published by
     // some other device since the user invoked resolve.
-    pull_all(vault, adapter, None, None)
-        .await
-        .map_err(|e| ResolveError::Chain(format!("pre-publish pull_all failed: {e}")))?;
-
-    // Re-read heads after the pull. If the head set CHANGED (a NEW
-    // head id is present that wasn't there before), abort cleanly —
-    // the user's `--keep` was made against a stale view of the
-    // chain. Per P9 plan Q7 / A7 the recovery is "re-run resolve
-    // against the freshest heads".
-    let post_pull_heads = vault.account_heads(account_id).map_err(|e| match e {
-        StoreError::AccountNotFound => ResolveError::AccountNotFound { account_id },
-        other => ResolveError::Store(other),
-    })?;
+    //
+    // **P9 fix-pass MED-4.** Skip the pull entirely under dry-run
+    // so a dry-run invocation does NOT mutate `last_pulled_block`
+    // or ingest any chain rows. The dry-run output's stdout is
+    // expected to call out that the chain view may be stale.
+    let post_pull_heads = if dry_run {
+        // Dry-run skips the pull; head set is the pre-pull view.
+        pre_pull_heads.clone()
+    } else {
+        pull_all(vault, adapter, None, None)
+            .await
+            .map_err(|e| ResolveError::Chain(format!("pre-publish pull_all failed: {e}")))?;
+        vault.account_heads(account_id).map_err(|e| match e {
+            StoreError::AccountNotFound => ResolveError::AccountNotFound { account_id },
+            other => ResolveError::Store(other),
+        })?
+    };
+    // Re-read heads after the (possibly skipped) pull. If the head
+    // set CHANGED (a NEW head id is present that wasn't there
+    // before), abort cleanly — the user's `--keep` was made
+    // against a stale view of the chain. Per P9 plan Q7 / A7 the
+    // recovery is "re-run resolve against the freshest heads".
+    // Under dry-run this comparison is a no-op (the same set), so
+    // the chain-moved branch only fires on the wet path.
     let chain_moved = post_pull_heads.iter().any(|h| !pre_pull_heads.contains(h));
     if chain_moved {
         return Err(ResolveError::ChainMovedDuringResolve {
@@ -688,20 +729,77 @@ pub async fn resolve_one<A: ChainAdapter + ?Sized>(
         });
     }
 
-    // Capture the post-pull chain view ONCE (for the A3
-    // idempotency check below). A chain-side error here drops the
-    // optimisation and pushes us to the unconditional publish path.
-    let vault_id_arr: VaultId = vault.vault_id();
-    let last_pulled = vault.last_pulled_block().map_err(ResolveError::Store)?;
-    let chain_view: Option<Vec<RevisionEvent>> = adapter
-        .pull_since(&vault_id_arr, last_pulled, None)
-        .await
-        .ok();
-
-    // ---- Step 3: read chosen plaintext + re-seal under merge AAD. ----
-    let (enc_payload, schema_version, _is_tombstone) = vault
-        .build_merge_payload_for_resolve(account_id, chosen_revision_id)
+    // ---- Step 2.5: P9 fix-pass HIGH-1 — recover from a prior partial run. ----
+    //
+    // Look up the `pending_merges` stash for `(account_id,
+    // chosen_revision_id)`. If present, the prior run had already
+    // built + sealed the merge revision and stashed the bytes
+    // BEFORE adapter.publish. We reuse those exact bytes (same
+    // ephemeral DeviceKey reconstructed from the stashed seed,
+    // same AEAD nonce, same ciphertext) so the canonical hash is
+    // bit-equal to the prior run's. This is what makes the A3
+    // idempotency check below capable of matching the chain event
+    // from the prior partially-completed run.
+    //
+    // Without this stash, each retry generates a fresh ephemeral
+    // key + nonce, the canonical hash differs every run, and the
+    // user is permanently stuck with a frozen account. See
+    // THREAT_MODEL row #13.
+    let stash: Option<PendingMerge> = vault
+        .take_pending_merge(account_id, chosen_revision_id)
         .map_err(ResolveError::Store)?;
+    let stash_present = stash.is_some();
+
+    let vault_id_arr: VaultId = vault.vault_id();
+
+    // ---- Step 3: build (or recover) merge revision payload. ----
+    //
+    // If a stash exists: reuse the stashed seed, nonce, and
+    // ciphertext (they were already written under the merge
+    // revision's AAD by the prior run; re-using them produces a
+    // bit-identical canonical hash). Reconstruct the ephemeral
+    // DeviceKey from the stashed seed.
+    //
+    // If no stash: do the normal seal flow via
+    // `build_merge_payload_for_resolve` (which also returns the
+    // fresh nonce that we stash below before publish).
+    let (enc_payload, fresh_nonce, schema_version, ephemeral_dev): (
+        Vec<u8>,
+        [u8; pangolin_store::PENDING_MERGE_NONCE_LEN],
+        u8,
+        Option<DeviceKey>,
+    ) = if let Some(s) = stash.as_ref() {
+        // Reconstruct the ephemeral DeviceKey from the stashed
+        // 32-byte secret seed. The stash's `device_secret` is
+        // SecretBytes (zeroizes on drop); we copy out into a
+        // fixed-size array immediately and pass to
+        // DeviceKey::from_seed which itself zeroes the
+        // parameter slot after dalek consumes it.
+        let seed_slice = s.device_secret.expose();
+        let mut seed_arr = [0u8; pangolin_crypto::sign::SECRET_KEY_LEN];
+        seed_arr.copy_from_slice(seed_slice);
+        let dev = DeviceKey::from_seed(seed_arr);
+        // The supplied `device_key` argument is ignored on the
+        // recovery path — the stash's seed is the authoritative
+        // bytes that produce the same canonical hash on every
+        // retry.
+        (
+            s.enc_payload.clone(),
+            s.aead_nonce,
+            s.schema_version,
+            Some(dev),
+        )
+    } else {
+        let (ct, nonce_bytes, sv, _is_tombstone) = vault
+            .build_merge_payload_for_resolve(account_id, chosen_revision_id)
+            .map_err(ResolveError::Store)?;
+        (ct, nonce_bytes, sv, None)
+    };
+
+    // The signing device key for THIS invocation: the stash's
+    // reconstructed key on the recovery path; the supplied
+    // `device_key` on the fresh path.
+    let signing_key: &DeviceKey = ephemeral_dev.as_ref().unwrap_or(device_key);
 
     // ---- Step 4: build SignedRevision. ----
     //
@@ -709,12 +807,12 @@ pub async fn resolve_one<A: ChainAdapter + ?Sized>(
     // `revision_id`. The `device_id` is the ephemeral signing
     // key's public bytes (PoC two-key model — same as `publish`).
     let signed: SignedRevision = build_signed_revision(
-        device_key,
+        signing_key,
         vault_id_arr,
         *account_id.as_bytes(),
         *chosen_revision_id.as_bytes(),
         schema_version,
-        enc_payload,
+        enc_payload.clone(),
     );
     let canonical = pangolin_chain::canonical_hash(
         &signed.vault_id,
@@ -726,18 +824,39 @@ pub async fn resolve_one<A: ChainAdapter + ?Sized>(
     );
 
     // ---- Step 5 (early-exit): dry-run prints the canonical hash. ----
+    //
+    // P9 fix-pass MED-4: dry-run does NOT touch the stash. Since
+    // `take_pending_merge` is read-only (does NOT delete), the
+    // stash row remains on disk untouched after dry-run; the
+    // natural caller pattern of "dry-run to inspect, then re-run
+    // for real" preserves the recovery state across the two
+    // calls.
     if dry_run {
         return Ok(ResolveOutcome::DryRun {
             planned_revision_id: canonical,
         });
     }
 
+    // Capture the post-pull chain view ONCE (for the A3
+    // idempotency check below). A chain-side error here drops the
+    // optimisation and pushes us to the unconditional publish path.
+    let last_pulled = vault.last_pulled_block().map_err(ResolveError::Store)?;
+    let chain_view: Option<Vec<RevisionEvent>> = adapter
+        .pull_since(&vault_id_arr, last_pulled, None)
+        .await
+        .ok();
+
     // ---- Step 5: A3 pre-publish check. ----
     //
     // If the merge revision's canonical hash already appears on
     // chain (recovery from a kill between publish + ingest +
     // clear_frozen), skip the publish and run only the local
-    // commit.
+    // commit. This is the load-bearing branch that the HIGH-1
+    // stash makes effective: with the stash's identical-bytes
+    // discipline, the canonical hash IS bit-equal to the prior
+    // run's, so the chain event lands here. Without the stash,
+    // each retry generated a fresh canonical hash and this branch
+    // never matched.
     let mut already_on_chain_anchor: Option<ChainAnchor> = None;
     if let Some(events) = &chain_view {
         for ev in events {
@@ -754,6 +873,41 @@ pub async fn resolve_one<A: ChainAdapter + ?Sized>(
                 break;
             }
         }
+    }
+
+    // ---- Step 5.5: P9 fix-pass HIGH-1 — stash BEFORE publish. ----
+    //
+    // Persist the build state so the next retry can reproduce the
+    // same canonical hash bit-for-bit. The stash row's
+    // `device_secret` is the ephemeral DeviceKey's secret seed;
+    // its `aead_nonce` + `enc_payload` are the bytes that went
+    // into the AEAD seal inside
+    // `build_merge_payload_for_resolve`.
+    //
+    // Skipped on the recovery path (`stash_present`) because the
+    // stash row already exists with the same bytes — re-stashing
+    // would INSERT-OR-REPLACE identical content (semantic no-op).
+    //
+    // Skipped on the A3 hit path because publish won't run; the
+    // recovery semantics for the local commit (ingest +
+    // clear_frozen) are independently idempotent and the stash's
+    // purpose is exclusively the publish-failure case.
+    if !stash_present && already_on_chain_anchor.is_none() {
+        // Pull the seed bytes out of the supplied DeviceKey so the
+        // recovery path can reconstruct the SAME key from the
+        // stashed seed. The Zeroizing<[u8; 32]> wrapper wipes the
+        // local stack copy when this scope ends.
+        let seed_z = signing_key.secret_seed_bytes();
+        vault
+            .stash_pending_merge(
+                account_id,
+                chosen_revision_id,
+                *seed_z,
+                fresh_nonce,
+                enc_payload.clone(),
+                schema_version,
+            )
+            .map_err(ResolveError::Store)?;
     }
 
     // ---- Step 6: publish (or skip per A3). ----
@@ -801,6 +955,28 @@ pub async fn resolve_one<A: ChainAdapter + ?Sized>(
     vault
         .clear_frozen(account_id, merge_rev_id)
         .map_err(ResolveError::Store)?;
+
+    // ---- Step 9: P9 fix-pass HIGH-1 — clear the stash. ----
+    //
+    // After `clear_frozen` succeeds, the recovery state is no
+    // longer needed. Drop the stash row so the ephemeral signing
+    // seed is no longer at rest in the vault file. Idempotent:
+    // calling on a non-existent row is a no-op (the stash may
+    // not exist if this run took the fresh path AND the A3 hit
+    // path — but since we skipped the pre-publish stash on the
+    // A3 hit path, the row may not exist there either; the
+    // clear is unconditionally safe).
+    if let Err(e) = vault.clear_pending_merge(account_id, chosen_revision_id) {
+        // Non-fatal: the stash row contains a discarded ephemeral
+        // signing key that's no longer useful (the merge revision
+        // is on chain + ingested + clear_frozen succeeded). Log
+        // but don't abort.
+        eprintln!(
+            "warning: clear_pending_merge for {}/{}: {e}",
+            hex::encode(account_id.as_bytes()),
+            hex::encode(chosen_revision_id.as_bytes()),
+        );
+    }
 
     // Advance last_pulled_block to capture the just-published
     // event's block (so a subsequent pull doesn't re-fetch it). We
@@ -1662,8 +1838,11 @@ mod tests {
         );
     }
 
-    /// **P9-4 dry-run.** `--dry-run` returns a canonical hash but
-    /// does NOT publish on chain or clear the freeze flag.
+    /// **P9-4 dry-run + P9 fix-pass MED-4.** `--dry-run` returns a
+    /// canonical hash but does NOT publish on chain, clear the
+    /// freeze flag, OR mutate `last_pulled_block` via the
+    /// pre-publish pull (the pull step is short-circuited under
+    /// dry-run per MED-4).
     #[tokio::test]
     async fn dry_run_does_not_publish_or_clear() {
         let (mut v, _d) = fresh_vault();
@@ -1672,6 +1851,11 @@ mod tests {
         let (account_id, local_head) =
             drive_into_forked_and_frozen(&mut v, &adapter, &device).await;
         let pre_event_count = adapter.event_count();
+        // P9 fix-pass MED-4: capture last_pulled_block BEFORE the
+        // dry-run resolve. Under MED-4 the dry-run path skips the
+        // pre-publish `pull_all`, so this checkpoint must be
+        // unchanged after the call.
+        let pre_last_pulled = v.last_pulled_block().expect("read pre last_pulled");
 
         let resolve_dev = DeviceKey::generate();
         let outcome = resolve_one(
@@ -1700,6 +1884,13 @@ mod tests {
             .list_frozen_accounts()
             .expect("list frozen")
             .contains(&account_id));
+        // P9 fix-pass MED-4: last_pulled_block unchanged — the
+        // pre-publish pull is short-circuited on dry-run.
+        let post_last_pulled = v.last_pulled_block().expect("read post last_pulled");
+        assert_eq!(
+            post_last_pulled, pre_last_pulled,
+            "MED-4: dry-run must NOT advance last_pulled_block via the pre-publish pull"
+        );
     }
 
     /// **P9-4 `NotAHead`.** A `--keep` revision id that is not a
@@ -1755,5 +1946,343 @@ mod tests {
         async fn current_block(&self) -> Result<u64, ChainError> {
             self.inner.current_block().await
         }
+    }
+
+    // ---------------------------------------------------------------
+    // P9 fix-pass MED-1: multi-resolve invariant test
+    // ---------------------------------------------------------------
+
+    /// **P9 fix-pass MED-1.** Multi-head resolve: a 3-head fork
+    /// resolved with `--keep <chosen>` produces a merge revision
+    /// pointing at `<chosen>`, while the two unchosen heads remain
+    /// in the local revision graph as orphans (still surfaced by
+    /// `account_heads` until the user runs resolve again to fold
+    /// them in). This is the documented Q1 multi-resolve pattern:
+    /// under `PoC` two-key the AEAD nonce of foreign rows is not on
+    /// chain, so each foreign-head resolve produces a distinct
+    /// merge revision; the user re-runs resolve N times for N
+    /// foreign heads. MVP-1's switch to D-006's single-key model
+    /// closes the gap.
+    ///
+    /// The test pins the structural invariant: after one resolve,
+    /// `account_heads(account_id)` returns the merge revision
+    /// PLUS the two unchosen orphans (length 3, not length 1).
+    /// The merge revision is one of the heads; the chosen
+    /// revision is no longer a head (the merge demoted it).
+    #[tokio::test]
+    async fn resolve_against_three_heads_keeps_chosen_demotes_others_to_orphans() {
+        let (mut v, _d) = fresh_vault();
+        let device = DeviceKey::generate();
+        let adapter = MockChainAdapter::new();
+
+        // Step 1: drive the vault into the standard 2-head fork
+        // (local genesis + foreign sibling). After this, the
+        // account has 2 heads + the freeze flag.
+        let (account_id, local_head) =
+            drive_into_forked_and_frozen(&mut v, &adapter, &device).await;
+        let pre_heads = v.account_heads(account_id).expect("heads");
+        assert_eq!(pre_heads.len(), 2, "drive produced 2 heads");
+
+        // Step 2: inject a SECOND foreign event sharing the same
+        // genesis-parent so the account becomes a 3-head fork.
+        let foreign_dev_2 = DeviceKey::generate();
+        let foreign_signed_2 = build_signed_revision(
+            &foreign_dev_2,
+            v.vault_id(),
+            *account_id.as_bytes(),
+            [0u8; 32], // genesis-parent — same as local genesis + first foreign
+            0,
+            b"foreign-content-2".to_vec(),
+        );
+        adapter
+            .publish(&foreign_signed_2)
+            .await
+            .expect("publish 2nd foreign");
+        // Pull to ingest the new foreign event into the local store.
+        let _ = pull_all(&mut v, &adapter, None, None)
+            .await
+            .expect("pull 2nd foreign");
+        let pre_resolve_heads = v
+            .account_heads(account_id)
+            .expect("heads after 2nd foreign");
+        assert_eq!(
+            pre_resolve_heads.len(),
+            3,
+            "two foreign events + local genesis = 3 heads"
+        );
+        assert!(
+            pre_resolve_heads.contains(&local_head),
+            "local genesis is one of the 3 heads"
+        );
+
+        // Step 3: resolve with `--keep local_head`. After the
+        // resolve, the merge revision is a NEW head; the chosen
+        // local_head is demoted (it is now the parent of the
+        // merge); the two unchosen foreign heads remain as
+        // orphans because the merge is parented on local_head, NOT
+        // on either foreign — so neither foreign has a child, both
+        // remain heads.
+        let resolve_dev = DeviceKey::generate();
+        let outcome = resolve_one(
+            &mut v,
+            &adapter,
+            &resolve_dev,
+            account_id,
+            local_head,
+            false,
+        )
+        .await
+        .expect("resolve ok");
+
+        let merge_rev_id = match outcome {
+            ResolveOutcome::Published { revision_id, .. } => RevisionId::from_bytes(revision_id),
+            other => panic!("expected Published, got {other:?}"),
+        };
+
+        // The post-resolve head set must contain:
+        //  - the merge revision (newly created child of local_head),
+        //  - the two unchosen foreign heads (still orphans).
+        // local_head itself MUST be absent (it now has a child).
+        let post_heads = v.account_heads(account_id).expect("heads after resolve");
+        assert_eq!(
+            post_heads.len(),
+            3,
+            "1 merge + 2 unchosen orphans = 3 heads"
+        );
+        assert!(
+            post_heads.contains(&merge_rev_id),
+            "merge revision is a head"
+        );
+        assert!(
+            !post_heads.contains(&local_head),
+            "chosen revision was demoted by the merge's INSERT"
+        );
+        // The two foreign heads are exactly the heads that were in
+        // the pre-resolve set BUT were not local_head.
+        let unchosen_foreigns: Vec<RevisionId> = pre_resolve_heads
+            .iter()
+            .filter(|h| **h != local_head)
+            .copied()
+            .collect();
+        assert_eq!(unchosen_foreigns.len(), 2);
+        for f in &unchosen_foreigns {
+            assert!(
+                post_heads.contains(f),
+                "unchosen foreign head must remain in the head set as an orphan"
+            );
+        }
+        // The freeze flag is cleared (the resolve flow's
+        // clear_frozen succeeded for the chosen lineage).
+        assert!(
+            !v.list_frozen_accounts()
+                .expect("list frozen")
+                .contains(&account_id),
+            "freeze flag cleared after a successful resolve"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // P9 fix-pass HIGH-1: stash-mediated retry recovery
+    // ---------------------------------------------------------------
+
+    /// **P9 fix-pass HIGH-1.** Stash-mediated retry recovery:
+    /// simulate a kill between `adapter.publish` and `clear_frozen`
+    /// by manually:
+    ///
+    /// 1. Calling `take_pending_merge` on a clean vault → expect
+    ///    `Ok(None)` (no stash yet).
+    /// 2. Running `resolve_one` once with a `publish`-failing
+    ///    adapter; the publish fails AFTER stashing, so the stash
+    ///    survives, the chain has no event, the local commit was
+    ///    never reached. The freeze flag remains set.
+    /// 3. Verify the stash is present after the failed resolve.
+    /// 4. Re-run `resolve_one` with a working adapter on the
+    ///    SAME `(account_id, --keep)` pair. The stash's
+    ///    canonical-hash determinism produces the same merge
+    ///    revision id as the prior partial run; the publish lands
+    ///    a NEW chain event (because the publish from step 2
+    ///    failed before reaching the chain); ingest +
+    ///    `clear_frozen` succeed.
+    /// 5. After the successful retry, the stash is gone, the
+    ///    freeze flag is cleared, and exactly one chain event
+    ///    appears for the merge.
+    ///
+    /// This is the structural property that the audit's HIGH-1
+    /// finding called out: WITHOUT the stash, step 4 would
+    /// generate a fresh ephemeral `DeviceKey` + nonce + ciphertext,
+    /// yielding a DIFFERENT canonical hash — so even on retry the
+    /// chain event from a TRULY-published prior run could not be
+    /// matched, and (in the matching variant where the publish
+    /// from step 2 actually landed on chain) the user would be
+    /// permanently stuck.
+    ///
+    /// The closely-related "publish actually landed but
+    /// `clear_frozen` was killed" variant is exercised by the
+    /// existing `resolve_idempotent_after_partial_failure` test +
+    /// the A3 idempotency scan (which the stash makes effective
+    /// via canonical-hash determinism).
+    #[allow(clippy::too_many_lines)]
+    // The test deliberately walks
+    // through five distinct phases of the recovery state machine
+    // (clean, post-failure, retry, post-success, determinism check)
+    // with explicit assertions on each phase; factoring out
+    // helpers would obscure the linear narrative of the recovery
+    // semantics that the audit explicitly called out.
+    #[tokio::test]
+    async fn resolve_idempotent_after_partial_failure_via_stash() {
+        let (mut v, _d) = fresh_vault();
+        let device = DeviceKey::generate();
+        let adapter = MockChainAdapter::new();
+        let (account_id, local_head) =
+            drive_into_forked_and_frozen(&mut v, &adapter, &device).await;
+
+        // Step 1: confirm no stash on clean vault.
+        let pre = v
+            .take_pending_merge(account_id, local_head)
+            .expect("take pre");
+        assert!(pre.is_none(), "no stash before any resolve attempt");
+
+        // Step 2: resolve_one with a publish-failing adapter.
+        // Under the HIGH-1 fix, the stash is written BEFORE the
+        // publish call, so the stash should survive the failure.
+        let failing = ResolvePublishFailingAdapter {
+            inner: adapter.clone(),
+        };
+        let resolve_dev_a = DeviceKey::generate();
+        let pre_event_count = adapter.event_count();
+        let err = resolve_one(
+            &mut v,
+            &failing,
+            &resolve_dev_a,
+            account_id,
+            local_head,
+            false,
+        )
+        .await
+        .expect_err("publish failure path must surface");
+        assert!(
+            matches!(err, ResolveError::Chain(_)),
+            "publish failure must surface as ResolveError::Chain, got {err:?}"
+        );
+        // The chain has no new events from the failed publish.
+        assert_eq!(
+            adapter.event_count(),
+            pre_event_count,
+            "failed publish must NOT mutate the chain"
+        );
+
+        // Step 3: verify the stash IS present (HIGH-1 invariant).
+        let after_fail = v
+            .take_pending_merge(account_id, local_head)
+            .expect("take after failure")
+            .expect("stash present after publish-failure (HIGH-1)");
+        // Bytes are non-trivial: ciphertext is non-empty, seed
+        // is 32 bytes, nonce is 24 bytes.
+        assert!(!after_fail.enc_payload.is_empty());
+        assert_eq!(after_fail.aead_nonce.len(), 24);
+        assert_eq!(after_fail.device_secret.expose().len(), 32);
+        // Capture the stashed seed bytes so we can confirm the
+        // retry uses THIS seed (not a fresh one).
+        let stashed_seed: Vec<u8> = after_fail.device_secret.expose().to_vec();
+        let stashed_nonce = after_fail.aead_nonce;
+        let stashed_payload = after_fail.enc_payload.clone();
+        drop(after_fail);
+
+        // Step 4: re-run resolve_one with a working adapter.
+        // We pass a DIFFERENT `device_key` argument — the recovery
+        // path MUST ignore it and use the stashed seed instead, so
+        // the canonical hash is deterministic across retries.
+        let resolve_dev_b = DeviceKey::generate();
+        let outcome = resolve_one(
+            &mut v,
+            &adapter,
+            &resolve_dev_b,
+            account_id,
+            local_head,
+            false,
+        )
+        .await
+        .expect("retry with healthy adapter must succeed via stash");
+        let revision_id = match outcome {
+            ResolveOutcome::Published { revision_id, .. } => revision_id,
+            other => panic!("expected Published, got {other:?}"),
+        };
+
+        // The chain has exactly ONE new event from the successful
+        // retry's publish.
+        assert_eq!(
+            adapter.event_count(),
+            pre_event_count + 1,
+            "retry's successful publish lands one chain event"
+        );
+
+        // Step 5a: stash is GONE after clear_frozen succeeds
+        // (the recovery row's purpose is exhausted).
+        let after_success = v
+            .take_pending_merge(account_id, local_head)
+            .expect("take after success");
+        assert!(
+            after_success.is_none(),
+            "stash must be cleared after clear_frozen succeeds"
+        );
+
+        // Step 5b: freeze flag cleared.
+        assert!(
+            !v.list_frozen_accounts()
+                .expect("list frozen")
+                .contains(&account_id),
+            "freeze flag cleared after successful retry"
+        );
+
+        // Determinism cross-check: the canonical hash that landed
+        // on chain matches the one that WOULD have been produced
+        // from the stashed bytes. We can't reach into adapter for
+        // the chain event's full bytes here, but the structural
+        // determinism is pinned by the fact that:
+        //   - the retry used `resolve_dev_b` (different from
+        //     `resolve_dev_a` of the failed run),
+        //   - yet the retry succeeded via the stash, meaning
+        //     `resolve_dev_b` was NOT used to sign,
+        //   - and the stashed seed bytes were what produced the
+        //     canonical hash.
+        // The signing key's verifying-key bytes equal the chain
+        // event's `device_id`, so we can verify the stash drove
+        // the publish by reading the chain event back.
+        let pulled = adapter
+            .pull_since(&v.vault_id(), 0, None)
+            .await
+            .expect("pull since 0");
+        let merge_event = pulled
+            .iter()
+            .find(|ev| {
+                pangolin_chain::canonical_hash(
+                    &ev.vault_id,
+                    &ev.account_id,
+                    &ev.parent_revision,
+                    &ev.device_id,
+                    ev.schema_version,
+                    &ev.enc_payload,
+                ) == revision_id
+            })
+            .expect("merge event present on chain");
+        // The chain event's `device_id` must equal the verifying
+        // key derived from the STASHED seed (not from
+        // `resolve_dev_b`).
+        let mut seed_arr = [0u8; pangolin_crypto::sign::SECRET_KEY_LEN];
+        seed_arr.copy_from_slice(&stashed_seed);
+        let stashed_dev = DeviceKey::from_seed(seed_arr);
+        assert_eq!(
+            merge_event.device_id,
+            stashed_dev.verifying_key().to_bytes(),
+            "HIGH-1: retry's chain event was signed by the STASHED key, not a fresh one"
+        );
+        // Also: the chain event's enc_payload bytes equal the
+        // stashed enc_payload, and the chain event's parent
+        // matches local_head (the chosen --keep).
+        assert_eq!(merge_event.enc_payload, stashed_payload);
+        assert_eq!(merge_event.parent_revision, *local_head.as_bytes());
+        // Reading the stashed nonce here just to use the var
+        // (the nonce isn't carried on chain).
+        let _ = stashed_nonce;
     }
 }

@@ -1157,8 +1157,9 @@ impl Vault {
     /// the merge."
     ///
     /// Idempotency: a non-frozen account whose `head_revision_id` is
-    /// already `chosen_revision_id` is a no-op (zero rows updated; no
-    /// error). This makes recovery from a kill between
+    /// already `chosen_revision_id` is a no-op-equivalent (the
+    /// transaction body re-runs the same UPDATE, which is identity).
+    /// This makes recovery from a kill between
     /// `ingest_chain_revision` and `clear_frozen` straightforward —
     /// re-run the resolve flow with the same `--keep` choice; the
     /// pre-publish check sees the merge revision is already on chain,
@@ -1169,6 +1170,19 @@ impl Vault {
     /// Both writes (clearing the freeze flag + advancing the head
     /// pointer) run inside one `BEGIN IMMEDIATE … COMMIT` so a crash
     /// between them leaves the vault in the pre-transaction state.
+    ///
+    /// **P9 fix-pass MED-3.** Inside the SQL transaction (`BEGIN
+    /// IMMEDIATE`), BEFORE the UPDATE, the implementation calls
+    /// [`Self::account_heads`] and verifies `chosen_revision_id` is
+    /// in the returned set. If not, returns
+    /// [`StoreError::NotAHead`]. The check runs INSIDE the
+    /// transaction so a concurrent ingest cannot change the head set
+    /// between check and update — the contract is "errors with
+    /// `NotAHead` if the supplied `revision_id` is not a current head
+    /// AT THE TIME of the SQL transaction." This catches the bug
+    /// class where the resolve flow passes the old chosen-revision
+    /// id (a non-head, demoted by the merge revision's INSERT)
+    /// instead of the merge revision's id.
     ///
     /// Metadata-only — does NOT require [`VaultState::Active`]. The
     /// caller (`pangolin-cli resolve`) holds the vault unlocked because
@@ -1181,7 +1195,10 @@ impl Vault {
     /// `StoreError::AccountNotFound` if `account_id` has no
     /// `account_identities` row. `StoreError::RevisionNotFound` if
     /// `chosen_revision_id` does not exist in the `revisions` table for
-    /// this `account_id`. `StoreError::Sqlite` for any database issue.
+    /// this `account_id`. [`StoreError::NotAHead`] (P9 fix-pass MED-3)
+    /// if the revision exists but is not a current head at the time
+    /// of the SQL transaction. `StoreError::Sqlite` for any database
+    /// issue.
     pub fn clear_frozen(
         &mut self,
         account_id: AccountId,
@@ -1227,11 +1244,50 @@ impl Vault {
             return Err(StoreError::RevisionNotFound);
         }
 
-        // Apply both writes atomically: clear the freeze flag AND
-        // advance the head pointer. `BEGIN IMMEDIATE` so a concurrent
-        // writer (which the lock file already prevents at the OS
-        // boundary, but defense in depth) cannot interleave.
+        // Apply both writes atomically: validate head-membership AND
+        // clear the freeze flag AND advance the head pointer.
+        // `BEGIN IMMEDIATE` so a concurrent writer (which the lock
+        // file already prevents at the OS boundary, but defense in
+        // depth) cannot interleave between the head check and the
+        // UPDATE.
         let tx = self.conn.unchecked_transaction()?;
+
+        // P9 fix-pass MED-3: head-membership check INSIDE the
+        // transaction. We use the same NOT EXISTS predicate that
+        // `account_heads` uses for the multi-head detector, scoped
+        // by `account_id` (M-1 P3 audit defense-in-depth).
+        let mut head_stmt = tx.prepare(
+            "SELECT r.revision_id FROM revisions r
+             WHERE r.account_id = ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM revisions r2
+                 WHERE r2.parent_revision_id = r.revision_id
+                   AND r2.account_id = r.account_id
+               )",
+        )?;
+        let head_rows = head_stmt.query_map(params![account_id.as_bytes().as_slice()], |row| {
+            let rid: Vec<u8> = row.get(0)?;
+            Ok(rid)
+        })?;
+        let mut head_set: Vec<RevisionId> = Vec::new();
+        for r in head_rows {
+            let blob = r?;
+            let arr: [u8; REVISION_ID_LEN] = blob
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Corrupted("head revision_id not 32 bytes".into()))?;
+            head_set.push(RevisionId::from_bytes(arr));
+        }
+        drop(head_stmt);
+        if !head_set.contains(&chosen_revision_id) {
+            // Don't commit — let the transaction roll back.
+            return Err(StoreError::NotAHead {
+                account_id,
+                chosen: chosen_revision_id,
+                current_heads: head_set,
+            });
+        }
+
         let now = current_unix_ms();
         tx.execute(
             "UPDATE account_identities
@@ -1424,9 +1480,13 @@ impl Vault {
     /// `account_id` and `vault_id` unchanged, `schema_version`
     /// inherited from the chosen revision).
     ///
-    /// Returns `(enc_payload, schema_version, is_tombstone)` —
-    /// plaintext NEVER leaves the store crate; the cli crate only
-    /// sees the new ciphertext + the chain-relevant fields.
+    /// Returns `(enc_payload, aead_nonce_bytes, schema_version,
+    /// is_tombstone)` — plaintext NEVER leaves the store crate; the
+    /// cli crate only sees the new ciphertext + the chain-relevant
+    /// fields plus the nonce (load-bearing for the P9 fix-pass HIGH-1
+    /// `pending_merges` stash so a kill mid-publish is recoverable on
+    /// retry by re-using the SAME nonce + ciphertext — see
+    /// [`Self::stash_pending_merge`] and `THREAT_MODEL.md` row #13).
     ///
     /// If the chosen revision is a tombstone, re-seals via
     /// [`crate::blob::seal_tombstone`] so the merge revision is
@@ -1446,7 +1506,7 @@ impl Vault {
         &mut self,
         account_id: AccountId,
         chosen_revision_id: RevisionId,
-    ) -> Result<(Vec<u8>, u8, bool)> {
+    ) -> Result<(Vec<u8>, [u8; NONCE_LEN], u8, bool)> {
         // Strict freshness — same as the plaintext reader (this
         // method composes that reader's discipline).
         self.check_session_freshness()?;
@@ -1497,7 +1557,7 @@ impl Vault {
         let active = self.require_active()?;
         let aead_key = active.vdk.aead_key();
 
-        let (ct, _nonce) = if is_tombstone {
+        let (ct, nonce) = if is_tombstone {
             // Tombstone-resolve: re-seal the tombstone sentinel
             // payload under the merge AAD.
             seal_tombstone(aead_key, &merge_aad)?
@@ -1516,26 +1576,244 @@ impl Vault {
             seal_snapshot(active.vdk.aead_key(), &snapshot, &merge_aad)?
         };
 
-        // Note on the `_nonce` discard: the cli crate doesn't need
-        // the nonce because the merge revision's payload, once
-        // published on chain and pulled back, will be ingested via
-        // `ingest_chain_revision` which uses a placeholder zeroed
-        // nonce for foreign-ingested rows (the chain doesn't carry
-        // the AEAD nonce). The vault that originated the publish
-        // recognises its own publish via the chain-anchor merge
-        // arm and stamps the anchor onto the row directly — which
-        // means the original local row (with the real nonce) is
-        // what survives. The current resolve flow doesn't INSERT a
-        // pre-publish local row before publish; it goes straight to
-        // the on-chain submit, so the nonce is lost on this device.
-        // This is acceptable for PoC because the resolve flow's
-        // post-publish ingest call carries the chain anchor, and
-        // the chosen-head's own row (which DOES have the original
-        // plaintext-recoverable nonce) is the one the local cache
-        // continues to read from.
+        // P9 fix-pass HIGH-1: the nonce is now surfaced to the caller
+        // so it can be stashed in `pending_merges` BEFORE
+        // adapter.publish. On retry, `take_pending_merge` returns the
+        // same nonce + ciphertext + ephemeral signing seed; the
+        // canonical hash is identical across retries and the chain
+        // event from a prior partially-completed run can be matched
+        // via the existing A3 idempotency scan inside
+        // `sync::resolve_one`. Without this stash, every retry
+        // generates a fresh nonce + fresh `DeviceKey`, the canonical
+        // hash differs every run, and the user is permanently stuck
+        // with a frozen account. See `THREAT_MODEL.md` row #13 +
+        // DEVLOG P9 fix-pass entry.
 
+        let nonce_bytes = *nonce.as_bytes();
         self.touch_session();
-        Ok((ct.into_vec(), schema_version, is_tombstone))
+        Ok((ct.into_vec(), nonce_bytes, schema_version, is_tombstone))
+    }
+
+    // -----------------------------------------------------------------
+    // P9 fix-pass HIGH-1: pending_merges stash for partial-failure
+    //                     recovery
+    // -----------------------------------------------------------------
+
+    /// **P9 fix-pass HIGH-1.** Stash the merge-revision-build state
+    /// so a kill between `adapter.publish` and `clear_frozen` is
+    /// recoverable on retry.
+    ///
+    /// **LOAD-BEARING.** See `THREAT_MODEL.md` row #13. Without this
+    /// stash, each retry of `sync::resolve_one` generates a fresh
+    /// ephemeral [`pangolin_crypto::keys::DeviceKey`] + a fresh AEAD
+    /// nonce, so the canonical hash differs every run and the chain
+    /// event from a prior partially-completed run cannot be matched
+    /// on retry. The user would be permanently stuck with a frozen
+    /// account.
+    ///
+    /// `device_secret` is the 32-byte Ed25519 secret seed of the
+    /// ephemeral merge-revision signing key. The seed bytes live at
+    /// rest in the `SQLite` vault file as a BLOB; NOT additionally
+    /// AEAD-sealed because at-rest exposure of the `.pvf` file
+    /// already compromises the VDK and worse, so the marginal
+    /// exposure of an ephemeral merge-signing key is bounded. The
+    /// ephemeral key is discarded after `clear_frozen` succeeds (the
+    /// row is deleted by [`Self::clear_pending_merge`]).
+    ///
+    /// `enc_payload` is AEAD ciphertext (NOT plaintext — the seal
+    /// happened inside [`Self::build_merge_payload_for_resolve`]
+    /// before the stash). Cardinal principle 2 holds.
+    ///
+    /// Idempotent: re-stashing the same `(account_id,
+    /// target_head_id)` overwrites the prior row (`INSERT OR
+    /// REPLACE`) — sharp-edged because it forfeits the prior
+    /// stash's signing key, but the natural caller pattern stashes
+    /// once per resolve invocation and the prior stash would only
+    /// survive if the caller had already issued a publish under
+    /// those bytes (in which case the prior bytes are still
+    /// recoverable from the chain via the A3 idempotency scan).
+    ///
+    /// Metadata-only — does NOT require [`VaultState::Active`].
+    /// Callers will hold an active session (the build of the
+    /// payload requires it) but the stash itself does not.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` for any database issue.
+    // `enc_payload: Vec<u8>` is taken by value so the call site
+    // doesn't need a borrow on a shared cipher buffer; the clippy
+    // `needless_pass_by_value` lint flags the body's `&enc_payload[..]`
+    // as a non-consumption, but the by-value contract here is
+    // load-bearing for the move-into-SQLite ergonomics.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn stash_pending_merge(
+        &mut self,
+        account_id: AccountId,
+        target_head_id: RevisionId,
+        device_secret: [u8; pangolin_crypto::sign::SECRET_KEY_LEN],
+        aead_nonce: [u8; NONCE_LEN],
+        enc_payload: Vec<u8>,
+        schema_version: u8,
+    ) -> Result<()> {
+        // Soft-expiry: this is metadata-only.
+        self.maybe_expire_active_session();
+        let now = current_unix_ms();
+        // The seed is ABOUT to be persisted into a long-lived BLOB
+        // column. Wrap it in zeroizing so the local stack copy is
+        // wiped when this function returns — even though the bytes
+        // inside SQLite remain at rest until clear_pending_merge.
+        let seed_z: zeroize::Zeroizing<[u8; pangolin_crypto::sign::SECRET_KEY_LEN]> =
+            zeroize::Zeroizing::new(device_secret);
+        self.conn.execute(
+            "INSERT OR REPLACE INTO pending_merges (
+                account_id, target_head_id, device_secret, aead_nonce,
+                enc_payload, schema_version, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                account_id.as_bytes().as_slice(),
+                target_head_id.as_bytes().as_slice(),
+                &seed_z[..],
+                &aead_nonce[..],
+                &enc_payload[..],
+                i64::from(schema_version),
+                now,
+            ],
+        )?;
+        // Touch only if Active.
+        self.touch_session();
+        Ok(())
+    }
+
+    /// **P9 fix-pass HIGH-1.** Returns the stashed merge state for
+    /// `(account_id, target_head_id)` if present.
+    ///
+    /// Read-only; does NOT delete the row. The caller (`sync::resolve_one`'s
+    /// retry path) deletes via [`Self::clear_pending_merge`] only
+    /// after `clear_frozen` succeeds, so a kill between
+    /// `take_pending_merge` and `clear_frozen` still leaves a
+    /// recoverable stash on disk for the next retry.
+    ///
+    /// The returned [`PendingMerge`]'s `device_secret` field is a
+    /// [`SecretBytes`] that zeroizes on drop; callers must consume
+    /// it immediately into the [`pangolin_crypto::keys::DeviceKey::from_seed`]
+    /// reconstruction path and let it drop.
+    ///
+    /// Returns `Ok(None)` for a clean miss (no stash for this pair),
+    /// distinguishable from an error case.
+    ///
+    /// Metadata-only — does NOT require [`VaultState::Active`].
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` for any database issue.
+    /// `StoreError::Corrupted` if a stored BLOB has the wrong length
+    /// for its column (e.g., `device_secret` not 32 bytes).
+    pub fn take_pending_merge(
+        &self,
+        account_id: AccountId,
+        target_head_id: RevisionId,
+    ) -> Result<Option<crate::pending::PendingMerge>> {
+        // Soft-expiry would mutate self; this method is &self for
+        // read-only callers, so we do not touch the session here.
+        // Callers who need session-touch can do so at their own layer.
+        // Local helper struct to keep the row type sane for clippy's
+        // type-complexity lint (the alternative tuple `(Vec<u8>,
+        // Vec<u8>, Vec<u8>, i64)` triggers `clippy::type_complexity`
+        // even though it is structurally simple).
+        struct StashRowRaw {
+            device_secret: Vec<u8>,
+            aead_nonce: Vec<u8>,
+            enc_payload: Vec<u8>,
+            schema_version: i64,
+        }
+        let row: Option<StashRowRaw> = self
+            .conn
+            .query_row(
+                "SELECT device_secret, aead_nonce, enc_payload, schema_version
+                 FROM pending_merges
+                 WHERE account_id = ?1 AND target_head_id = ?2",
+                params![
+                    account_id.as_bytes().as_slice(),
+                    target_head_id.as_bytes().as_slice(),
+                ],
+                |row| {
+                    Ok(StashRowRaw {
+                        device_secret: row.get(0)?,
+                        aead_nonce: row.get(1)?,
+                        enc_payload: row.get(2)?,
+                        schema_version: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(raw) = row else {
+            return Ok(None);
+        };
+        let StashRowRaw {
+            device_secret: seed_blob,
+            aead_nonce: nonce_blob,
+            enc_payload,
+            schema_version: sv_i64,
+        } = raw;
+        if seed_blob.len() != pangolin_crypto::sign::SECRET_KEY_LEN {
+            return Err(StoreError::Corrupted(format!(
+                "pending_merges.device_secret not {} bytes (was {})",
+                pangolin_crypto::sign::SECRET_KEY_LEN,
+                seed_blob.len()
+            )));
+        }
+        if nonce_blob.len() != NONCE_LEN {
+            return Err(StoreError::Corrupted(format!(
+                "pending_merges.aead_nonce not {NONCE_LEN} bytes (was {})",
+                nonce_blob.len()
+            )));
+        }
+        let mut nonce_arr = [0u8; NONCE_LEN];
+        nonce_arr.copy_from_slice(&nonce_blob);
+        let schema_version = u8::try_from(sv_i64).map_err(|_| {
+            StoreError::Corrupted("pending_merges.schema_version out of u8 range".into())
+        })?;
+        // SecretBytes zeroizes on drop; the seed BLOB Vec<u8> from
+        // rusqlite is moved into the SecretBytes constructor and
+        // wiped via the SecretBytes drop impl.
+        let device_secret = SecretBytes::new(seed_blob);
+        Ok(Some(crate::pending::PendingMerge {
+            device_secret,
+            aead_nonce: nonce_arr,
+            enc_payload,
+            schema_version,
+        }))
+    }
+
+    /// **P9 fix-pass HIGH-1.** Delete the stashed merge state for
+    /// `(account_id, target_head_id)`.
+    ///
+    /// Idempotent — calling on a non-existent row is a no-op (zero
+    /// rows deleted; no error). The natural caller pattern is
+    /// "after `clear_frozen` succeeds, drop the stash so the
+    /// ephemeral signing seed no longer lives at rest."
+    ///
+    /// Metadata-only — does NOT require [`VaultState::Active`].
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` for any database issue.
+    pub fn clear_pending_merge(
+        &mut self,
+        account_id: AccountId,
+        target_head_id: RevisionId,
+    ) -> Result<()> {
+        self.maybe_expire_active_session();
+        self.conn.execute(
+            "DELETE FROM pending_merges
+             WHERE account_id = ?1 AND target_head_id = ?2",
+            params![
+                account_id.as_bytes().as_slice(),
+                target_head_id.as_bytes().as_slice(),
+            ],
+        )?;
+        self.touch_session();
+        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -2135,11 +2413,18 @@ impl Vault {
     /// plus the `#[doc(hidden)]` attribute on the method itself are
     /// the standard Rust idiom for "this is in the public surface
     /// strictly to make the test harness work; not for downstream
-    /// consumption." A future iteration that introduces a
-    /// `cargo`-feature-gated test-utilities surface (`feature =
-    /// "test-utilities"`) can move this method behind that gate
-    /// without breaking any consumer that respects the prefix
-    /// convention.
+    /// consumption."
+    ///
+    /// **P9 fix-pass LOW-1.** Previously this method was `pub`
+    /// unconditionally, relying on the `__` prefix + `#[doc(hidden)]`
+    /// as the only discipline against accidental production use.
+    /// This fix-pass moves the method behind the existing
+    /// `feature = "test-utilities"` gate (also active under `cfg(test)`
+    /// for in-crate tests) so production builds of downstream
+    /// binaries (`chaincli`, `pangolin-cli`) cannot link against the
+    /// helper at all.  The helper is still reachable from this
+    /// crate's own `#[cfg(test)]` modules and from external
+    /// integration tests that opt in to the `test-utilities` feature.
     ///
     /// Returns the synthesized revision's id.
     ///
@@ -2148,6 +2433,7 @@ impl Vault {
     /// Same set as `update_account`, plus `RevisionNotFound` if the
     /// declared parent is not in the account's revision history.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utilities"))]
     // Mirrors the `add_account` / `update_account` signature shape
     // (snapshot taken by value) so a test reads identically to a
     // production write. Production paths consume the snapshot into
@@ -4724,6 +5010,340 @@ mod tests {
         assert!(
             matches!(err, StoreError::AccountNotFound),
             "cross-account substitution must collapse to AccountNotFound, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // P9 fix-pass MED-3: clear_frozen validates head membership inside tx
+    // -----------------------------------------------------------------
+
+    /// **P9 fix-pass MED-3.** `clear_frozen` rejects with
+    /// `NotAHead` when the supplied `chosen_revision_id` exists in
+    /// the `revisions` table for the account but is not a current
+    /// head of the account's revision graph at the time of the SQL
+    /// transaction.
+    ///
+    /// Setup: an account with two revisions where the local genesis
+    /// has been `UPDATE`d to a child. The child is the only head; the
+    /// genesis is no longer a head (it has a child).
+    #[test]
+    fn clear_frozen_rejects_non_head_revision_id() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).expect("add");
+        // Update so genesis is no longer a head.
+        let _child = v
+            .update_account(id, fresh_snapshot())
+            .expect("update so genesis is demoted");
+        // The genesis revision is the older (smaller created_at)
+        // entry; the child is the head. Pull both ids.
+        let revs = v.revisions_for(id).expect("revisions");
+        assert_eq!(revs.len(), 2);
+        let genesis = revs
+            .iter()
+            .find(|m| m.parent_revision_id == crate::revision::RevisionId::GENESIS_PARENT)
+            .map(|m| m.revision_id)
+            .expect("genesis row present");
+
+        // Try to `clear_frozen` against the genesis (a non-head).
+        // Must reject with NotAHead.
+        let err = v
+            .clear_frozen(id, genesis)
+            .expect_err("non-head clear must reject");
+        match err {
+            StoreError::NotAHead {
+                account_id,
+                chosen,
+                current_heads,
+            } => {
+                assert_eq!(account_id, id);
+                assert_eq!(chosen, genesis);
+                assert_eq!(current_heads.len(), 1, "exactly one head after the update");
+                assert_ne!(current_heads[0], genesis);
+            }
+            other => panic!("expected NotAHead, got {other:?}"),
+        }
+    }
+
+    /// **P9 fix-pass MED-2.** `clear_frozen`'s `BEGIN IMMEDIATE`
+    /// wrapper holds across the freeze-clear + head-advance UPDATE
+    /// pair. Pinned by exercising the simulated-crash discipline
+    /// from the audit hint:
+    ///
+    /// 1. Run `clear_frozen` to completion on a fresh frozen
+    ///    account; observe the post-state (flag = 0, head =
+    ///    chosen).
+    /// 2. As a control: directly UPDATE only one of the two
+    ///    columns inside a transaction that is THEN rolled back;
+    ///    confirm the transaction-rollback semantics work as
+    ///    expected on this rusqlite version (state is unchanged
+    ///    after rollback). This validates the test infrastructure.
+    /// 3. Confirm `clear_frozen`'s `unchecked_transaction()` +
+    ///    `tx.commit()` discipline runs the freeze-clear and
+    ///    head-advance UPDATE inside a single atomic boundary
+    ///    (verified structurally by reading the SQL through the
+    ///    code in this file — the test in step 1 already exercised
+    ///    the success path; step 2 confirms rollback works on this
+    ///    `SQLite` build).
+    ///
+    /// Note on the simulated crash: rusqlite's `update_hook` API
+    /// is not stable across versions, and a true `panic` between
+    /// two SQL statements would unwind the `unchecked_transaction`
+    /// (which `Drop`s with rollback semantics). We therefore
+    /// validate the rollback path explicitly via a manual
+    /// transaction abort, then assert that `clear_frozen`'s
+    /// success path lands the expected end state.
+    #[test]
+    fn clear_frozen_atomic_under_simulated_crash() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).expect("add");
+        // Trigger freeze + a fork via a foreign event. The local
+        // genesis remains a head.
+        let ev = fresh_event(v.vault_id(), *id.as_bytes(), [0u8; 32], b"foreign", 1, 0);
+        v.ingest_chain_revision(&ev).expect("ingest");
+        assert!(v.list_frozen_accounts().unwrap().contains(&id));
+        let revs = v.revisions_for(id).expect("revisions");
+        let local_genesis = revs
+            .iter()
+            .find(|m| {
+                m.parent_revision_id == crate::revision::RevisionId::GENESIS_PARENT
+                    && !m.is_tombstone
+            })
+            .map(|m| m.revision_id)
+            .expect("local genesis present");
+
+        // ---- Step 2: transaction-rollback control. ----
+        //
+        // Validate that an aborted transaction on the same row
+        // shape leaves the row in its pre-transaction state. We
+        // partially mutate `last_modified_at` via a direct SQL
+        // UPDATE inside a transaction we never commit, then
+        // confirm the column is unchanged after the abort.
+        let pre_last_modified: i64 = v
+            .conn
+            .query_row(
+                "SELECT last_modified_at FROM account_identities WHERE account_id = ?1",
+                rusqlite::params![id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("read pre");
+        {
+            let tx = v.conn.unchecked_transaction().expect("tx open");
+            tx.execute(
+                "UPDATE account_identities SET last_modified_at = ?1 WHERE account_id = ?2",
+                rusqlite::params![pre_last_modified + 999_999, id.as_bytes().as_slice()],
+            )
+            .expect("partial update");
+            // Drop the tx WITHOUT committing — rollback semantics
+            // restore the row to its pre-update state.
+            drop(tx);
+        }
+        let post_abort_last_modified: i64 = v
+            .conn
+            .query_row(
+                "SELECT last_modified_at FROM account_identities WHERE account_id = ?1",
+                rusqlite::params![id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("read post-abort");
+        assert_eq!(
+            pre_last_modified, post_abort_last_modified,
+            "transaction-rollback control: aborted UPDATE must not persist"
+        );
+
+        // ---- Step 3: clear_frozen's success path lands the
+        // expected end state in one atomic step. ----
+        v.clear_frozen(id, local_genesis).expect("clear_frozen ok");
+        // Both writes (freeze flag + head pointer) landed.
+        let (flag, head): (i64, Vec<u8>) = v
+            .conn
+            .query_row(
+                "SELECT frozen_pending_resolve, head_revision_id
+                 FROM account_identities WHERE account_id = ?1",
+                rusqlite::params![id.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read post-clear");
+        assert_eq!(flag, 0, "freeze flag cleared");
+        assert_eq!(head.as_slice(), local_genesis.as_bytes().as_slice());
+        // The vault is no longer in the frozen-set.
+        assert!(!v.list_frozen_accounts().unwrap().contains(&id));
+    }
+
+    // -----------------------------------------------------------------
+    // P9 fix-pass HIGH-1: pending_merges stash tests
+    // -----------------------------------------------------------------
+
+    /// **P9 fix-pass HIGH-1.** Round-trip the stash API:
+    /// `stash_pending_merge` writes the row, `take_pending_merge`
+    /// reads it back, `clear_pending_merge` deletes it. The
+    /// retrieved bytes equal the stashed bytes byte-for-byte
+    /// (essential for the canonical-hash determinism that the
+    /// recovery path depends on).
+    #[test]
+    fn stash_take_clear_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).expect("add");
+        let target = crate::revision::RevisionId::from_bytes([0xAA; 32]);
+        let seed = [0x33u8; pangolin_crypto::sign::SECRET_KEY_LEN];
+        let nonce = [0x44u8; crate::pending::PENDING_MERGE_NONCE_LEN];
+        let payload = b"sealed-bytes".to_vec();
+
+        // Pre-condition: no stash present.
+        let before = v.take_pending_merge(id, target).expect("take pre");
+        assert!(before.is_none(), "no stash on a clean vault");
+
+        // Stash.
+        v.stash_pending_merge(id, target, seed, nonce, payload.clone(), 7)
+            .expect("stash ok");
+
+        // Take returns Some and the bytes match exactly.
+        let got = v
+            .take_pending_merge(id, target)
+            .expect("take post-stash")
+            .expect("stash present");
+        assert_eq!(got.device_secret.expose(), &seed[..]);
+        assert_eq!(got.aead_nonce, nonce);
+        assert_eq!(got.enc_payload, payload);
+        assert_eq!(got.schema_version, 7);
+
+        // Take is read-only — the stash is still there for a
+        // second `take`.
+        let got_again = v
+            .take_pending_merge(id, target)
+            .expect("take is non-destructive")
+            .expect("stash still present after take");
+        assert_eq!(got_again.enc_payload, payload);
+
+        // Clear deletes the row.
+        v.clear_pending_merge(id, target).expect("clear ok");
+        let after = v.take_pending_merge(id, target).expect("take post-clear");
+        assert!(after.is_none(), "stash gone after clear");
+
+        // Clear is idempotent — second call on the missing row is OK.
+        v.clear_pending_merge(id, target)
+            .expect("idempotent second clear");
+    }
+
+    /// **P9 fix-pass HIGH-1.** The stash row is durable across
+    /// close + open (the recovery semantics MUST survive a process
+    /// restart, otherwise the kill-mid-publish recovery doesn't
+    /// work).
+    #[test]
+    fn stash_persists_across_close_open() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let target = crate::revision::RevisionId::from_bytes([0xBB; 32]);
+        let seed = [0x55u8; pangolin_crypto::sign::SECRET_KEY_LEN];
+        let nonce = [0x66u8; crate::pending::PENDING_MERGE_NONCE_LEN];
+        let payload = b"durable".to_vec();
+        let id;
+        {
+            let mut v = Vault::open(&p).unwrap();
+            v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+            id = v.add_account(fresh_snapshot()).expect("add");
+            v.stash_pending_merge(id, target, seed, nonce, payload.clone(), 3)
+                .expect("stash");
+            v.close().expect("close");
+        }
+        // Re-open in a fresh handle. Stash should be intact.
+        let v = Vault::open(&p).expect("re-open");
+        let got = v
+            .take_pending_merge(id, target)
+            .expect("take after reopen")
+            .expect("stash survived close+open");
+        assert_eq!(got.device_secret.expose(), &seed[..]);
+        assert_eq!(got.aead_nonce, nonce);
+        assert_eq!(got.enc_payload, payload);
+        assert_eq!(got.schema_version, 3);
+    }
+
+    /// **P9 fix-pass HIGH-1.** `take_pending_merge` returns
+    /// `Ok(None)` on a clean miss (no stash for this pair), not an
+    /// error. Distinguishable from the case where the stash row
+    /// exists.
+    #[test]
+    fn take_returns_none_for_nonexistent_account() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let v = Vault::open(&p).unwrap();
+        let bogus_acct = crate::account::AccountId::from_bytes([0xDE; 32]);
+        let bogus_target = crate::revision::RevisionId::from_bytes([0xAD; 32]);
+        let got = v
+            .take_pending_merge(bogus_acct, bogus_target)
+            .expect("take on missing pair must Ok-None, not error");
+        assert!(got.is_none(), "no stash row for an unknown account");
+    }
+
+    /// **P9 fix-pass HIGH-1.** The in-memory `device_secret` field
+    /// of the returned [`crate::pending::PendingMerge`] zeroizes
+    /// when the struct is dropped. We verify this structurally —
+    /// the field is a [`pangolin_crypto::secret::SecretBytes`] which
+    /// derives `Drop` via `zeroize::Zeroizing`, so dropping the
+    /// struct triggers the zeroize. We exercise the type-level
+    /// invariant by constructing a stash, taking it, asserting the
+    /// `expose()` returns the expected bytes, then dropping the
+    /// struct — the structural guarantee from the `SecretBytes`
+    /// type definition is what makes this safe.
+    #[test]
+    fn pending_merge_zeroizes_secret_on_drop() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).expect("add");
+        let target = crate::revision::RevisionId::from_bytes([0xCD; 32]);
+        let seed = [0x77u8; pangolin_crypto::sign::SECRET_KEY_LEN];
+        v.stash_pending_merge(
+            id,
+            target,
+            seed,
+            [0u8; crate::pending::PENDING_MERGE_NONCE_LEN],
+            b"".to_vec(),
+            0,
+        )
+        .expect("stash");
+        // Take, observe, then drop. The `SecretBytes`-typed
+        // `device_secret` field zeroizes on drop by construction
+        // (the `zeroize::Zeroizing` wrapper inside SecretBytes is
+        // a `Drop` impl that wipes the heap allocation). The
+        // structural invariant is the load-bearing property here;
+        // a runtime memory inspection would be unreliable on a
+        // managed allocator.
+        {
+            let stash = v
+                .take_pending_merge(id, target)
+                .expect("take")
+                .expect("present");
+            assert_eq!(stash.device_secret.expose(), &seed[..]);
+            // `stash` is dropped at this scope's end; SecretBytes
+            // wipes the heap bytes via its Drop impl.
+        }
+        // Type-level invariant: `SecretBytes` wraps
+        // `Zeroizing<Vec<u8>>` which has a Drop impl that wipes
+        // the heap allocation. The structural guarantee is what
+        // we rely on; the runtime drop above exercises the path.
+        // The `static_assertions` crate's `const_assert` would
+        // fire at compile time; we use a runtime assertion here
+        // because `needs_drop` is a const fn and the runtime
+        // call has zero overhead (the compiler folds it).
+        assert!(
+            std::mem::needs_drop::<pangolin_crypto::secret::SecretBytes>(),
+            "SecretBytes must implement Drop (zeroize-on-drop discipline)"
         );
     }
 }

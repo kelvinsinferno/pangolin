@@ -119,6 +119,38 @@ CREATE TABLE IF NOT EXISTS dirty_accounts (
 );
 CREATE INDEX IF NOT EXISTS dirty_accounts_marked_at_idx
     ON dirty_accounts (marked_at);
+
+-- P9 fix-pass HIGH-1: per-(account, target_head_id) stash for the
+-- ephemeral merge-revision build state.  Persisted BEFORE
+-- adapter.publish so a kill mid-publish is recoverable on retry by
+-- reconstructing the SAME DeviceKey (same AEAD nonce, same ciphertext
+-- ⇒ same canonical hash every run).  Without this stash, each retry
+-- generates a fresh ephemeral DeviceKey + AEAD nonce, the canonical
+-- hash differs every run, and the chain event from the prior run
+-- cannot be matched on retry — leaving the user permanently stuck
+-- with a frozen account.  Stash row deleted after `clear_frozen`
+-- succeeds.  See THREAT_MODEL row #13 + DEVLOG P9 fix-pass entry +
+-- `Vault::stash_pending_merge` / `take_pending_merge` /
+-- `clear_pending_merge`.
+--
+-- Privacy posture: `device_secret` is an Ed25519 secret seed at rest
+-- in the vault file, NOT additionally AEAD-sealed.  At-rest exposure
+-- of the .pvf file already compromises the VDK and worse, so the
+-- marginal exposure of an ephemeral merge-signing key is bounded.
+-- `enc_payload` is the AEAD-sealed merge revision ciphertext (NOT
+-- plaintext — the seal happened before the stash).  `aead_nonce`
+-- pairs with `enc_payload` for the merge revision's AEAD identity;
+-- it is NOT secret in the same sense as the seed.
+CREATE TABLE IF NOT EXISTS pending_merges (
+    account_id            BLOB NOT NULL,    -- 32 bytes
+    target_head_id        BLOB NOT NULL,    -- 32 bytes (the user's --keep)
+    device_secret         BLOB NOT NULL,    -- 32 bytes Ed25519 secret seed
+    aead_nonce            BLOB NOT NULL,    -- 24 bytes (XChaCha20-Poly1305 nonce)
+    enc_payload           BLOB NOT NULL,    -- the merge revision AEAD ciphertext
+    schema_version        INTEGER NOT NULL,
+    created_at_ms         INTEGER NOT NULL,
+    PRIMARY KEY (account_id, target_head_id)
+);
 ";
 
 /// Apply all pragmas and the schema DDL on the supplied connection.
@@ -160,6 +192,16 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     // path (the old `ingest_chain_revision` had no flag to set).
     migrate_frozen_pending_resolve_column(conn)?;
 
+    // P9 fix-pass HIGH-1 migration: the `pending_merges` table was
+    // added to address the audit's "partial-failure recovery is
+    // structurally non-functional" finding. The schema DDL above
+    // already includes `CREATE TABLE IF NOT EXISTS pending_merges`
+    // so a fresh-vault path picks it up trivially; this migration is
+    // belt + suspenders for legacy vaults where `apply_pragmas_and_schema`
+    // ran under an older build and the DDL string did not yet contain
+    // the table. Idempotent — checks `sqlite_master` first.
+    migrate_pending_merges_table(conn)?;
+
     Ok(())
 }
 
@@ -190,6 +232,31 @@ fn migrate_frozen_pending_resolve_column(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    Ok(())
+}
+
+/// **P9 fix-pass HIGH-1 migration.** Ensure the `pending_merges`
+/// table exists on legacy vault files.  Idempotent — uses
+/// `CREATE TABLE IF NOT EXISTS` directly so re-running it on an
+/// already-up-to-date file is a no-op.  The schema DDL string above
+/// already contains the same `CREATE TABLE IF NOT EXISTS` statement,
+/// so for new-build vaults this is structurally redundant; the value
+/// is in pinning the migration intent for legacy files where an
+/// older build's DDL did not include this table.
+fn migrate_pending_merges_table(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS pending_merges (
+            account_id            BLOB NOT NULL,
+            target_head_id        BLOB NOT NULL,
+            device_secret         BLOB NOT NULL,
+            aead_nonce            BLOB NOT NULL,
+            enc_payload           BLOB NOT NULL,
+            schema_version        INTEGER NOT NULL,
+            created_at_ms         INTEGER NOT NULL,
+            PRIMARY KEY (account_id, target_head_id)
+        )",
+        [],
+    )?;
     Ok(())
 }
 

@@ -54,3 +54,13 @@ static_assertions = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 hex      = { workspace = true }
+
+# P9 fix-pass LOW-1: integration tests in `tests/e2e.rs` use the
+# `__test_synthesize_sibling_revision` helper which is now gated
+# behind the `test-utilities` feature.  `required-features` ensures
+# cargo enables the feature on this crate before compiling the
+# integration test.
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+required-features = ["test-utilities"]

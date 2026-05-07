@@ -400,22 +400,63 @@ the PR.
     — same gate that catches forged publish events. The PoC
     two-key model carries forward unchanged: resolve generates
     an ephemeral `DeviceKey` per run.
-13. **Replay of an old resolve.** Defense: the canonical hash
-    binds `parent_revision`. A resolve replay against a
-    moved-on head (someone else has published a descendant in
-    the meantime, advancing the head past the chosen one) lands
-    as another fork rather than a duplicate, surfacing on the
-    next pull as the concurrent-resolve race described in P9
-    plan §A7. Re-publishing the same merge revision with a
-    stale parent is additionally guarded by the resolve flow's
-    pre-publish check (Q7-APPROVED): `pull_all` runs first and
-    then re-validates `account_heads`; if the chosen revision
-    is no longer a head OR a NEW head appeared,
+13. **Replay of an old resolve, AND partial-failure recovery
+    between `adapter.publish` and `clear_frozen` (P9 fix-pass
+    HIGH-1).** Defense: the canonical hash binds
+    `parent_revision`. A resolve replay against a moved-on head
+    (someone else has published a descendant in the meantime,
+    advancing the head past the chosen one) lands as another
+    fork rather than a duplicate, surfacing on the next pull as
+    the concurrent-resolve race described in P9 plan §A7.
+    Re-publishing the same merge revision with a stale parent
+    is additionally guarded by the resolve flow's pre-publish
+    check (Q7-APPROVED): `pull_all` runs first and then
+    re-validates `account_heads`; if the chosen revision is no
+    longer a head OR a NEW head appeared,
     `ResolveError::ChainMovedDuringResolve` aborts the resolve
-    cleanly. The A3-style canonical-hash scan inside
-    `resolve_one` additionally detects an already-on-chain
-    merge revision and skips the redundant publish (recovery
-    from a kill between publish + ingest + clear_frozen).
+    cleanly.
+
+    **Recovery from a kill between `adapter.publish` and
+    `clear_frozen` is via the `pending_merges` stash** (added
+    by P9 fix-pass HIGH-1; resolves the audit's "the user is
+    permanently stuck — frozen account, unresolvable" finding).
+    The merge-revision-build state — ephemeral `DeviceKey`
+    secret seed (32 bytes), AEAD nonce (24 bytes), and the
+    AEAD-sealed merge revision ciphertext — is persisted to a
+    new SQLite table `pending_merges` BEFORE `adapter.publish`.
+    Retry looks up the stash via `Vault::take_pending_merge`,
+    skips the re-seal step, reconstructs the SAME `DeviceKey`
+    from the stashed seed, and re-attempts publish using the
+    SAME ciphertext + nonce. The canonical hash is bit-equal
+    across retries, so the chain event from the prior
+    partially-completed run can be matched via the existing A3
+    idempotency scan inside `sync::resolve_one`. After
+    `clear_frozen` succeeds, the stash row is deleted by
+    `Vault::clear_pending_merge`. Without this stash discipline,
+    each retry would generate a fresh ephemeral `DeviceKey` AND
+    a fresh AEAD nonce — the canonical hash would differ every
+    run and the chain event from the prior run could not be
+    matched, leaving the user permanently stuck with a frozen
+    account.
+
+    The stash row contains an Ed25519 secret seed at rest in
+    the vault file as a SQLite BLOB column, NOT additionally
+    AEAD-sealed. The reasoning is bounded-marginal-exposure:
+    at-rest exposure of the `.pvf` file already compromises
+    the VDK and worse (every account's encrypted ciphertext,
+    every chain anchor, every `account_identities` row), so
+    the marginal exposure of an ephemeral merge-signing key
+    that is discarded after `clear_frozen` succeeds is
+    bounded. The stashed `enc_payload` is AEAD ciphertext
+    (NOT plaintext — cardinal principle 2 holds; the seal
+    happens inside `Vault::build_merge_payload_for_resolve`
+    BEFORE the stash). Tests pinning the stash discipline:
+    `stash_take_clear_round_trip`,
+    `stash_persists_across_close_open`,
+    `take_returns_none_for_nonexistent_account`,
+    `pending_merge_zeroizes_secret_on_drop`,
+    `resolve_idempotent_after_partial_failure_via_stash` (the
+    end-to-end recovery test).
 14. **Frozen flag cleared without publish.** Defense: the
     `Vault::clear_frozen` API takes `chosen_revision_id` as a
     parameter and atomically advances `head_revision_id` to it;
