@@ -418,26 +418,62 @@ the PR.
 
     **Recovery from a kill between `adapter.publish` and
     `clear_frozen` is via the `pending_merges` stash** (added
-    by P9 fix-pass HIGH-1; resolves the audit's "the user is
-    permanently stuck — frozen account, unresolvable" finding).
-    The merge-revision-build state — ephemeral `DeviceKey`
-    secret seed (32 bytes), AEAD nonce (24 bytes), and the
-    AEAD-sealed merge revision ciphertext — is persisted to a
-    new SQLite table `pending_merges` BEFORE `adapter.publish`.
-    Retry looks up the stash via `Vault::take_pending_merge`,
-    skips the re-seal step, reconstructs the SAME `DeviceKey`
-    from the stashed seed, and re-attempts publish using the
-    SAME ciphertext + nonce. The canonical hash is bit-equal
-    across retries, so the chain event from the prior
-    partially-completed run can be matched via the existing A3
-    idempotency scan inside `sync::resolve_one`. After
-    `clear_frozen` succeeds, the stash row is deleted by
-    `Vault::clear_pending_merge`. Without this stash discipline,
-    each retry would generate a fresh ephemeral `DeviceKey` AND
-    a fresh AEAD nonce — the canonical hash would differ every
-    run and the chain event from the prior run could not be
-    matched, leaving the user permanently stuck with a frozen
-    account.
+    by P9 fix-pass HIGH-1; deepened by P9 fix-pass 2 HIGH-1;
+    resolves the audit's "the user is permanently stuck —
+    frozen account, unresolvable" finding). The merge-revision-
+    build state — ephemeral `DeviceKey` secret seed (32 bytes),
+    AEAD nonce (24 bytes), and the AEAD-sealed merge revision
+    ciphertext — is persisted to a new SQLite table
+    `pending_merges` BEFORE `adapter.publish`. The retry path
+    looks up the stash via `Vault::take_pending_merge`,
+    reconstructs the SAME `DeviceKey` from the stashed seed,
+    and re-uses the SAME ciphertext + nonce — so the canonical
+    hash is bit-equal across retries and the chain event from
+    the prior partially-completed run can be matched on retry.
+
+    **Re-ordered `sync::resolve_one` (P9 fix-pass 2 HIGH-1
+    deeper fix).** `take_pending_merge` runs BEFORE the
+    `pull_all` + `chain_moved` guard. After `pull_all`, the
+    stash's deterministic canonical hash is matched against
+    the post-pull LOCAL revisions table (the merge revision is
+    ingested by `pull_all` if the prior publish landed); if a
+    matching row with a populated chain anchor exists,
+    `resolve_one` takes the `AlreadyOnChain` path: skips
+    publish, calls `clear_frozen` (which advances
+    `head_revision_id` to the merge-rev id and clears the
+    freeze flag in one transaction), and clears the stash. The
+    `ChainMovedDuringResolve` branch only fires when the chain
+    has a head NOT matching any stash for the user's
+    `(account_id, --keep)` pair — kill-after-publish-success
+    recovery is genuinely complete end-to-end, not just kill-
+    before-publish-reaches-chain. `clear_frozen` succeeds even
+    on a foreign-ingested row whose `enc_nonce` is the
+    placeholder zero, because `clear_frozen` only validates
+    head-membership + advances the head pointer — it does not
+    decrypt the row.
+
+    **Orphan stash pruning (P9 fix-pass 2 MEDIUM-2).**
+    `Vault::prune_orphan_pending_merges(account_id)` deletes
+    stash rows whose `target_head_id` is no longer a current
+    head. Called from `pull_all` after each chunk's per-
+    account ingest sequence completes (separate transaction,
+    so the per-chunk all-or-nothing discipline is preserved),
+    and from `resolve_one` alongside `take_pending_merge`. A
+    user-changed `--keep`, `ChainMovedDuringResolve`, or any
+    other path that abandons a stash row is bounded — the
+    32-byte Ed25519 seed does not accumulate at rest
+    indefinitely. Three tests pin the prune semantics:
+    `prune_orphan_pending_merges_removes_non_head_targets`,
+    `prune_no_op_when_all_targets_are_heads`,
+    `prune_no_op_on_empty_table`.
+
+    Without the stash + the re-ordered flow, each retry would
+    generate a fresh ephemeral `DeviceKey` AND a fresh AEAD
+    nonce — the canonical hash would differ every run, the
+    chain event from the prior run could not be matched, and
+    `ChainMovedDuringResolve` would fire on the merge-revision-
+    foreign-ingest path before any recovery code ran, leaving
+    the user permanently stuck with a frozen account.
 
     The stash row contains an Ed25519 secret seed at rest in
     the vault file as a SQLite BLOB column, NOT additionally
@@ -446,17 +482,21 @@ the PR.
     the VDK and worse (every account's encrypted ciphertext,
     every chain anchor, every `account_identities` row), so
     the marginal exposure of an ephemeral merge-signing key
-    that is discarded after `clear_frozen` succeeds is
+    that is discarded after `clear_frozen` succeeds (and
+    additionally pruned per MEDIUM-2 if abandoned) is
     bounded. The stashed `enc_payload` is AEAD ciphertext
     (NOT plaintext — cardinal principle 2 holds; the seal
     happens inside `Vault::build_merge_payload_for_resolve`
-    BEFORE the stash). Tests pinning the stash discipline:
+    BEFORE the stash). Tests pinning the recovery semantics:
     `stash_take_clear_round_trip`,
     `stash_persists_across_close_open`,
     `take_returns_none_for_nonexistent_account`,
     `pending_merge_zeroizes_secret_on_drop`,
     `resolve_idempotent_after_partial_failure_via_stash` (the
-    end-to-end recovery test).
+    publish-failed retry test),
+    `resolve_recovers_from_kill_after_publish_success` (the
+    kill-after-publish-success retry test added by P9 fix-pass
+    2), plus the three prune tests above.
 14. **Frozen flag cleared without publish.** Defense: the
     `Vault::clear_frozen` API takes `chosen_revision_id` as a
     parameter and atomically advances `head_revision_id` to it;

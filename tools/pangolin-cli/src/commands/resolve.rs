@@ -204,6 +204,17 @@ pub async fn run(global: &GlobalArgs, args: ResolveArgs) -> Result<()> {
             ResolveOutcome::DryRun {
                 planned_revision_id,
             } => {
+                // P9 fix-pass 2 — LOW-2. The dry-run path skips the
+                // pre-publish chain re-pull (per MED-4 hygiene), so
+                // the canonical hash below is computed against the
+                // last-known-local view of the chain. Surface this
+                // staleness disclosure BEFORE the hash so the user
+                // can decide whether to re-run `pangolin-cli pull`
+                // first.
+                eprintln!(
+                    "dry run: pre-publish chain re-pull SKIPPED \
+                     (dry-run mode); current local view may be stale"
+                );
                 eprintln!(
                     "dry run: would publish merge revision {}",
                     hex::encode(planned_revision_id)

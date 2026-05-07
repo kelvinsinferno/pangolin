@@ -1816,6 +1816,118 @@ impl Vault {
         Ok(())
     }
 
+    /// **P9 fix-pass 2 — MEDIUM-2.** Prune `pending_merges` rows for
+    /// `account_id` whose `target_head_id` is no longer a current
+    /// head. Returns the number of rows deleted.
+    ///
+    /// Background: each entry in `pending_merges` carries a 32-byte
+    /// Ed25519 secret seed. A user-changed `--keep` (or
+    /// chain-moved-during-resolve, or any other path that abandons a
+    /// stash row) leaves the row at rest indefinitely. This sweep
+    /// keeps the stash table aligned with the current head set,
+    /// bounding the at-rest seed exposure to the active recovery
+    /// state only.
+    ///
+    /// Wraps the per-row scan + DELETE in a single SQL transaction
+    /// so a concurrent writer cannot interleave between the head
+    /// snapshot and the DELETE. The transaction is independent of
+    /// any caller-side transaction, so the prune is composable
+    /// (safe to call from inside `pull_all`'s per-chunk post-ingest
+    /// step, where the chunk's own transaction has already
+    /// committed).
+    ///
+    /// Idempotent — calling on a clean table or with all targets
+    /// being current heads returns `Ok(0)`.
+    ///
+    /// Metadata-only — does NOT require [`VaultState::Active`].
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::AccountNotFound` if `account_id` is unknown.
+    /// `StoreError::Sqlite` for any database issue.
+    pub fn prune_orphan_pending_merges(&mut self, account_id: AccountId) -> Result<usize> {
+        self.maybe_expire_active_session();
+
+        // Cross-check the account exists at the identity layer; if
+        // not, surface AccountNotFound rather than a silently-empty
+        // result.
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM account_identities WHERE account_id = ?1",
+                params![account_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(StoreError::AccountNotFound);
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Collect the current head set (same NOT EXISTS predicate
+        // that `account_heads` uses, scoped by `account_id` per
+        // M-1's defense-in-depth).
+        let mut head_stmt = tx.prepare(
+            "SELECT r.revision_id FROM revisions r
+             WHERE r.account_id = ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM revisions r2
+                 WHERE r2.parent_revision_id = r.revision_id
+                   AND r2.account_id = r.account_id
+               )",
+        )?;
+        let head_rows = head_stmt.query_map(params![account_id.as_bytes().as_slice()], |row| {
+            let rid: Vec<u8> = row.get(0)?;
+            Ok(rid)
+        })?;
+        let mut head_set: Vec<[u8; REVISION_ID_LEN]> = Vec::new();
+        for r in head_rows {
+            let blob = r?;
+            let arr: [u8; REVISION_ID_LEN] = blob
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Corrupted("head revision_id not 32 bytes".into()))?;
+            head_set.push(arr);
+        }
+        drop(head_stmt);
+
+        // Scan stash rows for this account.
+        let mut stash_stmt = tx.prepare(
+            "SELECT target_head_id FROM pending_merges
+             WHERE account_id = ?1",
+        )?;
+        let stash_rows =
+            stash_stmt.query_map(params![account_id.as_bytes().as_slice()], |row| {
+                let rid: Vec<u8> = row.get(0)?;
+                Ok(rid)
+            })?;
+        let mut to_delete: Vec<[u8; REVISION_ID_LEN]> = Vec::new();
+        for r in stash_rows {
+            let blob = r?;
+            let arr: [u8; REVISION_ID_LEN] = blob.as_slice().try_into().map_err(|_| {
+                StoreError::Corrupted("pending_merges.target_head_id not 32 bytes".into())
+            })?;
+            if !head_set.contains(&arr) {
+                to_delete.push(arr);
+            }
+        }
+        drop(stash_stmt);
+
+        let mut deleted: usize = 0;
+        for target in &to_delete {
+            tx.execute(
+                "DELETE FROM pending_merges
+                 WHERE account_id = ?1 AND target_head_id = ?2",
+                params![account_id.as_bytes().as_slice(), &target[..]],
+            )?;
+            deleted += 1;
+        }
+        tx.commit()?;
+        self.touch_session();
+        Ok(deleted)
+    }
+
     // -----------------------------------------------------------------
     // P4: high-risk operations — presence escalation
     // -----------------------------------------------------------------
@@ -5345,5 +5457,108 @@ mod tests {
             std::mem::needs_drop::<pangolin_crypto::secret::SecretBytes>(),
             "SecretBytes must implement Drop (zeroize-on-drop discipline)"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // P9 fix-pass 2 — MEDIUM-2: prune_orphan_pending_merges tests
+    // -----------------------------------------------------------------
+
+    /// **P9 fix-pass 2 — MEDIUM-2.** Stash three rows with distinct
+    /// `target_head_id`s; only one is a current head (the genesis
+    /// revision id). Prune. Two rows whose `target_head_id` is NOT a
+    /// head are deleted; the matching row remains.
+    #[test]
+    fn prune_orphan_pending_merges_removes_non_head_targets() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "prune.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).expect("add account");
+
+        // Read the genesis revision id — that's the current sole head.
+        let heads = v.account_heads(id).expect("heads");
+        assert_eq!(heads.len(), 1, "genesis is sole head");
+        let head = heads[0];
+        let orphan_a = crate::revision::RevisionId::from_bytes([0xAA; 32]);
+        let orphan_b = crate::revision::RevisionId::from_bytes([0xBB; 32]);
+
+        // Stash three rows: one matching the head, two orphans.
+        let seed = [0x33u8; pangolin_crypto::sign::SECRET_KEY_LEN];
+        let nonce = [0x44u8; crate::pending::PENDING_MERGE_NONCE_LEN];
+        let payload = b"sealed".to_vec();
+        v.stash_pending_merge(id, head, seed, nonce, payload.clone(), 0)
+            .expect("stash head");
+        v.stash_pending_merge(id, orphan_a, seed, nonce, payload.clone(), 0)
+            .expect("stash orphan_a");
+        v.stash_pending_merge(id, orphan_b, seed, nonce, payload, 0)
+            .expect("stash orphan_b");
+
+        // Prune.
+        let deleted = v.prune_orphan_pending_merges(id).expect("prune ok");
+        assert_eq!(deleted, 2, "exactly two orphan rows deleted");
+
+        // The matching head's row remains; both orphans are gone.
+        assert!(
+            v.take_pending_merge(id, head).expect("take head").is_some(),
+            "head's stash row remains"
+        );
+        assert!(
+            v.take_pending_merge(id, orphan_a)
+                .expect("take a")
+                .is_none(),
+            "orphan A's stash row deleted"
+        );
+        assert!(
+            v.take_pending_merge(id, orphan_b)
+                .expect("take b")
+                .is_none(),
+            "orphan B's stash row deleted"
+        );
+    }
+
+    /// **P9 fix-pass 2 — MEDIUM-2.** When every stash row's
+    /// `target_head_id` IS a current head, prune is a no-op
+    /// (returns 0).
+    #[test]
+    fn prune_no_op_when_all_targets_are_heads() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "prune-noop.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).expect("add account");
+        let heads = v.account_heads(id).expect("heads");
+        assert_eq!(heads.len(), 1);
+        let head = heads[0];
+        v.stash_pending_merge(
+            id,
+            head,
+            [0x11u8; pangolin_crypto::sign::SECRET_KEY_LEN],
+            [0x22u8; crate::pending::PENDING_MERGE_NONCE_LEN],
+            b"sealed".to_vec(),
+            0,
+        )
+        .expect("stash");
+        let deleted = v.prune_orphan_pending_merges(id).expect("prune ok");
+        assert_eq!(deleted, 0, "no orphans → 0 deletions");
+        // Stash row still present.
+        assert!(v.take_pending_merge(id, head).expect("take").is_some());
+    }
+
+    /// **P9 fix-pass 2 — MEDIUM-2.** Empty stash table → prune
+    /// returns 0 with no errors.
+    #[test]
+    fn prune_no_op_on_empty_table() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "prune-empty.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).expect("add account");
+        let deleted = v
+            .prune_orphan_pending_merges(id)
+            .expect("prune ok on empty");
+        assert_eq!(deleted, 0, "empty stash table → 0 deletions");
     }
 }

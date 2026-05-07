@@ -539,3 +539,120 @@ stash adds two new methods (`stash_pending_merge`,
 signature was extended (returning a 4-tuple including the
 nonce instead of a 3-tuple) — internal-only call inside
 `sync::resolve_one`.
+
+## 2026-05-07 · P9 fix-pass 2 — close HIGH-1 fully + orphan stash prune + cosmetic  ✅ SIGNOFF
+
+The `2d13fea` first fix-pass closed HIGH-1 for the publish-FAILED
+retry case but the re-audit identified that the publish-SUCCEEDED-
+but-`clear_frozen`-killed case was still unrecoverable. Plus two
+new findings (MEDIUM-2 orphan stash accumulation, LOW-2 dry-run
+staleness disclosure) and one cosmetic (LOW-1 stale comment about
+`DeviceKey::from_seed`).
+
+**HIGH-1 deeper fix — kill-after-publish-success recovery.** The
+re-auditor's structural diagnosis: in the prior `resolve_one`, the
+sequence `pull_all → chain_moved guard → take_pending_merge` was
+fatal for the publish-succeeded-but-killed scenario. On retry,
+`pull_all` ingested the prior merge revision as a foreign event,
+advancing the head set; `chain_moved = post_pull_heads.iter().any(|h|
+!pre_pull_heads.contains(h))` fired (the just-ingested merge IS a
+new head); `ChainMovedDuringResolve` aborted BEFORE the stash was
+consulted; user permanently stuck.
+
+Fix: re-ordered `sync::resolve_one`. `take_pending_merge` runs FIRST
+(unconditionally), THEN `pull_all`, THEN a stash-vs-chain canonical-
+hash match against the post-pull LOCAL revisions table. If the
+stash's deterministic canonical hash matches a locally-ingested row
+with a populated chain anchor, we take the `AlreadyOnChain` path:
+`clear_frozen` (advances `head_revision_id` to the merge-rev id and
+clears the freeze flag in one transaction) + `clear_pending_merge`
+(drop the stash row). The `chain_moved` and `chosen-still-a-head`
+guards fire only when no stash matches — i.e., when the chain has
+moved BEYOND the user's stashed-`--keep` target. Critical
+correctness point: `clear_frozen` does NOT decrypt the local row;
+it only validates head-membership and runs the UPDATE pair, so
+the foreign-ingested row's placeholder zero `enc_nonce` is not a
+problem for the recovery path.
+
+We use the LOCAL revisions table (post-pull) rather than re-calling
+`adapter.pull_since` because `pull_all` already advanced
+`last_pulled_block` past the merge event's block, so a fresh
+`pull_since(last_pulled_block)` would return an empty view. The
+local revisions table is the canonical post-pull source of truth,
+and `pull_all` itself signature-verifies the foreign event's
+`device_id` canonical form (defense-in-depth against forged
+streams) before ingesting — so a stash-match against a locally-
+ingested row is no weaker than a stash-match against the chain
+view.
+
+**MEDIUM-2 (new) — orphan stash accumulation.** Added
+`Vault::prune_orphan_pending_merges(account_id) -> Result<usize>`.
+Iterates `pending_merges` rows for `account_id` inside a single
+SQL transaction (collects current heads via the `account_heads`
+predicate, scans stash rows, deletes any whose `target_head_id`
+is not a current head). Called from:
+
+- `pull_all` after each chunk's per-account ingest sequence
+  completes (per-chunk all-or-nothing discipline preserved — the
+  prune runs in its own transaction after the chunk's events
+  have committed and the checkpoint has advanced),
+- `resolve_one` alongside `take_pending_merge` at the top of the
+  flow (skipped on dry-run for purity).
+
+Failures are non-fatal — logged + skipped, the next prune
+invocation retries. Three new tests:
+`prune_orphan_pending_merges_removes_non_head_targets`,
+`prune_no_op_when_all_targets_are_heads`, `prune_no_op_on_empty_table`.
+
+**LOW-1 (re-audit) — stale comment in `crates/pangolin-chain/src/evm.rs`.**
+The comment in `structural_property_distinct_seeds_distinct_signatures`
+claimed "we can't construct `DeviceKey::from_seed` (no such public
+API)". The first P9 fix-pass made `DeviceKey::from_seed` public.
+Updated the comment to reflect the new state: "now public (added
+by P9 fix-pass HIGH-1), but this test predates that surface and
+intentionally probes the structural property at the `SigningKey`
+layer to keep the pangolin-chain → pangolin-crypto dependency
+surface minimal." Test logic unchanged — uses `SigningKey::from_seed`
+directly per the auditor's read.
+
+**LOW-2 (re-audit) — dry-run output omits staleness disclosure.**
+The `--dry-run` path in `sync::resolve_one` skips the pre-publish
+chain re-pull (per MED-4 hygiene), so the canonical hash printed
+to the user is computed against a possibly-stale local view of the
+chain. Added an explicit disclosure line BEFORE the canonical-hash
+print in `tools/pangolin-cli/src/commands/resolve.rs`'s dry-run
+branch: "pre-publish chain re-pull SKIPPED (dry-run mode); current
+local view may be stale." Wet-path output unchanged.
+
+**`THREAT_MODEL.md` row #13** rewritten to honestly describe the
+now-fully-functional kill-after-publish-success recovery (the
+re-ordered `resolve_one`'s stash-vs-local match path), the
+`prune_orphan_pending_merges` mechanism, and the updated test list.
+
+**Test count delta:** 290 → 294 lib tests workspace-wide (+4):
+
+1. `prune_orphan_pending_merges_removes_non_head_targets` (vault.rs).
+2. `prune_no_op_when_all_targets_are_heads` (vault.rs).
+3. `prune_no_op_on_empty_table` (vault.rs).
+4. `resolve_recovers_from_kill_after_publish_success` (sync.rs)
+   — the kill-after-publish-success end-to-end recovery test
+   that the re-auditor explicitly called out as missing.
+
+**Critical invariants verified at the P9 fix-pass 2 SIGNOFF tip:**
+
+1. `cargo tree -p pangolin-crypto | grep -ci serde` → 0 (HIGH-1
+   bound holds; no new transitive deps from the fix-pass).
+2. No new `unsafe`.
+3. No plaintext on disk. The stash semantics + the freeze-guard
+   bypass discipline are unchanged.
+4. Per-chunk all-or-nothing in pull. Preserved — the prune runs
+   in its own transaction AFTER the chunk's events have
+   committed and the checkpoint has advanced; failures are
+   logged but not fatal.
+5. Per-account atomicity. Strengthened (the stash-match path
+   composes `clear_frozen`'s atomic head-advance with the stash
+   delete, all under per-account scoping).
+6. `cargo fmt --all --check` clean.
+7. `cargo clippy --workspace --all-targets -- -D warnings` clean.
+8. `cargo test --workspace --lib` — 294/294 passing (290
+   baseline + 4 new).
