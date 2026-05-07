@@ -455,6 +455,169 @@ pub async fn pull_all<A: ChainAdapter + ?Sized>(
     Ok(report)
 }
 
+// ---------------------------------------------------------------------
+// Resolve orchestration (P9-3 skeleton — full body in P9-4)
+// ---------------------------------------------------------------------
+
+/// Outcome of a single `resolve_one` call.
+///
+/// Three terminal states:
+///
+/// - `DryRun` — args validated, plaintext re-sealed, canonical hash
+///   computed; nothing published, freeze flag unchanged.
+/// - `Published` — fresh on-chain publish landed and the local
+///   ingest + `clear_frozen` ran cleanly.
+/// - `AlreadyOnChain` — the merge revision was already on chain
+///   (recovery from a prior partial failure where the publish
+///   succeeded but the local commit was killed before completion).
+#[derive(Debug, Clone)]
+pub enum ResolveOutcome {
+    /// `--dry-run`: validation + plaintext-read + re-seal-into-
+    /// canonical-hash. No on-chain side effects; no local writes.
+    DryRun { planned_revision_id: [u8; 32] },
+    /// Fresh publish + ingest + `clear_frozen` succeeded.
+    Published {
+        revision_id: [u8; 32],
+        anchor: ChainAnchor,
+    },
+    /// The merge revision was already on chain (recovery path);
+    /// only the local ingest + `clear_frozen` ran in this invocation.
+    AlreadyOnChain {
+        revision_id: [u8; 32],
+        anchor: ChainAnchor,
+    },
+}
+
+/// Distinct error class for resolve-flow failures so callers can
+/// recognise the chain-moved-during-resolve case (the only
+/// non-fatal abort that the CLI surfaces with a friendly remediation
+/// hint).
+#[derive(Debug)]
+pub enum ResolveError {
+    /// The chain moved between the user's `--keep` choice and the
+    /// pre-publish re-pull. A new revision for the same `account_id`
+    /// landed; the user must re-run resolve against the freshest
+    /// heads. Per P9 plan Q7 — APPROVED to abort cleanly and let
+    /// the user retry.
+    ChainMovedDuringResolve {
+        account_id: AccountId,
+        previous_heads: Vec<RevisionId>,
+        new_heads: Vec<RevisionId>,
+    },
+    /// `--keep <id>` is not a current head of the supplied account.
+    NotAHead {
+        account_id: AccountId,
+        chosen: RevisionId,
+        current_heads: Vec<RevisionId>,
+    },
+    /// `account_id` is unknown to the local store.
+    AccountNotFound { account_id: AccountId },
+    /// Underlying store error (decrypt failure, sqlite error, etc.).
+    Store(StoreError),
+    /// Underlying chain error (RPC failure, signature rejection by
+    /// the eager-verify mock, etc.).
+    Chain(String),
+}
+
+impl core::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ChainMovedDuringResolve {
+                account_id,
+                previous_heads,
+                new_heads,
+            } => {
+                write!(
+                    f,
+                    "chain moved during resolve for account {}: \
+                     previous heads {:?}, new heads {:?}; \
+                     re-run `pangolin-cli resolve` against the freshest heads",
+                    hex::encode(account_id.as_bytes()),
+                    previous_heads
+                        .iter()
+                        .map(|h| hex::encode(h.as_bytes()))
+                        .collect::<Vec<_>>(),
+                    new_heads
+                        .iter()
+                        .map(|h| hex::encode(h.as_bytes()))
+                        .collect::<Vec<_>>(),
+                )
+            }
+            Self::NotAHead {
+                account_id,
+                chosen,
+                current_heads,
+            } => {
+                write!(
+                    f,
+                    "the supplied --keep revision {} is not a current head of account {}; \
+                     current heads: {:?}",
+                    hex::encode(chosen.as_bytes()),
+                    hex::encode(account_id.as_bytes()),
+                    current_heads
+                        .iter()
+                        .map(|h| hex::encode(h.as_bytes()))
+                        .collect::<Vec<_>>(),
+                )
+            }
+            Self::AccountNotFound { account_id } => {
+                write!(
+                    f,
+                    "account {} is unknown to the local store",
+                    hex::encode(account_id.as_bytes()),
+                )
+            }
+            Self::Store(e) => write!(f, "store error: {e}"),
+            Self::Chain(s) => write!(f, "chain error: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+impl From<StoreError> for ResolveError {
+    fn from(e: StoreError) -> Self {
+        Self::Store(e)
+    }
+}
+
+/// **P9-3 skeleton.** End-to-end resolve flow for a single account.
+/// The full body — pre-publish re-pull, plaintext read + re-seal,
+/// publish via `ChainAdapter`, ingest + `clear_frozen` — lands in P9-4.
+///
+/// For now this returns a stub `DryRun` outcome regardless of the
+/// `dry_run` flag so the binary compiles end-to-end and the clap
+/// surface is exercisable; P9-4 swaps in the real implementation.
+#[allow(clippy::missing_errors_doc, clippy::unused_async)]
+pub async fn resolve_one<A: ChainAdapter + ?Sized>(
+    vault: &mut Vault,
+    _adapter: &A,
+    _device_key: &DeviceKey,
+    account_id: AccountId,
+    chosen_revision_id: RevisionId,
+    _dry_run: bool,
+) -> Result<ResolveOutcome, ResolveError> {
+    // P9-3: skeleton returns a placeholder DryRun outcome. P9-4
+    // replaces this stub with the full publish + ingest + clear
+    // flow. The validation below is the same as the production path
+    // so the clap-test-driven "resolve_rejects_non_head_revision"
+    // already passes against the skeleton.
+    let heads = vault.account_heads(account_id).map_err(|e| match e {
+        StoreError::AccountNotFound => ResolveError::AccountNotFound { account_id },
+        other => ResolveError::Store(other),
+    })?;
+    if !heads.contains(&chosen_revision_id) {
+        return Err(ResolveError::NotAHead {
+            account_id,
+            chosen: chosen_revision_id,
+            current_heads: heads,
+        });
+    }
+    Ok(ResolveOutcome::DryRun {
+        planned_revision_id: [0u8; 32],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
