@@ -48,7 +48,9 @@ use pangolin_crypto::secret::SecretBytes;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::account::{AccountId, AccountSnapshot, ACCOUNT_ID_LEN};
-use crate::blob::{build_aad, open_payload, seal_snapshot, seal_tombstone, DecodedPayload};
+use crate::blob::{
+    build_aad, open_payload, seal_snapshot, seal_tombstone, DecodedPayload, TombstonePayload,
+};
 use crate::dirty::{IngestOutcome, RevisionPublishPayload};
 use crate::error::{Result, StoreError};
 use crate::meta::{self, VaultMeta};
@@ -961,8 +963,14 @@ impl Vault {
             self.meta.wrap_context.schema_version,
         );
         let active = self.require_active()?;
-        let (ct, nonce) = seal_tombstone(active.vdk.aead_key(), &aad)?;
         let now = current_unix_ms();
+        // P10-1: widened tombstone payload carries account_id + the
+        // unix-ms timestamp. `tombstoned_at_ms` matches the row's
+        // `last_modified_at` (we use `now` for both so a forensic
+        // reader sees consistent values), but the in-payload field
+        // is the AEAD-authenticated source of truth.
+        let tombstone_payload = TombstonePayload::new(id, u64::try_from(now).unwrap_or(0));
+        let (ct, nonce) = seal_tombstone(active.vdk.aead_key(), &aad, &tombstone_payload)?;
 
         // P8-2: tombstone-revision + flip + dirty marker in one
         // transaction. Tombstone revisions also need publishing —
@@ -1455,7 +1463,7 @@ impl Vault {
             // (per P9 plan §A5). If the caller passed a tombstone
             // revision into THIS method, surface a CBOR-class error
             // — the API contract is "live snapshot only".
-            DecodedPayload::Tombstone => {
+            DecodedPayload::Tombstone(_) => {
                 return Err(StoreError::Cbor(
                     "read_payload_plaintext_for_resolve called on tombstone revision; \
                      resolve flow must use seal_tombstone for tombstone heads"
@@ -1558,9 +1566,17 @@ impl Vault {
         let aead_key = active.vdk.aead_key();
 
         let (ct, nonce) = if is_tombstone {
-            // Tombstone-resolve: re-seal the tombstone sentinel
-            // payload under the merge AAD.
-            seal_tombstone(aead_key, &merge_aad)?
+            // Tombstone-resolve: re-seal the tombstone payload under
+            // the merge AAD. P10 plan §A5 / Q2: `tombstoned_at_ms`
+            // is the merge revision's OWN seal time (not the original
+            // tombstone's timestamp). The merge revision is a fresh
+            // chain event published at merge time; the in-payload
+            // timestamp is the timestamp of the *seal*, not the
+            // *concept*. The original tombstone's timestamp is
+            // recoverable from the chain history of its parent event.
+            let merge_payload =
+                TombstonePayload::new(account_id, u64::try_from(current_unix_ms()).unwrap_or(0));
+            seal_tombstone(aead_key, &merge_aad, &merge_payload)?
         } else {
             // Live snapshot: read plaintext via the bypass-aware
             // helper, then re-seal under the merge AAD with a fresh
@@ -3464,7 +3480,7 @@ fn build_decrypted_cache(
             DecodedPayload::Live(snapshot) => {
                 cache.insert(account_id, snapshot);
             }
-            DecodedPayload::Tombstone => {
+            DecodedPayload::Tombstone(_) => {
                 // A tombstoned head should not have appeared because
                 // ai.tombstoned = 0 in the WHERE clause, but if it
                 // does we treat it as corruption.
@@ -3705,6 +3721,72 @@ mod tests {
             v.delete_account(id).unwrap_err(),
             StoreError::AccountTombstoned
         ));
+    }
+
+    /// **P10-1.** `delete_account` writes a tombstone whose
+    /// AEAD-sealed plaintext is the canonical three-field
+    /// [`crate::blob::TombstonePayload`], NOT the legacy single-entry
+    /// shape. We open the persisted ciphertext via the same VDK + AAD
+    /// the vault used at seal time and assert the payload's
+    /// `account_id` and timestamp survive the round-trip.
+    #[test]
+    fn delete_account_writes_canonical_three_field_tombstone_payload() {
+        use crate::blob::{build_aad, open_payload, DecodedPayload};
+        use pangolin_crypto::aead::{Ciphertext, Nonce, NONCE_LEN};
+        use rusqlite::params;
+
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).unwrap();
+        v.delete_account(id).unwrap();
+
+        // Find the tombstone revision row for this account.
+        let history = v.revisions_for(id).unwrap();
+        let tomb_meta = history
+            .iter()
+            .find(|m| m.is_tombstone)
+            .expect("tombstone revision present");
+        let parent_id = tomb_meta.parent_revision_id;
+
+        // Read the row's enc_payload + enc_nonce + schema_version
+        // directly from the SQL layer so we can re-derive the AAD
+        // and open the ciphertext.
+        let (payload_bytes, nonce_bytes, schema_version_i): (Vec<u8>, Vec<u8>, i64) = v
+            .conn
+            .query_row(
+                "SELECT enc_payload, enc_nonce, schema_version
+                 FROM revisions
+                 WHERE revision_id = ?1",
+                params![tomb_meta.revision_id.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let schema_version = u8::try_from(schema_version_i).unwrap();
+        let aad = build_aad(&v.meta.vault_id, &id, &parent_id, schema_version);
+        let nonce_arr: [u8; NONCE_LEN] = nonce_bytes.as_slice().try_into().unwrap();
+        let nonce = Nonce::from_storage_bytes(nonce_arr);
+        let ct = Ciphertext::from_vec(payload_bytes);
+
+        let active = v.require_active().unwrap();
+        let decoded = open_payload(active.vdk.aead_key(), &nonce, &ct, &aad).unwrap();
+        match decoded {
+            DecodedPayload::Tombstone(p) => {
+                assert!(p.is_deleted(), "deleted bit must be true");
+                assert_eq!(
+                    p.account_id(),
+                    id.as_bytes(),
+                    "in-payload account_id must match the AAD-bound account_id"
+                );
+                assert!(
+                    p.tombstoned_at_ms() > 0,
+                    "tombstoned_at_ms must be a real timestamp, got 0"
+                );
+            }
+            DecodedPayload::Live(_) => panic!("expected Tombstone, got Live"),
+        }
     }
 
     /// Success criterion 10: WAL pragma.
