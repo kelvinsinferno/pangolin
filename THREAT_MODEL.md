@@ -43,7 +43,7 @@ Per-component threat enumeration lands as part of MVP-1 issue 0.2 and is updated
 | Session policy engine | MVP-1 | TBD (issue 0.2) |
 | Revision Log v0 contract | PoC | DOCUMENTED (P5-1) |
 | Pangolin chain adapter (`pangolin-chain`) | PoC | DOCUMENTED (P7) |
-| Pangolin sync orchestrator (`pangolin-cli`) | PoC | DOCUMENTED (P8) |
+| Pangolin sync orchestrator (`pangolin-cli`) | PoC | DOCUMENTED (P8 + P9) |
 | Revision Log v1 contract | MVP-2 | TBD (issue 2.1 plan) |
 | Funder service | MVP-2 | TBD (issue 3.4 plan) |
 | Ephemeral local indexer | MVP-2 | TBD (issue 4.2 plan) |
@@ -385,3 +385,185 @@ the PR.
     local-row and chain-event `device_id`, restoring silent
     cross-device merge under the non-attack case while
     preserving the device_id binding's defense.
+
+12. **Forged resolve (foreign device claiming to be the user's,
+    publishing a merge revision under the user's account).**
+    Defense: the merge revision is signed by the device's
+    Ed25519 `DeviceKey` via `signing::build_signed_revision`,
+    same path as `publish`. The canonical hash binds
+    `parent_revision` (= the chosen head's `revision_id`),
+    `account_id`, `vault_id`, `device_id`, and `enc_payload`. v0
+    contract does not verify on-chain; v1 will (MVP-2 issue 2.1).
+    Per Q6 defense-in-depth, the receiving device's `pull_all`
+    runs `VerifyingKey::from_bytes` on the merge event's
+    `device_id` before invoking `Vault::ingest_chain_revision`
+    — same gate that catches forged publish events. The PoC
+    two-key model carries forward unchanged: resolve generates
+    an ephemeral `DeviceKey` per run.
+13. **Replay of an old resolve, AND partial-failure recovery
+    between `adapter.publish` and `clear_frozen` (P9 fix-pass
+    HIGH-1).** Defense: the canonical hash binds
+    `parent_revision`. A resolve replay against a moved-on head
+    (someone else has published a descendant in the meantime,
+    advancing the head past the chosen one) lands as another
+    fork rather than a duplicate, surfacing on the next pull as
+    the concurrent-resolve race described in P9 plan §A7.
+    Re-publishing the same merge revision with a stale parent
+    is additionally guarded by the resolve flow's pre-publish
+    check (Q7-APPROVED): `pull_all` runs first and then
+    re-validates `account_heads`; if the chosen revision is no
+    longer a head OR a NEW head appeared,
+    `ResolveError::ChainMovedDuringResolve` aborts the resolve
+    cleanly.
+
+    **Recovery from a kill between `adapter.publish` and
+    `clear_frozen` is via the `pending_merges` stash** (added
+    by P9 fix-pass HIGH-1; deepened by P9 fix-pass 2 HIGH-1;
+    resolves the audit's "the user is permanently stuck —
+    frozen account, unresolvable" finding). The merge-revision-
+    build state — ephemeral `DeviceKey` secret seed (32 bytes),
+    AEAD nonce (24 bytes), and the AEAD-sealed merge revision
+    ciphertext — is persisted to a new SQLite table
+    `pending_merges` BEFORE `adapter.publish`. The retry path
+    looks up the stash via `Vault::take_pending_merge`,
+    reconstructs the SAME `DeviceKey` from the stashed seed,
+    and re-uses the SAME ciphertext + nonce — so the canonical
+    hash is bit-equal across retries and the chain event from
+    the prior partially-completed run can be matched on retry.
+
+    **Re-ordered `sync::resolve_one` (P9 fix-pass 2 HIGH-1
+    deeper fix).** `take_pending_merge` runs BEFORE the
+    `pull_all` + `chain_moved` guard. After `pull_all`, the
+    stash's deterministic canonical hash is matched against
+    the post-pull LOCAL revisions table (the merge revision is
+    ingested by `pull_all` if the prior publish landed); if a
+    matching row with a populated chain anchor exists,
+    `resolve_one` takes the `AlreadyOnChain` path: skips
+    publish, calls `clear_frozen` (which advances
+    `head_revision_id` to the merge-rev id and clears the
+    freeze flag in one transaction), and clears the stash. The
+    `ChainMovedDuringResolve` branch only fires when the chain
+    has a head NOT matching any stash for the user's
+    `(account_id, --keep)` pair — kill-after-publish-success
+    recovery is genuinely complete end-to-end, not just kill-
+    before-publish-reaches-chain. `clear_frozen` succeeds even
+    on a foreign-ingested row whose `enc_nonce` is the
+    placeholder zero, because `clear_frozen` only validates
+    head-membership + advances the head pointer — it does not
+    decrypt the row.
+
+    **Orphan stash pruning (P9 fix-pass 2 MEDIUM-2).**
+    `Vault::prune_orphan_pending_merges(account_id)` deletes
+    stash rows whose `target_head_id` is no longer a current
+    head. Called from `pull_all` after each chunk's per-
+    account ingest sequence completes (separate transaction,
+    so the per-chunk all-or-nothing discipline is preserved),
+    and from `resolve_one` alongside `take_pending_merge`. A
+    user-changed `--keep`, `ChainMovedDuringResolve`, or any
+    other path that abandons a stash row is bounded — the
+    32-byte Ed25519 seed does not accumulate at rest
+    indefinitely. Three tests pin the prune semantics:
+    `prune_orphan_pending_merges_removes_non_head_targets`,
+    `prune_no_op_when_all_targets_are_heads`,
+    `prune_no_op_on_empty_table`.
+
+    Without the stash + the re-ordered flow, each retry would
+    generate a fresh ephemeral `DeviceKey` AND a fresh AEAD
+    nonce — the canonical hash would differ every run, the
+    chain event from the prior run could not be matched, and
+    `ChainMovedDuringResolve` would fire on the merge-revision-
+    foreign-ingest path before any recovery code ran, leaving
+    the user permanently stuck with a frozen account.
+
+    The stash row contains an Ed25519 secret seed at rest in
+    the vault file as a SQLite BLOB column, NOT additionally
+    AEAD-sealed. The reasoning is bounded-marginal-exposure:
+    at-rest exposure of the `.pvf` file already compromises
+    the VDK and worse (every account's encrypted ciphertext,
+    every chain anchor, every `account_identities` row), so
+    the marginal exposure of an ephemeral merge-signing key
+    that is discarded after `clear_frozen` succeeds (and
+    additionally pruned per MEDIUM-2 if abandoned) is
+    bounded. The stashed `enc_payload` is AEAD ciphertext
+    (NOT plaintext — cardinal principle 2 holds; the seal
+    happens inside `Vault::build_merge_payload_for_resolve`
+    BEFORE the stash). Tests pinning the recovery semantics:
+    `stash_take_clear_round_trip`,
+    `stash_persists_across_close_open`,
+    `take_returns_none_for_nonexistent_account`,
+    `pending_merge_zeroizes_secret_on_drop`,
+    `resolve_idempotent_after_partial_failure_via_stash` (the
+    publish-failed retry test),
+    `resolve_recovers_from_kill_after_publish_success` (the
+    kill-after-publish-success retry test added by P9 fix-pass
+    2), plus the three prune tests above.
+14. **Frozen flag cleared without publish.** Defense: the
+    `Vault::clear_frozen` API takes `chosen_revision_id` as a
+    parameter and atomically advances `head_revision_id` to it;
+    the resolve flow ALWAYS calls `clear_frozen` only after a
+    successful publish + ingest of the merge revision. There is
+    no API path that clears the freeze flag without a
+    corresponding revision row in the local store —
+    `clear_frozen` errors with `StoreError::RevisionNotFound`
+    if the supplied `chosen_revision_id` does not exist as a
+    `revisions` row for the account. A malicious local actor
+    with vault-file access could `UPDATE account_identities SET
+    frozen_pending_resolve = 0` directly via sqlite tooling,
+    but that's the same as them tampering with any other row —
+    not a defense the application layer can mount.
+15. **User keeps an attacker-controlled head (HIGH-1 from P8
+    audit).** Defense (acknowledgement, UX-only): under the
+    threat model where a malicious RPC injects events with
+    garbage `device_id`, P8 fix CRIT-1 freezes the account so
+    the user cannot read the stale plaintext. If the user then
+    runs `pangolin-cli resolve --keep <id>` where `<id>`
+    references one of the attacker-injected events, they have
+    explicitly adopted attacker-controlled state. The
+    mitigation is UX: `pangolin-cli resolve` prints the
+    metadata of each candidate head so the user can spot an
+    unfamiliar `device_id` (a foreign device they don't
+    recognise). Full defense requires v1 contract on-chain
+    signature verification (MVP-2 issue 2.1); PoC ships with
+    the UX surfacing as the only defense against this class.
+    Documented as a known UX-bound gap.
+16. **`Vault::read_payload_plaintext_for_resolve` as a
+    documented freeze-guard bypass.** The resolve flow needs
+    to read the chosen revision's plaintext to re-seal it
+    under the merge revision's AAD (per P9 plan §A2 — a
+    byte-copy of the source ciphertext would carry the source
+    row's `parent_revision_id` baked into the AAD, producing
+    an unopenable merge row). The bypass is gated by the
+    user's `--keep <id>` argument as proof-of-intent: the user
+    has named the specific revision they want to ratify, so we
+    trust the read for that one revision for the duration of
+    one resolve invocation. The accessor is loudly documented
+    (`DOCUMENTED FREEZE-GUARD BYPASS — DO NOT CALL FROM ANY
+    PATH EXCEPT pangolin-cli resolve`) and has a single
+    in-process caller. Cross-account substitution is blocked:
+    supplying a `revision_id` that belongs to a different
+    account collapses to `StoreError::AccountNotFound` so the
+    method is not an oracle. Per P9 plan Q6 / §A8, this is the
+    accepted design trade-off; an alternative
+    "user re-supplies password as fresh proof" model has
+    higher UX friction without measurable security gain
+    (the user is already past the unlock proof at the
+    `--keep` step). MVP-1 may revisit if audit feedback
+    surfaces a stronger bypass discipline.
+17. **Concurrent-resolve race (P9 plan §A7 — Q2 APPROVED to
+    ship without a guard).** Defense (acknowledgement):
+    devices A and B running `pangolin-cli resolve` on the same
+    forked account concurrently both pass their pre-publish
+    re-pull (each sees the chain without the other's merge
+    yet) and both successfully publish. The result is yet
+    another fork: parent = chosen_head, two children (A's
+    merge and B's merge). The next pull from any device
+    surfaces the new fork; the user resolves it again. This is
+    the same class of race as P8 threat #6 (concurrent edits
+    by independent devices fork; the fork surfaces on next
+    pull). The recovery is mechanical (re-resolve) and the
+    race window is small (concurrent resolve attempts on the
+    same fork require both devices to be online and aware of
+    the fork at the same instant). P11 may add an interactive
+    freshness guard ("verify chosen head is still a head as of
+    right now"); P9 ships without it per Kelvin's locked
+    answer Q2.

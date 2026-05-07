@@ -11,6 +11,7 @@
 - **E2E-001 — RevisionLogV0 deployed-contract smoke test (Base Sepolia)** — issue P5-4
 - **E2E-002 — chaincli debug oracle smoke test** — issue P6
 - **E2E-003 — pangolin-cli two-vault sync round-trip** — issue P8
+- **E2E-004 — pangolin-cli resolve convergence after fork+freeze** — issue P9
 
 ---
 
@@ -362,6 +363,128 @@ production chain integration.
   being persisted; non-canonical bytes are rejected. Verified
   structurally in `sync::pull_all`'s loop body and asserted by the
   defense-in-depth check in `signing::verify_signed_revision`.
+
+---
+
+## E2E-004: pangolin-cli resolve convergence after fork+freeze
+
+**Issue:** P9
+**Phase:** PoC
+**Date added:** 2026-05-07
+**Last verified:** 2026-05-07 by automated tests
+(`tools/pangolin-cli/tests/two_vault_roundtrip.rs::convergence_after_resolve`)
+
+### Setup
+
+1. Workspace toolchain ready: `cargo build -p pangolin-cli`
+   succeeds.
+2. Two empty directories for the two vault files (or two devices
+   sharing the cloned `.pvf` over any out-of-band channel).
+3. For the chain-backed manual scenario: a Foundry keystore funded
+   with Base Sepolia ETH. The unattended `MockChainAdapter` path
+   needs no funds.
+
+### Steps (automated path — `MockChainAdapter`)
+
+1. **Run the integration test:**
+   ```bash
+   cargo test -p pangolin-cli --test two_vault_roundtrip \
+       convergence_after_resolve
+   ```
+
+   Sub-scenario:
+   - A creates an account, copies the vault file to B
+     (`clone_vault_file`), publishes via `MockChainAdapter`.
+   - B opens the cloned file and pulls. Under the PoC two-key
+     model the foreign device_id triggers the CRIT-1 freeze
+     sentinel: `Vault::list_frozen_accounts()` lists the account.
+   - B runs `pangolin_cli::sync::resolve_one(...)` with `--keep`
+     pointing at B's local genesis row (the one with a
+     plaintext-recoverable nonce, NOT the foreign-ingested row
+     with the placeholder zero nonce). Resolve succeeds end-to-end:
+     plaintext re-seal under merge AAD, build SignedRevision,
+     publish, ingest, clear_frozen.
+   - Final assertions: B's freeze flag is CLEAR
+     (`list_frozen_accounts` does not contain the account); the
+     chain now has at least 2 events (A's original publish + B's
+     merge); A's pull post-B-resolve sees both rows.
+
+   **Expected:** `test result: ok. 4 passed; 0 failed`.
+
+### Steps (manual path — Base Sepolia + funded keystore)
+
+The automated path uses `MockChainAdapter` so it costs no gas.
+The manual path is for humans verifying the production chain
+integration.
+
+1. **Run E2E-003 steps 1–6.** Vault A creates an account, copies
+   to B, publishes; B pulls and observes the freeze.
+
+2. **Run resolve on B:**
+   ```bash
+   pangolin-cli resolve \
+       --vault-path ~/pangolin-test/B/v.pvf \
+       --account-id <hex-32-bytes-of-the-frozen-account> \
+       --keep <hex-32-bytes-of-Bs-local-genesis-revision-id> \
+       --account pangolin-dev \
+       --yes
+   ```
+   At the prompt, enter the vault password (then the keystore
+   password). **Expected:** `resolve summary: published merge
+   revision <hex> at block <n> log <m> seq <k>`.
+
+3. **Confirm the freeze cleared** by re-running pull on B:
+   ```bash
+   pangolin-cli pull --vault-path ~/pangolin-test/B/v.pvf
+   ```
+   The pull summary's `frozen account(s)` count is now 0.
+
+4. **Pull on A** to bring A's view current with B's merge:
+   ```bash
+   pangolin-cli pull --vault-path ~/pangolin-test/A/v.pvf
+   ```
+   Under PoC two-key A's pull will surface the merge revision
+   as a freeze on A — the multi-resolve pattern (P9 plan §A4)
+   handles this by A running its own resolve next. Full
+   single-head convergence across N devices requires MVP-1's
+   single-key model (D-006).
+
+5. **Dry-run example:**
+   ```bash
+   pangolin-cli resolve \
+       --vault-path ~/pangolin-test/A/v.pvf \
+       --account-id <hex> --keep <hex> \
+       --account pangolin-dev \
+       --dry-run
+   ```
+   **Expected:** prints `dry run: would publish merge revision
+   <hex>` without making any chain calls or clearing the freeze
+   flag.
+
+### Expected outcome
+
+- The `MockChainAdapter` path runs in under 60 seconds and exits 0.
+- The Base Sepolia path completes in roughly 30 seconds per round-
+  trip (publish + ingest + clear_frozen). Multi-resolve for full
+  convergence across N devices is documented as expected PoC
+  behavior.
+
+### Failure modes covered
+
+- **Chain moves between user invocation and pre-publish re-pull.**
+  Q7's pre-publish re-pull detects new heads and surfaces
+  `ResolveError::ChainMovedDuringResolve` so the user re-runs
+  against the freshest heads. Verified by
+  `sync::tests::resolve_chain_moved_during_resolve_aborts_cleanly`.
+- **Process killed mid-resolve.** Re-running with the same
+  `--keep` returns `NotAHead` (the merge superseded the chosen
+  revision) — no chain side effects, no local-store corruption.
+  Verified by `sync::tests::resolve_idempotent_after_partial_failure`.
+- **Publish RPC error.** Freeze flag remains set; the user
+  retries. Verified by
+  `sync::tests::resolve_fails_cleanly_on_publish_error`.
+- **`--dry-run`.** No chain side effects; freeze flag unchanged.
+  Verified by `sync::tests::dry_run_does_not_publish_or_clear`.
 
 ---
 

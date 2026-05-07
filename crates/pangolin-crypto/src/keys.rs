@@ -518,6 +518,36 @@ impl DeviceKey {
         }
     }
 
+    /// Reconstructs a `DeviceKey` from a 32-byte seed.
+    ///
+    /// Mirrors [`AuthorityKey::from_seed`] / [`SigningKey::from_seed`].
+    /// Used by `pangolin-store`'s P9 fix-pass `pending_merges` recovery
+    /// path: the resolve flow stashes the ephemeral signing seed BEFORE
+    /// calling `adapter.publish` so a kill mid-publish can be recovered
+    /// on retry by reconstructing the SAME `DeviceKey` (same canonical
+    /// hash on every retry — without that determinism each retry
+    /// generates a fresh ephemeral key and the merge revision's
+    /// canonical hash differs every run, leaving the user permanently
+    /// stuck with a frozen account).
+    ///
+    /// # Misuse warning
+    ///
+    /// Do not synthesize seeds here. Do not pass `[0u8; 32]` or any
+    /// other hard-coded value. The only legitimate inputs are seeds
+    /// previously emitted by this crate via the [`SigningKey`] surface
+    /// (e.g., a stashed `pending_merges.device_secret` BLOB) and
+    /// recovered through a protocol the caller has audited.
+    ///
+    /// The caller's array is moved into the underlying [`SigningKey`]
+    /// via [`SigningKey::from_seed`], which zeroes the parameter slot
+    /// after the dalek key consumes it.
+    #[must_use]
+    pub fn from_seed(seed: [u8; crate::sign::SECRET_KEY_LEN]) -> Self {
+        Self {
+            inner: SigningKey::from_seed(seed),
+        }
+    }
+
     /// Returns the public verifying half of this device key.
     #[must_use]
     pub fn verifying_key(&self) -> VerifyingKey {
@@ -536,6 +566,28 @@ impl DeviceKey {
     #[must_use]
     pub fn ct_eq(&self, other: &Self) -> subtle::Choice {
         self.inner.ct_eq(&other.inner)
+    }
+
+    /// Returns a heap-allocated, zeroizing copy of the 32-byte secret
+    /// seed for this device key.
+    ///
+    /// **AUDIT-LOAD-BEARING.** Used by `pangolin-store`'s P9 fix-pass
+    /// `pending_merges` recovery to stash the ephemeral merge-revision
+    /// signing seed BEFORE `adapter.publish` so a kill mid-publish is
+    /// recoverable on retry by reconstructing the SAME `DeviceKey`
+    /// (same canonical hash on every retry). Without persisting the
+    /// seed, each retry generates a fresh ephemeral key and the
+    /// canonical hash differs every run, leaving the user permanently
+    /// stuck with a frozen account (see `THREAT_MODEL` row #13).
+    ///
+    /// The returned buffer wipes itself on drop. Callers must ensure
+    /// the bytes are passed straight to the at-rest storage discipline
+    /// (the `SQLite` `pending_merges` table, AEAD-protected at the
+    /// OS-page level by the vault file's normal at-rest model) without
+    /// branching, logging, or formatting them.
+    #[must_use]
+    pub fn secret_seed_bytes(&self) -> zeroize::Zeroizing<[u8; crate::sign::SECRET_KEY_LEN]> {
+        self.inner.seed_bytes()
     }
 }
 

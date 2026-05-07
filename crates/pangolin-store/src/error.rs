@@ -104,6 +104,28 @@ pub enum StoreError {
     #[error("revision not found")]
     RevisionNotFound,
 
+    /// **P9 fix-pass MED-3.** [`crate::vault::Vault::clear_frozen`]
+    /// was called with a `chosen_revision_id` that exists in the
+    /// `revisions` table for the account but is NOT a current head
+    /// of the account's revision graph at the time of the SQL
+    /// transaction. This catches the bug class where the resolve
+    /// flow passes the old chosen-revision-id (a non-head, demoted
+    /// by the merge revision's INSERT) instead of the merge
+    /// revision's id. Distinct from `RevisionNotFound` because the
+    /// row exists; it just isn't a current head.
+    #[error(
+        "supplied revision_id is not a current head at the time of the clear_frozen \
+         transaction"
+    )]
+    NotAHead {
+        /// The account id that was being cleared.
+        account_id: crate::account::AccountId,
+        /// The non-head revision id supplied by the caller.
+        chosen: crate::revision::RevisionId,
+        /// The actual head set at the time of the transaction.
+        current_heads: Vec<crate::revision::RevisionId>,
+    },
+
     /// Catch-all for storage-level integrity violations (e.g.,
     /// `PRAGMA integrity_check` returning anything other than "ok").
     #[error("storage corruption detected: {0}")]

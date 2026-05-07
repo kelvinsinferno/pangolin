@@ -388,9 +388,12 @@ mod tests {
     /// test through a `SigningKey` directly, and assert that the
     /// derivation pipeline (sign(domain) → HKDF → scalar → address)
     /// is purely a function of the seed bytes for a fixed encoding.
-    /// We can't construct `DeviceKey::from_seed` (no such public API)
-    /// so this test verifies the structural property at the
-    /// `SigningKey` layer instead.
+    /// `DeviceKey::from_seed` is now public (added by P9 fix-pass
+    /// HIGH-1 to support the `pending_merges` retry stash), but this
+    /// test predates that surface and intentionally probes the
+    /// structural property at the `SigningKey` layer to keep the
+    /// pangolin-chain → pangolin-crypto dependency surface minimal —
+    /// the chain crate does not need `DeviceKey` for this test.
     #[test]
     fn structural_property_distinct_seeds_distinct_signatures() {
         let s1 = SigningKey::from_seed([0x11; 32]);

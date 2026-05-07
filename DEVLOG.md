@@ -257,3 +257,402 @@ Plus `tests/two_vault_roundtrip.rs::convergence` updated to assert that B's pull
 10. `cargo deny check` — advisories ok, bans ok, licenses ok, sources ok
 11. `cargo build --workspace --release` clean
 12. `pangolin-cli --help` lists `status`, `publish`, `pull` and the new `--allow-insecure-rpc` flag
+
+## 2026-05-07 · P9 — pangolin-cli resolve (Conflicts & Resolve EPIC)  ✅ SIGNOFF
+
+Plan at `docs/issue-plans/P9.md` Kelvin-approved with seven locked
+answers (Q1: multi-resolve for N-way forks APPROVED, no
+`demote_orphan_heads`; Q2: ship without concurrent-resolve race
+guard; Q6: `read_payload_plaintext_for_resolve` documented bypass
+APPROVED; Q7: pre-publish chain re-pull APPROVED; Q3/Q4/Q5: full
+hex revision-id, tombstone-of-tombstone, `--dry-run` ships).
+Ship six commits on `issue/P9-resolve` branch from baseline tip
+`101c1c3`.
+
+**P9-1.** `Vault::clear_frozen(account_id, chosen_revision_id)`
+clears `frozen_pending_resolve` AND advances `head_revision_id`
+in one `BEGIN IMMEDIATE … COMMIT` transaction.
+`Vault::read_payload_plaintext_for_resolve(account_id,
+revision_id)` is the documented freeze-guard bypass for the
+resolve flow's plaintext re-seal step (loud docstring; single
+in-process caller). Cross-account substitution collapses to
+`AccountNotFound` (no oracle). 7 tests added.
+
+**P9-2.** New `crate::conflict` module hosts `ConflictReport {
+account_id, heads, frozen }`. `Vault::list_conflicts()` joins
+fork state and freeze state via union-then-dedup, sorted by
+`account_id` byte-order ASC. Surfaces all four state combinations
+(forked / frozen / both / neither). 6 tests added.
+
+**P9-3.** clap surface for `pangolin-cli resolve --account-id
+<hex> --keep <hex> [--yes] [--dry-run] [--account|--keystore-path]
+[--vault-password] [--keystore-password]`. Custom value parsers
+`HexAccountId` / `HexRevisionId` reject non-64-char or non-hex
+input at clap-validation time per Q3 (full hex, no prefix).
+`commands/resolve.rs` handler opens the vault, validates the
+chosen head locally, prompts for confirmation (skippable via
+`--yes`), builds the adapter, dispatches to
+`sync::resolve_one`. 9 clap-shape tests added.
+
+**P9-4.** Full `sync::resolve_one` body. Flow: validate `--keep`
+is a current head → pre-publish re-pull (Q7) → re-validate heads
+(`ChainMovedDuringResolve` if a NEW head appeared) →
+`Vault::build_merge_payload_for_resolve` (the new helper that
+composes `read_payload_plaintext_for_resolve` + `seal_snapshot` /
+`seal_tombstone` per A2/A5; plaintext NEVER leaves the store
+crate) → `build_signed_revision` → A3 pre-publish canonical-hash
+scan → publish (or skip per A3 already-on-chain) →
+`ingest_chain_revision` → `clear_frozen` → advance
+`last_pulled_block`. `--dry-run` short-circuits at the canonical
+hash and prints `would publish revision <hex>`. 7 tests added.
+
+**P9-5.** Renames the existing `convergence` integration test to
+`convergence_freezes_on_pull` (the post-P8-CRIT-1 freeze remains
+the expected pre-resolve PoC behavior). New
+`convergence_after_resolve` test pins the simple two-handle
+convergence flow per P9 plan §A4: A publishes → B pulls
+(frozen) → B runs `resolve` against B's local genesis (the only
+locally-decryptable head) → B's freeze is CLEAR. Adds E2E-004
+entry to `E2E_TESTS.md` with both automated + manual paths.
+
+**P9-6.** This DEVLOG entry. `THREAT_MODEL.md` rows 12–17 added
+to the `pangolin-cli` section: 12 (forged resolve), 13 (replay
+of an old resolve), 14 (frozen flag cleared without publish),
+15 (HIGH-1 attacker-controlled head adoption — UX-only mitigation
+acknowledged), 16 (`read_payload_plaintext_for_resolve` bypass —
+loud-docstring mitigation per Q6), 17 (concurrent-resolve race
+per A7 / Q2 — ship without).
+
+**Test count delta:** 253 → 282 lib tests (+29). New tests:
+
+- `pangolin-store::vault::tests::clear_frozen_advances_head_and_clears_flag`
+- `pangolin-store::vault::tests::clear_frozen_idempotent_on_already_clean`
+- `pangolin-store::vault::tests::clear_frozen_rejects_unknown_revision`
+- `pangolin-store::vault::tests::clear_frozen_rejects_unknown_account`
+- `pangolin-store::vault::tests::read_payload_plaintext_for_resolve_bypasses_freeze_guard`
+- `pangolin-store::vault::tests::read_payload_plaintext_for_resolve_requires_unlocked_vault`
+- `pangolin-store::vault::tests::read_payload_plaintext_for_resolve_rejects_wrong_account_id`
+- `pangolin-store::conflict::tests::list_conflicts_empty_on_clean_vault`
+- `pangolin-store::conflict::tests::list_conflicts_lists_only_forked`
+- `pangolin-store::conflict::tests::list_conflicts_lists_only_frozen`
+- `pangolin-store::conflict::tests::list_conflicts_lists_forked_and_frozen`
+- `pangolin-store::conflict::tests::list_conflicts_handles_frozen_with_single_head`
+- `pangolin-store::conflict::tests::list_conflicts_dedup_when_account_is_both_forked_and_frozen`
+- `pangolin-cli::cli::tests::resolve_parses_with_minimum_args`
+- `pangolin-cli::cli::tests::resolve_requires_account_id`
+- `pangolin-cli::cli::tests::resolve_requires_keep`
+- `pangolin-cli::cli::tests::resolve_account_id_must_be_64_hex_chars`
+- `pangolin-cli::cli::tests::resolve_keep_must_be_64_hex_chars`
+- `pangolin-cli::cli::tests::resolve_account_id_rejects_non_hex`
+- `pangolin-cli::cli::tests::resolve_dry_run_flag_parses`
+- `pangolin-cli::cli::tests::resolve_yes_flag_parses`
+- `pangolin-cli::cli::tests::resolve_account_and_keystore_path_conflict`
+- `pangolin-cli::sync::tests::resolve_publishes_merge_revision`
+- `pangolin-cli::sync::tests::resolve_clears_freeze_on_success`
+- `pangolin-cli::sync::tests::resolve_fails_cleanly_on_publish_error`
+- `pangolin-cli::sync::tests::resolve_idempotent_after_partial_failure`
+- `pangolin-cli::sync::tests::resolve_chain_moved_during_resolve_aborts_cleanly`
+- `pangolin-cli::sync::tests::dry_run_does_not_publish_or_clear`
+- `pangolin-cli::sync::tests::resolve_rejects_non_head_revision`
+
+Plus integration: `tests/two_vault_roundtrip.rs::convergence_after_resolve` (new) + `convergence_freezes_on_pull` (rename of `convergence`).
+
+**Critical invariants verified at the SIGNOFF tip:**
+
+1. `cargo tree -p pangolin-crypto | grep -ci serde` → 0 (HIGH-1 holds)
+2. No new `unsafe`; `forbid(unsafe_code)` unconditional in pangolin-cli (P8 MED-4)
+3. No plaintext on disk — `read_payload_plaintext_for_resolve` returns plaintext to RAM only; `build_merge_payload_for_resolve` re-seals in RAM and returns ciphertext
+4. Append-only state — `clear_frozen` UPDATEs only the freeze flag + head_revision_id; no revision row is ever mutated
+5. Per-account atomicity — resolve = "publish then ingest+clear"; failed clear after publish is recoverable (the next pull's arm-2 catches via tx_hash) and re-running resolve with the stale `--keep` surfaces `NotAHead` cleanly
+6. `cargo fmt --all --check` clean
+7. `cargo clippy --workspace --all-targets -- -D warnings` clean
+8. `cargo test --workspace --lib` — 282/282 passing (253 baseline + 29 new)
+9. `cargo test --workspace --tests` — integration tests pass (4 in two_vault_roundtrip; the rest unchanged)
+10. `cargo audit` — 2 pre-existing unmaintained advisories documented in `deny.toml` (RUSTSEC-2024-0388 etc.) — no new advisories
+11. `cargo deny check` — advisories ok, bans ok, licenses ok, sources ok
+12. `cargo build --workspace --release` clean
+
+**Open questions / acknowledged gaps:**
+
+- The convergence test's full multi-device single-head pattern
+  requires N resolves under PoC two-key (one per device that has
+  ingested the foreign chain row but cannot decrypt it because the
+  AEAD nonce isn't on chain). MVP-1's switch to D-006's single-key
+  model + nonce-on-chain semantics closes the multi-resolve gap.
+  The test pins the simple two-handle case where ONE resolve
+  clears B's freeze; the multi-resolve N-way case is documented
+  as expected PoC behavior per Q1.
+- Concurrent-resolve race ships without an interactive freshness
+  guard per Q2 — recovery is mechanical (re-resolve on next pull).
+- `read_payload_plaintext_for_resolve` is documented as the only
+  freeze-guard bypass; alternatives (re-supply password as fresh
+  proof) were rejected per the rationale in P9 plan §A8.
+
+Unblocks **P10** (tombstone-aware deletes — P9 ships the
+structural is_tombstone round-trip; P10 owns full semantics) and
+**P11** (E2E recorded screencast). The `pangolin-cli` binary is
+now at four subcommands: `status`, `publish`, `pull`, `resolve`.
+
+## 2026-05-07 · P9 fix-pass — §16.5 audit findings (HIGH-1, MED-1, MED-2, MED-3, MED-4, LOW-1)  ✅ SIGNOFF
+
+Per Kelvin's "100% clean" bar, every actionable finding from the
+P9 §16.5 audit is closed with code + tests. Single commit on
+`issue/P9-resolve` from baseline tip `6d6bc28`.
+
+**HIGH-1 — A3 partial-failure recovery is structurally
+non-functional.** Auditor's exact text: "the user is permanently
+stuck — frozen account, unresolvable." Each `resolve_one`
+invocation generated a fresh ephemeral `DeviceKey` AND a fresh
+AEAD nonce, so the canonical hash differed every run; the chain
+event from a prior partially-completed run could not be matched
+on retry.
+
+Fix: new `pending_merges` SQLite table stashes the
+merge-revision-build state (ephemeral `DeviceKey` secret seed,
+AEAD nonce, AEAD ciphertext, schema_version) BEFORE
+`adapter.publish`. Retry calls `Vault::take_pending_merge`,
+reconstructs the SAME `DeviceKey` via `DeviceKey::from_seed`, and
+re-uses the SAME nonce + ciphertext — so the canonical hash is
+bit-equal across retries and the existing A3 idempotency scan
+inside `sync::resolve_one` matches the chain event from the prior
+run. After `clear_frozen` succeeds the stash row is deleted via
+`Vault::clear_pending_merge`. Schema migration is idempotent
+(`CREATE TABLE IF NOT EXISTS` + a defensive
+`migrate_pending_merges_table` helper that runs on every
+`Vault::open` for legacy vaults).
+
+**MED-1 — multi-resolve invariant untested.** Added
+`resolve_against_three_heads_keeps_chosen_demotes_others_to_orphans`
+in `tools/pangolin-cli/src/sync.rs::tests`. A 3-head fork
+(`MockChainAdapter` + two synthetic foreign events under the same
+genesis-parent) resolved with `--keep <local_genesis>` produces a
+merge revision pointing at `local_genesis`; the post-resolve
+`account_heads(account_id)` returns the merge revision PLUS the
+two unchosen orphans (length 3, not 1). The user re-runs resolve
+to fold each orphan in (PoC two-key Q1 multi-resolve pattern;
+MVP-1's switch to D-006's single-key model closes the gap).
+
+**MED-2 — `clear_frozen` atomicity test dropped.** Added
+`clear_frozen_atomic_under_simulated_crash` in vault.rs. Pinned
+the BEGIN IMMEDIATE wrapper across the freeze-clear +
+head-advance UPDATE pair via a transaction-rollback control test
+(direct SQL UPDATE inside an unchecked_transaction that is
+dropped without commit) followed by the `clear_frozen` success
+path's combined-write assertion. We did not use
+`rusqlite::update_hook` per the audit's fallback hint — the API
+is not stable across rusqlite versions and the
+transaction-rollback discipline is the relevant invariant
+anyway.
+
+**MED-3 — `clear_frozen` doesn't validate `chosen_revision_id`
+is a current head.** New head-membership check inside
+`clear_frozen`'s SQL transaction (`BEGIN IMMEDIATE`) BEFORE the
+UPDATE — uses the same `NOT EXISTS` predicate that
+`account_heads` uses for the multi-head detector, scoped by
+`account_id`. New `StoreError::NotAHead {account_id, chosen,
+current_heads}` variant fires if the supplied revision exists
+but isn't a current head. Test:
+`clear_frozen_rejects_non_head_revision_id` (a UPDATE-demoted
+genesis revision is rejected as non-head). Updated docstring:
+"errors with NotAHead if the supplied revision_id is not a
+current head AT THE TIME of the SQL transaction."
+
+**MED-4 — `--dry-run` mutates local state via pre-publish pull.**
+`sync::resolve_one` now short-circuits `pull_all` on `dry_run =
+true`. The dry-run output retains the canonical-hash computation
+but does not advance `last_pulled_block` or ingest any chain
+rows. Updated existing test `dry_run_does_not_publish_or_clear`
+to also assert `last_pulled_block` is UNCHANGED post-call.
+
+**LOW-1 — `__test_synthesize_sibling_revision` is `pub` without
+`cfg`.** Added `#[cfg(any(test, feature = "test-utilities"))]`
+gate per the docstring's existing promise. The
+`tests/e2e.rs` integration test (which links the crate
+externally and uses the helper) is annotated with
+`required-features = ["test-utilities"]` in pangolin-store's
+Cargo.toml so cargo skips it when the feature is disabled and
+includes it when `--features test-utilities` is set. Production
+builds of the workspace binaries (`chaincli`, `pangolin-cli`)
+do not link against the helper.
+
+**LOW-2, LOW-3, INFO-1 — observation-class.** Per audit
+guidance: LOW-2 is inherited from P8 (no new code change);
+LOW-3 ("AlreadyOnChain user message dead code") naturally
+closes via HIGH-1's stash mechanism — with the canonical-hash
+determinism the stash provides, the AlreadyOnChain branch
+becomes reachable when the prior run's publish landed on chain
+but `clear_frozen` was killed; INFO-1 is observation-only.
+
+**`THREAT_MODEL.md` row #13** rewritten to honestly describe the
+stash discipline, the at-rest model for the seed BLOB, and the
+test list pinning the recovery semantics.
+
+**Test count delta:** 282 → 290 lib tests workspace-wide (+8):
+
+1. `stash_take_clear_round_trip` (vault.rs) — basic API.
+2. `stash_persists_across_close_open` (vault.rs) — durability.
+3. `take_returns_none_for_nonexistent_account` (vault.rs).
+4. `pending_merge_zeroizes_secret_on_drop` (vault.rs) —
+   structural Drop discipline on `SecretBytes`.
+5. `clear_frozen_rejects_non_head_revision_id` (vault.rs) —
+   MED-3.
+6. `clear_frozen_atomic_under_simulated_crash` (vault.rs) —
+   MED-2.
+7. `resolve_against_three_heads_keeps_chosen_demotes_others_to_orphans`
+   (sync.rs) — MED-1.
+8. `resolve_idempotent_after_partial_failure_via_stash`
+   (sync.rs) — HIGH-1 end-to-end recovery.
+
+The existing `dry_run_does_not_publish_or_clear` test was
+extended with a `last_pulled_block` assertion (MED-4) without
+counting as a separate addition.
+
+**Critical invariants verified at the SIGNOFF tip:**
+
+1. `cargo tree -p pangolin-crypto | grep -ci serde` → 0 (HIGH-1
+   bound holds; no new transitive deps from the fix-pass).
+2. No new `unsafe`. The stash table stores secrets at rest but
+   doesn't introduce unsafe.
+3. No plaintext on disk. The stashed `enc_payload` is AEAD
+   ciphertext; the `device_secret` is an Ed25519 secret seed
+   (NOT vault plaintext). The AEAD-seal happens inside
+   `Vault::build_merge_payload_for_resolve` BEFORE the stash.
+4. Per-chunk all-or-nothing in pull. Unchanged.
+5. Per-account atomicity. Strengthened by the stash + by
+   MED-3's head-membership check inside `clear_frozen`'s
+   transaction.
+6. `cargo fmt --all --check` clean.
+7. `cargo clippy --workspace --all-targets --features
+   pangolin-store/test-utilities -- -D warnings` clean.
+8. `cargo test --workspace --lib --features
+   pangolin-store/test-utilities` — 290/290 passing (282
+   baseline + 8 new).
+9. `cargo test --workspace --tests --features
+   pangolin-store/test-utilities` — integration tests pass.
+10. `cargo build --workspace --release` clean.
+
+**Behaviour-preserving for everyone except the auditor's
+finding:** existing tests all continue to pass. The HIGH-1
+stash adds two new methods (`stash_pending_merge`,
+`take_pending_merge`, `clear_pending_merge`) and one new struct
+(`PendingMerge`); the existing `Vault::build_merge_payload_for_resolve`
+signature was extended (returning a 4-tuple including the
+nonce instead of a 3-tuple) — internal-only call inside
+`sync::resolve_one`.
+
+## 2026-05-07 · P9 fix-pass 2 — close HIGH-1 fully + orphan stash prune + cosmetic  ✅ SIGNOFF
+
+The `2d13fea` first fix-pass closed HIGH-1 for the publish-FAILED
+retry case but the re-audit identified that the publish-SUCCEEDED-
+but-`clear_frozen`-killed case was still unrecoverable. Plus two
+new findings (MEDIUM-2 orphan stash accumulation, LOW-2 dry-run
+staleness disclosure) and one cosmetic (LOW-1 stale comment about
+`DeviceKey::from_seed`).
+
+**HIGH-1 deeper fix — kill-after-publish-success recovery.** The
+re-auditor's structural diagnosis: in the prior `resolve_one`, the
+sequence `pull_all → chain_moved guard → take_pending_merge` was
+fatal for the publish-succeeded-but-killed scenario. On retry,
+`pull_all` ingested the prior merge revision as a foreign event,
+advancing the head set; `chain_moved = post_pull_heads.iter().any(|h|
+!pre_pull_heads.contains(h))` fired (the just-ingested merge IS a
+new head); `ChainMovedDuringResolve` aborted BEFORE the stash was
+consulted; user permanently stuck.
+
+Fix: re-ordered `sync::resolve_one`. `take_pending_merge` runs FIRST
+(unconditionally), THEN `pull_all`, THEN a stash-vs-chain canonical-
+hash match against the post-pull LOCAL revisions table. If the
+stash's deterministic canonical hash matches a locally-ingested row
+with a populated chain anchor, we take the `AlreadyOnChain` path:
+`clear_frozen` (advances `head_revision_id` to the merge-rev id and
+clears the freeze flag in one transaction) + `clear_pending_merge`
+(drop the stash row). The `chain_moved` and `chosen-still-a-head`
+guards fire only when no stash matches — i.e., when the chain has
+moved BEYOND the user's stashed-`--keep` target. Critical
+correctness point: `clear_frozen` does NOT decrypt the local row;
+it only validates head-membership and runs the UPDATE pair, so
+the foreign-ingested row's placeholder zero `enc_nonce` is not a
+problem for the recovery path.
+
+We use the LOCAL revisions table (post-pull) rather than re-calling
+`adapter.pull_since` because `pull_all` already advanced
+`last_pulled_block` past the merge event's block, so a fresh
+`pull_since(last_pulled_block)` would return an empty view. The
+local revisions table is the canonical post-pull source of truth,
+and `pull_all` itself signature-verifies the foreign event's
+`device_id` canonical form (defense-in-depth against forged
+streams) before ingesting — so a stash-match against a locally-
+ingested row is no weaker than a stash-match against the chain
+view.
+
+**MEDIUM-2 (new) — orphan stash accumulation.** Added
+`Vault::prune_orphan_pending_merges(account_id) -> Result<usize>`.
+Iterates `pending_merges` rows for `account_id` inside a single
+SQL transaction (collects current heads via the `account_heads`
+predicate, scans stash rows, deletes any whose `target_head_id`
+is not a current head). Called from:
+
+- `pull_all` after each chunk's per-account ingest sequence
+  completes (per-chunk all-or-nothing discipline preserved — the
+  prune runs in its own transaction after the chunk's events
+  have committed and the checkpoint has advanced),
+- `resolve_one` alongside `take_pending_merge` at the top of the
+  flow (skipped on dry-run for purity).
+
+Failures are non-fatal — logged + skipped, the next prune
+invocation retries. Three new tests:
+`prune_orphan_pending_merges_removes_non_head_targets`,
+`prune_no_op_when_all_targets_are_heads`, `prune_no_op_on_empty_table`.
+
+**LOW-1 (re-audit) — stale comment in `crates/pangolin-chain/src/evm.rs`.**
+The comment in `structural_property_distinct_seeds_distinct_signatures`
+claimed "we can't construct `DeviceKey::from_seed` (no such public
+API)". The first P9 fix-pass made `DeviceKey::from_seed` public.
+Updated the comment to reflect the new state: "now public (added
+by P9 fix-pass HIGH-1), but this test predates that surface and
+intentionally probes the structural property at the `SigningKey`
+layer to keep the pangolin-chain → pangolin-crypto dependency
+surface minimal." Test logic unchanged — uses `SigningKey::from_seed`
+directly per the auditor's read.
+
+**LOW-2 (re-audit) — dry-run output omits staleness disclosure.**
+The `--dry-run` path in `sync::resolve_one` skips the pre-publish
+chain re-pull (per MED-4 hygiene), so the canonical hash printed
+to the user is computed against a possibly-stale local view of the
+chain. Added an explicit disclosure line BEFORE the canonical-hash
+print in `tools/pangolin-cli/src/commands/resolve.rs`'s dry-run
+branch: "pre-publish chain re-pull SKIPPED (dry-run mode); current
+local view may be stale." Wet-path output unchanged.
+
+**`THREAT_MODEL.md` row #13** rewritten to honestly describe the
+now-fully-functional kill-after-publish-success recovery (the
+re-ordered `resolve_one`'s stash-vs-local match path), the
+`prune_orphan_pending_merges` mechanism, and the updated test list.
+
+**Test count delta:** 290 → 294 lib tests workspace-wide (+4):
+
+1. `prune_orphan_pending_merges_removes_non_head_targets` (vault.rs).
+2. `prune_no_op_when_all_targets_are_heads` (vault.rs).
+3. `prune_no_op_on_empty_table` (vault.rs).
+4. `resolve_recovers_from_kill_after_publish_success` (sync.rs)
+   — the kill-after-publish-success end-to-end recovery test
+   that the re-auditor explicitly called out as missing.
+
+**Critical invariants verified at the P9 fix-pass 2 SIGNOFF tip:**
+
+1. `cargo tree -p pangolin-crypto | grep -ci serde` → 0 (HIGH-1
+   bound holds; no new transitive deps from the fix-pass).
+2. No new `unsafe`.
+3. No plaintext on disk. The stash semantics + the freeze-guard
+   bypass discipline are unchanged.
+4. Per-chunk all-or-nothing in pull. Preserved — the prune runs
+   in its own transaction AFTER the chunk's events have
+   committed and the checkpoint has advanced; failures are
+   logged but not fatal.
+5. Per-account atomicity. Strengthened (the stash-match path
+   composes `clear_frozen`'s atomic head-advance with the stash
+   delete, all under per-account scoping).
+6. `cargo fmt --all --check` clean.
+7. `cargo clippy --workspace --all-targets -- -D warnings` clean.
+8. `cargo test --workspace --lib` — 294/294 passing (290
+   baseline + 4 new).
