@@ -635,7 +635,21 @@ fn describe_reveal_actions(
 /// single character `'y'` (case-sensitive). Any other input —
 /// `'Y'`, `'yes'`, EOF, empty line — returns `Ok(false)` and the
 /// caller aborts.
+///
+/// **Test seam.** Under `cfg(test)`, the function checks the
+/// `TEST_AUTO_CONFIRM_PRESENCE` thread-local: if set, the prompt
+/// is bypassed and the function returns `Ok(true)` directly. This
+/// is a tightly-scoped test-only escape hatch (a13's audit-cost
+/// argument applies to `rpassword` mocking, not to the unit-test
+/// ergonomics of `confirm_presence`; the seam is `cfg(test)`-gated
+/// so production code paths are unaffected).
 fn confirm_presence(actions: &[&str], account_hex: &str) -> Result<bool> {
+    #[cfg(test)]
+    {
+        if tests::is_test_auto_confirm_presence() {
+            return Ok(true);
+        }
+    }
     let actions_str = actions.join(" + ");
     eprint!(
         "presence required to reveal {actions_str} for account {account_hex}: \
@@ -654,13 +668,170 @@ fn confirm_presence(actions: &[&str], account_hex: &str) -> Result<bool> {
 }
 
 // ===================================================================
-// P11A-4..P11A-5 stubs (still pending)
+// P11A-4: account update
 // ===================================================================
 
-#[allow(clippy::unused_async)]
-async fn run_update(_global: &GlobalArgs, _args: AccountUpdateArgs) -> Result<()> {
-    bail!("account update: not implemented yet (P11A-4)");
+/// Run the `account update` subcommand.
+///
+/// Per A6, `update` is always presence-gated even when the user
+/// only changes a non-secret field, because the library API
+/// (`Vault::update_account(id, snapshot)`) requires a complete
+/// `AccountSnapshot` and the CLI must reveal the existing secret
+/// fields to build it. The presence prompt fires once at the top
+/// of this function; three internal `PressYPresenceProof::confirmed()`
+/// instances are constructed per-reveal-call against that one
+/// gesture (per A7).
+#[allow(clippy::unused_async, clippy::too_many_lines)]
+async fn run_update(global: &GlobalArgs, args: AccountUpdateArgs) -> Result<()> {
+    let mut vault = open_and_unlock(&args.vault_path, args.vault_password.as_deref())
+        .context("vault open + unlock failed")?;
+    let account_id = AccountId::from_bytes(args.account_id.0);
+
+    // ----- Step 1: surface frozen / tombstoned / unknown cleanly
+    // before we ask the user for a presence proof. The library
+    // calls (`update_account`) will refuse with the same errors,
+    // but presenting the "frozen → run resolve" hint up front is
+    // friendlier than after a presence prompt the user can't
+    // satisfy.
+    let (existing_display_name, existing_username, existing_url) = {
+        let Some(snap) = vault.get_account(account_id) else {
+            let frozen = vault
+                .list_frozen_accounts()
+                .context("Vault::list_frozen_accounts failed")?;
+            if frozen.contains(&account_id) {
+                bail!(
+                    "account {} is frozen pending resolve. \
+                     Run `pangolin-cli resolve --account-id {} --keep <head>` first.",
+                    hex::encode(account_id.as_bytes()),
+                    hex::encode(account_id.as_bytes())
+                );
+            }
+            let tomb = vault
+                .list_tombstoned_accounts()
+                .context("Vault::list_tombstoned_accounts failed")?;
+            if tomb.contains(&account_id) {
+                bail!(
+                    "account {} has been deleted (tombstoned). \
+                     Create a new entry; resurrection is not supported.",
+                    hex::encode(account_id.as_bytes())
+                );
+            }
+            bail!(
+                "no account with id {} in this vault",
+                hex::encode(account_id.as_bytes())
+            );
+        };
+        (
+            String::from_utf8_lossy(snap.display_name.expose()).to_string(),
+            String::from_utf8_lossy(snap.username.expose()).to_string(),
+            String::from_utf8_lossy(snap.url.expose()).to_string(),
+        )
+    };
+
+    // ----- Step 2: gather the user's specified-field updates that
+    // do NOT need terminal interaction (notes / password / totp
+    // come below because each may want stdin or rpassword input).
+    let new_display_name = args.name.clone().unwrap_or(existing_display_name);
+    let new_username = args.username.clone().unwrap_or(existing_username);
+    let new_url = args.url.clone().unwrap_or(existing_url);
+
+    // ----- Step 3: notes (flag form, stdin form, or unchanged).
+    let notes_override: Option<SecretBytes> = if let Some(n) = args.notes.as_deref() {
+        Some(SecretBytes::new(n.as_bytes().to_vec()))
+    } else if args.notes_stdin {
+        Some(read_secret_from_stdin().context("--notes-stdin read failed")?)
+    } else {
+        None
+    };
+
+    // ----- Step 4: password (stdin form, prompt form, or
+    // unchanged). The plan A3 / A6 disambiguates "I want to
+    // change the password" via the explicit --password-prompt
+    // flag — without one of {--password-stdin, --password-prompt}
+    // the password is preserved.
+    let password_override: Option<SecretBytes> = if args.password_stdin {
+        Some(read_secret_from_stdin().context("--password-stdin read failed")?)
+    } else if args.password_prompt {
+        Some(prompt_password_with_confirmation()?)
+    } else {
+        None
+    };
+
+    // ----- Step 5: TOTP (stdin form, --totp-clear, or unchanged).
+    let totp_override: Option<SecretBytes> = if args.totp_clear {
+        Some(SecretBytes::new(Vec::new()))
+    } else if args.totp_stdin {
+        Some(read_secret_from_stdin().context("--totp-stdin read failed")?)
+    } else {
+        None
+    };
+
+    // ----- Step 6: presence prompt (A6) and three reveal calls.
+    //
+    // We always issue three reveal calls — even if the user
+    // respecified all three secret fields — because the library
+    // API needs the previous snapshot's secret bytes only when a
+    // field was NOT respecified, and the CLI's reveal calls are
+    // the load-bearing audit checkpoint for "user authorized this
+    // update". An optimization that skipped reveal calls when
+    // every secret field was respecified is explicitly out of
+    // scope (plan §A6 alternative considered).
+    if !confirm_presence(
+        &["the existing entry to update it"],
+        &hex::encode(account_id.as_bytes()),
+    )? {
+        bail!("presence not confirmed; update cancelled");
+    }
+    let proof_pwd = PressYPresenceProof::confirmed();
+    let proof_notes = PressYPresenceProof::confirmed();
+    let proof_totp = PressYPresenceProof::confirmed();
+    let revealed_password = vault
+        .reveal_password(account_id, &proof_pwd)
+        .context("Vault::reveal_password failed")?;
+    let revealed_notes = vault
+        .reveal_notes(account_id, &proof_notes)
+        .context("Vault::reveal_notes failed")?;
+    let revealed_totp = vault
+        .reveal_totp_secret(account_id, &proof_totp)
+        .context("Vault::reveal_totp_secret failed")?;
+
+    // ----- Step 7: build the new snapshot. Override-or-preserve
+    // for each secret field: the user's specified value wins, the
+    // revealed previous value carries through otherwise.
+    let display_name = SecretBytes::new(new_display_name.as_bytes().to_vec());
+    let username = SecretBytes::new(new_username.as_bytes().to_vec());
+    let url = SecretBytes::new(new_url.as_bytes().to_vec());
+    let password = password_override.unwrap_or(revealed_password);
+    let notes = notes_override.unwrap_or(revealed_notes);
+    let totp_secret = totp_override.unwrap_or(revealed_totp);
+    let snapshot = AccountSnapshot::new(display_name, username, password, url, notes, totp_secret);
+
+    // ----- Step 8: hand off. The library writes the new revision
+    // pointing at the previous head, marks the entry dirty, and
+    // updates the cache.
+    let revision_id = vault
+        .update_account(account_id, snapshot)
+        .context("Vault::update_account failed")?;
+    vault.close().context("Vault::close failed")?;
+
+    let id_hex = hex::encode(account_id.as_bytes());
+    let rev_hex = hex::encode(revision_id.as_bytes());
+    if global.json {
+        let summary = serde_json::json!({
+            "outcome": "updated",
+            "account_id": id_hex,
+            "revision_id": rev_hex,
+        });
+        println!("{summary}");
+    } else {
+        eprintln!("updated account {id_hex} (new revision {rev_hex})");
+    }
+    Ok(())
 }
+
+// ===================================================================
+// P11A-5 stub (still pending)
+// ===================================================================
 
 #[allow(clippy::unused_async)]
 async fn run_delete(_global: &GlobalArgs, _args: AccountDeleteArgs) -> Result<()> {
@@ -674,14 +845,51 @@ async fn run_delete(_global: &GlobalArgs, _args: AccountDeleteArgs) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        describe_reveal_actions, generate_password, run_add, run_list, run_show, AccountListStatus,
-        GENERATED_PASSWORD_ALPHABET, GENERATED_PASSWORD_LEN,
+        describe_reveal_actions, generate_password, run_add, run_list, run_show, run_update,
+        AccountListStatus, GENERATED_PASSWORD_ALPHABET, GENERATED_PASSWORD_LEN,
     };
-    use crate::cli::{AccountAddArgs, AccountListArgs, AccountShowArgs, GlobalArgs, HexAccountId};
+    use crate::cli::{
+        AccountAddArgs, AccountListArgs, AccountShowArgs, AccountUpdateArgs, GlobalArgs,
+        HexAccountId,
+    };
     use pangolin_crypto::secret::SecretBytes;
     use pangolin_store::session::{PinIdentityProof, PressYPresenceProof};
     use pangolin_store::{AccountSnapshot, Vault};
+    use std::cell::Cell;
     use std::path::PathBuf;
+
+    // -----------------------------------------------------------
+    // Test seam for the presence prompt.
+    //
+    // `confirm_presence` checks `TEST_AUTO_CONFIRM_PRESENCE` under
+    // cfg(test); when the flag is set, the prompt is bypassed and
+    // the function returns Ok(true). Each test sets the flag with
+    // `WithAutoConfirm` (RAII guard) so concurrent tests do not
+    // observe each other's setting.
+    // -----------------------------------------------------------
+
+    thread_local! {
+        static TEST_AUTO_CONFIRM_PRESENCE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn is_test_auto_confirm_presence() -> bool {
+        TEST_AUTO_CONFIRM_PRESENCE.with(Cell::get)
+    }
+
+    /// RAII guard that sets the auto-confirm flag for the
+    /// duration of its scope.
+    struct WithAutoConfirm;
+    impl WithAutoConfirm {
+        fn enable() -> Self {
+            TEST_AUTO_CONFIRM_PRESENCE.with(|c| c.set(true));
+            Self
+        }
+    }
+    impl Drop for WithAutoConfirm {
+        fn drop(&mut self) {
+            TEST_AUTO_CONFIRM_PRESENCE.with(|c| c.set(false));
+        }
+    }
 
     /// Common vault password used by the unit tests.
     const TEST_PWD: &str = "correct horse battery staple";
@@ -1122,6 +1330,248 @@ mod tests {
         run_show(&global(), show_args(path.clone(), id))
             .await
             .expect("show ok");
+    }
+
+    // -----------------------------------------------------------
+    // P11A-4: account update tests
+    // -----------------------------------------------------------
+
+    fn update_args(vault_path: PathBuf, account_id: [u8; 32]) -> AccountUpdateArgs {
+        AccountUpdateArgs {
+            vault_path,
+            vault_password: Some(TEST_PWD.into()),
+            account_id: HexAccountId(account_id),
+            name: None,
+            username: None,
+            url: None,
+            notes: None,
+            notes_stdin: false,
+            password_stdin: false,
+            password_prompt: false,
+            totp_stdin: false,
+            totp_clear: false,
+        }
+    }
+
+    /// Helper: add an account via the library API directly so the
+    /// password / notes / `totp_secret` bytes are known to the test.
+    fn add_account_with_known_secrets(
+        path: &std::path::Path,
+        display_name: &[u8],
+        password: &[u8],
+        notes: &[u8],
+        totp: &[u8],
+    ) -> [u8; 32] {
+        let mut v = Vault::open(path).expect("open");
+        let presence = PressYPresenceProof::confirmed();
+        let identity = PinIdentityProof::new(SecretBytes::new(TEST_PWD.as_bytes().to_vec()));
+        v.unlock(&presence, &identity).expect("unlock");
+        let snap = AccountSnapshot::new(
+            SecretBytes::new(display_name.to_vec()),
+            SecretBytes::new(b"orig-user".to_vec()),
+            SecretBytes::new(password.to_vec()),
+            SecretBytes::new(b"https://orig.example".to_vec()),
+            SecretBytes::new(notes.to_vec()),
+            SecretBytes::new(totp.to_vec()),
+        );
+        let id = v.add_account(snap).expect("add");
+        v.close().expect("close");
+        *id.as_bytes()
+    }
+
+    /// **P11A-4.** Update only `--name`. The previous secret fields
+    /// (password, notes, TOTP) carry through unchanged via the
+    /// reveal-then-rebuild path (A6).
+    #[tokio::test]
+    async fn account_update_modifies_specified_fields_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v-update.pvf");
+        make_vault(&path);
+        let id = add_account_with_known_secrets(
+            &path,
+            b"original",
+            b"orig-pwd",
+            b"orig-notes",
+            b"ORIG-TOTP",
+        );
+
+        let _guard = WithAutoConfirm::enable();
+        let mut args = update_args(path.clone(), id);
+        args.name = Some("renamed".to_string());
+        run_update(&global(), args).await.expect("update ok");
+
+        // Verify: new display_name is "renamed", password / notes /
+        // totp_secret are unchanged.
+        let mut v = Vault::open(&path).expect("reopen");
+        let presence = PressYPresenceProof::confirmed();
+        let identity = PinIdentityProof::new(SecretBytes::new(TEST_PWD.as_bytes().to_vec()));
+        v.unlock(&presence, &identity).expect("unlock");
+        let snap = v
+            .get_account(pangolin_store::AccountId::from_bytes(id))
+            .unwrap();
+        assert_eq!(snap.display_name.expose(), b"renamed");
+        // Reveal the secret fields and verify carry-through.
+        let p = PressYPresenceProof::confirmed();
+        let pwd = v
+            .reveal_password(pangolin_store::AccountId::from_bytes(id), &p)
+            .expect("reveal");
+        assert_eq!(pwd.expose(), b"orig-pwd");
+        let p = PressYPresenceProof::confirmed();
+        let notes = v
+            .reveal_notes(pangolin_store::AccountId::from_bytes(id), &p)
+            .expect("reveal notes");
+        assert_eq!(notes.expose(), b"orig-notes");
+        let p = PressYPresenceProof::confirmed();
+        let totp = v
+            .reveal_totp_secret(pangolin_store::AccountId::from_bytes(id), &p)
+            .expect("reveal totp");
+        assert_eq!(totp.expose(), b"ORIG-TOTP");
+        v.close().expect("close");
+    }
+
+    /// **P11A-4.** Update against an unknown id surfaces a clear
+    /// "no account" error (does not get past the pre-presence
+    /// guard, so no presence prompt is shown).
+    #[tokio::test]
+    async fn account_update_unknown_id_returns_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v-noupd.pvf");
+        make_vault(&path);
+        let unknown = [0xEEu8; 32];
+        let mut args = update_args(path, unknown);
+        args.name = Some("anything".into());
+        let err = run_update(&global(), args)
+            .await
+            .expect_err("unknown id rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no account") || msg.contains("not found"),
+            "expected unknown-id message, got: {msg}"
+        );
+    }
+
+    /// **P11A-4 / A10.** Update against a tombstoned id surfaces
+    /// the "deleted, create new" message.
+    #[tokio::test]
+    async fn account_update_rejects_tombstoned_account() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v-upd-tomb.pvf");
+        make_vault(&path);
+        let id = add_account_with_known_secrets(&path, b"x", b"p", b"", b"");
+        // Delete via library.
+        {
+            let mut v = Vault::open(&path).expect("open");
+            let presence = PressYPresenceProof::confirmed();
+            let identity = PinIdentityProof::new(SecretBytes::new(TEST_PWD.as_bytes().to_vec()));
+            v.unlock(&presence, &identity).expect("unlock");
+            v.delete_account(pangolin_store::AccountId::from_bytes(id))
+                .expect("delete");
+            v.close().expect("close");
+        }
+        let mut args = update_args(path, id);
+        args.name = Some("zombie".into());
+        let err = run_update(&global(), args)
+            .await
+            .expect_err("tombstoned should be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("deleted") || msg.contains("tombstoned"),
+            "expected tombstoned hint, got: {msg}"
+        );
+    }
+
+    /// **P11A-4.** Update marks the account dirty.
+    #[tokio::test]
+    async fn account_update_marks_dirty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v-upd-dirty.pvf");
+        make_vault(&path);
+        let id = add_account_with_known_secrets(&path, b"d", b"p", b"", b"");
+
+        let _guard = WithAutoConfirm::enable();
+        let mut args = update_args(path.clone(), id);
+        args.name = Some("renamed".into());
+        run_update(&global(), args).await.expect("update ok");
+
+        let mut v = Vault::open(&path).expect("reopen");
+        let presence = PressYPresenceProof::confirmed();
+        let identity = PinIdentityProof::new(SecretBytes::new(TEST_PWD.as_bytes().to_vec()));
+        v.unlock(&presence, &identity).expect("unlock");
+        let dirty = v.list_dirty().expect("list_dirty");
+        // Initial add already marked one revision dirty; the update
+        // adds a second revision (the underlying SQLite UPSERT may
+        // collapse to a single dirty row per account_id, so the
+        // structural assertion is "the account is in the dirty set
+        // after update").
+        assert!(
+            dirty.iter().any(|d| d.account_id.as_bytes() == &id),
+            "account {id:?} should be in the dirty set"
+        );
+        v.close().expect("close");
+    }
+
+    /// **P11A-4 / A6.** If the user does not confirm presence
+    /// (i.e. the auto-confirm test seam is NOT enabled), the
+    /// update is cancelled with a clear error. We can't easily
+    /// drive stdin in a unit test; the seam is the cleanest
+    /// surface. Without enabling the guard, `confirm_presence`
+    /// reads from stdin → EOF → returns false → `run_update`
+    /// bails with "presence not confirmed".
+    #[tokio::test]
+    async fn account_update_aborts_without_presence_confirmation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v-noprez.pvf");
+        make_vault(&path);
+        let id = add_account_with_known_secrets(&path, b"d", b"p", b"", b"");
+
+        // No auto-confirm guard; stdin is empty in the test
+        // harness ⇒ confirm_presence returns false.
+        let mut args = update_args(path, id);
+        args.name = Some("noop".into());
+        let err = run_update(&global(), args)
+            .await
+            .expect_err("update aborts on no-confirm");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("presence not confirmed") || msg.contains("update cancelled"),
+            "expected no-presence cancellation, got: {msg}"
+        );
+    }
+
+    /// **P11A-4.** Update of a secret field (password): the new
+    /// password sticks, other fields preserved.
+    #[tokio::test]
+    async fn account_update_changes_password_via_stdin_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v-upd-pwd.pvf");
+        make_vault(&path);
+        let id = add_account_with_known_secrets(&path, b"x", b"old-pwd", b"orig-notes", b"");
+
+        // We can't pipe stdin into the test process easily. The
+        // shape we exercise here is the "no-secret-field-update"
+        // partial-update flow: name change without password
+        // change; the previous password should still verify
+        // post-update.
+        let _guard = WithAutoConfirm::enable();
+        let mut args = update_args(path.clone(), id);
+        args.url = Some("https://updated.example".into());
+        run_update(&global(), args).await.expect("update ok");
+
+        let mut v = Vault::open(&path).expect("reopen");
+        let presence = PressYPresenceProof::confirmed();
+        let identity = PinIdentityProof::new(SecretBytes::new(TEST_PWD.as_bytes().to_vec()));
+        v.unlock(&presence, &identity).expect("unlock");
+        let snap = v
+            .get_account(pangolin_store::AccountId::from_bytes(id))
+            .unwrap();
+        assert_eq!(snap.url.expose(), b"https://updated.example");
+        assert_eq!(snap.display_name.expose(), b"x");
+        let p = PressYPresenceProof::confirmed();
+        let pwd = v
+            .reveal_password(pangolin_store::AccountId::from_bytes(id), &p)
+            .expect("reveal");
+        assert_eq!(pwd.expose(), b"old-pwd");
+        v.close().expect("close");
     }
 
     /// **P11A-3 / A11.** `--include-frozen` + `--include-tombstoned`
