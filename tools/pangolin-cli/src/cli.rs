@@ -99,6 +99,324 @@ pub enum Command {
     /// fresh nonce, publishes a merge revision pointing at the
     /// chosen head, and clears the freeze flag.
     Resolve(ResolveArgs),
+
+    /// Manage credential entries inside a vault: add, list, show,
+    /// update, delete. All operations are local to the vault file;
+    /// no chain calls. Use `pangolin-cli publish` to push the
+    /// resulting changes on chain.
+    Account(AccountArgs),
+}
+
+/// `account` subcommand — wraps the per-verb sub-subcommands.
+///
+/// Per P11A plan §A1 the verbs live under a nested
+/// `pangolin-cli account <verb>` namespace. The flat verbs
+/// (`status`, `publish`, `pull`, `resolve`) stay flat — they are
+/// vault-level / chain-level orchestrators and don't share a noun.
+#[derive(Debug, Args)]
+pub struct AccountArgs {
+    #[command(subcommand)]
+    pub command: AccountCommand,
+}
+
+/// The five `account` sub-subcommands.
+#[derive(Debug, Subcommand)]
+pub enum AccountCommand {
+    /// Add a new credential entry. Generates a fresh per-row
+    /// identifier, seals the credential under the vault key, marks
+    /// the new entry for the next publish run.
+    Add(AccountAddArgs),
+
+    /// List the credential entries in the vault. Default: active
+    /// entries only (no frozen, no deleted). Optional flags surface
+    /// frozen / deleted entries with a status suffix. Never emits
+    /// secret fields.
+    List(AccountListArgs),
+
+    /// Display one credential entry. Default: identifier fields
+    /// only (name, username, URL). Pass `--reveal-password`,
+    /// `--reveal-notes`, or `--reveal-totp-secret` to print the
+    /// corresponding secret to stdout; each requires a presence
+    /// confirmation prompt.
+    Show(AccountShowArgs),
+
+    /// Modify an existing credential entry. Field flags are
+    /// optional; unspecified fields are preserved unchanged.
+    Update(AccountUpdateArgs),
+
+    /// Delete a credential entry. Writes a tombstone revision
+    /// (append-only — the entry is no longer readable but its
+    /// historical record is preserved).
+    Delete(AccountDeleteArgs),
+}
+
+/// `account add` — create a new credential entry.
+///
+/// Password input has three exclusive paths:
+///
+/// 1. `--generate-password` — auto-generate a 24-char password
+///    drawn from a 70-char alphabet. The generated value is
+///    printed to stderr inside a clearly-flagged save-this-now
+///    block; copy it into the user's preferred password store.
+/// 2. `--password-stdin` — read the first line of stdin as the
+///    password (CI / scripted use). Trailing newline is trimmed.
+/// 3. (default) Interactive prompt at the terminal without echo,
+///    plus a confirmation re-prompt; aborts on mismatch after
+///    bounded retry.
+///
+/// There is **NO** `--password <flag>` form. The flag form leaks
+/// via process listing (`ps aux`) and Pangolin refuses to ship
+/// that footgun. Same discipline applies to `--totp-stdin`
+/// (`--totp-secret <flag>` is not accepted).
+///
+/// Notes accept the flag form `--notes <str>` because notes are a
+/// lower-tier secret per the spec's reveal hierarchy; users who
+/// want to avoid shell-history capture should use `--notes-stdin`.
+#[allow(clippy::struct_excessive_bools)]
+// The clap-derive args struct
+// collects independent boolean flags by design; refactoring
+// into a state machine would obscure the user-facing surface.
+#[derive(Debug, Args)]
+pub struct AccountAddArgs {
+    /// Path to the `.pvf` vault file.
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Vault password (echoes in `ps`; CI use only). If omitted,
+    /// prompted at the terminal without echo.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+
+    /// Display name for the new entry. Required. Must be
+    /// non-empty.
+    #[arg(long, value_parser = parse_non_empty_string)]
+    pub name: String,
+
+    /// Login username for the new entry.
+    #[arg(long)]
+    pub username: Option<String>,
+
+    /// Service URL the credential applies to.
+    #[arg(long)]
+    pub url: Option<String>,
+
+    /// Free-form notes. Lower-tier secret per the reveal-class
+    /// hierarchy; users running interactively should prefer
+    /// `--notes-stdin`.
+    #[arg(long, conflicts_with = "notes_stdin")]
+    pub notes: Option<String>,
+
+    /// Read notes from stdin. Recommended for multi-line notes or
+    /// notes containing shell-special characters.
+    #[arg(long, conflicts_with = "notes")]
+    pub notes_stdin: bool,
+
+    /// Read the password from stdin (CI / scripted use).
+    /// Mutually exclusive with `--generate-password`.
+    #[arg(long, conflicts_with = "generate_password")]
+    pub password_stdin: bool,
+
+    /// Auto-generate a 24-character password from a 70-char
+    /// alphabet. The generated value is printed to stderr inside
+    /// a save-this-now block. Mutually exclusive with
+    /// `--password-stdin`.
+    #[arg(long, conflicts_with = "password_stdin")]
+    pub generate_password: bool,
+
+    /// Read the TOTP shared secret from stdin (interactive
+    /// prompt is the default when this flag is absent and the
+    /// user has not specified `--no-totp`).
+    #[arg(long)]
+    pub totp_stdin: bool,
+
+    /// Skip the TOTP prompt — create the entry without a TOTP
+    /// secret. The entry can still be updated later to add one.
+    #[arg(long, conflicts_with = "totp_stdin")]
+    pub no_totp: bool,
+}
+
+/// `account list` — list credential entries.
+#[derive(Debug, Args)]
+pub struct AccountListArgs {
+    /// Path to the `.pvf` vault file.
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Vault password (echoes in `ps`; CI use only). If omitted,
+    /// prompted at the terminal without echo.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+
+    /// Include entries that are frozen pending resolve. Each is
+    /// suffixed with `[frozen]` in the human-readable output.
+    #[arg(long)]
+    pub include_frozen: bool,
+
+    /// Include entries that have been deleted (tombstoned). Each
+    /// is suffixed with `[deleted]` in the human-readable output.
+    #[arg(long)]
+    pub include_tombstoned: bool,
+}
+
+/// `account show` — display one credential entry.
+///
+/// Default behavior prints the identifier fields (display name,
+/// username, URL) to stdout; secret fields are omitted. The three
+/// `--reveal-*` flags opt into printing the corresponding secret;
+/// each is gated by a presence-confirmation prompt before the
+/// reveal call fires (per the spec's high-risk-action discipline).
+///
+/// Multiple `--reveal-*` flags in one invocation share a single
+/// presence prompt — one user gesture authorizes the bundle.
+#[derive(Debug, Args)]
+pub struct AccountShowArgs {
+    /// Path to the `.pvf` vault file.
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Vault password (echoes in `ps`; CI use only). If omitted,
+    /// prompted at the terminal without echo.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+
+    /// 32-byte account identifier as 64-char lowercase hex.
+    #[arg(long, value_parser = clap::value_parser!(HexAccountId))]
+    pub account_id: HexAccountId,
+
+    /// Print the password to stdout. Presence-gated; the user
+    /// must confirm at the prompt before any reveal call fires.
+    #[arg(long)]
+    pub reveal_password: bool,
+
+    /// Print the notes to stdout. Same presence gate as
+    /// `--reveal-password`.
+    #[arg(long)]
+    pub reveal_notes: bool,
+
+    /// Print the TOTP shared secret to stdout. Same presence
+    /// gate as `--reveal-password`.
+    #[arg(long)]
+    pub reveal_totp_secret: bool,
+}
+
+/// `account update` — modify an existing credential entry.
+///
+/// Field flags are all optional. Unspecified fields are
+/// preserved by reading the current entry, layering the
+/// specified updates on top, and writing a new revision pointing
+/// at the previous head. **The implementation reveals every
+/// secret field of the entry** (password, notes, TOTP) so it can
+/// build a complete new snapshot — even if the user only changes
+/// a non-secret field. As a consequence, `account update` is
+/// always presence-gated. (`PoC` limitation; a future partial-
+/// update API would skip the reveal calls for unspecified
+/// fields.)
+#[allow(clippy::struct_excessive_bools)] // Same rationale as
+// AccountAddArgs — clap-derive shape mirrors the user surface.
+#[derive(Debug, Args)]
+pub struct AccountUpdateArgs {
+    /// Path to the `.pvf` vault file.
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Vault password (echoes in `ps`; CI use only). If omitted,
+    /// prompted at the terminal without echo.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+
+    /// 32-byte account identifier as 64-char lowercase hex.
+    #[arg(long, value_parser = clap::value_parser!(HexAccountId))]
+    pub account_id: HexAccountId,
+
+    /// New display name. Must be non-empty if specified.
+    #[arg(long, value_parser = parse_non_empty_string)]
+    pub name: Option<String>,
+
+    /// New login username.
+    #[arg(long)]
+    pub username: Option<String>,
+
+    /// New service URL.
+    #[arg(long)]
+    pub url: Option<String>,
+
+    /// New free-form notes. Mutually exclusive with
+    /// `--notes-stdin`.
+    #[arg(long, conflicts_with = "notes_stdin")]
+    pub notes: Option<String>,
+
+    /// Read new notes from stdin. Mutually exclusive with
+    /// `--notes`.
+    #[arg(long, conflicts_with = "notes")]
+    pub notes_stdin: bool,
+
+    /// Read a new password from stdin (CI / scripted use).
+    /// Mutually exclusive with `--password-prompt`.
+    #[arg(long, conflicts_with = "password_prompt")]
+    pub password_stdin: bool,
+
+    /// Prompt at the terminal for a new password (interactive
+    /// use). Disambiguates "I want to change the password" from
+    /// "I left the password unchanged" — no flag means no
+    /// password change. Mutually exclusive with
+    /// `--password-stdin`.
+    #[arg(long, conflicts_with = "password_stdin")]
+    pub password_prompt: bool,
+
+    /// Read a new TOTP secret from stdin. Mutually exclusive
+    /// with `--totp-clear`.
+    #[arg(long, conflicts_with = "totp_clear")]
+    pub totp_stdin: bool,
+
+    /// Clear the entry's TOTP secret (set it to empty). Mutually
+    /// exclusive with `--totp-stdin`.
+    #[arg(long, conflicts_with = "totp_stdin")]
+    pub totp_clear: bool,
+}
+
+/// `account delete` — tombstone a credential entry.
+///
+/// Default behavior loads the entry, prints a confirmation
+/// prompt that includes the display name (typo-prevention), and
+/// reads a literal lowercase `"yes"` from stdin before writing
+/// the tombstone. `--yes` skips the prompt for scripted use.
+#[derive(Debug, Args)]
+pub struct AccountDeleteArgs {
+    /// Path to the `.pvf` vault file.
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Vault password (echoes in `ps`; CI use only). If omitted,
+    /// prompted at the terminal without echo.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+
+    /// 32-byte account identifier as 64-char lowercase hex.
+    #[arg(long, value_parser = clap::value_parser!(HexAccountId))]
+    pub account_id: HexAccountId,
+
+    /// Skip the interactive confirmation prompt. Required for
+    /// scripted / CI use. Without this flag, the user must type
+    /// the literal lowercase string `"yes"` at the prompt.
+    #[arg(long)]
+    pub yes: bool,
+
+    /// Optional free-form note. NOT cryptographically stored —
+    /// only echoed in the eprintln summary line and in the JSON
+    /// summary output. Useful for ad-hoc audit traces.
+    #[arg(long)]
+    pub why: Option<String>,
+}
+
+/// Reject empty strings at clap-arg-validation time. Used by the
+/// `--name` flag on `account add` and `account update` so a
+/// caller passing `--name ""` surfaces a clear error before any
+/// vault open or session unlock fires.
+fn parse_non_empty_string(s: &str) -> Result<String, String> {
+    if s.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    Ok(s.to_string())
 }
 
 /// `status` subcommand args.
@@ -639,6 +957,279 @@ mod tests {
             err.kind(),
             clap::error::ErrorKind::ArgumentConflict
         ));
+    }
+
+    // -----------------------------------------------------------
+    // P11A-1: account subcommand clap shape
+    // -----------------------------------------------------------
+
+    /// **P11A-1.** `account --help` renders.
+    #[test]
+    fn account_subcommand_parses_with_help() {
+        let err = Cli::try_parse_from(["pangolin-cli", "account", "--help"]).unwrap_err();
+        assert!(matches!(err.kind(), clap::error::ErrorKind::DisplayHelp));
+    }
+
+    /// **P11A-1.** `account add --vault-path <path> --name <str>`
+    /// parses cleanly with the minimum required args.
+    #[test]
+    fn account_add_parses_with_name() {
+        let cli = Cli::try_parse_from([
+            "pangolin-cli",
+            "account",
+            "add",
+            "--vault-path",
+            "/tmp/v.pvf",
+            "--name",
+            "github work",
+        ])
+        .expect("account add parses");
+        match cli.command {
+            super::Command::Account(args) => match args.command {
+                super::AccountCommand::Add(a) => {
+                    assert_eq!(a.name, "github work");
+                    assert!(a.username.is_none());
+                    assert!(!a.password_stdin);
+                    assert!(!a.generate_password);
+                    assert!(!a.no_totp);
+                }
+                other => panic!("expected Add, got {other:?}"),
+            },
+            other => panic!("expected Account, got {other:?}"),
+        }
+    }
+
+    /// **P11A-1.** `--name ""` is rejected at clap-arg-validation
+    /// time. P11A-2 plan §A2 anti-empty-name guard.
+    #[test]
+    fn account_add_rejects_empty_name() {
+        let err = Cli::try_parse_from([
+            "pangolin-cli",
+            "account",
+            "add",
+            "--vault-path",
+            "/tmp/v.pvf",
+            "--name",
+            "",
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must not be empty") || msg.contains("--name"),
+            "expected empty-name rejection, got: {msg}"
+        );
+    }
+
+    /// **P11A-1.** `account list --vault-path` parses.
+    #[test]
+    fn account_list_parses_with_vault_path() {
+        let cli = Cli::try_parse_from([
+            "pangolin-cli",
+            "account",
+            "list",
+            "--vault-path",
+            "/tmp/v.pvf",
+        ])
+        .expect("account list parses");
+        match cli.command {
+            super::Command::Account(args) => match args.command {
+                super::AccountCommand::List(l) => {
+                    assert!(!l.include_frozen);
+                    assert!(!l.include_tombstoned);
+                }
+                _ => panic!("expected List"),
+            },
+            _ => panic!("expected Account"),
+        }
+    }
+
+    /// **P11A-1.** `account show --account-id <hex>` parses.
+    #[test]
+    fn account_show_parses_with_account_id() {
+        let hex = "ab".repeat(32);
+        let cli = Cli::try_parse_from([
+            "pangolin-cli",
+            "account",
+            "show",
+            "--vault-path",
+            "/tmp/v.pvf",
+            "--account-id",
+            &hex,
+        ])
+        .expect("account show parses");
+        match cli.command {
+            super::Command::Account(args) => match args.command {
+                super::AccountCommand::Show(s) => {
+                    assert_eq!(s.account_id.0, [0xAB; 32]);
+                    assert!(!s.reveal_password);
+                    assert!(!s.reveal_notes);
+                    assert!(!s.reveal_totp_secret);
+                }
+                _ => panic!("expected Show"),
+            },
+            _ => panic!("expected Account"),
+        }
+    }
+
+    /// **P11A-1.** `account update --account-id <hex>` parses.
+    #[test]
+    fn account_update_parses_with_account_id() {
+        let hex = "12".repeat(32);
+        let cli = Cli::try_parse_from([
+            "pangolin-cli",
+            "account",
+            "update",
+            "--vault-path",
+            "/tmp/v.pvf",
+            "--account-id",
+            &hex,
+            "--name",
+            "renamed",
+        ])
+        .expect("account update parses");
+        match cli.command {
+            super::Command::Account(args) => match args.command {
+                super::AccountCommand::Update(u) => {
+                    assert_eq!(u.account_id.0, [0x12; 32]);
+                    assert_eq!(u.name.as_deref(), Some("renamed"));
+                }
+                _ => panic!("expected Update"),
+            },
+            _ => panic!("expected Account"),
+        }
+    }
+
+    /// **P11A-1.** `account delete --account-id <hex> --yes`
+    /// parses.
+    #[test]
+    fn account_delete_parses_with_account_id_and_yes() {
+        let hex = "cd".repeat(32);
+        let cli = Cli::try_parse_from([
+            "pangolin-cli",
+            "account",
+            "delete",
+            "--vault-path",
+            "/tmp/v.pvf",
+            "--account-id",
+            &hex,
+            "--yes",
+        ])
+        .expect("account delete parses");
+        match cli.command {
+            super::Command::Account(args) => match args.command {
+                super::AccountCommand::Delete(d) => {
+                    assert_eq!(d.account_id.0, [0xCD; 32]);
+                    assert!(d.yes);
+                }
+                _ => panic!("expected Delete"),
+            },
+            _ => panic!("expected Account"),
+        }
+    }
+
+    /// **P11A-1.** `account add --password-stdin --generate-password`
+    /// is rejected as a flag conflict (only one password-source
+    /// path is allowed per invocation).
+    #[test]
+    fn account_add_password_stdin_and_generate_conflict() {
+        let err = Cli::try_parse_from([
+            "pangolin-cli",
+            "account",
+            "add",
+            "--vault-path",
+            "/tmp/v.pvf",
+            "--name",
+            "x",
+            "--password-stdin",
+            "--generate-password",
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        ));
+    }
+
+    /// **P11A-1.** `account add --notes "..." --notes-stdin` is
+    /// rejected (mutually exclusive notes-source flags).
+    #[test]
+    fn account_add_notes_and_notes_stdin_conflict() {
+        let err = Cli::try_parse_from([
+            "pangolin-cli",
+            "account",
+            "add",
+            "--vault-path",
+            "/tmp/v.pvf",
+            "--name",
+            "x",
+            "--notes",
+            "n",
+            "--notes-stdin",
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        ));
+    }
+
+    /// **P11A-1 / A16.** The rendered help for `account` and each
+    /// of the five sub-verbs MUST NOT contain any of the §3.5
+    /// forbidden user-facing terms ("blockchain", "gas",
+    /// "transaction", "decentralized storage", "hashes",
+    /// "revisions"). The clap-derive `--help` output is the
+    /// audit-relevant surface.
+    #[test]
+    fn account_help_avoids_forbidden_user_facing_terms() {
+        use clap::CommandFactory as _;
+        let mut cmd = super::Cli::command();
+        // Force clap to fully build subcommand help.
+        cmd.build();
+        // Render `account --help`.
+        let account_subcmd = cmd
+            .find_subcommand_mut("account")
+            .expect("account subcommand exists");
+        let mut buf = Vec::new();
+        account_subcmd
+            .write_help(&mut buf)
+            .expect("write_help succeeds");
+        let account_help = String::from_utf8(buf).expect("help is utf8");
+        let forbidden = [
+            "blockchain",
+            "decentralized storage",
+            // Surface-only check: `gas`/`transaction` would
+            // appear in any help text that names those concepts;
+            // enforce via case-sensitive substring.
+            "gas ",
+            " gas",
+            "transaction",
+            // "hashes" and "revisions" are spec-internal terms;
+            // the user-facing help must avoid them.
+            "hashes",
+            "revisions",
+        ];
+        for term in forbidden {
+            assert!(
+                !account_help.to_lowercase().contains(term),
+                "account --help contains forbidden term '{term}': {account_help}"
+            );
+        }
+        // Also walk per-verb help.
+        let verbs = ["add", "list", "show", "update", "delete"];
+        for verb in verbs {
+            let mut buf = Vec::new();
+            let sub = account_subcmd
+                .find_subcommand_mut(verb)
+                .unwrap_or_else(|| panic!("subcommand {verb} exists"));
+            sub.write_help(&mut buf).expect("write_help");
+            let h = String::from_utf8(buf).expect("utf8");
+            for term in forbidden {
+                assert!(
+                    !h.to_lowercase().contains(term),
+                    "account {verb} --help contains forbidden term '{term}': {h}"
+                );
+            }
+        }
     }
 
     /// **P8 fix MED-2.** `--allow-insecure-rpc` is recognized as a

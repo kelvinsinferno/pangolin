@@ -63,6 +63,7 @@ fn main() -> Result<()> {
             cli::Command::Publish(sub) => commands::publish::run(&args.global, sub).await,
             cli::Command::Pull(sub) => commands::pull::run(&args.global, sub).await,
             cli::Command::Resolve(sub) => commands::resolve::run(&args.global, sub).await,
+            cli::Command::Account(sub) => commands::account::run(&args.global, sub).await,
         }
     })
 }

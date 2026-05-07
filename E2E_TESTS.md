@@ -12,6 +12,8 @@
 - **E2E-002 — chaincli debug oracle smoke test** — issue P6
 - **E2E-003 — pangolin-cli two-vault sync round-trip** — issue P8
 - **E2E-004 — pangolin-cli resolve convergence after fork+freeze** — issue P9
+- **E2E-005 — pangolin-cli offline-edit-then-online-publish** — issue P10
+- **E2E-006 — pangolin-cli account add → list → show → update → delete round trip** — issue P11A
 
 ---
 
@@ -620,6 +622,106 @@ integration.
   event whose `canonical_hash` differs and lands as a co-fork
   rather than a silent duplicate. THREAT_MODEL row #20 documents
   this thoroughly.
+
+---
+
+## E2E-006: pangolin-cli account add → list → show → update → delete round trip
+
+**Issue:** P11A
+**Phase:** PoC
+**Date added:** 2026-05-07
+**Last verified:** 2026-05-07 by Claude Code via the
+`account_lifecycle.rs` integration test on a fresh tempdir
+vault (MockChainAdapter not required — account ops are
+local-vault-only).
+
+### Setup
+1. A scratch directory for the vault file (`.pvf`).
+2. The `pangolin-cli` binary built from
+   `tools/pangolin-cli/`. The integration test under
+   `tools/pangolin-cli/tests/account_lifecycle.rs` drives
+   the flow without invoking the binary directly — it
+   imports the public library entry points
+   (`pangolin_cli::commands::account::*`,
+   `pangolin_cli::cli::*`) per the same pattern as
+   `two_vault_roundtrip.rs` and `offline_mode.rs`.
+
+### Steps (automated path — `account_lifecycle.rs`)
+
+1. **Create** a fresh `.pvf` vault via `Vault::create`
+   under a scratch tempdir.
+2. **Add** an account via `commands::account::run_add`
+   with `--generate-password` + `--no-totp` + a
+   non-empty `--name`. Capture the `account_id` returned
+   (the test re-opens the vault to read it).
+3. **List** via `commands::account::run_list` with no
+   include flags. Assert the just-added entry appears.
+4. **Show (no reveal)** via `commands::account::run_show`
+   without any `--reveal-*` flag. Assert the call
+   succeeds (the test seam ensures no presence prompt is
+   needed since no reveal is requested).
+5. **Show (reveal-password)** at the library layer:
+   verify `Vault::reveal_password(id, &fresh_proof)`
+   returns the expected bytes. (The CLI-level reveal
+   path requires interactive `'y'` input and is covered
+   by the unit-test seam in `account.rs::tests`.)
+6. **Update** via `commands::account::run_update` with
+   the `WithAutoConfirm` test seam enabled, modifying
+   `--name` only. Assert the new display name is in
+   place AND the password / notes / TOTP carry through
+   unchanged.
+7. **Delete** via `commands::account::run_delete` with
+   `--yes`. Assert the row is now in
+   `Vault::list_tombstoned_accounts()` and absent from
+   `Vault::list_accounts()`.
+8. **Delete-replay refused.** Re-run `run_delete` against
+   the same id; assert it fails with the "already been
+   deleted (tombstoned)" message.
+9. **Show on tombstoned id surfaces the deleted-message**
+   not "not found". Assert the error message includes
+   "deleted" or "tombstoned".
+
+### Expected outcome
+- Each step succeeds at the library layer.
+- The dirty list contains exactly the expected revision
+  count for the account at the end of step 7 (the
+  collapsed-by-account_id semantics of
+  `INSERT OR IGNORE INTO dirty_accounts` may keep the
+  count at 1; the structural assertion is "the account
+  is in the dirty set after every mutating call").
+- No plaintext leaks via stdout when no `--reveal-*`
+  flag is set — verified by inspection of `run_show`'s
+  default branch (only identifier-class fields are
+  printed).
+- The test runs end-to-end in under 10 seconds on the
+  CI host.
+
+### Failure modes covered
+- **Auto-resurrection refused.** Step 8 covers Cardinal
+  Principle 4: a re-delete on a tombstoned row is
+  refused with a clear error rather than silently
+  succeeding (which would mask user error).
+- **Frozen-account write refusal.** Not exercised by
+  this happy-path scenario directly (would require
+  ingesting a foreign chain event mid-flow); covered
+  by the underlying library tests
+  (`update_refuses_frozen_account`,
+  `delete_refuses_frozen_account`) and by the
+  pre-presence guard in `run_update` / pre-prompt
+  guard in `run_delete`.
+- **Frozen + tombstoned filtering by default in `list`.**
+  Implicitly covered: step 3 lists only the active
+  entries; after step 7's tombstone, step 9's `show`
+  surfaces the deleted-message rather than re-finding
+  the entry.
+- **Identifier surface secret-omission.** Verified
+  structurally by the `ListRow` struct having no
+  password / notes / `totp_secret` fields
+  (`list_row_omits_secret_fields_structurally`); E2E-006
+  inherits this invariant from the unit tests.
+
+### Automated equivalent
+`tools/pangolin-cli/tests/account_lifecycle.rs`
 
 ---
 

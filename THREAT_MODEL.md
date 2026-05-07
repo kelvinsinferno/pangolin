@@ -687,3 +687,120 @@ the PR.
     NOT fire during an offline session (no chain ingest
     happened — verified by
     `offline_session_does_not_set_freeze_sentinel`).
+23. **Password disclosure via process listing (`ps aux` /
+    `/proc/<pid>/cmdline`) on `pangolin-cli account add` /
+    `account update`.** Defense: P11A REFUSES to ship a
+    `--password <flag>` argument form. The only paths to
+    provide a password are interactive terminal prompt
+    (`rpassword::prompt_password`, no echo), stdin
+    (`--password-stdin`, redirected by the user), or
+    auto-generation (`--generate-password`, written to
+    stderr inside a save-this-now block). Same shape as
+    `pass`, `1password-cli`, `bw`, `op`. The clap-derive
+    schema for `AccountAddArgs` and `AccountUpdateArgs`
+    has no `password: Option<String>` field; a future PR
+    that re-introduces one would surface in the
+    `account_add_password_stdin_and_generate_conflict`
+    test plus the SIGNOFF spot-check of `--help` output.
+    The TOTP secret follows the same discipline
+    (`--totp-stdin` / interactive only; no
+    `--totp-secret <flag>`). Notes accept the lower-tier
+    `--notes <str>` flag form per A5's documented
+    trade-off (notes are not load-bearing for account
+    access; user accepts the shell-history risk). The
+    `--vault-password <flag>` and `--keystore-password
+    <flag>` arguments inherited from P8 retain the same
+    "echoes in ps; CI only" caveat in their `--help`
+    text; P11A does NOT extend that pattern to credential
+    passwords. The `account show --reveal-password`
+    output prints to stdout; shell-history capture is the
+    user's risk to manage (no different from
+    `pass show <name>`). An additional vector is `2>file`
+    redirect of `--generate-password` output, which would
+    persist the generated password to disk; document in
+    user-facing help text and treat as user responsibility.
+24. **Account-show plaintext leak via shell history /
+    terminal scrollback.** Defense (acknowledgement, UX-
+    bound): the `--reveal-password` / `--reveal-notes` /
+    `--reveal-totp-secret` flags require a presence proof
+    via the `confirm_presence` prompt — the user types
+    `'y'` at the prompt before any reveal call fires.
+    Once revealed, plaintext is on the user's terminal
+    scrollback; the CLI cannot retract it. The presence
+    prompt is the load-bearing mitigation; the prompt's
+    wording explicitly names the action ("presence
+    required to reveal password for account <hex>: type
+    'y' and press enter:"), so a user who didn't intend a
+    reveal can decline. Multi-flag invocations
+    (`--reveal-password --reveal-notes
+    --reveal-totp-secret`) prompt ONCE per A7 and produce
+    three internal `PressYPresenceProof::confirmed()`
+    instances against the single user gesture; the same
+    shape MVP-1's hardware attestation will surface.
+    Default `account show` (no reveal flags) prints
+    non-secret fields only and emits no presence prompt.
+    JSON output omits (rather than `null`-fills) the
+    unrevealed secret fields — verified by inspection of
+    `run_show`'s JSON-building branch. An additional risk
+    is attacker-controlled display names containing
+    terminal escape sequences; sanitization via
+    `sanitize_for_display` strips C0/DEL control
+    characters before printing in delete confirmation
+    prompts and other display contexts.
+25. **Tombstone replay via `account delete`.** Defense:
+    same protection as P10's tombstone discipline (rows
+    #20, #22) — the tombstone revision's canonical hash
+    binds `(vault_id, account_id, parent_revision,
+    schema_version, enc_payload)`; replay against a
+    moved-on head produces a fork rather than a duplicate
+    (Cardinal Principle 4 holds at the `delete` site
+    too — same chain ordering as publish/update).
+    `Vault::delete_account` refuses on already-tombstoned
+    accounts with `StoreError::AccountTombstoned`; the
+    CLI surfaces "already been deleted (tombstoned).
+    Idempotency-by-clear-error: re-deletion is refused"
+    rather than silently re-tombstoning. The append-only
+    invariant (P10 anti-resurrection: `Vault::add_account`
+    refuses to reuse a tombstoned `account_id`) extends
+    to the CLI boundary unchanged.
+26. **Reveal-confirmation phishing under `PoC`
+    `PressYPresenceProof`.** Defense (acknowledgement,
+    `PoC` limitation): the `PoC`'s `'y'` keystroke proof
+    is a stand-in for MVP-1's hardware attestation; under
+    `PoC`, an attacker who has stolen the user's session-
+    active vault state (e.g., post-unlock memory dump, or
+    unattended unlocked terminal) can fire any reveal
+    call by typing `'y'` at the prompt. The MVP-1
+    hardware-attestation switch closes this; under
+    `PoC`, the `'y'` keystroke is the only proof-of-
+    presence available. P11A inherits this limitation
+    unchanged. The `'y'` prompt's wording explicitly
+    names the account (account id + which secret) so an
+    unattended terminal attacker who automates the prompt
+    response leaves distinguishable per-account audit
+    lines on stderr. The `cfg(test)`-only
+    `TEST_AUTO_CONFIRM_PRESENCE` and
+    `TEST_AUTO_CONFIRM_DELETE` thread-local seams in
+    `commands/account.rs::tests` are unit-test
+    ergonomics aids; production binaries cannot reach
+    them (the seams are gated on `cfg(test)` and the
+    `tests` module is private to the source unit).
+    Documented as a known `PoC` limitation; closed by
+    MVP-1's hardware path.
+27. **`account update` / `account delete` of frozen
+    account.** Defense: `Vault::update_account` and
+    `Vault::delete_account` refuse with
+    `StoreError::AccountFrozenPendingResolve` (P8 CRIT-1
+    freeze guard); the CLI's `run_update` and
+    `run_delete` ALSO refuse via a pre-presence /
+    pre-prompt guard (membership probe in
+    `list_frozen_accounts`) so the user is not asked for
+    a presence proof or confirmation on a frozen entry.
+    The user-facing error message includes the resolve
+    hint ("Run `pangolin-cli resolve --account-id <hex>
+    --keep <head>` first"). The user cannot accidentally
+    write a stale-plaintext-based update to a frozen
+    account (Cardinal Principle 4 protected at the CLI
+    boundary). Per Q8 there is no `--force` flag to
+    bypass the freeze guard on either verb. Resolve flow
+    per P9 is unchanged.
