@@ -429,6 +429,101 @@ async fn convergence_after_resolve() {
     }
 }
 
+/// **P10-3.** Own-tombstone round-trip via the chain.
+///
+/// Pin the post-P10 invariant that a tombstone published to chain
+/// and then re-pulled to the same vault remains tombstoned (the
+/// idempotency arm #2 chain-anchor stamp matches the local row's
+/// `mark_published` anchor; the row's `is_tombstone = 1` flag and
+/// the `account_identities.tombstoned = 1` flag both survive
+/// unchanged).
+///
+/// Under `PoC` two-key, the cross-vault tombstone propagation case
+/// (vault A tombstones X; vault B pulls; B's row's `is_tombstone`
+/// reflects the chain) is acknowledged limitation Threat #15 — the
+/// chain event ABI does not transport the AEAD nonce, so the
+/// foreign-ingest path's opportunistic decode (P10-2) cannot
+/// decrypt the payload, the bit stays 0, and the freeze sentinel
+/// fires. Closed by MVP-1's nonce-on-chain. This test does NOT
+/// exercise the cross-vault propagation; it exercises the OWN-
+/// publish round-trip (vault A publishes, vault A pulls), which IS
+/// covered under `PoC` (idempotency arm #2 stamps the chain anchor;
+/// the local `is_tombstone = 1` from `delete_account` is preserved).
+#[tokio::test]
+async fn own_tombstone_round_trip_via_chain() {
+    let adapter = MockChainAdapter::new();
+    let dir_a = TempDir::new().expect("dir A");
+    let path_a = create_locked_vault(&dir_a, "a.pvf");
+    let device = DeviceKey::generate();
+
+    let account_id;
+    {
+        let mut va = open_unlocked(&path_a);
+        // 1. Add an account, publish.
+        account_id = va.add_account(snap("own-tombstone")).expect("add");
+        let publish_report = pangolin_cli_sync::publish_all(&mut va, &adapter, &device)
+            .await
+            .expect("publish");
+        assert_eq!(publish_report.published_count(), 1);
+
+        // 2. Delete the account (writes a tombstone revision with
+        //    is_tombstone = 1 + tombstoned = 1 directly via
+        //    delete_account; queues a dirty marker for the tombstone
+        //    revision).
+        va.delete_account(account_id).expect("delete");
+        let dirty = va.list_dirty().expect("list dirty");
+        assert_eq!(
+            dirty.len(),
+            1,
+            "delete_account stamped a dirty marker for the tombstone"
+        );
+        assert!(va.get_account(account_id).is_none(), "tombstoned");
+
+        // 3. Publish the tombstone revision. The chain now has 2
+        //    events (live + tombstone).
+        let publish_report = pangolin_cli_sync::publish_all(&mut va, &adapter, &device)
+            .await
+            .expect("publish tombstone");
+        assert_eq!(publish_report.published_count(), 1);
+        assert!(va.list_dirty().expect("list dirty").is_empty());
+        assert_eq!(adapter.event_count(), 2, "chain has 2 events");
+
+        // 4. Pull on the same vault. Idempotency arm #2 (chain
+        //    anchor stamp via `mark_published`) hits, so the
+        //    genuine-foreign-INSERT branch is bypassed. The
+        //    pre-existing `is_tombstone = 1` and `tombstoned = 1`
+        //    flags on the local row survive unchanged. The freeze
+        //    sentinel does NOT fire (own-publish round-trip).
+        let _pull_report = pangolin_cli_sync::pull_all(&mut va, &adapter, None, None)
+            .await
+            .expect("pull");
+
+        // 5. Final assertions: the tombstone is still a tombstone
+        //    (the chain round-trip preserved it, NOT undeleted it).
+        assert!(
+            va.get_account(account_id).is_none(),
+            "round-trip preserves the tombstone (no resurrection)"
+        );
+        let history = va.revisions_for(account_id).expect("revs");
+        assert_eq!(history.len(), 2, "live + tombstone");
+        let tomb = history.last().expect("tomb");
+        assert!(tomb.is_tombstone, "tombstone bit preserved");
+        assert!(
+            tomb.chain_anchor.is_some(),
+            "tombstone has its chain anchor stamped from publish"
+        );
+        // Freeze sentinel did NOT fire (own-publish round-trip
+        // hits idempotency arm #2 before the genuine-foreign-INSERT
+        // branch).
+        let frozen = va.list_frozen_accounts().expect("frozen");
+        assert!(
+            frozen.is_empty(),
+            "own-tombstone round-trip must NOT freeze"
+        );
+        va.close().expect("close A");
+    }
+}
+
 /// Re-export wrapper. `pangolin_cli::sync` is the library entry
 /// point introduced in P8-6 specifically so integration tests under
 /// `tests/` can import the orchestration core without going through

@@ -32,6 +32,7 @@
 //! threaded by default and the lock is held for nanoseconds. The
 //! adapter implements `Send + Sync` because the trait demands it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -64,9 +65,26 @@ struct MockChainState {
 /// the same chain state, which is the right semantics for tests that
 /// need multiple references to the "same" chain (e.g., one publish
 /// site and one pull site).
+///
+/// **P10-4 disconnect toggle.** A test-utilities-gated
+/// [`Self::set_disconnected`] toggle simulates a network outage: when
+/// `true`, every adapter method returns `ChainError::Rpc("simulated
+/// offline")` synchronously without touching internal state. The
+/// toggle is shared via the `Arc<AtomicBool>` interior alongside the
+/// state mutex; cloning shares both. Production binaries cannot
+/// construct a disconnected mock — the entire `mock` module is gated
+/// on `cfg(any(test, feature = "test-utilities"))` (see crate-level
+/// docs).
 #[derive(Debug, Clone, Default)]
 pub struct MockChainAdapter {
     state: Arc<Mutex<MockChainState>>,
+    /// **P10-4.** When `true`, every adapter method short-circuits
+    /// to `ChainError::Rpc("simulated offline")`. Shared with clones.
+    /// `AtomicBool` (not `RwLock<bool>`) because the toggle is
+    /// concurrency-safe at zero coordination cost; the test never
+    /// needs to read-lock a snapshot of the toggle separate from
+    /// each adapter call.
+    disconnected: Arc<AtomicBool>,
 }
 
 impl MockChainAdapter {
@@ -81,6 +99,28 @@ impl MockChainAdapter {
         self.lock_state().events.len()
     }
 
+    /// **P10-4.** Toggle the disconnected state. When `true`, every
+    /// adapter method returns `ChainError::Rpc("simulated offline")`
+    /// without touching any internal state. Test-utilities-gated; the
+    /// production binary cannot construct a disconnected mock (the
+    /// whole `mock` module is gated, not just this method).
+    pub fn set_disconnected(&self, disconnected: bool) {
+        self.disconnected.store(disconnected, Ordering::SeqCst);
+    }
+
+    /// **P10-4.** Read the disconnected toggle. Test diagnostic only.
+    #[must_use]
+    pub fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::SeqCst)
+    }
+
+    /// Helper: short-circuit error for every adapter method when
+    /// disconnected. Returning a fresh `ChainError::Rpc` each call
+    /// (cannot be `const`) to match alloy's `TransportError` shape.
+    fn offline_error() -> ChainError {
+        ChainError::Rpc("simulated offline".into())
+    }
+
     /// Lock the mutex; panic on poisoning. Tests don't need
     /// fault-tolerance against panicking publishers.
     fn lock_state(&self) -> std::sync::MutexGuard<'_, MockChainState> {
@@ -93,6 +133,13 @@ impl MockChainAdapter {
 #[async_trait]
 impl ChainAdapter for MockChainAdapter {
     async fn publish(&self, signed: &SignedRevision) -> Result<ChainAnchor, ChainError> {
+        // P10-4: short-circuit on disconnect BEFORE any state access
+        // or signature verification. Matches the production behavior
+        // of `BaseSepoliaAdapter::with_signer` failing the
+        // `eth_chainId` precheck on a network outage.
+        if self.is_disconnected() {
+            return Err(Self::offline_error());
+        }
         // P7 audit MED-4: verify the signature eagerly. v0 contract
         // doesn't, but the mock should match v1's planned behavior
         // (per MVP-2 issue 2.1) so any regression in
@@ -155,6 +202,10 @@ impl ChainAdapter for MockChainAdapter {
         from_block: u64,
         until_block: Option<u64>,
     ) -> Result<Vec<RevisionEvent>, ChainError> {
+        // P10-4: short-circuit on disconnect.
+        if self.is_disconnected() {
+            return Err(Self::offline_error());
+        }
         let upper = until_block.unwrap_or(u64::MAX);
         // Take a snapshot under the lock, then sort outside. Keeps
         // the critical section short (clippy's
@@ -185,6 +236,10 @@ impl ChainAdapter for MockChainAdapter {
         &self,
         location: &EventLocation,
     ) -> Result<Option<RevisionEvent>, ChainError> {
+        // P10-4: short-circuit on disconnect.
+        if self.is_disconnected() {
+            return Err(Self::offline_error());
+        }
         let found = {
             let state = self.lock_state();
             state
@@ -199,6 +254,10 @@ impl ChainAdapter for MockChainAdapter {
     }
 
     async fn current_block(&self) -> Result<u64, ChainError> {
+        // P10-4: short-circuit on disconnect.
+        if self.is_disconnected() {
+            return Err(Self::offline_error());
+        }
         Ok(self.lock_state().next_block)
     }
 }
@@ -472,5 +531,107 @@ mod tests {
         let signed = fresh_signed(b"counted");
         adapter.publish(&signed).await.unwrap();
         assert_eq!(adapter.event_count(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // P10-4: disconnect toggle tests
+    // -----------------------------------------------------------------
+
+    /// **P10-4 A6.** `set_disconnected(true)` makes `publish` return
+    /// `ChainError::Rpc` regardless of the signed revision's validity.
+    #[tokio::test]
+    async fn disconnect_makes_publish_return_rpc_error() {
+        let adapter = MockChainAdapter::new();
+        adapter.set_disconnected(true);
+        let signed = fresh_signed(b"disconnected");
+        let err = adapter
+            .publish(&signed)
+            .await
+            .expect_err("publish must fail while disconnected");
+        match err {
+            ChainError::Rpc(msg) => assert!(msg.contains("offline")),
+            other => panic!("expected Rpc(simulated offline), got {other:?}"),
+        }
+        // The chain log is unchanged — disconnect short-circuited
+        // before any state mutation.
+        assert_eq!(adapter.event_count(), 0);
+    }
+
+    /// **P10-4 A6.** `set_disconnected(true)` makes `pull_since`
+    /// return `ChainError::Rpc`.
+    #[tokio::test]
+    async fn disconnect_makes_pull_since_return_rpc_error() {
+        let adapter = MockChainAdapter::new();
+        adapter.set_disconnected(true);
+        let err = adapter
+            .pull_since(&[0u8; 32], 0, None)
+            .await
+            .expect_err("pull_since must fail while disconnected");
+        assert!(matches!(err, ChainError::Rpc(_)));
+    }
+
+    /// **P10-4 A6.** `set_disconnected(true)` makes `get_revision`
+    /// return `ChainError::Rpc`.
+    #[tokio::test]
+    async fn disconnect_makes_get_revision_return_rpc_error() {
+        let adapter = MockChainAdapter::new();
+        adapter.set_disconnected(true);
+        let loc = EventLocation {
+            tx_hash: [0u8; 32],
+            log_index: 0,
+        };
+        let err = adapter
+            .get_revision(&loc)
+            .await
+            .expect_err("get_revision must fail while disconnected");
+        assert!(matches!(err, ChainError::Rpc(_)));
+    }
+
+    /// **P10-4 A6.** `set_disconnected(true)` makes `current_block`
+    /// return `ChainError::Rpc`.
+    #[tokio::test]
+    async fn disconnect_makes_current_block_return_rpc_error() {
+        let adapter = MockChainAdapter::new();
+        adapter.set_disconnected(true);
+        let err = adapter
+            .current_block()
+            .await
+            .expect_err("current_block must fail while disconnected");
+        assert!(matches!(err, ChainError::Rpc(_)));
+    }
+
+    /// **P10-4 A6.** The toggle is sticky — after
+    /// `set_disconnected(true)`, the adapter remains disconnected
+    /// across multiple calls, until `set_disconnected(false)` clears
+    /// it.
+    #[tokio::test]
+    async fn disconnect_persists_until_reconnect() {
+        let adapter = MockChainAdapter::new();
+        adapter.set_disconnected(true);
+        for _ in 0..3 {
+            assert!(adapter.is_disconnected());
+            assert!(adapter.current_block().await.is_err());
+        }
+        adapter.set_disconnected(false);
+        assert!(!adapter.is_disconnected());
+        assert!(adapter.current_block().await.is_ok());
+    }
+
+    /// **P10-4 A6.** Reconnecting (`set_disconnected(false)`) does
+    /// NOT flush adapter state; events published before disconnect
+    /// remain queryable after reconnect.
+    #[tokio::test]
+    async fn reconnect_after_disconnect_preserves_state() {
+        let adapter = MockChainAdapter::new();
+        let signed = fresh_signed(b"survives-disconnect");
+        adapter.publish(&signed).await.unwrap();
+        assert_eq!(adapter.event_count(), 1);
+        adapter.set_disconnected(true);
+        // pull fails while disconnected.
+        assert!(adapter.pull_since(&signed.vault_id, 0, None).await.is_err());
+        adapter.set_disconnected(false);
+        let events = adapter.pull_since(&signed.vault_id, 0, None).await.unwrap();
+        assert_eq!(events.len(), 1, "event survived the disconnect/reconnect");
+        assert_eq!(events[0].enc_payload, b"survives-disconnect");
     }
 }

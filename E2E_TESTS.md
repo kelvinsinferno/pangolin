@@ -488,6 +488,141 @@ integration.
 
 ---
 
+## E2E-005: pangolin-cli offline-edit-then-online-publish
+
+**Issue:** P10
+**Phase:** PoC
+**Date added:** 2026-05-07
+**Last verified:** 2026-05-07 by automated tests
+(`tools/pangolin-cli/tests/offline_mode.rs::offline_edit_then_online_publish`)
+
+### Setup
+
+1. Workspace toolchain ready: `cargo build -p pangolin-cli`
+   succeeds.
+2. One empty directory for the vault file.
+3. For the chain-backed manual scenario: a Foundry keystore funded
+   with Base Sepolia ETH. The unattended `MockChainAdapter` path
+   needs no funds (the disconnect toggle is mock-only — production
+   chain disconnect is observable via real `ChainError::Rpc`).
+
+### Steps (automated path — `MockChainAdapter`)
+
+1. **Run the integration test:**
+   ```bash
+   cargo test -p pangolin-cli --test offline_mode \
+       offline_edit_then_online_publish
+   ```
+
+   Sub-scenario:
+   - Connect; create + publish initial account. Chain has 1 event.
+   - `set_disconnected(true)`. Add 5 accounts, update one, delete
+     one (writes a P10-1 widened tombstone payload). All edits
+     succeed locally; `Vault::list_dirty()` returns the queued
+     entries.
+   - `publish_all` while disconnected: every per-entry attempt
+     errors with `ChainError::Rpc`; dirty markers PRESERVED;
+     `list_frozen_accounts()` empty (no chain ingest happened, so
+     the freeze sentinel cannot fire).
+   - `set_disconnected(false)` (reconnect). `publish_all` succeeds
+     for every queued entry; chain now has at least 8 events
+     (1 initial + 5 add + 1 update + 1 delete).
+   - Final: `list_dirty()` empty; `list_accounts().len() == 5`
+     (genesis + 5 added - 1 tombstoned).
+
+   **Expected:** `test result: ok. 3 passed; 0 failed`.
+
+### Steps (manual path — Base Sepolia + funded keystore + real network outage)
+
+The automated path uses `MockChainAdapter` so it costs no gas. The
+manual path is for humans verifying the production chain
+integration.
+
+1. **Connected: publish initial state.**
+   ```bash
+   pangolin-cli publish \
+       --vault-path ~/pangolin-test/v.pvf \
+       --account pangolin-dev
+   ```
+   Add an account first via the host application (or directly via
+   `pangolin-store`'s `add_account` API; the CLI does not currently
+   expose an `add` subcommand — that's MVP-1 polish).
+
+2. **Disconnect from the network.** Either kill the local network
+   interface, switch to a network without internet, or stop the
+   local RPC. Real-world reproduction.
+
+3. **Edit the vault offline.** Add / update / delete accounts via
+   the host app. Each edit succeeds locally (Cardinal Principle 1
+   — edits MUST succeed without network).
+
+4. **Attempt publish while disconnected:**
+   ```bash
+   pangolin-cli publish \
+       --vault-path ~/pangolin-test/v.pvf \
+       --account pangolin-dev
+   ```
+   **Expected:** the CLI surfaces `ChainError::Rpc(...)` from the
+   `BaseSepoliaAdapter::with_signer` `eth_chainId` precheck and
+   exits non-zero. No partial chain state. Dirty markers
+   preserved.
+
+5. **Reconnect.** Restore the network.
+
+6. **Re-run publish.**
+   ```bash
+   pangolin-cli publish \
+       --vault-path ~/pangolin-test/v.pvf \
+       --account pangolin-dev
+   ```
+   **Expected:** every queued entry lands. The publish summary
+   reports the per-account success count. Dirty list is now empty.
+
+7. **Verify with status:**
+   ```bash
+   pangolin-cli status \
+       --vault-path ~/pangolin-test/v.pvf
+   ```
+   `dirty_count` is 0; `account_count` reflects the offline-session
+   net change.
+
+### Expected outcome
+
+- The `MockChainAdapter` path runs in under 60 seconds and exits 0.
+- The Base Sepolia path completes per offline-session edits + one
+  reconnect-publish round-trip; ~30-60 seconds for the publish
+  flush depending on the offline edit count.
+
+### Failure modes covered
+
+- **Publish-while-disconnected.** `ChainError::Rpc` is the surface;
+  dirty markers persist; user retries on reconnect. Verified by
+  `offline_mode::offline_edit_then_online_publish`.
+- **Empty dirty list while disconnected (lib-layer no-op).** The
+  `sync::publish_all` library entry point is idempotent on an
+  empty dirty list — the chain-view precheck failure is non-fatal
+  (the loop body sees `chain_view = None` and proceeds). The user-
+  facing `pangolin-cli publish` subcommand DOES require
+  connectivity for the underlying adapter constructor to succeed,
+  so the binary boundary preserves the §A7 invariant. Verified by
+  `offline_mode::offline_publish_with_no_dirty_entries_is_noop_at_lib_layer`.
+- **No freeze sentinel during offline session.** The freeze
+  sentinel is set inside `Vault::ingest_chain_revision`'s
+  genuine-foreign-INSERT branch; that function is only invoked by
+  `sync::pull_all`, which fails before reaching it on a
+  disconnected adapter. Verified by
+  `offline_mode::offline_session_does_not_set_freeze_sentinel`.
+- **Offline edits cannot be replayed by another device.** The
+  dirty markers live inside the encrypted `.pvf` file; another
+  device with the same `.pvf` (cross-vault under PoC two-key) sees
+  the same markers, but its `device_id` differs from the original
+  device's, so any publish from the second device produces an
+  event whose `canonical_hash` differs and lands as a co-fork
+  rather than a silent duplicate. THREAT_MODEL row #20 documents
+  this thoroughly.
+
+---
+
 ## Template
 
 ```

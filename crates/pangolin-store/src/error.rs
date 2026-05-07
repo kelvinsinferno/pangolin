@@ -131,6 +131,26 @@ pub enum StoreError {
     #[error("storage corruption detected: {0}")]
     Corrupted(String),
 
+    /// **P10-3 / A4.** Internal-state failure that is not a corruption
+    /// of the on-disk store but a transient runtime condition the
+    /// caller cannot meaningfully recover from. The current sole user
+    /// is `Vault::add_account`'s anti-resurrection retry loop: after
+    /// `ADD_ACCOUNT_RETRY_BUDGET` (4) consecutive collisions between
+    /// the randomly-derived `account_id` and an existing tombstoned
+    /// row, the loop surfaces this rather than spinning indefinitely
+    /// or silently skipping. The probability of a 4-attempt collision
+    /// is bounded at `4 * N / 2^256` where N is the tombstone count;
+    /// for any plausible vault size the bound is negligible
+    /// (vanishingly less than 1-in-2^200), so this variant only fires
+    /// under a pathological RNG (e.g., a broken `SQLite randomblob`
+    /// implementation). Distinct from `Corrupted` because the on-disk
+    /// store is not necessarily damaged.
+    #[error("internal failure: {reason}")]
+    Internal {
+        /// Human-readable cause string. Non-secret.
+        reason: String,
+    },
+
     /// The session was active but its idle timer or absolute-max ceiling
     /// fired. The cache is zeroized at the moment of expiry; the next
     /// op must re-supply both proofs (presence + identity) per Session

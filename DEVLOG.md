@@ -656,3 +656,269 @@ re-ordered `resolve_one`'s stash-vs-local match path), the
 7. `cargo clippy --workspace --all-targets -- -D warnings` clean.
 8. `cargo test --workspace --lib` — 294/294 passing (290
    baseline + 4 new).
+
+## 2026-05-07 · P10 — Tombstones & Offline Mode EPIC  ✅ SIGNOFF
+
+Plan at `docs/issue-plans/P10.md` Kelvin-approved with three
+locked answers (Q1: TombstonePayload three-field shape APPROVED;
+Q2: tombstoned_at_ms in merge revision is the merge's own seal
+time, not the original tombstone's; Q3: add_account
+anti-resurrection retry budget = 4). Five commits land on
+`issue/P10-tombstones-offline` from baseline tip `562a3ba`.
+
+**P10-1.** Widened tombstone payload schema. New
+`pangolin_store::TombstonePayload { deleted, account_id,
+tombstoned_at_ms }` with private fields + accessor methods;
+deterministic CBOR encoding with three-entry alphabetical key
+order (`account_id`, `deleted`, `tombstoned_at_ms`). Encoded via
+`ciborium-ll` directly (no serde — HIGH-1 invariant preserved).
+Legacy P3-era single-entry `{ "deleted": true }` payloads
+continue to decode for forward-compat (produce a
+`TombstonePayload` with all-zeros `account_id` and ts=0).
+`seal_tombstone` signature widens to take `&TombstonePayload`;
+`DecodedPayload::Tombstone` now carries the parsed payload.
+`Vault::delete_account` and `Vault::build_merge_payload_for_resolve`
+updated; the merge-of-tombstone case carries the merge revision's
+own seal time per Q2 (not the original tombstone's). 11 tests
+added (10 blob-level + 1 vault-level).
+
+**P10-2.** Opportunistic tombstone-bit detection in
+`Vault::ingest_chain_revision`'s genuine-foreign-INSERT branch.
+Replaced the audit-flagged hardcode `is_tombstone_i64 = 0` with a
+helper `Vault::detect_tombstone_bit_at_ingest` that AEAD-decrypts
+under the local VDK + the placeholder zero nonce that ingest
+persists for foreign events; sets bit=1 iff the decoded plaintext
+is a `TombstonePayload` whose `deleted` is true. Non-oracle
+property: every error variant collapses to bit=0; both decode-
+success and decode-failure paths return `IngestOutcome::Inserted`;
+no error variant escapes; the freeze sentinel still fires for
+foreign-ingest UX safety. PoC two-key reality (acknowledged
+limitation, plan §A2 / Threat #19): under PoC the chain event
+ABI does not transport the AEAD nonce, so the open under
+placeholder zero nonce will fail authentication for any real
+foreign event — the new logic is functionally a no-op (always
+falls through to bit=0 + freeze). The structurally-correct code
+is in place for MVP-1's nonce-on-chain to make this functional
+without further code changes. The synthetic-decryptable-tombstone
+test exercises the positive branch by sealing an event payload
+deliberately under the placeholder zero nonce. 5 tests added.
+
+**P10-3.** Read-guard reaffirmation +
+`add_account` anti-resurrection. (1)
+`ingest_chain_revision` now flips `account_identities.tombstoned
+= 1` when P10-2's opportunistic decode returns `is_tombstone =
+1`; without this UPDATE, P10-2's bit-set on the revisions row
+alone wouldn't propagate through `list_accounts`. (2)
+`Vault::add_account` runs a new `derive_fresh_account_id` helper
+that probes the existing account_identities row for a
+tombstoned-id collision; on collision, regenerate; after
+`ADD_ACCOUNT_RETRY_BUDGET` (4) collisions, surface
+`StoreError::Internal { reason }` rather than spinning. New
+`StoreError::Internal { reason: String }` variant. 7 lib tests
++ 1 integration test added (the integration covers the own-
+publish round-trip; the cross-vault propagation case is
+acknowledged Threat #19 limitation, closed by MVP-1).
+
+**P10-4.** `MockChainAdapter::set_disconnected(bool)` toggle.
+`Arc<AtomicBool>` field next to the existing `Arc<Mutex<...>>`;
+cloned mock handles share both. When disconnected, every
+adapter method returns `ChainError::Rpc("simulated offline")`
+synchronously without state mutation. Test-utilities-feature-
+gated alongside the rest of the `mock` module. New
+integration test file `tools/pangolin-cli/tests/offline_mode.rs`
+with three tests: `offline_edit_then_online_publish` (full
+flow: connect → publish 1 → disconnect → 5 add + 1 update +
+1 delete locally → publish_all fails per-entry, dirty markers
+preserved → reconnect → publish_all drains the queue, chain
+has 8 events, list_dirty empty, list_accounts.len() == 5);
+`offline_publish_with_no_dirty_entries_is_noop_at_lib_layer`
+(documents the orchestrator's swallow-chain-view-precheck-error
+discipline; the §A7 connectivity-required invariant lives at
+the binary boundary, not the lib entry point);
+`offline_session_does_not_set_freeze_sentinel` (pin: pull_all
+errors before reaching ingest_chain_revision, so the freeze
+sentinel cannot fire). E2E_TESTS.md gains E2E-005 with both
+automated and manual paths. 6 mock-level tests added.
+
+**P10-5.** This DEVLOG entry. THREAT_MODEL.md gains rows
+18–22 in the `pangolin-cli` section: 18 (forged tombstone),
+19 (tombstone-bit non-propagation under PoC two-key — closed
+structurally by P10-2, functionally by MVP-1), 20 (resurrection
+of tombstoned account_id forbidden), 21 (offline edit replay —
+inherits #5 cross-vault discipline), 22 (tombstone-bit at-rest
+modification — defense-in-depth via AEAD AAD binding + non-
+oracle decode). `pangolin-cli status` output gains a
+`tombstoned_count` line (per A8 — omitted in human-readable
+output when count is 0; always emitted in JSON for machine
+consumers). New `Vault::list_tombstoned_accounts()` accessor.
+
+**Test count delta:** 294 → 323 lib tests (+29) plus 4 new
+integration tests:
+
+Lib tests added:
+- `pangolin_store::blob::tests::tombstone_payload_round_trip_three_field`
+- `pangolin_store::blob::tests::tombstone_payload_encoding_is_deterministic`
+- `pangolin_store::blob::tests::tombstone_payload_legacy_single_entry_decodes`
+- `pangolin_store::blob::tests::tombstone_payload_rejects_arity_two`
+- `pangolin_store::blob::tests::tombstone_payload_rejects_arity_four_or_more`
+- `pangolin_store::blob::tests::tombstone_payload_rejects_non_canonical_key_order`
+- `pangolin_store::blob::tests::tombstone_payload_rejects_account_id_wrong_length`
+- `pangolin_store::blob::tests::tombstone_payload_rejects_tombstoned_at_negative`
+- `pangolin_store::blob::tests::seal_tombstone_with_payload_round_trips_through_open_payload`
+- `pangolin_store::blob::tests::tombstone_aad_substitution_fails`
+- `pangolin_store::vault::tests::delete_account_writes_canonical_three_field_tombstone_payload`
+- `pangolin_store::vault::tests::ingest_synthetic_decryptable_tombstone_event_sets_bit`
+- `pangolin_store::vault::tests::ingest_own_live_revision_does_not_set_tombstone_bit`
+- `pangolin_store::vault::tests::ingest_foreign_event_with_unreadable_payload_leaves_tombstone_clear_and_freezes`
+- `pangolin_store::vault::tests::ingest_locked_vault_skips_decryption_and_treats_as_unreadable`
+- `pangolin_store::vault::tests::ingest_tombstone_bit_does_not_oracle_aead_failure_versus_decode_failure`
+- `pangolin_store::vault::tests::ingest_tombstone_sets_account_identities_tombstoned_flag`
+- `pangolin_store::vault::tests::ingest_tombstone_filters_account_from_list_accounts`
+- `pangolin_store::vault::tests::ingest_tombstone_makes_get_account_return_none`
+- `pangolin_store::vault::tests::ingest_tombstone_makes_reveal_password_return_account_tombstoned`
+- `pangolin_store::vault::tests::add_account_refuses_to_resurrect_tombstoned_id`
+- `pangolin_store::vault::tests::add_account_retry_budget_happy_path_no_collision`
+- `pangolin_store::vault::tests::merge_payload_for_resolve_uses_new_three_field_tombstone_shape`
+- `pangolin_chain::mock::tests::disconnect_makes_publish_return_rpc_error`
+- `pangolin_chain::mock::tests::disconnect_makes_pull_since_return_rpc_error`
+- `pangolin_chain::mock::tests::disconnect_makes_get_revision_return_rpc_error`
+- `pangolin_chain::mock::tests::disconnect_makes_current_block_return_rpc_error`
+- `pangolin_chain::mock::tests::disconnect_persists_until_reconnect`
+- `pangolin_chain::mock::tests::reconnect_after_disconnect_preserves_state`
+- `pangolin_cli::commands::status::tests::status_includes_tombstone_count_when_nonzero`
+
+Integration tests added:
+- `pangolin_cli::tests::two_vault_roundtrip::own_tombstone_round_trip_via_chain`
+- `pangolin_cli::tests::offline_mode::offline_edit_then_online_publish`
+- `pangolin_cli::tests::offline_mode::offline_publish_with_no_dirty_entries_is_noop_at_lib_layer`
+- `pangolin_cli::tests::offline_mode::offline_session_does_not_set_freeze_sentinel`
+
+**Critical invariants verified at the P10 SIGNOFF tip:**
+
+1. `cargo tree -p pangolin-crypto | grep -ci serde` → 0 (HIGH-1
+   bound holds; P10 introduces no new transitive deps for the
+   crypto crate. The widened `TombstonePayload` uses
+   `ciborium-ll` directly, same as the live-snapshot encoder).
+2. No new `unsafe`.
+3. No plaintext on disk. The opportunistic-decode in P10-2
+   happens entirely in memory; the decrypted plaintext is
+   wiped on drop via `Zeroizing<Vec<u8>>` inside `open_payload`
+   (existing P3 discipline). The bit derived from the plaintext
+   IS persisted, but it's a one-bit structural derivation, not
+   a plaintext leak.
+4. Non-oracle property. P10-2's opportunistic-decode collapses
+   every error variant (AEAD failure, CBOR malformed, decoded
+   as Live, locked vault) into a single `bit=0` arm; both paths
+   return `IngestOutcome::Inserted`. Verified by
+   `ingest_tombstone_bit_does_not_oracle_aead_failure_versus_decode_failure`.
+5. Append-only state. Tombstone bit is set by INSERT-time
+   logic only (in `delete_account` and `ingest_chain_revision`'s
+   genuine-foreign-INSERT branch); never UPDATEd after the
+   row's initial write. The `account_identities.tombstoned`
+   flag is sticky once set (only the resolve flow producing a
+   live merge revision can clear it via P9's `clear_frozen`,
+   and that path applies to live-revision merges only).
+6. `cargo fmt --all --check` clean.
+7. `cargo clippy --workspace --all-targets -- -D warnings` clean.
+8. `cargo test --workspace --lib` — 323/323 passing (294
+   baseline + 29 new).
+9. `cargo test --workspace --tests` — integration tests pass,
+   including the new `offline_mode::*` and
+   `two_vault_roundtrip::own_tombstone_round_trip_via_chain`.
+
+**PoC limitations carried forward (documented in plan + threats):**
+
+- Foreign-event tombstone propagation under PoC two-key
+  (Threat #19). Closed structurally in P10-2; closes
+  functionally with MVP-1's nonce-on-chain.
+- Resurrection of tombstoned account_id is forbidden; under
+  PoC, undelete = create a new account with a fresh id (Threat
+  #20). MVP-1 may revisit if a deliberate-undelete user
+  feature emerges.
+- Cross-device offline edit replay inherits #5 — same
+  cross-vault discipline applies (Threat #21).
+- Tombstone-bit at-rest modification: defense-in-depth via
+  AEAD AAD binding; full mitigation is not the application
+  layer's job (Threat #22).
+
+## 2026-05-07 · P10 fix-pass — §16.5 audit findings (M-1, M-2, L-1; M-3 deferred; L-2/L-3 no-action)  ✅ SIGNOFF
+
+P10 §16.5 audit (commit `e7d9018`) flagged a documentation drift
+plus housekeeping. Fix-pass closes M-1 + M-2 with code+tests, L-1
+with a one-line `deny.toml` edit, and explicitly defers M-3 per
+auditor recommendation.
+
+**M-1 + M-2 — payload-vs-event `account_id` cross-check (CLOSED).**
+THREAT_MODEL row 18 + `docs/issue-plans/P10.md` §A1/§C claimed the
+cross-check existed before the code shipped it. Implemented inside
+`Vault::detect_tombstone_bit_at_ingest` using
+`subtle::ConstantTimeEq::ct_eq` over the 32-byte arrays. Mismatch
+silently collapses to `is_tombstone = 0` — same bucket as AEAD
+failure / CBOR failure / locked vault — preserving (and
+strengthening) the non-oracle property of the ingest decoder. No
+new error variant; the decoder itself stays type-pure (the
+cross-check is in the ingest layer, not in `decode_payload`). The
+freeze sentinel still fires for the row's INSERT, so the
+user-facing safety property is unaffected. `subtle` was already a
+dep of `pangolin-store` (used in `account.rs::AccountId::ct_eq`);
+no Cargo.toml change. Verified `cargo tree -p pangolin-crypto |
+grep -ci serde` is still 0 — the new use of `subtle` is in the
+store crate, NOT crypto. Two new tests:
+- `detect_tombstone_bit_rejects_cross_account_payload` — synthetic
+  ciphertext whose AAD-bound id is X but whose plaintext
+  `account_id` is Y; bit lands at 0 silently.
+- `detect_tombstone_bit_accepts_matching_payload` — same setup
+  with X==Y; bit lands at 1 (regression coverage).
+
+THREAT_MODEL row 18 prose updated: replaced the "triggers
+`StoreError::Cbor(...)`" claim with the constant-time
+silent-rejection description. `docs/issue-plans/P10.md` §A1
+(rationale 2), §C (audit-bullet on AAD-vs-plaintext cross-checks),
+the threat-model row 14 draft (which is the eventual THREAT_MODEL
+row 18 text), and the failure-modes table all updated to align.
+
+**L-1 — stale `RUSTSEC-2024-0388` advisory ignore (CLOSED).** The
+alloy/coins version churn that landed earlier dropped `derivative`
+from the dep graph, so the ignore began firing
+`advisory-not-detected` warnings. Removed the entry from
+`deny.toml`; left a forward-comment so a future re-introduction
+re-adds it verbatim. `cargo deny check` is now fully clean.
+
+**M-3 — retry-exhaustion deterministic test (DEFERRED).** Per
+auditor's PoC-scope recommendation. The retry-loop's failure path
+needs a test-only RNG seam to drive `random_32_via_sqlite` through
+4 successive collisions; existing happy-path coverage plus the
+`~4×N/2^256` probability bound is sound for PoC. Documented in
+`docs/issue-plans/P10.md` §"Out of scope (explicit)".
+
+**L-2, L-3 — no-action observations.** L-2 (comment polish on
+`derive_fresh_account_id`) and L-3 (positive test count drift)
+are acknowledged; no code change.
+
+**Test-count delta:** 324 → 326 lib tests (+2 from M-1+M-2
+positive/negative coverage).
+
+**Critical invariants verified at the P10 fix-pass SIGNOFF tip:**
+
+1. `cargo tree -p pangolin-crypto | grep -ci serde` → 0 (HIGH-1
+   bound holds; the `subtle` dep was already in `pangolin-store`
+   and `subtle` itself does not pull `serde`).
+2. No new `unsafe`.
+3. No plaintext on disk. The constant-time compare runs on the
+   already-decrypted-and-zeroizing-on-drop plaintext inside
+   `open_payload`; nothing new is persisted beyond the same
+   one-bit `is_tombstone` derivation as P10-2.
+4. Non-oracle property STRENGTHENED. The cross-check uses
+   `subtle::ConstantTimeEq::ct_eq` (no timing-channel divergence
+   on byte-prefix-match position) AND collapses to `0` on
+   mismatch (no different error variant). Verified by both new
+   tests — the rejection is silent end-to-end.
+5. Append-only state unchanged. The cross-check only gates
+   bit-set on INSERT; no UPDATE introduced.
+6. `cargo fmt --all --check` clean.
+7. `cargo clippy --workspace --all-targets -- -D warnings` clean.
+8. `cargo test --workspace --lib` — 326/326 passing.
+9. `cargo test --workspace --tests` — integration tests
+   unchanged from P10 SIGNOFF tip (no integration test touched).
+10. `cargo deny check` fully clean (no `advisory-not-detected`
+    warnings after L-1 fix).

@@ -49,6 +49,7 @@ pub(crate) mod schema;
 pub(crate) mod search;
 
 pub use account::{AccountId, AccountSnapshot};
+pub use blob::TombstonePayload;
 pub use conflict::ConflictReport;
 pub use dirty::{DirtyEntry, IngestOutcome, RevisionPublishPayload};
 pub use error::{Result, StoreError};

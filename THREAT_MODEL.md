@@ -567,3 +567,123 @@ the PR.
     freshness guard ("verify chosen head is still a head as of
     right now"); P9 ships without it per Kelvin's locked
     answer Q2.
+18. **Forged tombstone (foreign device claiming to delete the
+    user's account).** Defense: tombstone revisions are signed
+    by the device's Ed25519 `DeviceKey` via
+    `signing::build_signed_revision`, same path as publish +
+    resolve. The canonical hash binds `parent_revision`,
+    `account_id`, `vault_id`, `device_id`, `schema_version`,
+    and `enc_payload`. v0 contract does not verify on-chain;
+    v1 will (MVP-2 issue 2.1). Per Q6 defense-in-depth, every
+    chain event including tombstones passes the
+    `VerifyingKey::from_bytes` check in `pull_all` before
+    reaching `ingest_chain_revision`. Under the PoC two-key
+    model (P8 §A7) carries forward unchanged — the ephemeral
+    signing `DeviceKey` per run discipline applies to
+    tombstone publishes too. The plaintext-level payload's
+    `account_id` field added in P10-1 is a defense-in-depth
+    cross-check against the AAD-bound `account_id`: an attacker
+    who has somehow constructed a valid AEAD seal under the
+    user's VDK but with a wrong-account_id payload is rejected
+    inside `detect_tombstone_bit_at_ingest`. The cross-check is
+    constant-time via `subtle::ConstantTimeEq::ct_eq`; mismatch
+    silently returns `is_tombstone = 0`, preserving the
+    non-oracle property of the ingest decoder (the same bucket
+    as AEAD failure / CBOR failure / locked vault — no error
+    variant escapes). The freeze sentinel still fires for the
+    row's INSERT, so the user-facing safety property is
+    unaffected.
+19. **Tombstone-bit non-propagation under PoC two-key
+    foreign-ingest (P8 audit CRIT-1 origin, structurally
+    closed by P10-2).** Defense (acknowledged PoC limitation):
+    under PoC two-key, the chain event ABI carries no AEAD
+    nonce, so `ingest_chain_revision` stores a placeholder
+    zero nonce and cannot decrypt foreign events. The
+    opportunistic-decode logic in P10-2 falls through to
+    `is_tombstone = 0` for the affected row, and the existing
+    P8 freeze sentinel fires. The user-facing consequence is
+    "the foreign tombstone is not auto-applied; the account is
+    frozen until the user resolves." The user resolves by
+    running `pangolin-cli resolve --keep <chosen-revision-id>`
+    against the tombstone revision id (P9's resolve flow's
+    tombstone branch produces a tombstone merge per §A5), and
+    the post-resolve state has `is_tombstone = 1` correctly
+    set on the merge revision. Closed by MVP-1's
+    nonce-on-chain (the `RevisionPublished` event ABI gains a
+    nonce field; foreign events become decryptable; the
+    opportunistic-decode logic becomes functional without a
+    code change). Documented as a known PoC limitation. The
+    structurally-correct opportunistic-decode code is in place
+    (P10-2 replaced the audit-flagged hardcode
+    `is_tombstone_i64 = 0` comment) and exercised by a
+    synthetic-decryptable-tombstone test
+    (`ingest_synthetic_decryptable_tombstone_event_sets_bit`).
+20. **Resurrection of a tombstoned `account_id`.** Defense:
+    `Vault::add_account` refuses with `StoreError::Internal`
+    if the (randomly-derived) `account_id` collides with a row
+    whose `tombstoned = 1` after `ADD_ACCOUNT_RETRY_BUDGET`
+    (4) attempts. Under PoC the random-32-via-sqlite-derived
+    `account_id` makes this collision cryptographically
+    negligible (per-attempt probability `N / 2^256`; 4-attempt
+    bound `4 * N / 2^256`, vanishingly small for any plausible
+    vault size), so the guard is defense-in-depth + spec
+    compliance with the append-only invariant (Cardinal
+    Principle 4). MVP-1 may revisit for a deliberate "undelete"
+    feature; under PoC, undelete = create a new account with
+    a fresh `account_id`. The retry budget is bounded; failure-
+    after-4 surfaces `StoreError::Internal`, NOT a silent skip.
+21. **Offline edit replay (a queued dirty marker for an edit
+    made on device A is published from a different device B).**
+    Defense: dirty markers are local-only — they live in the
+    `dirty_accounts` table inside the encrypted `.pvf` file;
+    another device cannot read them without the `.pvf` file.
+    Under the PoC two-key model, the same `.pvf` file copied
+    to device B (the cross-vault case) shares the dirty list
+    with device A; device B running `publish_all` would
+    publish A's queued entries under B's ephemeral signing
+    `DeviceKey`. **This is the same threat as #5
+    (cross-vault replay protection).** The `vault_id` binding
+    in `signing::canonical_hash` ensures the published
+    revisions are cryptographically tied to the shared vault;
+    the `device_id` binding identifies B's device as the
+    publisher (which is correct — B is the one who broadcast
+    the transaction). Recovery: either device pulling sees
+    both the original dirty entries and B's
+    ephemeral-signing-key publish; the freeze sentinel fires
+    on A's next pull (since B's `device_id` != A's
+    `device_id`); A resolves. **MVP-1's switch to derived
+    wallet (D-006) closes this — both devices have the same
+    `device_id`; cross-device publish is structurally
+    indistinguishable from same-device publish.**
+22. **Tombstone-bit at-rest modification.** Defense
+    (defense-in-depth): the `is_tombstone` bit on a
+    `revisions` row is set by either (a)
+    `Vault::delete_account` at the local-write site (own-
+    delete), or (b) `Vault::ingest_chain_revision`'s
+    opportunistic-decode at chain-ingest (P10-2 / P10-3,
+    `tombstoned = 1` flag flipped when the AEAD plaintext
+    decodes to `TombstonePayload`). Both writes happen
+    INSIDE a `BEGIN IMMEDIATE … COMMIT` transaction
+    alongside the `revisions` INSERT; never UPDATEd later.
+    A malicious local actor with vault-file access could
+    `UPDATE revisions SET is_tombstone = 0` directly via
+    sqlite tooling, but that's the same as them tampering
+    with any row (e.g., `enc_payload`); not a defense the
+    application layer can mount against an attacker with
+    raw filesystem access. The AEAD seal binds the plaintext
+    to its AAD (`vault_id, account_id, parent_revision,
+    schema_version`); a tampered tombstone whose plaintext
+    no longer decodes as `TombstonePayload` would be
+    detected by the opportunistic-decode path (the bit
+    stays 0 and the freeze sentinel fires) at the next
+    chain ingest of a successor revision. Under the PoC
+    two-key model the marginal exposure of the bit value
+    is bounded — see also #19 for the propagation gap. The
+    test-utilities `MockChainAdapter::set_disconnected`
+    toggle (P10-4) is `#[cfg(any(test, feature =
+    "test-utilities"))]`-gated and cannot be constructed
+    by a production binary; the offline-edit-then-online-
+    publish E2E test pins that the freeze sentinel does
+    NOT fire during an offline session (no chain ingest
+    happened — verified by
+    `offline_session_does_not_set_freeze_sentinel`).
