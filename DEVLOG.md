@@ -157,3 +157,50 @@ Surprises: H-1 was the most substantive finding — a textbook "the gate exists 
 Unblocks: P5+ host UI shells (Tauri desktop, iOS, Android) — they consume the trait-based proof API and the `with_session` resume primitive. **P6** (chaincli debug oracle) and **P7** (Rust chain adapter) are also unblocked but those don't need session policy; they consume P5-4's deployed contract directly via `pangolin-chain`. Merged as `aab248f`.
 
 Next: **P6** (chaincli) and **P7** (chain adapter) are the natural next pair — both consume the deployed RevisionLogV0 from P5-4 + pangolin-crypto's signing + pangolin-store's local revisions. They unblock **P8** (sync flow), **P9** (conflict resolution), **P10** (tombstones), **P11** (E2E demo), **P12** (packaging) — i.e., the rest of the PoC.
+
+## 2026-05-06 · P8 — pangolin-cli sync (publish + pull + dirty tracking)  ✅ SIGNOFF
+
+Plan at `docs/issue-plans/P8.md` Kelvin-approved (Q4–Q6 answered: two-key PoC model accepted, `tools/pangolin-cli/` location accepted, defense-in-depth signature verify on ingest accepted). **Security-critical** per §16.3 — first issue that wires the vault end-to-end through the chain.
+
+7 commits along the §16.4 BUILD-gate discipline:
+
+- **P8-1** scaffolds `tools/pangolin-cli/` (clap shape, three subcommand stubs, deployment-file walk-up, RPC-URL precedence chain). Mirrors `tools/chaincli/` byte-for-byte. The pre-existing `crates/pangolin-cli/` placeholder (a `pangolin` smoke-test binary) is removed; workspace `members` updated.
+- **P8-2** adds the `dirty_accounts` SQL table with `Vault::{mark,clear,list}_dirty` API. Auto-stamp inside `add_account` / `update_account` / `delete_account` runs in the same transaction as the revision INSERT — a crash leaves the vault in the pre-transaction state. `(account_id, revision_id)` composite primary key per §A2 protects against duplicate-publish on re-run.
+- **P8-3** implements `pangolin-cli publish`. `sync::publish_all<A: ChainAdapter>` walks the dirty list; per-entry it reads the revision row's `(parent, schema_version, enc_payload)`, builds a `SignedRevision`, runs the §A3 pre-publish check (canonical-hash compare against `pull_since(vault_id, last_pulled_block, None)`), submits, then runs `mark_published` + `clear_dirty`. Per-account error isolation via `PublishReport`. The keystore loader mirrors chaincli; vault unlock uses the standard P4 two-proof flow.
+- **P8-4** implements `pangolin-cli pull`. `sync::pull_all<A: ChainAdapter>` chunks the block range into PULL_CHUNK_SIZE = 8 000 windows. Per chunk: pull → Q6 device_id canonical-form check on every event → `Vault::ingest_chain_revision`. After each chunk: `advance_last_pulled_block(chunk_end)` BEFORE the next chunk's `pull_since` — resolves P7 audit MED-3. Forks surface via `PullReport.forks` (cardinal principle 3 — chain is a log, not an authority). Pull exits 0 even with forks; P9 resolves them.
+- **P8-5** implements `pangolin-cli status`. Read-only diagnostics; works on a Locked vault (no chain calls). Reports `vault_id`, `dirty_count`, `account_count`, `last_pulled_block`, `last_published_block` (max chain_block_number).
+- **P8-6** ships the integration suite. `tests/two_vault_roundtrip.rs` runs three plan-required scenarios (`convergence`, `symmetric_fork`, `idempotent_repeat_pull`) using two vaults that share identity by file-copy. `tests/integration_base_sepolia.rs` is gated `#[cfg(feature = "integration-tests")]`. Adds `src/lib.rs` so integration tests can import the orchestration core (binary crates can't be imported by integration tests under `tests/*.rs` without a lib path).
+- **P8-7** documentation (this commit): THREAT_MODEL.md row (9 enumerated threats covering forged publish, replay, partition during chunked pull, dirty-entry leak, cross-vault replay, pre-publish check race, MockChainAdapter substitution, two-key gas-wallet correlation, forged-event-stream); E2E-003 entry (automated MockChainAdapter path + manual Base Sepolia path with funded keystore); this DEVLOG entry; surface table updated.
+
+**Test count delta:** 195 → 248 (53 new tests). Breakdown:
+- pangolin-store: 75 → 90 (+15 = 12 dirty + 3 ingest_chain_revision)
+- pangolin-cli unit (lib): 0 → 32 (cli, config, keystore, sync publish + pull, status, vault_open)
+- pangolin-cli integration: 0 → 6 (3 cli_arg_parsing + 3 two_vault_roundtrip)
+- gated Base Sepolia tests: 2 (off by default; not in the 248 count)
+
+**Architecture surprises:**
+
+- The plan's content-deterministic `revision_id = canonical_hash` discipline collides with P0..P7's random `RevisionId` generation. The two reconcile via three idempotency arms in `Vault::ingest_chain_revision`: exact `revision_id` match, `(account_id, chain_tx_hash, block_number, log_index)` match, and a content-merge path that UPDATEs the existing row's chain anchor when a local `chain_tx_hash IS NULL` row matches by `(account_id, parent_revision, enc_payload, schema_version)`. Without the merge arm, every publish-then-pull round-trip would produce a spurious 2-head fork.
+- Two-key PoC model means the locally-stored `device_id` (random bytes from `randomblob(32)`) doesn't match the publish-time signing key's pubkey. Idempotency checks therefore deliberately ignore `device_id` and match on chain anchor + content. MVP-1 will switch to `pangolin_chain::evm::derive_evm_wallet` to satisfy D-006's wording, at which point `device_id` will round-trip and the idempotency check can tighten.
+- v0 contract doesn't transport the signature bytes in `RevisionPublished`. Q6 defense-in-depth therefore reduces to a `VerifyingKey::from_bytes` shape check on every event's `device_id` — full Ed25519 `verify` is blocked until v1 records the signature on-chain. The shape check still catches an attacker-controlled-RPC threat: any `device_id` that isn't a canonical Ed25519 point is refused at the device boundary.
+- `pangolin-cli` has both `src/main.rs` and `src/lib.rs` because integration tests under `tests/*.rs` cannot import a binary's modules. The library is internal-use-only — external consumers should use `pangolin-store` + `pangolin-chain` directly.
+
+**Critical invariants verified at the tip:**
+
+1. `cargo tree -p pangolin-crypto | grep -ci serde` → 0 (HIGH-1 holds)
+2. No new `unsafe` (verified by workspace `unsafe_code = "deny"`)
+3. No plaintext on disk (`pangolin-cli` does not write decrypted vault data anywhere — `read_revision_for_publish` returns the AEAD-sealed `enc_payload` verbatim)
+4. Per-chunk all-or-nothing in pull (verified by `pull_chunk_failure_preserves_prior_chunk_progress`)
+5. Per-account atomicity in publish (verified by `publish_per_account_isolation` + `publish_idempotent_on_rerun_after_partial_failure`)
+6. Signature verify on pull (`pull_all`'s loop body runs `VerifyingKey::from_bytes` before ingest)
+7. Workspace clippy `-D warnings` clean
+8. No regression in the 195 P0..P7 lib tests; total now 248
+
+**Deferred follow-ups (not signoff blockers):**
+
+- MVP-1 switches `pangolin-cli publish` to `evm::derive_evm_wallet` for the gas wallet, closing the §A7 D-006 deviation.
+- MVP-1 issue 1.4 plans the move to content-deterministic `RevisionId` for locally-created revisions (P2/P3 still use random ids), at which point the ingest path's content-merge arm becomes redundant.
+- v1 contract (MVP-2 issue 2.1) records the signature on-chain; `pull_all`'s Q6 check upgrades from "device_id canonical form" to full `verify_signed_revision` at that point.
+- Master plan §16.8 layout table needs to record `tools/pangolin-cli/` (was `crates/pangolin-cli/` in the original layout; deviation per Q5 / §A8 of the P8 plan).
+
+Unblocks **P9** (conflict resolution UX — `pangolin-cli resolve <account-id> --keep <revision-id>`), **P10** (tombstone-aware deletes), **P11** (E2E recorded screencast).

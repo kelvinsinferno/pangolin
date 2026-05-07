@@ -43,6 +43,7 @@ Per-component threat enumeration lands as part of MVP-1 issue 0.2 and is updated
 | Session policy engine | MVP-1 | TBD (issue 0.2) |
 | Revision Log v0 contract | PoC | DOCUMENTED (P5-1) |
 | Pangolin chain adapter (`pangolin-chain`) | PoC | DOCUMENTED (P7) |
+| Pangolin sync orchestrator (`pangolin-cli`) | PoC | DOCUMENTED (P8) |
 | Revision Log v1 contract | MVP-2 | TBD (issue 2.1 plan) |
 | Funder service | MVP-2 | TBD (issue 3.4 plan) |
 | Ephemeral local indexer | MVP-2 | TBD (issue 4.2 plan) |
@@ -224,3 +225,108 @@ sidecar when present) for each marker — asserting zero matches across
 all writes. Runs on every `cargo test` invocation in CI; a marker hit
 would indicate a regression in the seal/AAD discipline and would block
 the PR.
+
+### Pangolin sync orchestrator (`pangolin-cli`)
+
+> Source: `docs/issue-plans/P8.md` §"Threat model row" and the P8
+> build-gate. The `pangolin-cli` binary at `tools/pangolin-cli/` is
+> the user-facing PoC orchestrator that drives `pangolin-chain` to
+> publish dirty revisions and pull chain events into the local
+> vault. It does not introduce new cryptographic primitives; the
+> threats below concern orchestration, idempotency, and the
+> publish/pull state machine.
+
+1. **Forged publish (foreign device claiming to be the user's).**
+   Defense: revisions are signed by an Ed25519 device key via
+   `signing::build_signed_revision`, which binds the canonical-hash
+   digest to the device's Ed25519 verifying-key bytes (`device_id`).
+   v0 contract does **not** verify on-chain; v1 will (MVP-2 issue
+   2.1). Per Q6 plan-gate decision, `pull_all` runs a defense-in-
+   depth `VerifyingKey::from_bytes` check on every event's
+   `device_id` BEFORE invoking `Vault::ingest_chain_revision` — an
+   event whose `device_id` is not a canonical Ed25519 point is
+   refused at the device boundary. Full signature verification (the
+   Ed25519 `verify` step over the canonical hash) is blocked until
+   v1 records the signature on-chain; v0's `RevisionPublished` event
+   ABI does not transport the signature bytes. *PoC two-key model
+   note:* under the §A7 deviation from D-006, `pangolin-cli`
+   generates an ephemeral signing `DeviceKey` per run (the
+   gas-paying secp256k1 wallet is the Foundry keystore). MVP-1 will
+   switch to `evm::derive_evm_wallet` so the same Pangolin device
+   key signs revisions and pays gas — closing the deviation while
+   preserving the canonical-hash discipline.
+2. **Replay of an old signed revision.** Defense: the canonical-
+   hash digest binds `parent_revision`. A revision with a stale
+   parent cannot apply to a moved-on head; ingestion only
+   structurally succeeds when the parent matches the local head OR
+   surfaces as a fork (per Cardinal Principle 3 the chain is a log,
+   not an authority — the local store records what the chain says
+   happened). Re-publishing the same revision is additionally
+   guarded by the A3 pre-publish check (`pull_since` →
+   canonical-hash compare → skip-if-already-on-chain), preventing
+   double-publish after a kill mid-publish.
+3. **Network partition during chunked pull.** Defense: per A5, the
+   chunked-pull design means a chunk failure preserves prior
+   chunks' progress on disk via `advance_last_pulled_block` per
+   chunk. Re-running `pangolin-cli pull` resumes from the new
+   `last_pulled_block`. This resolves P7 audit MED-3 without
+   altering the `ChainAdapter` trait shape.
+4. **Dirty-entry leak.** Defense: the `dirty_accounts` table stores
+   only `(account_id, revision_id, marked_at)`. `account_id` is
+   already an attacker-observable identifier on-chain (the
+   `RevisionPublished` event includes it as topic 2). `revision_id`
+   is the canonical-hash digest of the revision payload, which
+   becomes observable on chain anyway when the revision publishes.
+   `marked_at` is a unix-ms timestamp local to the device — the
+   only piece of new metadata, and it leaks only "when did this
+   device edit account X for the n-th time," visible only to an
+   attacker who has already compromised the local vault file (in
+   which case they have the AEAD-protected ciphertext, dwarfing
+   the timing leak).
+5. **Replay protection across vaults.** Defense: `vault_id` is
+   bound into `signing::canonical_hash`, so a revision signed for
+   vault A cannot be replayed against vault B even by the same
+   device. The chain event includes `vault_id` as topic 1; pulled
+   events for vault B never include vault A's revisions because
+   `pull_since` filters server-side on `vault_id` topic equality.
+6. **Pre-publish check race.** Defense (acknowledgement): the A3
+   pre-publish check runs `adapter.pull_since(vault_id,
+   last_pulled_block, None)` before any re-attempt. The race is:
+   two devices publish the same `(parent, payload)` simultaneously
+   and both A3 checks succeed (each sees the chain without the
+   other's revision yet). Both publishes succeed and create a fork.
+   This is **expected behavior** — concurrent edits by independent
+   devices fork; the fork surfaces on the next pull (A4); P9
+   resolves it. The race is not a defect.
+7. **Misuse of `MockChainAdapter` in the binary.** Defense:
+   `pangolin-cli` does not enable `pangolin-chain`'s
+   `test-utilities` feature in its default `[dependencies]` table
+   — only in `[dev-dependencies]`. `MockChainAdapter` is therefore
+   not constructible from the production build. Tests compile with
+   the feature enabled; humans who try to substitute the mock for
+   a real adapter would have to edit `tools/pangolin-cli/Cargo.toml`,
+   which an audit reviewer would catch. P7 audit's gating
+   discipline is inherited.
+8. **Two-key model gas-wallet correlation (D-006 deviation).**
+   Defense (acknowledgement): the gas-paying secp256k1 wallet
+   (Foundry keystore) is **separate** from the device's Ed25519
+   revision-signing key. The gas wallet's address appears as the
+   `tx.from` on every publish; an observer who learns "address X
+   paid gas for these revisions" can correlate all publishes from
+   the same machine across all vaults that share the keystore. This
+   is the same observability surface as P7 audit threat #6 (EVM
+   address observability) and the same Phase-2 mitigation applies
+   (per-publish wallet rotation via funder service, MVP-2 issue
+   3.4). The PoC-specific divergence from D-006 (which mandates
+   *one* keypair as both signer and gas payer) is documented in
+   §A7 of the P8 plan; MVP-1 will switch to
+   `pangolin_chain::evm::derive_evm_wallet` to satisfy D-006's
+   wording.
+9. **Forged-event-stream from compromised RPC.** Defense: per Q6
+   defense-in-depth, every event surfaced by `pull_since` is
+   subjected to a `VerifyingKey::from_bytes` check on its
+   `device_id` before reaching `ingest_chain_revision`. An RPC
+   that splices events with garbage `device_id` bytes is rejected
+   at the device boundary. v0 contract has no signature semantics;
+   this client-side check is the load-bearing defense until v1
+   records the signature on-chain (MVP-2 issue 2.1).
