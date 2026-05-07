@@ -922,3 +922,126 @@ positive/negative coverage).
    unchanged from P10 SIGNOFF tip (no integration test touched).
 10. `cargo deny check` fully clean (no `advisory-not-detected`
     warnings after L-1 fix).
+
+## 2026-05-07 · P11A — pangolin-cli account subcommands EPIC  ✅ SIGNOFF
+
+P11A closes the structural gap "Pangolin is a password manager
+whose CLI cannot manage passwords." Five new subcommands —
+`pangolin-cli account add` / `list` / `show` / `update` /
+`delete` — expose P3-era's library account-management API at
+the user-facing CLI boundary, preserving P4's presence-
+escalation discipline for credential reveals, P8's freeze-guard
+discipline, and P10's anti-resurrection / tombstone-payload
+discipline. No new cryptographic primitive, no new chain-side
+code, no new vault-schema column, no new public library API.
+
+**Commit-by-commit:**
+
+- **P11A-1 (`aba944f`)** — clap scaffold. New
+  `tools/pangolin-cli/src/commands/account.rs` module + the
+  `Command::Account(AccountArgs)` arm in `cli.rs`. Five sub-
+  verbs wired with full `#[derive(Args)]` types; per-verb
+  `run_*` functions are stubbed with `bail!("not implemented
+  yet")`. 10 clap tests pin the surface (help renders, per-
+  verb arg parsing, mutually-exclusive flag groups, empty-
+  name reject, §A16 forbidden-user-facing-terms invariant).
+- **P11A-2 (`fd382eb`)** — `account add` end-to-end.
+  Password input via `--generate-password` (24-char from a
+  64-char alphabet, `pangolin_crypto::rng::fill_random` as
+  entropy source; printed to STDERR per Q5 inside a
+  save-this-now block) OR `--password-stdin` OR interactive
+  prompt with confirmation. NO `--password <flag>`. TOTP
+  same shape; notes accept the lower-tier `--notes <str>`
+  per A5. New `account_id` (lowercase hex) goes to STDOUT
+  for shell-pipe ergonomics. Per Q1, `add` does NOT auto-
+  create the vault; missing `.pvf` errors fast. 7 tests.
+- **P11A-3 (`e2fac26`)** — `account list` + `account show`.
+  `list` walks `Vault::list_accounts` (frozen + tombstoned
+  filtered by default; `--include-frozen` /
+  `--include-tombstoned` opt them in with `[frozen]` /
+  `[deleted]` suffix per A11). The internal `ListRow`
+  struct holds only identifier-class fields — secret-bearing
+  fields are structurally absent (verified by
+  `list_row_omits_secret_fields_structurally`). `show`
+  default omits secrets; `--reveal-{password,notes,totp-secret}`
+  prompt ONCE for presence per A7, then construct N fresh
+  `PressYPresenceProof::confirmed()` instances. JSON output
+  uses the omit-vs-null discipline (unrevealed fields are
+  absent, not `null`). 10 tests.
+- **P11A-4 (`cd39730`)** — `account update`. Per A6,
+  always presence-gated: the library API requires a
+  complete `AccountSnapshot`, so the CLI reveals every
+  secret field of the entry to construct it (one prompt;
+  three fresh proofs; one update transaction).
+  Override-or-preserve per field. Pre-presence guard
+  surfaces frozen → resolve hint, tombstoned → "deleted",
+  unknown → "no account" before asking the user for a
+  presence proof. New `cfg(test)`-only test seam
+  `TEST_AUTO_CONFIRM_PRESENCE` bypasses the prompt for
+  unit tests; production binaries cannot reach it. 6 tests.
+- **P11A-5 (`693d9e2`)** — `account delete`. Default flow
+  prints a confirmation prompt that includes the display
+  name (typo-prevention per Q3) and reads the literal
+  lowercase string `"yes"` (case-sensitive, A9). `--yes`
+  bypasses the prompt; `--why <reason>` is informational
+  only (echoed to stderr; NOT in the tombstone payload).
+  Per Q8 there is NO `--force` flag — frozen-account delete
+  surfaces the same "run resolve" hint as `update`.
+  Re-deletion of a tombstoned id is refused with an
+  idempotency-by-clear-error message rather than silent
+  success. Sibling `TEST_AUTO_CONFIRM_DELETE` test seam
+  for unit-test ergonomics. 8 tests.
+- **P11A-6 (this entry)** — THREAT_MODEL rows 23–27 cover
+  the new threat surface: process-listing leak (defense:
+  no `--password <flag>`), shell-history leak, tombstone
+  replay, reveal-confirmation phishing under `PoC`, and
+  frozen-account update/delete refusal. Integration test
+  `tools/pangolin-cli/tests/account_lifecycle.rs` exercises
+  the full `add → list → show → update → delete` round
+  trip on a fresh vault. E2E_TESTS extended with E2E-006
+  scenario.
+
+**Test-count delta:** 326 → 367 lib tests (+41 across
+P11A-1..P11A-5) plus 1 new integration test
+(`account_lifecycle_round_trip`).
+
+**Critical invariants verified at the P11A SIGNOFF tip:**
+
+1. `cargo tree -p pangolin-crypto | grep -ci serde` → 0
+   (HIGH-1 bound holds; P11A introduces no new
+   `pangolin-crypto` dependency).
+2. No new `unsafe`. `forbid(unsafe_code)` is unconditional
+   at the top of `tools/pangolin-cli/src/main.rs` and
+   `lib.rs`; preserved.
+3. No plaintext on disk. Reveal output goes to stdout
+   (per Q2). The interactive password prompt, stdin
+   variants, and the auto-generated password block all
+   route through `SecretBytes` wrappers that zeroize on
+   drop. No CLI code path writes plaintext to a file or
+   environment variable.
+4. No `--password <flag>` form anywhere. Verified by
+   `account_add_password_stdin_and_generate_conflict` +
+   inspection of `AccountAddArgs` / `AccountUpdateArgs`
+   field set (only `password_stdin: bool`,
+   `generate_password: bool`, `password_prompt: bool`).
+5. Append-only state holds. Account ops use existing
+   `add_account` / `update_account` / `delete_account`
+   library calls, each of which writes a new revision in
+   one transaction (P3 / P8-2 / P10-1 invariants
+   preserved).
+6. `cargo fmt --all --check` clean.
+7. `cargo clippy --workspace --all-targets -- -D warnings`
+   clean.
+8. `cargo test --workspace --lib` — 367/367 passing
+   (326 + 41 new).
+9. `cargo test --workspace --tests` — integration tests
+   pass, including the new `account_lifecycle.rs`.
+10. §3.5 forbidden-user-facing-terms invariant holds —
+    `account_help_avoids_forbidden_user_facing_terms`
+    pins the rendered `--help` output for "blockchain",
+    "transaction", "hashes", "revisions",
+    "decentralized storage", and "gas".
+11. P0..P10 lib + integration tests unchanged.
+12. No new D-NNN entries — every architectural decision
+    in the P11A plan is local to the CLI surface and
+    documented in `docs/issue-plans/P11A.md` §A1..§A16.
