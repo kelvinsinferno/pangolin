@@ -7,8 +7,8 @@ members = [
     "crates/pangolin-chain",
     "crates/pangolin-indexer",
     "crates/pangolin-funder-client",
-    "crates/pangolin-cli",
     "tools/chaincli",
+    "tools/pangolin-cli",
 ]
 
 # Workspace-wide dependency pins. Crypto-bearing crates are restricted to the

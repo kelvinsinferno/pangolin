@@ -137,6 +137,26 @@ pub enum StoreError {
     /// prompt the user for an explicit presence confirmation and retry.
     #[error("operation requires a fresh presence proof")]
     PresenceProofRequired,
+
+    /// **P8 fix CRIT-1.** A user-facing read or edit was attempted
+    /// against an account whose `account_identities.frozen_pending_resolve`
+    /// flag is set. The flag is set by [`crate::vault::Vault::ingest_chain_revision`]
+    /// when a foreign-device chain event lands on an existing account
+    /// (the ingest takes the "INSERT new row" path rather than any of
+    /// the three idempotency-merge arms — see CRIT-1 in the P8 audit
+    /// fix-pass plan). It signals "this account was modified on
+    /// chain by another device under your handle's nose; you must run
+    /// `pangolin-cli resolve` (P9) before reading or editing".
+    ///
+    /// Distinct from `AccountTombstoned` because tombstone is a
+    /// terminal state visible to every consumer in the same way; the
+    /// frozen state is per-vault and clears once resolve runs.
+    /// Distinct from `AccountNotFound` because the row exists — it's
+    /// just not safe to read until the user reconciles.
+    #[error("account is frozen pending conflict resolution; run `pangolin-cli resolve` (P9)")]
+    AccountFrozenPendingResolve {
+        account_id: crate::account::AccountId,
+    },
 }
 
 impl From<AeadError> for StoreError {

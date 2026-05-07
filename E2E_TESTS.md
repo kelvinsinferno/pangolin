@@ -10,6 +10,7 @@
 
 - **E2E-001 — RevisionLogV0 deployed-contract smoke test (Base Sepolia)** — issue P5-4
 - **E2E-002 — chaincli debug oracle smoke test** — issue P6
+- **E2E-003 — pangolin-cli two-vault sync round-trip** — issue P8
 
 ---
 
@@ -228,6 +229,139 @@ cargo test -p chaincli --features integration-tests --test integration
 Step 4 (the write path) is NOT automated — it requires a funded
 wallet and a real keystore-password prompt, both of which are
 out-of-scope for an unattended test runner. Manual verification only.
+
+---
+
+## E2E-003: pangolin-cli two-vault sync round-trip
+
+**Issue:** P8
+**Phase:** PoC
+**Date added:** 2026-05-06
+**Last verified:** 2026-05-06 by automated tests
+(`tools/pangolin-cli/tests/two_vault_roundtrip.rs`)
+
+### Setup
+
+1. Workspace toolchain ready: `cargo build -p pangolin-cli` succeeds.
+2. Two empty directories on disk for the two vault files (or two
+   different machines for the genuine two-device case — copy the
+   `.pvf` between them via any out-of-band channel after step 1
+   below).
+3. For the chain-backed manual scenario: a Foundry keystore funded
+   with Base Sepolia ETH (deployer wallet `pangolin-dev` or any
+   keystore the user controls). The unattended `MockChainAdapter`
+   path needs no funds.
+
+### Steps (automated path — `MockChainAdapter`)
+
+1. **Run the integration test:**
+   ```bash
+   cargo test -p pangolin-cli --test two_vault_roundtrip
+   ```
+   This runs three sub-scenarios in one process:
+   - `convergence` — vault A publishes; vault B pulls; both end
+     with a single chain-anchored head row on the shared account.
+   - `symmetric_fork` — A and B make concurrent children of the
+     same parent and both publish; both pull and both observe the
+     same 2-head fork; `PullReport.forks` is non-empty on both
+     sides.
+   - `idempotent_repeat_pull` — `pull_all` twice in a row produces
+     `applied = 0` on the second run and a stable
+     `last_pulled_block`.
+
+   **Expected:** `test result: ok. 3 passed; 0 failed`.
+
+### Steps (manual path — Base Sepolia + funded keystore)
+
+The automated path uses `MockChainAdapter` so it costs no gas and
+needs no network. The manual path is for humans verifying the
+production chain integration.
+
+1. **Create vault A** (in `~/pangolin-test/A/`):
+   ```bash
+   # In a Rust shell or a small test harness — Vault::create is
+   # exposed by `pangolin-store`. Pick any password; the same
+   # password must be used for vault B because vault B is a copy.
+   ```
+
+2. **Add an account** (programmatically via `Vault::add_account`).
+   Confirm `pangolin-cli status --vault-path ~/pangolin-test/A/v.pvf`
+   reports `dirty_count: 1` and `account_count: 1`.
+
+3. **Publish from A:**
+   ```bash
+   pangolin-cli publish \
+       --vault-path ~/pangolin-test/A/v.pvf \
+       --account pangolin-dev
+   ```
+   At the prompt, enter the vault password (then the keystore
+   password). **Expected:** `publish summary: 1 published, 0 failed`.
+
+4. **Confirm via chaincli:**
+   ```bash
+   chaincli list --vault-id <hex> --rpc-url https://sepolia.base.org
+   ```
+   The just-published revision should appear at the head of the
+   chain log.
+
+5. **Copy vault A's file to vault B's path** (`~/pangolin-test/B/`):
+   ```bash
+   cp ~/pangolin-test/A/v.pvf ~/pangolin-test/B/v.pvf
+   ```
+   (Or copy across machines via any channel — the file is fully
+   self-contained.)
+
+6. **Pull on vault B:**
+   ```bash
+   pangolin-cli pull \
+       --vault-path ~/pangolin-test/B/v.pvf \
+       --rpc-url https://sepolia.base.org
+   ```
+   **Expected:** `pull summary: 1 new events ingested; …; 0 forked
+   account(s)`. Idempotent: re-running the same command immediately
+   returns `applied = 0`.
+
+7. **Verify convergence via status:**
+   ```bash
+   pangolin-cli status --vault-path ~/pangolin-test/B/v.pvf
+   ```
+   Both vaults should report the same `last_published_block` and
+   `dirty_count: 0`.
+
+8. **Concurrent-edit fork scenario** (optional):
+   - Update the account on A (e.g., `Vault::update_account(...)`),
+     publish.
+   - Update the same account on B, publish.
+   - Pull on both.
+   - **Expected:** both A and B's `pangolin-cli status` shows a
+     2-head fork via the per-account head listing. `PullReport.forks`
+     is non-empty on both. P9 (`pangolin-cli resolve …`, future
+     issue) handles the resolution.
+
+### Expected outcome
+
+- The `MockChainAdapter` path runs in under 60 seconds and exits 0.
+- The Base Sepolia path completes in roughly 30 seconds per network
+  round-trip (chain-id check + 9 000-block-windowed pull). Forks
+  are reported but not auto-resolved.
+
+### Failure modes covered
+
+- **Process killed mid-publish.** A re-run of `pangolin-cli publish`
+  triggers the A3 pre-publish check; the canonical-hash matches an
+  on-chain event and the local commit (`mark_published` +
+  `clear_dirty`) runs without a duplicate `publish` call. Verified
+  by the unit test
+  `sync::tests::publish_idempotent_on_rerun_after_partial_failure`.
+- **RPC flake mid-pull.** Per-chunk checkpoint advancement preserves
+  prior chunks' progress; re-running `pull` resumes from the new
+  `last_pulled_block`. Verified by
+  `sync::tests::pull_chunk_failure_preserves_prior_chunk_progress`.
+- **Forged-event-stream from compromised RPC.** Every event passes
+  a `VerifyingKey::from_bytes` check on its `device_id` before
+  being persisted; non-canonical bytes are rejected. Verified
+  structurally in `sync::pull_all`'s loop body and asserted by the
+  defense-in-depth check in `signing::verify_signed_revision`.
 
 ---
 

@@ -50,11 +50,20 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 CREATE TABLE IF NOT EXISTS account_identities (
-    account_id        BLOB PRIMARY KEY,
-    created_at        INTEGER NOT NULL,
-    last_modified_at  INTEGER NOT NULL,
-    tombstoned        INTEGER NOT NULL DEFAULT 0,
-    head_revision_id  BLOB    NOT NULL
+    account_id              BLOB PRIMARY KEY,
+    created_at              INTEGER NOT NULL,
+    last_modified_at        INTEGER NOT NULL,
+    tombstoned              INTEGER NOT NULL DEFAULT 0,
+    head_revision_id        BLOB    NOT NULL,
+    -- P8 fix CRIT-1: defensive sentinel set to 1 inside
+    -- Vault::ingest_chain_revision when a foreign-device chain event
+    -- lands via the genuine-foreign-INSERT path (none of the three
+    -- idempotency-merge arms matched). User-facing reads and edits
+    -- refuse on this account until the upcoming pangolin-cli resolve
+    -- (P9) clears the flag. Existing vault files predating this
+    -- column have it added via migrate_frozen_pending_resolve_column
+    -- at open time; default 0 so pre-migration accounts are unfrozen.
+    frozen_pending_resolve  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS revisions (
@@ -94,6 +103,22 @@ CREATE TABLE IF NOT EXISTS sync_state (
     id                  INTEGER PRIMARY KEY CHECK (id = 0),
     last_pulled_block   INTEGER NOT NULL DEFAULT 0
 );
+
+-- P8-2: per-(account, revision) dirty marker so `pangolin-cli publish`
+-- never loses track of an unpublished revision across restarts. Same
+-- additive `CREATE TABLE IF NOT EXISTS` posture as `sync_state` above
+-- (no `format_version` bump; existing P0..P7 vaults pick this up on
+-- next open). See `docs/issue-plans/P8.md` §A1+A2 for the rationale
+-- and the composite-primary-key (`account_id`, `revision_id`)
+-- discipline that protects against duplicate-publish on re-run.
+CREATE TABLE IF NOT EXISTS dirty_accounts (
+    account_id   BLOB NOT NULL,
+    revision_id  BLOB NOT NULL,
+    marked_at    INTEGER NOT NULL,
+    PRIMARY KEY (account_id, revision_id)
+);
+CREATE INDEX IF NOT EXISTS dirty_accounts_marked_at_idx
+    ON dirty_accounts (marked_at);
 ";
 
 /// Apply all pragmas and the schema DDL on the supplied connection.
@@ -124,6 +149,47 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     // leave us with some-but-not-all tables on a fresh-vault path.
     conn.execute_batch(&format!("BEGIN IMMEDIATE; {SCHEMA_DDL} COMMIT;"))?;
 
+    // P8 fix-pass migration: the `frozen_pending_resolve` column on
+    // `account_identities` was added to address CRIT-1 (tombstone-flag
+    // non-propagation). Existing vault files predating this fix have
+    // an `account_identities` table that does NOT include the column;
+    // we ALTER TABLE … ADD COLUMN at open if it's missing so legacy
+    // files keep opening cleanly. The default 0 means pre-migration
+    // accounts are unfrozen — exactly the right semantics, since they
+    // had no opportunity to be foreign-ingested under the old code
+    // path (the old `ingest_chain_revision` had no flag to set).
+    migrate_frozen_pending_resolve_column(conn)?;
+
+    Ok(())
+}
+
+/// Add the `frozen_pending_resolve` column to `account_identities` on
+/// vaults that predate the P8 fix-pass schema. Idempotent — checks
+/// `PRAGMA table_info` first and only runs the `ALTER TABLE` when the
+/// column is absent. Existing rows pick up the column's
+/// `DEFAULT 0`.
+fn migrate_frozen_pending_resolve_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(account_identities)")?;
+    let rows = stmt.query_map([], |row| {
+        let name: String = row.get(1)?;
+        Ok(name)
+    })?;
+    let mut has_column = false;
+    for r in rows {
+        let name = r?;
+        if name == "frozen_pending_resolve" {
+            has_column = true;
+            break;
+        }
+    }
+    drop(stmt);
+    if !has_column {
+        conn.execute(
+            "ALTER TABLE account_identities
+             ADD COLUMN frozen_pending_resolve INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 

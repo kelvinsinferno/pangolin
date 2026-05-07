@@ -35,6 +35,7 @@
 #![cfg_attr(test, deny(unsafe_code))]
 
 pub mod account;
+pub mod dirty;
 pub mod error;
 pub mod revision;
 pub mod session;
@@ -46,6 +47,7 @@ pub(crate) mod schema;
 pub(crate) mod search;
 
 pub use account::{AccountId, AccountSnapshot};
+pub use dirty::{DirtyEntry, IngestOutcome, RevisionPublishPayload};
 pub use error::{Result, StoreError};
 pub use revision::{ChainAnchor, DeviceId, RevisionGraph, RevisionId, RevisionMeta};
 pub use session::{
