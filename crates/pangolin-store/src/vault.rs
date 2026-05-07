@@ -1215,6 +1215,40 @@ impl Vault {
         Ok(self.list_frozen_accounts()?.into_iter().collect())
     }
 
+    /// **P10-5.** Snapshot of every account currently in the
+    /// tombstoned state. Surfaces the count for the
+    /// `pangolin-cli status` summary line.
+    ///
+    /// Metadata-only — does NOT require an active session. Empty
+    /// `Vec` for a freshly-created vault.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` for any database issue.
+    /// `StoreError::Corrupted` if a stored `account_id` BLOB is not
+    /// 32 bytes.
+    pub fn list_tombstoned_accounts(&self) -> Result<Vec<AccountId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT account_id
+             FROM account_identities
+             WHERE tombstoned = 1
+             ORDER BY account_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id: Vec<u8> = row.get(0)?;
+            Ok(id)
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let blob = r?;
+            let arr: [u8; ACCOUNT_ID_LEN] = blob.as_slice().try_into().map_err(|_| {
+                StoreError::Corrupted("account_identities.account_id not 32 bytes".into())
+            })?;
+            out.push(AccountId::from_bytes(arr));
+        }
+        Ok(out)
+    }
+
     // -----------------------------------------------------------------
     // P9: conflict-resolution primitives (clear_frozen +
     //      read_payload_plaintext_for_resolve)

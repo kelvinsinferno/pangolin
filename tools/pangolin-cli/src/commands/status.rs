@@ -63,6 +63,16 @@ pub async fn run(global: &GlobalArgs, args: StatusArgs) -> Result<()> {
     let frozen = vault
         .list_frozen_accounts()
         .context("Vault::list_frozen_accounts failed")?;
+    // **P10-5 / A8.** Surface the tombstoned-account count alongside
+    // the existing structural counters. The query walks the
+    // `account_identities` rows whose `tombstoned = 1` flag is set
+    // (set by `Vault::delete_account` for own-deletes and by
+    // `Vault::ingest_chain_revision`'s P10-3 path for
+    // chain-ingested tombstones). Like `frozen_count`, the line is
+    // omitted in the human-readable output when the count is zero
+    // (the JSON output always emits the field for machine
+    // consumers' completeness).
+    let tombstoned_count = count_tombstoned_accounts(&vault).context("tombstone count failed")?;
     let vault_id = vault.vault_id();
 
     if cfg.json {
@@ -72,6 +82,7 @@ pub async fn run(global: &GlobalArgs, args: StatusArgs) -> Result<()> {
             "dirty_count": dirty.len(),
             "account_count": account_count,
             "frozen_count": frozen.len(),
+            "tombstoned_count": tombstoned_count,
             "last_pulled_block": last_pulled,
             "last_published_block": last_published,
         });
@@ -82,6 +93,9 @@ pub async fn run(global: &GlobalArgs, args: StatusArgs) -> Result<()> {
         println!("dirty_count           {}", dirty.len());
         println!("account_count         {account_count}");
         println!("frozen_count          {}", frozen.len());
+        if tombstoned_count > 0 {
+            println!("tombstoned_count      {tombstoned_count}");
+        }
         println!("last_pulled_block     {last_pulled}");
         println!("last_published_block  {last_published}");
         if !dirty.is_empty() {
@@ -105,6 +119,18 @@ pub async fn run(global: &GlobalArgs, args: StatusArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// **P10-5 / A8.** Count the rows in `account_identities` whose
+/// `tombstoned = 1` flag is set. Implemented via the
+/// `Vault::list_tombstoned_accounts` accessor (P10-5 addition); we
+/// take the length so the caller doesn't allocate an unused Vec for
+/// the vault-id list.
+fn count_tombstoned_accounts(vault: &pangolin_store::Vault) -> Result<usize> {
+    Ok(vault
+        .list_tombstoned_accounts()
+        .context("Vault::list_tombstoned_accounts failed")?
+        .len())
 }
 
 /// Read the maximum value of `chain_block_number` across the entire
@@ -271,5 +297,42 @@ mod tests {
         run(&global, args)
             .await
             .expect("status run with relative path resolves");
+    }
+
+    /// **P10-5 / A8.** The `count_tombstoned_accounts` helper
+    /// returns 0 for a vault with no tombstoned accounts and >= 1
+    /// for a vault with at least one. We exercise both paths here
+    /// because the human-readable output suppresses the line when
+    /// count is 0; the JSON output always emits it.
+    #[tokio::test]
+    async fn status_includes_tombstone_count_when_nonzero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("status-tomb.pvf");
+        Vault::create(&path, &pwd()).expect("create");
+        // Initially zero tombstones.
+        {
+            let v = Vault::open(&path).expect("open");
+            assert_eq!(super::count_tombstoned_accounts(&v).unwrap(), 0);
+            v.close().expect("close");
+        }
+        // Add + delete one account → tombstone count becomes 1.
+        let id;
+        {
+            let mut v = Vault::open(&path).expect("open");
+            let presence = PressYPresenceProof::confirmed();
+            let identity = PinIdentityProof::new(pwd());
+            v.unlock(&presence, &identity).expect("unlock");
+            id = v.add_account(snap("tomb-test")).expect("add");
+            v.delete_account(id).expect("delete");
+            v.close().expect("close");
+        }
+        {
+            let v = Vault::open(&path).expect("reopen");
+            assert_eq!(super::count_tombstoned_accounts(&v).unwrap(), 1);
+            // List variant returns the right id.
+            let list = v.list_tombstoned_accounts().expect("list tomb");
+            assert_eq!(list, vec![id]);
+            v.close().expect("close");
+        }
     }
 }
