@@ -38,15 +38,14 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 #![cfg_attr(test, deny(unsafe_code))]
 
-mod cli;
-mod commands;
-mod config;
-mod keystore;
-mod sync;
-mod vault_open;
-
 use anyhow::Result;
 use clap::Parser;
+
+// Route everything through the library entry point. The binary is
+// the orchestration shell; the library is what integration tests
+// import.
+use pangolin_cli::cli;
+use pangolin_cli::commands;
 
 fn main() -> Result<()> {
     let args = cli::Cli::parse();

@@ -16,10 +16,12 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-/// Resolve the keystore path from `--account` / `--keystore-dir` /
-/// `--keystore-path`. Validates the `--account` value as a simple
-/// filename (no path separators, no `..`) before joining onto the
-/// keystore directory.
+/// Resolve the keystore path from CLI flags.
+///
+/// Reads `--account` / `--keystore-dir` / `--keystore-path` and
+/// produces an absolute path to a Foundry keystore file. Validates
+/// the `--account` value as a simple filename (no path separators,
+/// no `..`) before joining onto the keystore directory.
 pub fn resolve_keystore_path(
     account: Option<&str>,
     keystore_dir: Option<&Path>,
@@ -53,11 +55,13 @@ pub fn resolve_keystore_path(
     Ok(candidate)
 }
 
-/// Read the keystore password — either from `--keystore-password`
-/// (echoes in `ps`; for CI/scripted use only) or by prompting the
-/// terminal without echo via `rpassword`. Returns the password
-/// wrapped in `zeroize::Zeroizing<String>` so the heap buffer is
-/// overwritten on drop.
+/// Read the keystore password.
+///
+/// Either from `--keystore-password` (echoes in `ps`; for CI/scripted
+/// use only) or by prompting the terminal without echo via
+/// `rpassword`. Returns the password wrapped in
+/// `zeroize::Zeroizing<String>` so the heap buffer is overwritten on
+/// drop.
 pub fn read_keystore_password(
     keystore_path: &Path,
     flag_value: Option<&str>,

@@ -262,11 +262,13 @@ pub struct PullReport {
     pub last_pulled_block: u64,
 }
 
-/// Block window per chunk in the chunked pull loop. Chosen at 8 000
-/// blocks (below the 9 000-block window `BaseSepoliaAdapter` uses
-/// internally, which is itself below the public RPC's 10 000-block
-/// cap). Per `P8.md` §A5 — checkpoint advances per-chunk so a
-/// failure mid-range preserves prior chunks' progress.
+/// Block window per chunk in the chunked pull loop.
+///
+/// Chosen at 8 000 blocks: below the 9 000-block window
+/// `BaseSepoliaAdapter` uses internally, which is itself below the
+/// public RPC's 10 000-block cap. Per `P8.md` §A5 — the checkpoint
+/// advances per-chunk so a failure mid-range preserves prior
+/// chunks' progress.
 pub const PULL_CHUNK_SIZE: u64 = 8_000;
 
 /// Walk the chain forward from `vault.last_pulled_block()` to

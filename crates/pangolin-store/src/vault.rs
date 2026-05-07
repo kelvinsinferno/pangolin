@@ -1809,6 +1809,12 @@ impl Vault {
     /// `StoreError::Sqlite` for any database issue.
     /// `StoreError::Corrupted` if the supplied `tx_hash` /
     /// `block_number` / `log_index` values would not fit in `i64`.
+    #[allow(clippy::too_many_lines)] // The three idempotency checks
+                                     // + the merge path + the insert path inherently expand the body
+                                     // beyond the workspace's 100-line clippy floor; factoring out
+                                     // sub-helpers would obscure the linear flow that makes the
+                                     // method's invariants reviewable. The added comments are
+                                     // load-bearing for the audit.
     pub fn ingest_chain_revision(
         &mut self,
         event: &pangolin_chain::RevisionEvent,
@@ -1886,6 +1892,61 @@ impl Vault {
             )
             .optional()?;
         if existing_by_anchor.is_some() {
+            self.touch_session();
+            return Ok(IngestOutcome::AlreadyPresent);
+        }
+
+        // Idempotency check #3 — content-merge: a local row exists
+        // with the same `(account_id, parent_revision, enc_payload,
+        // schema_version)` AND its chain_tx_hash IS NULL. This is
+        // "I created this revision locally, and now it's coming back
+        // to me from the chain because some other handle published
+        // it." We merge by stamping the chain anchor onto the
+        // existing local row rather than inserting a duplicate
+        // canonical-hash-keyed row. Without this merge the vault
+        // would see a spurious 2-head fork on every round-trip
+        // through the chain.
+        //
+        // We DO NOT compare device_id here because the PoC two-key
+        // model means the locally-stored device_id (random) doesn't
+        // match the publish-time signing key's pubkey (the chain
+        // event's device_id). MVP-1 will switch publish to the
+        // derived wallet (D-006); at that point device_id will round-
+        // trip and we can tighten this check.
+        let merge_target: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT revision_id FROM revisions
+                 WHERE account_id = ?1
+                   AND parent_revision_id = ?2
+                   AND enc_payload = ?3
+                   AND schema_version = ?4
+                   AND chain_tx_hash IS NULL
+                 LIMIT 1",
+                params![
+                    &event.account_id[..],
+                    &event.parent_revision[..],
+                    &event.enc_payload,
+                    i64::from(event.schema_version),
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_rev_id) = merge_target {
+            // Stamp the chain anchor onto the existing local row.
+            self.conn.execute(
+                "UPDATE revisions
+                 SET chain_tx_hash = ?1,
+                     chain_block_number = ?2,
+                     chain_log_index = ?3
+                 WHERE revision_id = ?4",
+                params![
+                    &event.anchor.tx_hash[..],
+                    block_check,
+                    log_check,
+                    &existing_rev_id[..],
+                ],
+            )?;
             self.touch_session();
             return Ok(IngestOutcome::AlreadyPresent);
         }
