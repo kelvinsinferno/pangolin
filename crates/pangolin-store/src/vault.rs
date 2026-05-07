@@ -1913,6 +1913,68 @@ impl Vault {
         Ok(out)
     }
 
+    /// **P9-2.** Snapshot every account currently in a
+    /// conflict-needing-resolution state — fork OR freeze OR both.
+    ///
+    /// The returned vector is the union of `all_forked_accounts()`
+    /// and `list_frozen_accounts()`, with one
+    /// [`crate::conflict::ConflictReport`] row per account; the
+    /// per-account head set is computed via `account_heads(...)`.
+    /// Iteration order is `account_id` byte-order ASC for
+    /// deterministic output regardless of the underlying table layout.
+    ///
+    /// State combinations the caller will see:
+    ///
+    /// | `frozen` | `heads.len()` | Meaning                                  |
+    /// |---|---|---|
+    /// | true | 1 | Foreign chain event landed on a brand-new foreign account; the local row has the freeze flag set but the graph is structurally linear. |
+    /// | true | >1 | Foreign chain event landed under an existing local account whose graph is also forked (the dominant resolve case). |
+    /// | false | >1 | Two LOCAL revisions both unpublished, no chain involvement yet (e.g., two handles of the same vault file edited offline). |
+    /// | false | 1 | Not in the report (clean state). |
+    ///
+    /// Metadata-only — does NOT require [`VaultState::Active`]. The
+    /// `pangolin-cli resolve` subcommand calls this on a Locked vault
+    /// to enumerate candidates BEFORE prompting for the password.
+    ///
+    /// # Errors
+    ///
+    /// Inherits [`StoreError::Sqlite`] / [`StoreError::Corrupted`]
+    /// from the underlying `account_heads` /
+    /// `list_frozen_accounts` / `all_forked_accounts` calls.
+    pub fn list_conflicts(&self) -> Result<Vec<crate::conflict::ConflictReport>> {
+        // Build the union of forked + frozen account ids. The two
+        // sets can overlap (an account both forked AND frozen is the
+        // dominant case); we deduplicate via `BTreeSet`-equivalent
+        // logic — but `AccountId` does not implement `Ord`, so we
+        // use a `HashSet` and sort the resulting Vec by raw bytes
+        // for the deterministic output ordering.
+        let forked = self.all_forked_accounts()?;
+        let frozen = self.list_frozen_accounts()?;
+        let mut union: std::collections::HashSet<AccountId> = std::collections::HashSet::new();
+        union.extend(forked.iter().copied());
+        union.extend(frozen.iter().copied());
+
+        let frozen_set: std::collections::HashSet<AccountId> = frozen.iter().copied().collect();
+
+        let mut ids: Vec<AccountId> = union.into_iter().collect();
+        // `AccountId` is a 32-byte opaque blob; sort by raw bytes
+        // for deterministic iteration. The closure cannot panic —
+        // `as_bytes` returns a slice of fixed length 32.
+        ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+
+        let mut out: Vec<crate::conflict::ConflictReport> = Vec::with_capacity(ids.len());
+        for account_id in ids {
+            let heads = self.account_heads(account_id)?;
+            let report = crate::conflict::ConflictReport {
+                account_id,
+                heads,
+                frozen: frozen_set.contains(&account_id),
+            };
+            out.push(report);
+        }
+        Ok(out)
+    }
+
     // -----------------------------------------------------------------
     // P3 test helpers (cfg(test) only)
     // -----------------------------------------------------------------
