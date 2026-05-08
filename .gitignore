@@ -7,7 +7,10 @@
 contracts/out/
 contracts/cache/
 contracts/broadcast/
-contracts/lib/
+contracts/lib/*
+# forge-std is vendored at v1.16.1 (MIT/Apache-2.0). Keeps CI hermetic and
+# avoids forge-CLI flag-rename traps (see commit message for context).
+!contracts/lib/forge-std
 
 # Node (extension, desktop UI)
 node_modules/
