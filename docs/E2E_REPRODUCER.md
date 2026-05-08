@@ -112,6 +112,13 @@ These steps are run once at the start of the rehearsal; the three
 scenarios then share the resulting build artifact and scratch
 directory.
 
+> **Skip §3b if you only intend to run Mock mode.** Mock mode
+> needs no release build, no funded keystore, and no live RPC.
+> A non-author dev rehearsing Scenario 1 in Mock mode runs §1,
+> §2, §3a, §3c, then jumps straight to Scenario 1's Mock-mode
+> block — saving ~5 minutes of release-build time that Mock mode
+> never uses. §3b is required only for the Live-mode walkthroughs.
+
 ### 1. Clone the repository
 
 ```bash
@@ -122,7 +129,46 @@ cd pangolin
 (Replace `<owner>` with the actual GitHub owner; this reproducer
 assumes you already have a local clone at the repository root.)
 
-### 2. Build the workspace
+### 2. Toolchain check (required for both modes)
+
+```bash
+rustc --version
+```
+
+Expected: `rustc 1.83.0` or later. If your toolchain is older,
+follow the [Prerequisites](#prerequisites) install instructions
+and re-run the check.
+
+### 3a. Mock-mode prerequisites
+
+Mock mode runs the reproducer's scenarios as automated tests
+against the in-memory `MockChainAdapter`; no release build, no
+keystore, no live RPC needed.
+
+Run the smoke test to confirm the build is healthy:
+
+```bash
+cargo test --workspace --lib
+```
+
+Cargo prints one `test result:` summary line per crate (chain,
+cli, store, crypto, plus the empty subcrates). Sum them; on
+Windows you should see seven such lines totaling
+**401 passed; 0 failed** (~405 on Linux, where a handful of
+`cfg(unix)`-gated tests also run). Reading only the last line
+will show the largest single crate's count (~142 passed) — that
+is NOT the total; the total is the sum of all per-crate lines.
+
+If the sum is substantially lower, see
+[Troubleshooting](#troubleshooting) item 5.
+
+### 3b. Live-mode prerequisites
+
+> **Skip this subsection if you only run Mock mode.** It costs
+> ~5 minutes of release-build time plus a funded testnet keystore
+> from the [Live-mode safety](#live-mode-safety) workflow above.
+
+#### Build the workspace (release profile)
 
 ```bash
 cargo build --workspace --release
@@ -143,20 +189,7 @@ document, plain `pangolin-cli ...` and `chaincli ...` invocations
 assume `target/release/` is on `$PATH`; if you prefer the full
 path, substitute `./target/release/pangolin-cli ...` everywhere.
 
-### 3. Smoke test (Mock mode workspace tests)
-
-Before running any scenario, confirm the build is healthy:
-
-```bash
-cargo test --workspace --lib
-```
-
-Expected: ~395 tests pass on Linux/macOS, ~401 on Windows
-(`cfg(unix)`-gated tests are skipped on Windows). If the count is
-substantially lower, see [Troubleshooting](#troubleshooting) item
-5.
-
-### 4. Verify the deployed contract address (optional but recommended)
+#### Verify the deployed contract address (optional but recommended)
 
 The PoC's deployed RevisionLogV0 contract is recorded at
 `contracts/deployments/base-sepolia.json`. To cross-check it
@@ -179,9 +212,17 @@ If the address differs from
 your clone is on a different fork; the rest of this reproducer's
 Live-mode steps will not match the documented contract.
 
-### 5. Create a scratch directory
+#### Funded testnet keystore
 
-The scenarios use project-local files under `./tmp/`:
+Complete the funding workflow in the
+[Live-mode safety](#live-mode-safety) callout above (`cast wallet
+new`, faucet drip, `cast wallet import poc-rehearsal`) before
+starting any Live-mode scenario.
+
+### 3c. Create a scratch directory (required for both modes if you intend to run Live mode; harmless otherwise)
+
+The scenarios' Live-mode walkthroughs use project-local files
+under `./tmp/`:
 
 ```bash
 # Linux / macOS:
@@ -192,9 +233,11 @@ mkdir tmp -ErrorAction SilentlyContinue
 ```
 
 This directory holds the example vault files produced by the
-scenarios. It is git-ignored (or you can add it to your local
-ignore list). The [Cleanup](#cleanup) section at the end of this
-document removes the directory.
+Live-mode scenarios. It is git-ignored (or you can add it to your
+local ignore list). The [Cleanup](#cleanup) section at the end of
+this document removes the directory. Mock mode uses
+`tempfile`-managed scratch directories under the OS temp dir
+internally and does not touch `./tmp/`.
 
 ### Test password (used by every scenario)
 
@@ -275,15 +318,18 @@ This is the unattended path; no funded keystore needed.
 cargo test -p pangolin-cli --test two_vault_roundtrip
 ```
 
-Expected: three sub-tests pass —
-`convergence_freezes_on_pull`, `symmetric_fork`, and
-`idempotent_repeat_pull`. Output ends with:
+Expected: five sub-tests pass — Scenario 1's three named tests
+(`convergence_freezes_on_pull`, `symmetric_fork`,
+`idempotent_repeat_pull`) plus two siblings that share the same
+file (`convergence_after_resolve`, the Mock-mode test for
+Scenario 2 below; and `own_tombstone_round_trip_via_chain`, the
+P10 tombstone round-trip test). Output ends with:
 
 ```
-test result: ok. 3 passed; 0 failed; ... finished in <N>s
+test result: ok. 5 passed; 0 failed; ... finished in <N>s
 ```
 
-If any of the three fails, the build is broken; see
+If the count is lower than 5, the build is broken; see
 [Troubleshooting](#troubleshooting) item 5.
 
 ### Live mode — Base Sepolia walkthrough
@@ -951,10 +997,13 @@ The five most likely issues and their fixes:
    wait for the drip to land (`cast balance` should report
    non-zero). Then retry.
 
-5. **`cargo test --workspace --lib` prints fewer than ~395
-   passing tests on Linux/macOS (or fewer than ~401 on
-   Windows).** The build is on a stale tree or a feature flag
-   is misconfigured. Run:
+5. **`cargo test --workspace --lib` totals fewer than 401
+   passing tests on Windows (or ~405 on Linux/macOS) when you
+   sum the per-crate `test result:` lines.** The build is on a
+   stale tree or a feature flag is misconfigured. Note that the
+   last `test result:` line printed is the LARGEST single
+   crate's count (typically ~142), not the workspace total —
+   you must sum all per-crate lines. Run:
 
    ```bash
    git status
