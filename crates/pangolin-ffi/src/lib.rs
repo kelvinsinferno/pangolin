@@ -70,7 +70,7 @@ pub use error::FfiError;
 // MVP-1 issue 1.1: scaffolding-only re-export so 1.2-1.11 have a single
 // import path for FFI types. Bodies arrive in the per-domain modules.
 pub use identity::{AccountDraft, AccountId, AccountPatch, AccountSnapshot};
-pub use kdbx::KdbxImportReport;
+pub use kdbx::{CaptureAuthority, CaptureContext, KdbxImportReport};
 pub use revision::{RevisionId, RevisionMeta};
 pub use session::{
     PasswordPolicy, PlaintextExportConfirmation, PresenceProof, SecretPassword, SessionInfo,

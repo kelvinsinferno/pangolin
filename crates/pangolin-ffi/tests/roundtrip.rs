@@ -11,9 +11,9 @@
 //! scaffolding is what we're verifying.
 
 use pangolin_ffi::{
-    AccountDraft, AccountId, AccountPatch, AccountSnapshot, KdbxImportReport, PasswordPolicy,
-    PlaintextExportConfirmation, PresenceProof, RevisionId, RevisionMeta, SecretPassword,
-    SessionInfo, TotpCode, UnixTimestamp, VaultHandle,
+    AccountDraft, AccountId, AccountPatch, AccountSnapshot, CaptureAuthority, CaptureContext,
+    KdbxImportReport, PasswordPolicy, PlaintextExportConfirmation, PresenceProof, RevisionId,
+    RevisionMeta, SecretPassword, SessionInfo, TotpCode, UnixTimestamp, VaultHandle,
 };
 
 #[test]
@@ -184,6 +184,28 @@ fn kdbx_import_report_record_round_trip() {
     let cloned = original.clone();
     assert_eq!(original.imported, cloned.imported);
     assert_eq!(original.failure_kinds, cloned.failure_kinds);
+}
+
+#[test]
+fn capture_authority_record_round_trip() {
+    let original = CaptureAuthority {
+        schema_version: 0,
+        origin: "https://example.com".into(),
+    };
+    let cloned = original.clone();
+    assert_eq!(original.origin, cloned.origin);
+    assert_eq!(original.schema_version, cloned.schema_version);
+}
+
+#[test]
+fn capture_context_record_round_trip() {
+    let original = CaptureContext {
+        schema_version: 0,
+        label: "login-form".into(),
+    };
+    let cloned = original.clone();
+    assert_eq!(original.label, cloned.label);
+    assert_eq!(original.schema_version, cloned.schema_version);
 }
 
 #[test]

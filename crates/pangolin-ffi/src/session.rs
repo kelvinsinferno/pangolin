@@ -23,7 +23,7 @@ use crate::error::FfiError;
 /// buffer onto the GC heap.
 #[derive(uniffi::Object)]
 pub struct SecretPassword {
-    bytes: parking_lot_compat::SecretBuf,
+    bytes: secret_buf::SecretBuf,
 }
 
 // Manual `Debug` impl that never reveals plaintext. Per Design Spec
@@ -47,7 +47,7 @@ impl SecretPassword {
     #[must_use]
     pub fn new(bytes: Vec<u8>) -> Arc<Self> {
         Arc::new(Self {
-            bytes: parking_lot_compat::SecretBuf::new(bytes),
+            bytes: secret_buf::SecretBuf::new(bytes),
         })
     }
 
@@ -77,12 +77,12 @@ impl SecretPassword {
     }
 }
 
-// `parking_lot_compat` is a tiny inline shim to avoid pulling
-// `parking_lot`'s heavy dep tree into pangolin-ffi just for the
-// zero-on-drop secret buffer. The shim wraps `Vec<u8>` with manual
-// `Zeroize` + `ZeroizeOnDrop` impls; same discipline as
-// `pangolin_crypto::secret::SecretBytes`.
-mod parking_lot_compat {
+// `secret_buf` is an inline Zeroize wrapper kept local to this module
+// so the `SecretPassword` type stays self-contained and we avoid an
+// extra crate dependency just for a zero-on-drop `Vec<u8>`. The shim
+// wraps `Vec<u8>` with manual `Zeroize` + `ZeroizeOnDrop` impls; same
+// discipline as `pangolin_crypto::secret::SecretBytes`.
+mod secret_buf {
     use super::{Zeroize, ZeroizeOnDrop};
 
     pub struct SecretBuf {

@@ -20,8 +20,8 @@ Set-Location $repoRoot
 # case-insensitively. `Select-String -CaseSensitive:$false` returns
 # match objects; `.Count` gives the line count.
 $treeOutput = cargo tree -p pangolin-crypto 2>$null
-$matches = $treeOutput | Select-String -Pattern 'serde' -CaseSensitive:$false
-$matchCount = if ($null -eq $matches) { 0 } else { $matches.Count }
+$treeMatches = $treeOutput | Select-String -Pattern 'serde' -CaseSensitive:$false
+$matchCount = if ($null -eq $treeMatches) { 0 } else { $treeMatches.Count }
 
 if ($matchCount -ne 0) {
     Write-Host "::error::HIGH-1 invariant violated: pangolin-crypto's tree contains $matchCount reference(s) to serde."

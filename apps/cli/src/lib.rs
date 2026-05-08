@@ -3,7 +3,7 @@
 //! `pangolin-cli` is primarily a binary crate; this `lib.rs` exists
 //! to expose the orchestration modules (`sync`, `keystore`,
 //! `vault_open`, `config`, `cli`) to integration tests under
-//! `tools/pangolin-cli/tests/*.rs`. Cargo's binary-crate model does
+//! `apps/cli/tests/*.rs`. Cargo's binary-crate model does
 //! not allow integration tests to import a binary's modules; making
 //! the same source files compile as both library AND binary is the
 //! standard idiom for this case.

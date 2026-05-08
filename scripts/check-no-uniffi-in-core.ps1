@@ -13,8 +13,8 @@ $repoRoot = Resolve-Path (Join-Path $scriptDir "..")
 Set-Location $repoRoot
 
 $treeOutput = cargo tree -p pangolin-core 2>$null
-$matches = $treeOutput | Select-String -Pattern 'uniffi' -CaseSensitive:$false
-$matchCount = if ($null -eq $matches) { 0 } else { $matches.Count }
+$treeMatches = $treeOutput | Select-String -Pattern 'uniffi' -CaseSensitive:$false
+$matchCount = if ($null -eq $treeMatches) { 0 } else { $treeMatches.Count }
 
 if ($matchCount -ne 0) {
     Write-Host "::error::MVP-1 issue 1.1 Q3 invariant violated: pangolin-core's tree contains $matchCount reference(s) to uniffi."

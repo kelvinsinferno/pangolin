@@ -40,12 +40,18 @@ use std::sync::Arc;
 
 use crate::session::VaultHandle;
 
-/// Opaque handle for the C ABI. Layout-stable: `cbindgen` emits a
-/// forward declaration in `pangolin.h`.
+/// Opaque handle for the C ABI.
+///
+/// The `[u8; 0]` zero-sized private field makes this a true opaque
+/// type from the C side: cbindgen emits
+/// `struct PangolinVaultHandle { uint8_t _private[0]; };`, callers
+/// can only manipulate it through `*mut PangolinVaultHandle`
+/// pointers, and the inner Rust state (an `Arc<VaultHandle>` cast to
+/// a pointer) is not part of the public ABI.
 #[repr(C)]
 #[derive(Debug)]
 pub struct PangolinVaultHandle {
-    inner: *const VaultHandle,
+    _private: [u8; 0],
 }
 
 /// FFI-side error codes mirroring [`crate::FfiError`]'s discriminants.
@@ -106,11 +112,16 @@ pub unsafe extern "C" fn pangolin_vault_open(
 
     // Body lands in 1.3. For now the shim leaks an `Arc<VaultHandle>`
     // placeholder so the round-trip test can verify the close path.
+    //
+    // The opaque `*mut PangolinVaultHandle` returned to C is the raw
+    // `Arc<VaultHandle>` pointer cast to the opaque type. The Rust
+    // side reinterprets it back to `Arc::from_raw` in
+    // `pangolin_vault_close`. The inner `Arc` layout is therefore an
+    // implementation detail that is NOT part of the C ABI.
     let handle = VaultHandle::new_placeholder();
-    let raw = Arc::into_raw(handle);
-    let boxed = Box::new(PangolinVaultHandle { inner: raw });
+    let raw: *const VaultHandle = Arc::into_raw(handle);
     // SAFETY: caller-supplied invariant — `out_handle` is writable.
-    unsafe { *out_handle = Box::into_raw(boxed) };
+    unsafe { *out_handle = raw.cast::<PangolinVaultHandle>().cast_mut() };
     PangolinErrorCode::PANGOLIN_OK
 }
 
@@ -129,15 +140,14 @@ pub unsafe extern "C" fn pangolin_vault_close(
     if handle.is_null() {
         return PangolinErrorCode::PANGOLIN_ERR_VALIDATION;
     }
-    // SAFETY: caller-supplied invariant — `handle` was obtained from
-    // `pangolin_vault_open` and is exclusively owned.
-    let boxed = unsafe { Box::from_raw(handle) };
-    if !boxed.inner.is_null() {
-        // SAFETY: caller-supplied invariant — `inner` was produced by
-        // `Arc::into_raw` in `pangolin_vault_open` and has not been
-        // released elsewhere.
-        let _ = unsafe { Arc::from_raw(boxed.inner) };
-    }
+    // The opaque pointer is an `Arc<VaultHandle>` raw pointer in
+    // disguise (see `pangolin_vault_open`). Cast back and let the
+    // reconstructed `Arc` drop to release the underlying handle.
+    let raw: *const VaultHandle = handle.cast::<VaultHandle>().cast_const();
+    // SAFETY: caller-supplied invariant — `handle` was produced by
+    // `pangolin_vault_open` (where the opaque pointer was the raw
+    // result of `Arc::into_raw`) and has not been released elsewhere.
+    let _ = unsafe { Arc::from_raw(raw) };
     PangolinErrorCode::PANGOLIN_OK
 }
 
