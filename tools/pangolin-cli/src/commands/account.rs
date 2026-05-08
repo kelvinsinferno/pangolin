@@ -216,7 +216,12 @@ async fn run_add(global: &GlobalArgs, args: AccountAddArgs) -> Result<()> {
 /// the implementation match the documented contract.
 ///
 /// The returned `SecretBytes` owns its buffer and zeroizes on drop.
-fn read_secret_first_line_from_stdin() -> Result<SecretBytes> {
+///
+/// **P11B reuse (§A4).** Also called from
+/// `commands/vault.rs::run_create` for the `vault create
+/// --password-stdin` path. Keep the first-line + CR-trim
+/// semantics stable.
+pub(crate) fn read_secret_first_line_from_stdin() -> Result<SecretBytes> {
     let stdin = std::io::stdin();
     let mut handle = stdin.lock();
     let mut buf = Vec::new();
@@ -274,7 +279,13 @@ fn read_secret_multiline_from_stdin() -> Result<SecretBytes> {
 ///
 /// Returns the unchanged `SecretBytes` on success or an
 /// `anyhow::Error` with a stable, grep-able message on rejection.
-fn reject_empty_password(s: SecretBytes) -> Result<SecretBytes> {
+///
+/// **P11B reuse (§A4).** Also called from
+/// `commands/vault.rs::run_create` for the empty-password guard
+/// on both the stdin and prompt paths. Keep the
+/// `"password must not be empty"` message stable — tests across
+/// modules pin the substring.
+pub(crate) fn reject_empty_password(s: SecretBytes) -> Result<SecretBytes> {
     if s.expose().is_empty() {
         bail!("password must not be empty");
     }
@@ -442,7 +453,13 @@ fn format_frozen_resolve_hint(account_id: AccountId) -> String {
 /// with a stable error message; the user re-runs the command with
 /// proper input. Aligns with `vault_open::read_vault_password`'s
 /// "must not be empty" posture.
-fn prompt_password_with_confirmation() -> Result<SecretBytes> {
+///
+/// **P11B reuse (§A4).** Also called from
+/// `commands/vault.rs::run_create` for the interactive
+/// vault-password prompt. The bounded retry budget
+/// (`PASSWORD_RETRY_BUDGET = 2`, three total attempts) is shared
+/// across both call sites — same semantics, same UX.
+pub(crate) fn prompt_password_with_confirmation() -> Result<SecretBytes> {
     let mut attempts_left: i32 = (PASSWORD_RETRY_BUDGET + 1).try_into().unwrap_or(3);
     while attempts_left > 0 {
         attempts_left -= 1;
