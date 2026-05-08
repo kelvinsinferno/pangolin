@@ -6737,42 +6737,56 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn umask_restored_after_vault_create() {
+        use nix::sys::stat::{umask, Mode};
         use std::os::unix::fs::PermissionsExt as _;
         let dir = TempDir::new().unwrap();
 
-        // Probe 1: capture the user's current umask via a file
-        // created BEFORE `Vault::create` runs. We don't care what
-        // the absolute value is — we only need to compare it to
-        // probe 2 below.
+        // Pin the umask to a KNOWN non-0o077 value (0o022, the canonical
+        // Linux default) BEFORE we run anything. This sidesteps host-
+        // umask-dependent false alarms — GitHub Actions Linux runners
+        // default to 0o077, which would make the original probe-and-
+        // compare logic fail the "did the guard leak" assertion even
+        // though the guard works correctly.
+        //
+        // We capture the previous umask so we can restore the test
+        // host's actual umask on the way out (matches `UmaskGuard`'s
+        // Drop discipline).
+        let baseline = Mode::from_bits_truncate(0o022);
+        let original = umask(baseline);
+
+        // Probe 1: capture the umask we just pinned, via a file.
         let probe1 = dir.path().join("probe-before.txt");
         std::fs::File::create(&probe1).unwrap();
         let mode_before = std::fs::metadata(&probe1).unwrap().permissions().mode() & 0o777;
 
-        // Run `Vault::create` — this installs `0o077` for its
-        // duration and (under the M-1 fix) restores the previous
-        // value on `Drop`.
+        // Run `Vault::create` — this installs `0o077` for its duration
+        // and restores the previous (= our 0o022 baseline) value on Drop.
         let p = vault_path(&dir, "v-umask-restore.pvf");
         Vault::create(&p, &fresh_password()).unwrap();
 
-        // Probe 2: a fresh file created AFTER `Vault::create`
-        // returns must observe the SAME umask as probe 1.
+        // Probe 2: a fresh file created AFTER `Vault::create` returns
+        // must observe the SAME umask as probe 1 (= 0o022, mode 0o644).
         let probe2 = dir.path().join("probe-after.txt");
         std::fs::File::create(&probe2).unwrap();
         let mode_after = std::fs::metadata(&probe2).unwrap().permissions().mode() & 0o777;
 
-        assert_eq!(
-            mode_before, mode_after,
+        // Capture assertions BEFORE restoring umask so a panic doesn't
+        // skip the cleanup step.
+        let restoration_ok = mode_before == mode_after;
+        let no_leak = mode_after != 0o600;
+
+        // Restore the test host's original umask. Match `UmaskGuard`'s
+        // Drop discipline: this happens regardless of whether the
+        // assertions below succeed.
+        umask(original);
+
+        assert!(
+            restoration_ok,
             "umask must be restored after Vault::create (before: {mode_before:o}, after: {mode_after:o})",
         );
-        // Belt-and-braces: probe 2 must NOT be `0o600`, otherwise
-        // the guard leaked. (Pathological case: a user with an
-        // unusually-restrictive default umask of `0o077` would
-        // already see `0o600` here. We accept that false-positive
-        // narrowness because the typical CI host runs at `0o022`.)
-        assert_ne!(
-            mode_after, 0o600,
-            "umask 0o077 leaked past Vault::create; subsequent file creation observed 0o600. \
-             (If your test host's default umask is 0o077, this test is a false alarm.)",
+        assert!(
+            no_leak,
+            "umask 0o077 leaked past Vault::create; subsequent file creation observed 0o600 even though baseline was pinned to 0o022.",
         );
     }
 }
