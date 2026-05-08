@@ -51,6 +51,11 @@ deployments/*.local.json
 *.pvf-shm
 *.pvf.lock
 
+# Release artifacts produced by scripts/release-windows.ps1. The zip lives
+# at repo root by convention (per scripts/release-windows.ps1 §A12); the
+# binaries themselves are gitignored under dist/ above.
+pangolin-poc-*.zip
+
 # Test artifacts
 *.profraw
 coverage/
