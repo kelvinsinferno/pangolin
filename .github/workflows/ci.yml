@@ -70,10 +70,12 @@ jobs:
           submodules: recursive
       - uses: foundry-rs/foundry-toolchain@v1
         with:
-          # Pinned: floating `stable` keeps trapping us on Foundry CLI
-          # flag renames (e.g. `--no-commit` removed in 1.7.x). Bump
-          # deliberately when we want a new Foundry version.
-          version: v1.7.1
+          # Pinned to match the version Kelvin runs locally (forge
+          # 1.0.0-stable). Floating `stable` kept trapping us on Foundry
+          # CLI changes (e.g. `--no-commit` removed in 1.7.x; new
+          # `unsafe-typecast` linter introduced in 1.7.x). The invariant
+          # is: CI uses the same forge as local dev. Bump in lockstep.
+          version: v1.0.0
       # forge-std is vendored at contracts/lib/forge-std (v1.16.1) so no
       # `forge install` step is needed here — the working-directory checkout
       # already contains it. See `.gitignore` exception line.
@@ -103,10 +105,12 @@ jobs:
           submodules: recursive
       - uses: foundry-rs/foundry-toolchain@v1
         with:
-          # Pinned: floating `stable` keeps trapping us on Foundry CLI
-          # flag renames (e.g. `--no-commit` removed in 1.7.x). Bump
-          # deliberately when we want a new Foundry version.
-          version: v1.7.1
+          # Pinned to match the version Kelvin runs locally (forge
+          # 1.0.0-stable). Floating `stable` kept trapping us on Foundry
+          # CLI changes (e.g. `--no-commit` removed in 1.7.x; new
+          # `unsafe-typecast` linter introduced in 1.7.x). The invariant
+          # is: CI uses the same forge as local dev. Bump in lockstep.
+          version: v1.0.0
       # forge-std is vendored at contracts/lib/forge-std (v1.16.1) so no
       # `forge install` step is needed here — the working-directory checkout
       # already contains it. See `.gitignore` exception line.
@@ -132,10 +136,12 @@ jobs:
           submodules: recursive
       - uses: foundry-rs/foundry-toolchain@v1
         with:
-          # Pinned: floating `stable` keeps trapping us on Foundry CLI
-          # flag renames (e.g. `--no-commit` removed in 1.7.x). Bump
-          # deliberately when we want a new Foundry version.
-          version: v1.7.1
+          # Pinned to match the version Kelvin runs locally (forge
+          # 1.0.0-stable). Floating `stable` kept trapping us on Foundry
+          # CLI changes (e.g. `--no-commit` removed in 1.7.x; new
+          # `unsafe-typecast` linter introduced in 1.7.x). The invariant
+          # is: CI uses the same forge as local dev. Bump in lockstep.
+          version: v1.0.0
       # forge-std is vendored at contracts/lib/forge-std (v1.16.1) so no
       # `forge install` step is needed here — the working-directory checkout
       # already contains it. See `.gitignore` exception line.
@@ -170,10 +176,12 @@ jobs:
           submodules: recursive
       - uses: foundry-rs/foundry-toolchain@v1
         with:
-          # Pinned: floating `stable` keeps trapping us on Foundry CLI
-          # flag renames (e.g. `--no-commit` removed in 1.7.x). Bump
-          # deliberately when we want a new Foundry version.
-          version: v1.7.1
+          # Pinned to match the version Kelvin runs locally (forge
+          # 1.0.0-stable). Floating `stable` kept trapping us on Foundry
+          # CLI changes (e.g. `--no-commit` removed in 1.7.x; new
+          # `unsafe-typecast` linter introduced in 1.7.x). The invariant
+          # is: CI uses the same forge as local dev. Bump in lockstep.
+          version: v1.0.0
       # forge-std is vendored at contracts/lib/forge-std (v1.16.1) so no
       # `forge install` step is needed here — the working-directory checkout
       # already contains it. See `.gitignore` exception line.
