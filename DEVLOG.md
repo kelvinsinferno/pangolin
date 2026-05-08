@@ -1444,7 +1444,7 @@ Per `DECISIONS.md` retrospective (§"PoC retrospective"):
 | Criterion | Verdict | Evidence |
 |---|---|---|
 | 1. All issues closed; build artifact + screencast | OPEN-WITH-EVIDENCE | All P0..P11B SIGNOFFs in DEVLOG; P12 commits land the build pipeline + script + screencast script; YouTube URL filled in by Kelvin post-record. |
-| 2. E2E reproduced by non-author | CLOSED | P11-4 rehearsal transcript at `docs/issue-plans/P11-rehearsal.md`. |
+| 2. E2E reproduced by non-author | CLOSED | P11-4 rehearsal record (see `DEVLOG.md` § "Non-author rehearsal (P11-4)" under the P11 SIGNOFF entry). |
 | 3. No plaintext to disk in P1, P3, P7 | CLOSED | P1, P3, P7 SIGNOFF entries in DEVLOG; HIGH-1 invariant holds at this tip. |
 | 4. Contract redeployed at least once | CLOSED | D-015 (commit `329916d`) redeployed at `0x74f2…A9c4` block 41224971. |
 | 5. DECISIONS retrospectively updated | CLOSED | The retrospective IS this section in DECISIONS.md. |

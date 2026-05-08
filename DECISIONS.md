@@ -125,7 +125,7 @@ Verdict values per `P12.md` §A13:
 
 **Verdict:** OPEN-WITH-EVIDENCE.
 **Evidence:** All P0..P11B issues SIGNOFF entries in `DEVLOG.md`
-(11 SIGNOFF entries between commits `ad54185` and `1202`).
+(11 SIGNOFF entries between commits `ad54185` and `070258f`).
 P12 commit chain (`d73c247`, `c3c0c19`, `d9b520e`, this commit,
 SIGNOFF) lands the release-build pipeline (`scripts/release-windows.ps1`),
 the polished `POC_README.md`, and the screencast script
@@ -140,10 +140,10 @@ post-record.
 #### §3.9 criterion 2 — `E2E_TESTS.md` reproduced by a non-author developer from clean clone
 
 **Verdict:** CLOSED.
-**Evidence:** P11-4 non-author rehearsal transcript at
-`docs/issue-plans/P11-rehearsal.md` records a successful
-Scenario-1 cold-read walkthrough by a non-author agent (Mock
-mode). Per P11 SIGNOFF + locked Q3 answer, Scenarios 2/3 are
+**Evidence:** P11-4 non-author rehearsal record (see `DEVLOG.md`
+§ "Non-author rehearsal (P11-4)" under the P11 SIGNOFF entry)
+captures a successful Scenario-1 cold-read walkthrough by a
+non-author agent (Mock mode). Per P11 SIGNOFF + locked Q3 answer, Scenarios 2/3 are
 deferred from rehearsal; the rehearsal scope was sufficient to
 validate the reproducer's cold-read clarity. P11-5 fix-pass
 closed the three doc-gap findings (G1: count-from-3-to-5, G2:

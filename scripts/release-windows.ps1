@@ -59,6 +59,11 @@
 param(
     [switch]$SkipSign,
     [switch]$SkipPreflight,
+    # Restrict to a safe subset (alnum + dot/underscore/hyphen). Refuses
+    # path-traversal characters ('/', '\', '..', leading '-' beyond the
+    # parser, etc.) so the value can be safely concatenated into the
+    # output zip filename. Permits e.g. '0.0.0-poc', '1.2.3', '0.1.0-rc.1'.
+    [ValidatePattern('^[0-9a-zA-Z._-]+$')]
     [string]$Version = "0.0.0-poc"
 )
 
@@ -95,6 +100,42 @@ if (-not $SkipPreflight) {
 } else {
     Write-Host "==> Pre-flight SKIPPED (--SkipPreflight)" -ForegroundColor Yellow
 }
+
+# -----------------------------------------------------------------------------
+# Step 0b — toolchain preflight (rustc >= 1.83; capture rustc + cargo
+# versions for the summary block). RELEASE.md states "stable 1.83 or
+# newer"; refuse to build with an older rustc rather than ship a binary
+# from an unspecified toolchain.
+# -----------------------------------------------------------------------------
+Write-Host ""
+Write-Host "==> Toolchain preflight (rustc >= 1.83)" -ForegroundColor Cyan
+
+$rustcCmd = Get-Command rustc -ErrorAction SilentlyContinue
+if ($null -eq $rustcCmd) {
+    throw "rustc not found on PATH. Install Rust stable >= 1.83 (https://rustup.rs/)."
+}
+$cargoCmd = Get-Command cargo -ErrorAction SilentlyContinue
+if ($null -eq $cargoCmd) {
+    throw "cargo not found on PATH. Install Rust stable >= 1.83 (https://rustup.rs/)."
+}
+$rustcVersionRaw = (& rustc --version | Out-String).Trim()
+$cargoVersionRaw = (& cargo --version | Out-String).Trim()
+
+# Parse out the major.minor digits, e.g. "rustc 1.83.0 (...)" -> "1.83".
+if ($rustcVersionRaw -match '^rustc\s+(\d+)\.(\d+)') {
+    $rustcMajor = [int]$Matches[1]
+    $rustcMinor = [int]$Matches[2]
+} else {
+    throw "Unable to parse rustc version from: $rustcVersionRaw"
+}
+
+if ($rustcMajor -lt 1 -or ($rustcMajor -eq 1 -and $rustcMinor -lt 83)) {
+    throw "rustc $rustcMajor.$rustcMinor is older than required 1.83+. Run 'rustup update stable'."
+}
+
+Write-Host "    rustc:   $rustcVersionRaw"
+Write-Host "    cargo:   $cargoVersionRaw"
+Write-Host "    (>= 1.83 required)"
 
 # -----------------------------------------------------------------------------
 # Step 1 — release build.
@@ -169,9 +210,24 @@ Write-Host ""
 Write-Host "==> Computing SHA-256 manifest" -ForegroundColor Cyan
 
 $manifestEntries = New-Object System.Collections.Generic.List[string]
+# Resolve distDir to an absolute, canonicalised filesystem path so we can
+# do substring math against each file's FullName. We avoid
+# `Resolve-Path -RelativeBasePath` because that parameter requires
+# PowerShell 7.4+; this script must work on Windows PowerShell 5.1
+# (the default on Windows 10/11 hosts) per docs/RELEASE.md.
+$distDirFull = (Get-Item -LiteralPath $distDir).FullName.TrimEnd('\','/')
+$distDirPrefix = $distDirFull + [System.IO.Path]::DirectorySeparatorChar
 $relPaths = Get-ChildItem -Path $distDir -Recurse -File |
     Where-Object { $_.Name -ne "SHA256SUMS" -and $_.Name -ne "SHA256SUMS.asc" } |
-    ForEach-Object { (Resolve-Path -LiteralPath $_.FullName -Relative -RelativeBasePath $distDir) -replace '^\.[\\/]','' -replace '\\','/' } |
+    ForEach-Object {
+        $full = $_.FullName
+        if (-not $full.StartsWith($distDirPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Manifest path $full is not inside $distDirFull"
+        }
+        # Strip the dist-root prefix and normalise to forward slashes
+        # to match Linux sha256sum -c expectations.
+        $full.Substring($distDirPrefix.Length) -replace '\\','/'
+    } |
     Sort-Object
 
 foreach ($rel in $relPaths) {
@@ -237,8 +293,11 @@ $zipSize = (Get-Item $zipPath).Length
 Write-Host ""
 Write-Host "==> Release pipeline complete." -ForegroundColor Green
 Write-Host ""
+Write-Host "    Toolchain:"
+Write-Host "        $rustcVersionRaw"
+Write-Host "        $cargoVersionRaw"
 Write-Host "    Dist directory: $distDir"
-Write-Host "    Upload zip:     $zipPath ({0:N0} bytes)" -f $zipSize
+Write-Host ("    Upload zip:     {0} ({1:N0} bytes)" -f $zipPath, $zipSize)
 Write-Host "    Manifest:       $manifestPath"
 if (-not $SkipSign) {
     Write-Host "    Signature:      $sigPath"

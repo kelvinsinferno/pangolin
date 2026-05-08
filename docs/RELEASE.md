@@ -27,8 +27,16 @@ binary" — that's the audience the manifest signature is for.
 
 2. **Windows-x64 host** — the PoC release ships only a Windows-x64
    binary set; macOS / Linux / mobile are deferred to MVP-1+ packaging
-   per `docs/issue-plans/P12.md` §A2. Run the script from PowerShell
-   (5.1 or 7+); it does NOT require WSL.
+   per `docs/issue-plans/P12.md` §A2. Run the script from **PowerShell 7
+   or newer** (`pwsh.exe`); it does NOT require WSL.
+
+   Why 7+ specifically: the script invokes `cargo` and other native
+   exes whose stderr output (e.g., cargo's `Finished` success line)
+   trips PowerShell 5.1's `NativeCommandError` wrapping, causing
+   spurious failures even on successful builds. PowerShell 7 handles
+   native-exe stderr cleanly. Install via
+   [Microsoft's PowerShell 7 page](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-windows)
+   or `winget install --id Microsoft.Powershell`.
 
 3. **GnuPG** with Kelvin's signing key available in the host keyring.
    Install via [Gpg4win](https://www.gpg4win.org/) (recommended) or
@@ -189,7 +197,7 @@ Users verifying a downloaded release fetch the public key once:
 
 ```bash
 # Option A — keyserver fetch (preferred):
-gpg --keyserver hx-tt-pkeyservers.openpgp.org --recv-keys <fingerprint>
+gpg --keyserver hkps://keys.openpgp.org --recv-keys <fingerprint>
 
 # Option B — local import from a trusted out-of-band copy:
 gpg --import kelvin-pangolin-release.asc
