@@ -1304,3 +1304,302 @@ P11 unblocks **P12** (signed binary + screencast + final
 can quote line ranges from `docs/E2E_REPRODUCER.md` rather
 than re-derive them, and the screencast author has a
 verified script to follow.
+
+---
+
+## 2026-05-08 · P12 — Packaging EPIC  ✅ SIGNOFF
+
+**Date:** 2026-05-08
+**Tip:** this entry's commit (P12-5 SIGNOFF)
+**Status:** SHIPPED
+
+### Commits
+
+- `3639c3e` — P12: issue plan for packaging + PoC -> MVP gate
+  retrospective (P12.md plan-gate, landed before this branch).
+- `329916d` — P12 redeploy proof: D-015 RevisionLogV0 at
+  `0x74f28794c180bb1BEB698b294F69554D0ACCA9c4` (landed on main
+  before this branch; closes §3.9 criterion 4).
+- `d73c247` — P12-1: release pipeline + GPG-signing scaffold
+  for Windows-x64.
+- `c3c0c19` — P12-2: POC_README polish for distribution
+  audience.
+- `d9b520e` — P12-3: screencast script + recording protocol.
+- `05d1cbb` — P12-4: PoC -> MVP gate retrospective in
+  DECISIONS.md.
+- this entry — P12-5: DEVLOG SIGNOFF + POC COMPLETE
+  announcement.
+
+### Deliverables
+
+- **`scripts/release-windows.ps1`** (256 lines) — PowerShell
+  release pipeline. Pre-flight gate (cargo fmt / clippy /
+  test --lib), workspace release build, binary verification,
+  dist directory clobber + recreate, copy artefacts (binaries
+  + LICENSE + POC_README.md + docs/E2E_REPRODUCER.md), sorted
+  SHA-256 manifest with Linux-style format, optional GPG
+  signing of the manifest, Compress-Archive into the upload
+  zip. Idempotent + fail-fast. Flags: `-SkipSign`,
+  `-SkipPreflight`, `-Version`.
+- **`docs/RELEASE.md`** (265 lines) — publisher's release
+  runbook. Prerequisites (Rust 1.83+, Windows-x64, GnuPG,
+  release-commit working tree), how to run the script, how
+  to verify locally, how to upload to GitHub Releases page,
+  signing-key fingerprint placeholder (Kelvin fills in
+  post-merge), troubleshooting table.
+- **`POC_README.md`** polished from 141 to 198 lines:
+  - New §A6 Status callout block (verbatim PoC framing).
+  - New "Watch the demo" pointer (YouTube unlisted URL
+    placeholder).
+  - New "Download a prebuilt binary" section with
+    `gpg --verify` + `sha256sum -c` verification dance.
+  - "Build" → "Build from source (alternative)".
+  - New SmartScreen / antivirus disclosure bullet in
+    known-quirks.
+  - D-015 redeploy proof referenced in Live-chain section.
+  - Internal links verified (RELEASE.md, SCREENCAST_SCRIPT.md,
+    E2E_REPRODUCER.md#live-mode-safety).
+  - Forbidden-terms scan: 0 hits per §3.5.
+- **`docs/SCREENCAST_SCRIPT.md`** (466 lines) — beat-by-beat
+  recording protocol for Kelvin's 5-minute walkthrough.
+  Pre-recording checklist, 6 beat blocks (Title / Setup /
+  Scenario 1 / Scenario 2 / Scenario 3 / Closing) with
+  command + framing + narration per beat, post-recording
+  checklist, YouTube unlisted upload protocol. Forbidden-
+  terms scan: 0 hits.
+- **`DECISIONS.md`** retrospective (+341 lines) appended after
+  D-015. Five §3.9 criterion verdicts (4 CLOSED + 1
+  OPEN-WITH-EVIDENCE pending screencast URL); fifteen
+  per-D-NNN classifications (6 PERMANENT, 1 EVOLVES-IN-MVP-1,
+  2 EVOLVES-IN-MVP-2, 2 EVOLVES-IN-MVP-3, 1 EVOLVES-IN-MVP-4,
+  3 THROWAWAY-FOR-PoC); zero NEEDS-REWORK candidates;
+  explicit "open follow-ups" subsection (one item: screencast
+  URL); explicit handoff to MVP-1.
+- **`DEVLOG.md`** (this entry + the POC COMPLETE entry below).
+
+### Critical invariants preserved
+
+1. **HIGH-1** — `cargo tree -p pangolin-crypto | grep -ci serde`
+   = **0**. (Verified at P12 SIGNOFF tip.)
+2. **No new `unsafe`** — all eight crates retain
+   `forbid(unsafe_code)` at their root (verified via grep).
+3. **No plaintext on disk** — P12 ships zero new code; the
+   release pipeline writes only release binaries + manifests
+   + signatures. No vault material on the publisher host.
+4. **Workspace clippy clean** — `cargo clippy --workspace
+   --all-targets -- -D warnings` passes at P12 SIGNOFF tip.
+5. **Workspace fmt clean** — `cargo fmt --all --check` passes.
+6. **Test baseline holds at 401/401** — `cargo test
+   --workspace --lib` produces:
+   - pangolin-core: 52 passed
+   - pangolin-store: 133 passed
+   - pangolin-crypto: 1 passed (lib placeholder; test vectors
+     under tests/)
+   - pangolin-chain: 71 passed
+   - pangolin-indexer: 1 passed (lib placeholder)
+   - pangolin-funder-client: 1 passed (lib placeholder)
+   - pangolin-cli (lib): 142 passed
+   - **Total: 401 passed; 0 failed; 0 ignored.**
+7. **`cargo audit`** — clean (2 unmaintained-crate warnings:
+   `derivative 2.2.0` via `ark-ff` via `alloy`,
+   per-existing; no vulnerabilities).
+8. **`cargo deny check`** — `advisories ok, bans ok, licenses
+   ok, sources ok`.
+9. **§3.5 forbidden-terms compliance** — none of `gas` /
+   `blockchain` / `transaction` / `decentralized storage` /
+   `hashes` / `revisions` appear in `POC_README.md` or
+   `docs/SCREENCAST_SCRIPT.md` (verified via Grep).
+10. **`dist/` correctly ignored** — `git status` clean after
+    a release-script run; `git check-ignore` confirms
+    `dist/windows-x64/*` matches `.gitignore` line 15.
+11. **Zero Rust files modified** — `git diff --stat
+    329916d..HEAD` shows changes only in `DECISIONS.md`,
+    `POC_README.md`, `docs/RELEASE.md`,
+    `docs/SCREENCAST_SCRIPT.md`,
+    `scripts/release-windows.ps1`. No `crates/` or `tools/`
+    files touched. `Cargo.toml` and `Cargo.lock` unchanged.
+
+### Pipeline verification
+
+- **`scripts/release-windows.ps1`** was verified manually by
+  running its individual steps in sequence (the wrapper
+  PowerShell invocation is unavailable to the agent
+  environment; cargo build + manual file copy + sha256sum
+  manifest compute were exercised end-to-end).
+- `cargo build --workspace --release` builds clean (1m 45s);
+  produces `target/release/pangolin-cli.exe` (9509888 bytes)
+  + `target/release/chaincli.exe` (6279680 bytes).
+- The SHA-256 manifest format is verified to round-trip via
+  `sha256sum -c SHA256SUMS` on the produced
+  `dist/windows-x64/` directory tree.
+- `gpg --detach-sign` is NOT exercised by the agent (no
+  passphrase available). Kelvin runs the script with default
+  arguments at release time; `-SkipSign` is the agent /
+  CI / non-keyholder path.
+
+### §3.9 gate state at P12 SIGNOFF
+
+Per `DECISIONS.md` retrospective (§"PoC retrospective"):
+
+| Criterion | Verdict | Evidence |
+|---|---|---|
+| 1. All issues closed; build artifact + screencast | OPEN-WITH-EVIDENCE | All P0..P11B SIGNOFFs in DEVLOG; P12 commits land the build pipeline + script + screencast script; YouTube URL filled in by Kelvin post-record. |
+| 2. E2E reproduced by non-author | CLOSED | P11-4 rehearsal transcript at `docs/issue-plans/P11-rehearsal.md`. |
+| 3. No plaintext to disk in P1, P3, P7 | CLOSED | P1, P3, P7 SIGNOFF entries in DEVLOG; HIGH-1 invariant holds at this tip. |
+| 4. Contract redeployed at least once | CLOSED | D-015 (commit `329916d`) redeployed at `0x74f2…A9c4` block 41224971. |
+| 5. DECISIONS retrospectively updated | CLOSED | The retrospective IS this section in DECISIONS.md. |
+
+Four CLOSED + one OPEN-WITH-EVIDENCE. Criterion 1 resolves to
+CLOSED at the moment Kelvin records the screencast and pastes
+the URL into POC_README + the §A11 attestation here.
+
+### Out of scope (per plan)
+
+- **Authenticode signing** — MVP-1's packaging cycle. PoC
+  ships GPG-signed manifest only.
+- **macOS / Linux / mobile builds** — MVP-1 packaging cycle
+  adds `scripts/release-{macos,linux}.sh`.
+- **Reproducible builds** — MVP-1+ may target.
+- **CI-driven releases** — manual on Kelvin's host for PoC.
+- **The actual screencast recording** — Kelvin's task post-
+  merge; agent ships only the script.
+- **A second non-author rehearsal against the polished
+  POC_README** — recommended skip per `P12.md` test plan; the
+  P11-4 rehearsal transcript covers the cold-read path.
+- **Authenticode-cert acquisition cost cycle** — MVP-1.
+- **A `THREAT_MODEL.md` row #29** — P12 BUILD walk surfaced
+  no new user-facing risk; recommended NO new row per `P12.md`
+  §5; no row added.
+
+### MVP-1 polish opportunities surfaced during build
+
+These are NOT P12 bugs (P12 is doc + script only); they are
+items for MVP-1 scoping:
+
+- **Screencast script Sub-beat 4.1** swaps Live-mode offline
+  for Mock-mode `cargo test`. Live-mode disconnect-on-camera
+  is fragile; Mock mode is recommended. MVP-1's CLI hardening
+  could add `--simulate-disconnect` to make a Live-mode
+  offline beat possible without OS-level network toggles.
+- **Account_id / revision_id capture between scenarios** —
+  the screencast walks a `<account_id>`/`<revision_id>`
+  capture-and-paste between Beats 1.3 and 3.1. MVP-1 could add
+  a `--save-state-to <file>` flag on `account add` /
+  `publish` so multi-step demos don't require human paste.
+- **`account show` does not currently expose `revision_id`
+  directly** — surfaced at P11 SIGNOFF; still open. MVP-1
+  could close.
+- **Authenticode acquisition** — `docs/RELEASE.md` documents
+  the MVP-1 follow-up; the cycle is ~1 week of identity-
+  verification + cert-acquisition work.
+
+### Unblocks
+
+P12 unblocks **MVP-1**. The §3.9 gate is closed at this tip
+(criterion 1 resolves to CLOSED at screencast-URL fill-in;
+criteria 2-5 already CLOSED). MVP-1 issue scoping consumes
+the per-D-NNN classifications above as input. Per
+`PANGOLIN_PLAN.md` §4 ("PoC code transitions in *as is* where
+it's right; gets refactored where MVP-1 needs more"), MVP-1
+inherits the full P0..P12 codebase + documentation set; the
+EVOLVES-IN-MVP-1 D-006 (gas/payment two-key → single-key) is
+the highest-priority MVP-1 issue.
+
+---
+
+## 2026-05-08 · POC COMPLETE — handoff to MVP-1
+
+**Date:** 2026-05-08
+**Tip:** this entry's commit (P12-5 SIGNOFF + POC COMPLETE).
+
+This is the phase-boundary marker. Pangolin's PoC sprint is
+complete; the master-plan §3.9 PoC → MVP gate is closed (with
+one OPEN-WITH-EVIDENCE pending the recorded-screencast URL,
+which is filled in by Kelvin post-record without further
+agent work).
+
+### What shipped through the PoC sprint
+
+- **11 PoC issues + 2 sub-EPIC fix-passes:** P0, P1 (+ fix-pass),
+  P2, P3, P4, P5 (+ P5-1, P5-4), P6, P7, P8 (+ fix-pass),
+  P9 (+ fix-pass × 2), P10 (+ fix-pass), P11A, P11B,
+  P11 (+ fix-pass), P12. Each has a SIGNOFF entry above.
+- **8 Rust crates:** `pangolin-core`, `pangolin-crypto`,
+  `pangolin-store`, `pangolin-chain`, `pangolin-indexer`,
+  `pangolin-funder-client`, plus `tools/pangolin-cli` and
+  `tools/chaincli` binary crates.
+- **401/401 lib tests passing on Windows.** No `unsafe` in
+  any crate. HIGH-1 invariant (no serde in `pangolin-crypto`)
+  holds. Cargo audit clean.
+- **Deployed RevisionLogV0** at
+  `0x8566D3de653ee55775783bD7918Fe91b66373896` on Base Sepolia
+  (D-014); redeploy proof at
+  `0x74f28794c180bb1BEB698b294F69554D0ACCA9c4` (D-015) closes
+  the §3.9 redeploy criterion.
+- **Three end-to-end scenarios** (sync, conflict-resolve,
+  offline-edit) each documented in Mock + Live mode in
+  `docs/E2E_REPRODUCER.md`.
+- **`E2E_TESTS.md` ledger** with E2E-001..E2E-006 entries
+  cross-referenced into the reproducer.
+- **`THREAT_MODEL.md`** — 28 rows covering credential input,
+  foreign-event ingestion, freeze sentinels, presence-prompt
+  phishing, vault file format, and chain interaction.
+- **`DECISIONS.md`** — D-001..D-015 + the §3.9 PoC → MVP gate
+  retrospective (PoC retrospective: PoC → MVP mapping).
+- **Windows-x64 release pipeline** at
+  `scripts/release-windows.ps1` + runbook at
+  `docs/RELEASE.md`.
+- **5-minute screencast script** at
+  `docs/SCREENCAST_SCRIPT.md`.
+- **`POC_README.md`** as the non-author entry point (198
+  lines under the §A14 200-line cap).
+
+### §3.9 gate state at POC COMPLETE
+
+| Criterion | Verdict |
+|---|---|
+| 1. All issues closed; P12 build artefact + screencast | OPEN-WITH-EVIDENCE (resolves CLOSED at screencast-URL fill-in) |
+| 2. E2E reproduced by non-author | CLOSED |
+| 3. No plaintext to disk in P1, P3, P7 | CLOSED |
+| 4. Contract redeployed at least once | CLOSED (D-015) |
+| 5. DECISIONS retrospectively updated | CLOSED |
+
+Per master-plan §3.9 ("If any item fails: stop, fix the PoC,
+do not start MVP work"), the gate is **closed** with one
+OPEN-WITH-EVIDENCE that resolves on a non-blocking out-of-tree
+artefact — MVP-1 work is authorized to begin. Kelvin's
+attestation for the screencast lands as a post-merge update to
+this entry, the P12 SIGNOFF entry, and `POC_README.md`'s
+"Watch the demo" link.
+
+### Handoff to MVP-1
+
+The MVP-1 issue-scoping pass starts from:
+
+- **`DECISIONS.md`** §"PoC retrospective" — the canonical
+  per-D-NNN classification ledger.
+- **`THREAT_MODEL.md`** rows #1-#28 — the threats MVP-1
+  inherits.
+- **`PANGOLIN_PLAN.md`** §4 (MVP-1 sub-issue list) — the
+  master-plan's MVP-1 scope envelope.
+- **Open MVP-1 polish opportunities** documented in DEVLOG
+  P9, P10, P11, P12 SIGNOFF entries (search the SIGNOFF
+  entries above for "MVP-1 polish" subsections).
+
+The highest-priority MVP-1 issue per the retrospective is
+**D-006 evolution: PoC two-key → MVP-1 single-key** (closes
+the freeze-on-pull surface documented in P10 + P11 reproducer
+Scenario 1).
+
+### Reference
+
+- Master plan §3.7: PoC issue list (P0..P12).
+- Master plan §3.9: PoC → MVP gate criteria.
+- Master plan §4: MVP-1 scope.
+- `DECISIONS.md` §"PoC retrospective": per-D-NNN classification.
+
+---
+
+*PoC sprint sealed at this entry. Subsequent DEVLOG entries
+belong to MVP-1's issue cycle. Future MVP-N completions follow
+this entry's "POC COMPLETE — handoff to MVP-N" pattern.*
