@@ -1045,3 +1045,154 @@ P11A-1..P11A-5) plus 1 new integration test
 12. No new D-NNN entries — every architectural decision
     in the P11A plan is local to the CLI surface and
     documented in `docs/issue-plans/P11A.md` §A1..§A16.
+
+## 2026-05-07 · P11B — pangolin-cli vault create subcommand EPIC  ✅ SIGNOFF
+
+P11B closes the structural gap "Pangolin's CLI cannot create a
+vault." One new subcommand — `pangolin-cli vault create
+--path <path> [--password-stdin] [--print-id]` — exposes
+`Vault::create(path, password)` at the user-facing CLI
+boundary, preserving P11A's A3 password-input discipline
+(interactive prompt + confirmation OR `--password-stdin`;
+NEVER `--password <flag>`). With P11B in place, the P11
+reproducer guide drives a non-author developer through
+`vault create` → `account add` → `publish` → `pull`
+without bespoke fixture scaffolding (the
+`Vault::create` library escape hatch is no longer needed).
+
+P11B introduces no new cryptographic primitive, no new
+chain-side code, no new vault-schema column, no new public
+library API.
+
+**Commit-by-commit:**
+
+- **P11B-1 (`01ee02f`)** — clap scaffold. New
+  `Command::Vault(VaultArgs)` variant on the top-level
+  `Command` enum (alongside `Account`); nested
+  `VaultCommand::Create(VaultCreateArgs)` sub-subcommand;
+  one new dispatch arm in `main.rs`; new
+  `tools/pangolin-cli/src/commands/vault.rs` module with
+  a stubbed `run_create` returning `bail!("not implemented
+  yet")`. `VaultCreateArgs`: `--path <PathBuf>` (required),
+  `--password-stdin` (bool, default false), `--print-id`
+  (bool, default false). NO `--password <flag>` field.
+  Per locked Q5 the long-doc on `VaultCommand::Create`
+  warns explicitly: "Pangolin has no password-recovery
+  mechanism; loss of this password is permanent data
+  loss." Eight clap-shape unit tests pin the surface
+  (vault subcommand renders, per-verb arg parsing,
+  required `--path`, `--print-id` and `--password-stdin`
+  flags parse, `--password` flag REJECTED, §A14
+  forbidden-user-facing-terms invariant, no-recovery
+  warning is in the help output).
+
+- **P11B-2 (`c1d4c0c`)** — `vault create` end-to-end.
+  Path canonicalization per §A5: `parent.canonicalize() +
+  file_name`, surfacing the absolute resolved path in
+  the success message and any error message (matches P8
+  fix MED-3's discipline). Pre-flight overwrite refusal
+  per §A3: `path.exists()` check at the CLI boundary
+  before any password prompt; the library's own check
+  plus `acquire_lock`'s `OpenOptions::create_new(true)`
+  close the TOCTOU race per §A8; NO `--force` flag.
+  Password acquisition per §A2 reuses three helpers from
+  `commands/account.rs` (now `pub(crate)` per §A4):
+  `prompt_password_with_confirmation`,
+  `read_secret_first_line_from_stdin`, and
+  `reject_empty_password`. Empty-password guard fires on
+  both paths before any library call. Per §A9 the
+  interactive path emits a clarifying eprintln! BEFORE
+  the rpassword call. POSIX file-mode hardening per Q4:
+  after `Vault::create` returns, the new file is chmod
+  0o600 on Unix targets (best-effort; warn-but-don't-
+  abort on filesystems that ignore POSIX bits;
+  cfg(unix) — Windows is a no-op). Vault::close called
+  explicitly on success per §A11 (mirrors P11A's
+  pattern). Output per §A7: `vault created at
+  <canonical-path>` by default; `vault_id: <hex>` line
+  added when `--print-id` is set; `--json` global flag
+  emits the JSON bundle with the vault_id field always
+  present. Nine new unit tests in `commands/vault.rs::tests`
+  plus one new integration test
+  `tools/pangolin-cli/tests/vault_create_lifecycle.rs::vault_create_then_account_add_round_trip`
+  (spawns the binary via `CARGO_BIN_EXE_pangolin-cli`,
+  pipes the master password to stdin via
+  `--password-stdin`, asserts the produced vault is
+  consumable by `account add` under the same password).
+
+- **P11B-3 (this entry)** — THREAT_MODEL row 28 covers
+  the new threat surface: vault-creation password leak
+  (defense: no `--password <flag>` form), `.pvf`
+  overwrite hazard (defense: pre-flight check + library
+  guard + lock; no `--force`), parent-dir-traversal /
+  symlink redirection at the create boundary (defense:
+  parent-canonicalize per §A5), empty-password footgun
+  (defense: `reject_empty_password` reused from P11A's
+  MED-1 fix), POSIX file-mode hardening (chmod 0o600 on
+  Unix per Q4), no-password-recovery user warning
+  (`--help` long-doc per Q5; pinned by
+  `vault_create_help_warns_no_password_recovery`).
+  E2E_TESTS unchanged (`vault create` → `account add`
+  is the implicit prefix of every E2E-001..E2E-006
+  scenario; the new integration test pins the prefix
+  contract).
+
+**Test-count delta:** 384 → 401 lib tests (+17 across
+P11B-1's 8 clap tests in `cli.rs` plus P11B-2's 9 vault
+unit tests in `commands/vault.rs::tests` on Windows; one
+additional cfg(unix) test `vault_create_chmod_0600_on_unix`
+runs on Linux for +18 there) plus 1 new integration test
+(`vault_create_then_account_add_round_trip`). The P11A
+SIGNOFF entry recorded 367 lib tests; the P11B baseline
+at `7dd7e77` (P11B plan tip) already showed 384 lib
+tests workspace-wide due to P10 / P11A fix-pass / other
+intervening commits. P11B-1 took the count to 392
+(+8 cli tests), P11B-2 to 401 on Windows (+9 vault
+unit tests), and P11B-3 leaves it unchanged at 401.
+
+**Critical invariants verified at the P11B SIGNOFF tip:**
+
+1. `cargo tree -p pangolin-crypto | grep -ci serde` → 0
+   (HIGH-1 bound holds; P11B introduces no new
+   `pangolin-crypto` dependency and no new `pangolin-store`
+   public surface).
+2. No new `unsafe`. `forbid(unsafe_code)` is unconditional
+   at the top of `tools/pangolin-cli/src/main.rs` and
+   `lib.rs`; preserved.
+3. No plaintext on disk. Vault password handled via
+   `SecretBytes` (zeroizes on drop); the produced `.pvf`'s
+   contents are AEAD-encrypted under the VDK which is
+   wrapped under the password-derived authority. POSIX
+   file-mode hardening (chmod 0o600 on Unix) limits
+   on-disk DISCOVERABILITY of the encrypted file to the
+   owner UID, not its readability — defense in depth.
+4. No `--password <flag>` form anywhere. Verified by
+   `vault_create_does_not_accept_password_flag` (clap
+   rejects the flag at parse time) and inspection of
+   `VaultCreateArgs` field set (only `path: PathBuf`,
+   `password_stdin: bool`, `print_id: bool`).
+5. Append-only state holds. `Vault::create` is a
+   first-time-provisioning op; the append-only invariant
+   applies to revisions inside the freshly-created vault,
+   not to the `.pvf` file itself. P11B's "refuse to
+   overwrite" discipline is the moral equivalent: a
+   `.pvf` is created exactly once at a given path
+   (per §A3 / §A8).
+6. `cargo fmt --all --check` clean.
+7. `cargo clippy --workspace --all-targets -- -D warnings`
+   clean.
+8. `cargo test --workspace --lib` — 401/401 passing
+   on Windows (384 baseline + 17 new across P11B-1 +
+   P11B-2; +18 on Linux where the cfg(unix) chmod test
+   also runs).
+9. `cargo test --workspace --tests` — integration tests
+   pass, including the new `vault_create_lifecycle.rs::vault_create_then_account_add_round_trip`.
+10. §3.5 forbidden-user-facing-terms invariant holds —
+    `vault_help_avoids_forbidden_user_facing_terms` pins
+    the rendered `vault --help` and `vault create --help`
+    output for "blockchain", "transaction", "hashes",
+    "revisions", "decentralized storage", and "gas".
+11. P0..P11A lib + integration tests unchanged.
+12. No new D-NNN entries — every architectural decision
+    in the P11B plan is local to the CLI surface and
+    documented in `docs/issue-plans/P11B.md` §A1..§A14.
