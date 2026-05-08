@@ -88,6 +88,29 @@
         "This is the canonical PoC RevisionLog reference until P5-1 is replaced by MVP-2 issue 2.1 (RevisionLog v1 on mainnet). v1 will live at a separate address with signature verification.",
         "Contract is append-only by design: no admin, no upgrade, no pause, no selfdestruct. If broken, deploy v2 at a new address per the locked decision in §2 of the master plan."
       ]
+    },
+    "RevisionLogV0_redeploy_proof": {
+      "address": "0x74f28794c180bb1BEB698b294F69554D0ACCA9c4",
+      "deployer": "0x89e720238A3913688CB0E025ef03a64539575c54",
+      "deploy_tx": "0xe68ebcbbd342f71ae2e1766904c70f8fd2860c02c2c38142caad6bffc35d48c3",
+      "deploy_block": 41224971,
+      "deploy_timestamp_iso": "2026-05-08T~recorded-at-merge",
+      "gas_used": 149135,
+      "gas_price_gwei": 0.006,
+      "deploy_cost_eth": 0.00000089481,
+      "compiler": "identical to RevisionLogV0 above (same Solidity source, same solc 0.8.24, same optimizer settings)",
+      "bytecode": {
+        "matches_canonical": true,
+        "expected_runtime_keccak256": "0xdbab504e86eca48cbedf61bb1fbc04ab17a5bb880d5a468cbb64e4b64e95c6fe",
+        "comment": "Same source compiled with the same toolchain produces the same bytecode, so the runtime keccak should match the canonical contract above. Verifiable post-deploy via `cast keccak $(cast code 0x74f2...c4 --rpc-url https://sepolia.base.org)`."
+      },
+      "purpose": "P12 §3.9 PoC -> MVP gate criterion (4): proves redeploy-on-bug is real, not theoretical. The deploy script (contracts/script/DeployRevisionLogV0.s.sol) was re-run unchanged against the existing Foundry keystore and landed at a fresh address. This contract is NOT wired to any production code path; the canonical RevisionLogV0 above remains the active contract used by chaincli, pangolin-chain, and pangolin-cli.",
+      "explorer_link": "https://sepolia.basescan.org/address/0x74f28794c180bb1BEB698b294F69554D0ACCA9c4",
+      "notes": [
+        "Recorded under D-015 in DECISIONS.md.",
+        "Identical gas profile (149135 gas at 0.006 gwei) to the original deploy at 0x8566... — same bytecode, same compiler artifact.",
+        "MVP-2 issue 2.1's RevisionLog v1 (with signature verification) will land at a third address; this redeploy is just for the PoC gate."
+      ]
     }
   }
 }

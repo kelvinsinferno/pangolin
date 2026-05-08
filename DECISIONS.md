@@ -88,6 +88,12 @@
 **Why:** Per master plan §3.7 (P5-4) and D-005 (Base is the testnet target). Recording here so downstream PoC issues (P6 chaincli, P7 chain adapter, P8 sync) point at a single canonical address. v1 (MVP-2 issue 2.1) will live at a separate address with signature verification; this v0 stays append-only-immutable wherever it currently sits on chain.
 **Spec ref:** Whitepaper §D1; master plan §3.7 EPIC: Contract; full metadata in `contracts/deployments/base-sepolia.json`.
 
+## D-015 · PoC RevisionLog redeploy proof (Base Sepolia)
+**Date locked:** 2026-05-08
+**Decision:** `RevisionLogV0` redeployed (unchanged source) at `0x74f28794c180bb1BEB698b294F69554D0ACCA9c4` on Base Sepolia (chain id `84532`). Deploy tx `0xe68ebcbbd342f71ae2e1766904c70f8fd2860c02c2c38142caad6bffc35d48c3` in block `41224971`. Same deployer wallet as D-014. Identical gas profile (149,135 gas at 0.006 gwei) to D-014 — same bytecode, same `solc 0.8.24` artifact, same expected runtime keccak `0xdbab504e86eca48cbedf61bb1fbc04ab17a5bb880d5a468cbb64e4b64e95c6fe`. **This contract is NOT wired to any production code path** — `chaincli`, `pangolin-chain`, `pangolin-cli` all continue to point at D-014's `0x8566...3896`. The redeploy is purely operational evidence.
+**Why:** Closes §3.9 PoC → MVP gate criterion (4): "Contract redeployed at least once (proves redeploy-on-bug is real)." Per Q1 of P12 plan-gate, locked option (a) — actually redeploy rather than argue latent capability. Verified the existing `contracts/script/DeployRevisionLogV0.s.sol` script + Kelvin's `pangolin-dev` Foundry keystore + Base Sepolia testnet pipeline still works end-to-end as of 2026-05-08, two days after D-014.
+**Spec ref:** Master plan §3.9 PoC → MVP gate; full metadata in `contracts/deployments/base-sepolia.json` under the `RevisionLogV0_redeploy_proof` key.
+
 ---
 
 ## Decision template (for future entries)
