@@ -804,3 +804,157 @@ the PR.
     boundary). Per Q8 there is no `--force` flag to
     bypass the freeze guard on either verb. Resolve flow
     per P9 is unchanged.
+28. **Vault provisioning password leak (process listing,
+    shell history, scrollback) AND `.pvf` overwrite
+    hazard AND first-time-creator UX failures (empty
+    password, parent-dir traversal, mid-create races).**
+    Defense (multi-fold): `pangolin-cli vault create`
+    REFUSES to ship a `--password <flag>` argument form;
+    locked at the clap surface in `cli.rs` and pinned by
+    `vault_create_does_not_accept_password_flag`. The two
+    paths to provide a vault password are interactive
+    terminal prompt (`rpassword::prompt_password`, no
+    echo) with confirmation re-prompt and bounded retry
+    budget (2 retries; 3 attempts total) or stdin
+    (`--password-stdin`, redirected by the user). Same
+    shape `pass init` and `bw create` use. The empty-
+    password guard (`reject_empty_password`, reused from
+    P11A's MED-1 fix per plan §A4) fires on both paths
+    before any library call. The vault-creation password
+    is the master credential for the new vault — its
+    leak compromises every account stored inside; the
+    input-discipline carries P11A's row #23 weight
+    forward to this higher-tier secret. Path-traversal
+    handling: `--path` is processed via
+    `parent.canonicalize() + file_name` (§A5; note
+    `Path::canonicalize` requires file existence, which
+    the not-yet-created target lacks); relative-path
+    traversal and symlink redirection on the parent
+    surface as the canonical absolute path in the
+    success message and any error message, matching P8
+    fix MED-3's discipline. A `--path` with no
+    `file_name` (root, trailing slash, `..`) is rejected
+    with "--path must name a vault file (got <path>)"
+    before any password prompt. A `--path` whose parent
+    directory does not exist surfaces "could not
+    canonicalize parent directory of <path>" before any
+    password prompt — saves a wasted password entry on
+    the most common typo. Overwrite refusal: a pre-flight
+    `path.exists()` check at the CLI boundary plus the
+    library's `Vault::create`'s `path.exists()` +
+    `acquire_lock`'s `OpenOptions::create_new(true)`
+    write open close the TOCTOU race between the
+    pre-flight and the library call (§A8); two
+    concurrent `vault create` calls against the same
+    path produce one `Created` and one
+    `AlreadyExists`/`AlreadyOpen` cleanly, with the
+    loser's partial-file cleanup performed by
+    `Vault::create`'s existing
+    `std::fs::remove_file(path)` on-error path.
+    NO `--force` flag exists to overwrite an existing
+    `.pvf`; the user explicitly `rm`-then-rerun if they
+    want to start over (matches `git init`'s discipline).
+    POSIX file-mode hardening (Q4): after `Vault::create`
+    succeeds, the new file is chmod 0o600 on Unix
+    targets via
+    `std::os::unix::fs::PermissionsExt::set_mode`.
+    Best-effort — emits a warning but does not abort if
+    the chmod fails (e.g., on a filesystem that ignores
+    POSIX bits); the vault content remains AEAD-
+    encrypted under the user's password regardless.
+    No-op on Windows (file ACLs are inherited from the
+    parent directory; tightening is the user's
+    responsibility). KDF parameters are hard-coded
+    `KdfParams::RECOMMENDED` (256 MiB / t=3 / p=1, the
+    same value `Vault::create` already pins in vault.rs
+    L228); no `--kdf-params` selector at the CLI surface
+    per §A6, so every PoC vault produced by
+    `pangolin-cli vault create` has identical KDF
+    strength. **No password recovery (Q5).** Pangolin
+    has no password-recovery mechanism under PoC; loss
+    of the vault password permanently locks every
+    account stored inside. The `vault create --help`
+    output (and the long-doc rendered by clap-derive)
+    surface this explicitly via two pinned phrases:
+    "no password-recovery mechanism" and "permanent data
+    loss" — verified by
+    `vault_create_help_warns_no_password_recovery`. A
+    user reading `--help` BEFORE running the command is
+    expected to choose a password they can remember (or
+    write down securely); MVP-1's Recovery flow per
+    Whitepaper §10 will replace this hard-fail with the
+    epistemic-recovery procedure. Inherits the
+    `rpassword`-returns-unzeroized-`String` PoC
+    limitation from row #23 unchanged;
+    `--password-stdin` is the exposure-free path.
+    Audit-relevant test pins: `vault_create_succeeds_at_new_path`
+    (round-trip), `vault_create_rejects_existing_path`
+    (overwrite refuse), `vault_create_rejects_empty_password_via_stdin`,
+    `vault_create_rejects_empty_password_via_prompt`,
+    `vault_create_rejects_path_in_nonexistent_parent`,
+    `vault_create_canonicalizes_path_in_success_message`,
+    `vault_create_rejects_path_with_no_filename`,
+    `vault_create_chmod_0600_on_unix` (cfg(unix)),
+    `vault_create_password_stdin_path_works`,
+    `vault_create_with_print_id_outputs_hex_to_stdout`,
+    `vault_help_avoids_forbidden_user_facing_terms`
+    (§3.5 / §A14), and the round-trip integration test
+    `vault_create_then_account_add_round_trip` (spawns
+    the binary, pipes the password via stdin, asserts
+    the produced vault is consumable by `account add`).
+    **P11B fix-pass updates (audit M-1, M-2, L-1):** the §16.5
+    fix-pass closed two MEDIUM findings against this row.
+    M-1 (chmod race window) — the previous design relied on a
+    post-create `chmod 0o600` to tighten the file from the
+    process-default `0o644` (under a typical `0o022` umask). The
+    audit identified a window between `Vault::create`'s
+    `OpenOptions::create_new(true)` and `pangolin-cli`'s
+    `restrict_vault_file_mode` chmod during which an attacker with
+    a pre-positioned `inotify_add_watch` (or equivalent) could read
+    the freshly-written `.pvf`. The file content includes the
+    offline-Argon2id-bruteforce preconditions (`kdf_salt`,
+    `kdf_params`, `wrapped_ciphertext`, `wrap_nonce`); strong
+    passwords are still defended by the Argon2id RECOMMENDED expense,
+    but weak passwords would be exposed to an offline cracking
+    attempt. The fix moved the umask install into `Vault::create`
+    itself: an RAII `UmaskGuard` (built on `nix::sys::stat::umask`,
+    which is a safe wrapper — no `unsafe` needed at our call site)
+    sets `0o077` BEFORE the lock-file or `.pvf` are created and
+    restores the previous umask on `Drop`. Both files are now born
+    at mode `0o600` on Unix without any intervening permission
+    tweak. `nix` is `cfg(unix)`-gated so Windows does not pull it,
+    and the workspace `unsafe_code = "deny"` plus
+    `pangolin-store`'s `forbid(unsafe_code)` and `pangolin-cli`'s
+    `forbid(unsafe_code)` lints are unchanged. The CLI's existing
+    `restrict_vault_file_mode` chmod is preserved as belt-and-
+    braces defense-in-depth (e.g., for hosts with an unusual
+    `0o000` default umask that would still leave the file at a
+    too-permissive mode), but it is no longer the primary defense.
+    Test pins: `umask_set_to_0o077_around_vault_create_unix` (the
+    new file is `0o600` immediately on `Vault::create` return,
+    BEFORE any chmod), `umask_restored_after_vault_create` (a
+    sacrificial probe-file created after the call observes the
+    user's normal umask, confirming the guard's `Drop` restored
+    correctly), plus the existing `vault_create_chmod_0600_on_unix`
+    which continues to pass against the now-redundant CLI chmod.
+    M-2 (symlinked `--path` redirect) — the previous overwrite
+    pre-flight used `Path::exists()`, which follows symlinks. A
+    `--path` pointing at a *dangling* symlink (target missing) slid
+    past the check and `Vault::create` would then write through the
+    symlink to the target, silently provisioning the vault at an
+    unintended location. The fix replaces the pre-flight with a
+    `std::fs::symlink_metadata` match: a symlink at the final
+    component is refused with `"refusing to create vault at
+    <path>: path is a symlink; resolve to the real target and pass
+    that explicitly"` — matching `git init`'s discipline. A
+    pre-existing regular file still surfaces the original
+    `"vault file already exists"` overwrite-refuse error.
+    Parent-component symlinks remain intentionally followed (the
+    existing `parent.canonicalize()` resolves them, which is the
+    documented `--path` semantics). Test pin:
+    `vault_create_refuses_symlinked_path` (cfg(unix); plants a
+    dangling symlink and asserts both refusal AND that no vault
+    leaked through to the target). L-1 — the chmod-failure
+    warning prefix is now `WARNING:` (all caps) per the project
+    rubric; previously it was `warning:`. Cosmetic, no semantic
+    change.

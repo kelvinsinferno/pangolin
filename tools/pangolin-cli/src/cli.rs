@@ -105,6 +105,82 @@ pub enum Command {
     /// no chain calls. Use `pangolin-cli publish` to push the
     /// resulting changes on chain.
     Account(AccountArgs),
+
+    /// Manage vault files at the filesystem level: create. The
+    /// nested `create` verb provisions a brand-new `.pvf` file at
+    /// a user-specified path under a fresh master password. No
+    /// chain calls.
+    Vault(VaultArgs),
+}
+
+/// `vault` subcommand — wraps the per-verb sub-subcommands.
+///
+/// Per P11B plan §A1 the verbs live under a nested
+/// `pangolin-cli vault <verb>` namespace, mirroring P11A's
+/// `account <verb>` shape. `create` is the only verb shipped by
+/// P11B; MVP-1 may add `open` / `info` / `destroy` /
+/// `rotate-password` / `export` / `import` under the same noun.
+#[derive(Debug, Args)]
+pub struct VaultArgs {
+    #[command(subcommand)]
+    pub command: VaultCommand,
+}
+
+/// The `vault` sub-subcommands (P11B ships exactly one — `create`).
+#[derive(Debug, Subcommand)]
+pub enum VaultCommand {
+    /// Create a brand-new vault file at the given path. Prompts
+    /// for a fresh master password (with confirmation) or reads
+    /// it from stdin when `--password-stdin` is set. Refuses to
+    /// overwrite an existing file. Pangolin has no
+    /// password-recovery mechanism; loss of this password is
+    /// permanent data loss.
+    Create(VaultCreateArgs),
+}
+
+/// `vault create` — provision a fresh `.pvf` at `--path`.
+///
+/// Password input has two exclusive paths:
+///
+/// 1. `--password-stdin` — read the first line of stdin as the
+///    master password (CI / scripted use). Trailing newline is
+///    trimmed. Empty input is rejected.
+/// 2. (default) Interactive prompt at the terminal without echo,
+///    plus a confirmation re-prompt; aborts on mismatch after a
+///    bounded retry budget.
+///
+/// There is **NO** `--password <flag>` form. The flag form leaks
+/// via process listing (`ps aux`) and Pangolin refuses to ship
+/// that footgun. The vault password is the master credential for
+/// every account stored inside; its leak compromises the entire
+/// vault.
+///
+/// **No password recovery.** Pangolin has no
+/// password-recovery mechanism; if you forget this password the
+/// vault is unreadable and every account inside it is permanently
+/// inaccessible. Choose a password you can remember (or store it
+/// in a separate password manager) BEFORE running this command.
+#[derive(Debug, Args)]
+pub struct VaultCreateArgs {
+    /// Filesystem path where the new vault file will be created.
+    /// The parent directory must exist; the path itself must not.
+    /// Relative paths are resolved against the current working
+    /// directory.
+    #[arg(long)]
+    pub path: PathBuf,
+
+    /// Read the master password from the first line of stdin (CI
+    /// / scripted use). Mutually exclusive with the default
+    /// interactive prompt.
+    #[arg(long)]
+    pub password_stdin: bool,
+
+    /// After a successful create, also print the new vault's
+    /// 32-byte identifier as a 64-character lowercase hex string
+    /// on a second stdout line. Default off (matches `git init`'s
+    /// minimal-default convention).
+    #[arg(long)]
+    pub print_id: bool,
 }
 
 /// `account` subcommand — wraps the per-verb sub-subcommands.
@@ -1230,6 +1306,206 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------
+    // P11B-1: vault subcommand clap shape
+    // -----------------------------------------------------------
+
+    /// **P11B-1.** `vault --help` renders.
+    #[test]
+    fn vault_subcommand_parses_with_help() {
+        let err = Cli::try_parse_from(["pangolin-cli", "vault", "--help"]).unwrap_err();
+        assert!(matches!(err.kind(), clap::error::ErrorKind::DisplayHelp));
+    }
+
+    /// **P11B-1.** `vault create --path <path>` parses cleanly.
+    #[test]
+    fn vault_create_parses_with_path() {
+        let cli =
+            Cli::try_parse_from(["pangolin-cli", "vault", "create", "--path", "/tmp/new.pvf"])
+                .expect("vault create parses");
+        match cli.command {
+            super::Command::Vault(args) => match args.command {
+                super::VaultCommand::Create(c) => {
+                    assert_eq!(c.path, std::path::PathBuf::from("/tmp/new.pvf"));
+                    assert!(!c.password_stdin);
+                    assert!(!c.print_id);
+                }
+            },
+            other => panic!("expected Vault, got {other:?}"),
+        }
+    }
+
+    /// **P11B-1.** `vault create` requires `--path`.
+    #[test]
+    fn vault_create_path_is_required() {
+        let err = Cli::try_parse_from(["pangolin-cli", "vault", "create"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--path"),
+            "expected missing --path, got: {msg}"
+        );
+    }
+
+    /// **P11B-1 / A7.** `--print-id` flag is recognised and
+    /// defaults to false.
+    #[test]
+    fn vault_create_print_id_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "pangolin-cli",
+            "vault",
+            "create",
+            "--path",
+            "/tmp/new.pvf",
+            "--print-id",
+        ])
+        .expect("--print-id parses");
+        match cli.command {
+            super::Command::Vault(args) => match args.command {
+                super::VaultCommand::Create(c) => assert!(c.print_id),
+            },
+            _ => panic!("expected Vault"),
+        }
+    }
+
+    /// **P11B-1 / A2.** `--password-stdin` flag is recognised and
+    /// defaults to false.
+    #[test]
+    fn vault_create_password_stdin_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "pangolin-cli",
+            "vault",
+            "create",
+            "--path",
+            "/tmp/new.pvf",
+            "--password-stdin",
+        ])
+        .expect("--password-stdin parses");
+        match cli.command {
+            super::Command::Vault(args) => match args.command {
+                super::VaultCommand::Create(c) => assert!(c.password_stdin),
+            },
+            _ => panic!("expected Vault"),
+        }
+    }
+
+    /// **P11B-1 / A2.** There is NO `--password <flag>` form.
+    /// Passing `--password ...` to `vault create` is rejected by
+    /// clap with an "unexpected argument" error. Locks in the
+    /// "no flag form for the vault password" discipline at the
+    /// CLI surface (process-listing leak defense per §A2 + plan
+    /// open question §3).
+    #[test]
+    fn vault_create_does_not_accept_password_flag() {
+        let err = Cli::try_parse_from([
+            "pangolin-cli",
+            "vault",
+            "create",
+            "--path",
+            "/tmp/new.pvf",
+            "--password",
+            "hunter2",
+        ])
+        .unwrap_err();
+        // clap surfaces the unknown-arg error via UnknownArgument
+        // (or InvalidValue depending on version); either way the
+        // err message MUST mention `--password`.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--password"),
+            "expected unknown --password arg rejection, got: {msg}"
+        );
+    }
+
+    /// **P11B-1 / A14.** The rendered help for `vault` and the
+    /// `create` sub-verb MUST NOT contain any of the §3.5
+    /// forbidden user-facing terms ("blockchain", "gas",
+    /// "transaction", "decentralized storage", "hashes",
+    /// "revisions"). Same audit gate as
+    /// `account_help_avoids_forbidden_user_facing_terms`.
+    #[test]
+    fn vault_help_avoids_forbidden_user_facing_terms() {
+        use clap::CommandFactory as _;
+        let mut cmd = super::Cli::command();
+        cmd.build();
+        let vault_subcmd = cmd
+            .find_subcommand_mut("vault")
+            .expect("vault subcommand exists");
+        let mut buf = Vec::new();
+        vault_subcmd
+            .write_help(&mut buf)
+            .expect("write_help succeeds");
+        let vault_help = String::from_utf8(buf).expect("help is utf8");
+        let forbidden = [
+            "blockchain",
+            "decentralized storage",
+            "gas ",
+            " gas",
+            "transaction",
+            "hashes",
+            "revisions",
+        ];
+        for term in forbidden {
+            assert!(
+                !vault_help.to_lowercase().contains(term),
+                "vault --help contains forbidden term '{term}': {vault_help}"
+            );
+        }
+        // Walk the per-verb help.
+        let verbs = ["create"];
+        for verb in verbs {
+            let mut buf = Vec::new();
+            let sub = vault_subcmd
+                .find_subcommand_mut(verb)
+                .unwrap_or_else(|| panic!("subcommand {verb} exists"));
+            sub.write_help(&mut buf).expect("write_help");
+            let h = String::from_utf8(buf).expect("utf8");
+            for term in forbidden {
+                assert!(
+                    !h.to_lowercase().contains(term),
+                    "vault {verb} --help contains forbidden term '{term}': {h}"
+                );
+            }
+        }
+    }
+
+    /// **P11B-1 / Q5.** `vault create --help` includes the
+    /// no-recovery warning explicitly. The warning is the
+    /// load-bearing UX defense against "I forgot my master
+    /// password" data loss.
+    #[test]
+    fn vault_create_help_warns_no_password_recovery() {
+        use clap::CommandFactory as _;
+        let mut cmd = super::Cli::command();
+        cmd.build();
+        let vault_subcmd = cmd
+            .find_subcommand_mut("vault")
+            .expect("vault subcommand exists");
+        let create_subcmd = vault_subcmd
+            .find_subcommand_mut("create")
+            .expect("create sub-verb exists");
+        let mut buf = Vec::new();
+        create_subcmd.write_help(&mut buf).expect("write_help");
+        let help = String::from_utf8(buf).expect("utf8");
+        let lower = help.to_lowercase();
+        // The plan-locked Q5 wording is "no
+        // password-recovery mechanism; loss of this password is
+        // permanent data loss". We assert two grep-able
+        // substrings rather than the full sentence so a future
+        // copy edit (e.g., reordered clauses) does not break the
+        // test as long as the load-bearing concept survives.
+        assert!(
+            lower.contains("no password-recovery") || lower.contains("no password recovery"),
+            "expected 'no password-recovery' phrase in help, got: {help}"
+        );
+        assert!(
+            lower.contains("permanent data loss")
+                || lower.contains("vault is unreadable")
+                || lower.contains("vault is unrecoverable")
+                || lower.contains("permanently inaccessible"),
+            "expected data-loss warning in help, got: {help}"
+        );
     }
 
     /// **P8 fix MED-2.** `--allow-insecure-rpc` is recognized as a

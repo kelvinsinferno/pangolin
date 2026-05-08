@@ -50,6 +50,24 @@ subtle            = { workspace = true }
 # (`Send` is asserted; `Sync` is asserted NOT to be implemented).
 static_assertions = { workspace = true }
 
+# P11B fix-pass M-1: safe wrapper around POSIX `umask(2)` so
+# `Vault::create` can install a `0o077` umask BEFORE the `.pvf` file
+# is created on disk, structurally eliminating the world-readable
+# window between `OpenOptions::create_new(true)` and the CLI's
+# `chmod 0o600` call. The `nix` crate's `sys::stat::umask` is a
+# safe wrapper around the FFI call — no `unsafe` block is needed
+# at our call site, which preserves the workspace-wide
+# `unsafe_code = "deny"` lint AND `pangolin-store`'s
+# `forbid(unsafe_code)` attribute (which `forbid` does not allow
+# `#[allow]` to relax). `nix` is `cfg(unix)`-gated so Windows
+# builds do not pull it. `nix` does NOT pull `serde` (HIGH-1
+# invariant: `cargo tree -p pangolin-crypto | grep -ci serde`
+# stays 0; `pangolin-store` itself is downstream of
+# `pangolin-crypto` and adding `nix` here cannot affect that
+# upstream count).
+[target.'cfg(unix)'.dependencies]
+nix = { version = "=0.29.0", default-features = false, features = ["fs"] }
+
 [dev-dependencies]
 proptest = { workspace = true }
 tempfile = { workspace = true }
