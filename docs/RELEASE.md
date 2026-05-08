@@ -184,7 +184,7 @@ SIGNING SUBKEY ID: 78495586DDD92602
 ENCRYPTION SUBKEY ID: 6279B800FB19983F
 EXPIRES:      2028-05-08
 KEYSERVER:    https://keys.openpgp.org/search?q=74AE75D6FE13BDC0AC28999E3A32DB5A329EEA77
-PUBLISHED:    yes (uploaded 2026-05-08). Email→key binding pending Kelvin's inbox click on the verification email keys.openpgp.org sent to kelvinsinferno@gmail.com. Until clicked, verifiers can still fetch the key by fingerprint via `gpg --recv-keys`; only the email-based search would miss.
+PUBLISHED:    yes (uploaded + email-verified 2026-05-08). Both fingerprint and email-based fetches resolve via keys.openpgp.org.
 ```
 
 Per `P12.md` §A1 + Q6, the fingerprint is documented inline (so a
