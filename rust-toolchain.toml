@@ -1,4 +1,8 @@
+# MVP-1 issue 1.1 (Q5) pinned to 1.94.0 — last known-clean stable before
+# 1.95's `clippy::map-unwrap-or` lint started failing the workspace.
+# Bumps are deliberate via PR; matches the foundry-toolchain pinning model
+# used by the contracts pipeline. See `docs/issue-plans/1.1.md` §E.
 [toolchain]
-channel = "stable"
+channel = "1.94.0"
 components = ["rustfmt", "clippy"]
 profile = "default"
