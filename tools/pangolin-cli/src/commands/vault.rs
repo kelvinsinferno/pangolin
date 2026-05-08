@@ -615,9 +615,7 @@ mod tests {
         // The symlink itself is left intact — we did not unlink it
         // as a side-effect of the refusal.
         assert!(
-            std::fs::symlink_metadata(&link_path)
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false),
+            std::fs::symlink_metadata(&link_path).is_ok_and(|m| m.file_type().is_symlink()),
             "symlink at {} must remain after refusal",
             link_path.display()
         );

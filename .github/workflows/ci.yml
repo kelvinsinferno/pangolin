@@ -71,8 +71,15 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: stable
-      - name: Install forge-std (no submodule)
-        run: forge install foundry-rs/forge-std --no-git --no-commit
+      - name: Install forge-std (no submodule, idempotent)
+        run: |
+          # Working-directory is `contracts/` for these jobs, so the path is
+          # relative — `lib/forge-std`, not `contracts/lib/forge-std`.
+          if [ -d lib/forge-std ]; then
+            echo "forge-std already vendored at contracts/lib/forge-std; skipping install."
+          else
+            forge install foundry-rs/forge-std --no-git --no-commit
+          fi
       - name: forge build (deny warnings, sizes)
         run: forge build --deny-warnings --sizes
       - name: forge fmt --check
@@ -100,8 +107,15 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: stable
-      - name: Install forge-std (no submodule)
-        run: forge install foundry-rs/forge-std --no-git --no-commit
+      - name: Install forge-std (no submodule, idempotent)
+        run: |
+          # Working-directory is `contracts/` for these jobs, so the path is
+          # relative — `lib/forge-std`, not `contracts/lib/forge-std`.
+          if [ -d lib/forge-std ]; then
+            echo "forge-std already vendored at contracts/lib/forge-std; skipping install."
+          else
+            forge install foundry-rs/forge-std --no-git --no-commit
+          fi
       # Per docs/issue-plans/P5-1.md success criterion #3 the invariant
       # tests must run with at least 10,000 fuzzed runs. The default in
       # foundry.toml is already 10000; this env var is a belt-and-braces
@@ -125,8 +139,15 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: stable
-      - name: Install forge-std (no submodule)
-        run: forge install foundry-rs/forge-std --no-git --no-commit
+      - name: Install forge-std (no submodule, idempotent)
+        run: |
+          # Working-directory is `contracts/` for these jobs, so the path is
+          # relative — `lib/forge-std`, not `contracts/lib/forge-std`.
+          if [ -d lib/forge-std ]; then
+            echo "forge-std already vendored at contracts/lib/forge-std; skipping install."
+          else
+            forge install foundry-rs/forge-std --no-git --no-commit
+          fi
       # Re-build the contract from source and compare its ABI against
       # the committed JSON. Any drift = compilation reproducibility
       # failure or stale ABI commit.
@@ -159,8 +180,15 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: stable
-      - name: Install forge-std (no submodule)
-        run: forge install foundry-rs/forge-std --no-git --no-commit
+      - name: Install forge-std (no submodule, idempotent)
+        run: |
+          # Working-directory is `contracts/` for these jobs, so the path is
+          # relative — `lib/forge-std`, not `contracts/lib/forge-std`.
+          if [ -d lib/forge-std ]; then
+            echo "forge-std already vendored at contracts/lib/forge-std; skipping install."
+          else
+            forge install foundry-rs/forge-std --no-git --no-commit
+          fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -194,7 +222,12 @@ jobs:
       - name: Install cargo-audit
         run: cargo install --locked cargo-audit
       - name: Run cargo audit
-        run: cargo audit --deny warnings
+        # The two ignored advisories are alloy 2.x transitives flagged
+        # `unmaintained` (NOT vulnerabilities). They are also allow-listed
+        # in `deny.toml` for `cargo deny check`. Remove the ignore flags
+        # as soon as alloy bumps past these transitives.
+        # See `cargo audit --help` for `--ignore` semantics.
+        run: cargo audit --deny warnings --ignore RUSTSEC-2024-0388 --ignore RUSTSEC-2024-0436
 
   # Dependency policy. Enforces the crypto-crate allowlist + serde ban
   # and license / source / advisory rules defined in deny.toml.
