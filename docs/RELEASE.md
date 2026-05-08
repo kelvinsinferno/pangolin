@@ -175,14 +175,16 @@ locally first.
 
 ## Signing key fingerprint
 
-> **Placeholder.** Fill in the actual fingerprint at SIGNOFF time.
-
 ```
-KEY OWNER:    Kelvin (Kelvinsinferno Studio)
-KEY TYPE:     <ed25519 / rsa4096 — to be filled in>
-FINGERPRINT:  <40-character hex fingerprint — to be filled in>
-KEYSERVER:    https://keys.openpgp.org/search?q=<fingerprint>
-PUBLISHED:    <yes/no — fill in at SIGNOFF>
+KEY OWNER:    Kelvinsinferno <kelvinsinferno@gmail.com>
+KEY TYPE:     RSA 4096 (primary [CG]; signing subkey [S], encryption subkey [E])
+FINGERPRINT:  74AE75D6FE13BDC0AC28999E3A32DB5A329EEA77
+KEY ID:       3A32DB5A329EEA77
+SIGNING SUBKEY ID: 78495586DDD92602
+ENCRYPTION SUBKEY ID: 6279B800FB19983F
+EXPIRES:      2028-05-08
+KEYSERVER:    https://keys.openpgp.org/search?q=74AE75D6FE13BDC0AC28999E3A32DB5A329EEA77
+PUBLISHED:    pending — needs `gpg --keyserver hkps://keys.openpgp.org --send-keys 74AE75D6FE13BDC0AC28999E3A32DB5A329EEA77` + email-verification click
 ```
 
 Per `P12.md` §A1 + Q6, the fingerprint is documented inline (so a

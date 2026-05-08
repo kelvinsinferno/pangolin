@@ -43,8 +43,9 @@ quirks" below).
 
 ```bash
 # 1. Fetch the signing public key (one-time).
-#    Fingerprint published in docs/RELEASE.md.
-gpg --keyserver hkps://keys.openpgp.org --recv-keys <fingerprint>
+#    Fingerprint: 74AE75D6FE13BDC0AC28999E3A32DB5A329EEA77
+#    Owner: Kelvinsinferno <kelvinsinferno@gmail.com>
+gpg --keyserver hkps://keys.openpgp.org --recv-keys 74AE75D6FE13BDC0AC28999E3A32DB5A329EEA77
 
 # 2. Confirm the manifest signature + each artefact hash.
 gpg --verify SHA256SUMS.asc SHA256SUMS
