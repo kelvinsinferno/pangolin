@@ -1,0 +1,21 @@
+# Per-crate clippy configuration for `pangolin-crypto`.
+#
+# MVP-1 issue 1.1 §E: belt-and-braces complement to the deny.toml
+# rationale block + the cargo-tree zero-serde guard
+# (`scripts/check-no-serde-in-crypto.{sh,ps1}`). If a future PR ever
+# tries to `use serde::*` from inside this crate, `clippy::disallowed_types`
+# fires at lint time even before the dep-graph guard runs.
+#
+# Reachable from the workspace `[workspace.lints.clippy]` block by virtue
+# of `clippy::disallowed_types` being part of `clippy::all` (already
+# `deny`-level workspace-wide). The list below is consumed by the lint.
+#
+# See `docs/issue-plans/1.1.md` §E + `THREAT_MODEL.md` row #7 for the
+# full rationale.
+
+disallowed-types = [
+    { path = "serde::Serialize", reason = "HIGH-1: pangolin-crypto types must NEVER implement serde::Serialize. The dep-graph also bans serde from reaching this crate; this lint is the source-level belt-and-braces." },
+    { path = "serde::Deserialize", reason = "HIGH-1: see above — symmetric ban on Deserialize." },
+    { path = "serde::ser::Serializer", reason = "HIGH-1: any custom Serialize impl is forbidden." },
+    { path = "serde::de::Deserializer", reason = "HIGH-1: any custom Deserialize impl is forbidden." },
+]

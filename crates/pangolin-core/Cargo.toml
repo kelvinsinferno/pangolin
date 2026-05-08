@@ -11,3 +11,13 @@ description = "Pangolin core vault engine — single source of truth for securit
 
 [lints]
 workspace = true
+
+[dependencies]
+# MVP-1 issue 1.1 (Q2): the Vault / session / account / revision types
+# physically live in `pangolin-store` until issue 1.4 relocates them.
+# `pangolin-core` re-exports them so the FFI surface can name everything
+# under `pangolin_core::*` and the namespace freezes at this issue. The
+# dep arrow is one-way (core → store, never the reverse) so HIGH-1 and
+# the workspace circular-dep prohibition both hold.
+pangolin-store = { path = "../pangolin-store" }
+thiserror      = { workspace = true }

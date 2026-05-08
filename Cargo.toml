@@ -7,8 +7,11 @@ members = [
     "crates/pangolin-chain",
     "crates/pangolin-indexer",
     "crates/pangolin-funder-client",
+    "crates/pangolin-ffi",
+    "crates/pangolin-totp",
+    "crates/pangolin-kdbx",
+    "apps/cli",
     "tools/chaincli",
-    "tools/pangolin-cli",
 ]
 
 # Workspace-wide dependency pins. Crypto-bearing crates are restricted to the
@@ -96,7 +99,10 @@ async-trait       = "=0.1.89"
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.83"
+# MVP-1 issue 1.1 (Q5) pinned the workspace MSRV to 1.94 — last known-clean
+# stable before 1.95's `clippy::map-unwrap-or` lint. The exact toolchain
+# is also pinned in `rust-toolchain.toml` (channel = "1.94.0").
+rust-version = "1.94"
 license = "AGPL-3.0-or-later"
 authors = ["Kelvinsinferno Studio"]
 repository = "https://github.com/kelvinsinferno/pangolin"

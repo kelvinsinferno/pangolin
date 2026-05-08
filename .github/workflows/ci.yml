@@ -238,3 +238,116 @@ jobs:
         run: cargo install --locked cargo-deny
       - name: Run cargo deny
         run: cargo deny check advisories bans licenses sources
+
+  # -----------------------------------------------------------------
+  # MVP-1 issue 1.1 — invariant guards + FFI bindings smoke
+  # -----------------------------------------------------------------
+
+  # HIGH-1 (`pangolin-crypto` zero-serde) + Q3 (`pangolin-core`
+  # zero-uniffi) invariants. Both must hold on every PR; both are also
+  # enforced by deny.toml's bans table for serde, but the cargo-tree
+  # check is a stricter belt-and-braces guarantee that catches indirect
+  # paths a future `bans.deny` change might miss.
+  invariants:
+    name: invariants (no-serde-in-crypto + no-uniffi-in-core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify pangolin-crypto has zero serde references
+        run: bash scripts/check-no-serde-in-crypto.sh
+      - name: Verify pangolin-core has zero uniffi references
+        run: bash scripts/check-no-uniffi-in-core.sh
+
+  # MVP-1 issue 1.1 §Test plan: `ffi-bindings` job. Builds the FFI
+  # crate, asserts `staticlib`/`cdylib` artefacts exist, runs
+  # `uniffi-bindgen` for Swift+Kotlin emission, runs `cbindgen` for
+  # `pangolin.h` emission, runs `cc -fsyntax-only` on the emitted
+  # header. 3-OS matrix so artefact production is verified everywhere
+  # the master plan's downstream consumers (Tauri / iOS / Android)
+  # care about.
+  ffi-bindings:
+    name: ffi-bindings (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build pangolin-ffi (cdylib + staticlib)
+        run: cargo build -p pangolin-ffi
+
+      # Verify the cdylib + staticlib + rlib artefacts exist. Filenames
+      # differ across OSes: Linux ships `lib<name>.so`, macOS
+      # `lib<name>.dylib`, Windows `<name>.dll`. The staticlib is
+      # `lib<name>.a` on Linux/macOS, `<name>.lib` on Windows. We just
+      # glob for any matching pattern.
+      - name: Verify FFI artefacts exist (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          ls -la target/debug/libpangolin_ffi.so
+          ls -la target/debug/libpangolin_ffi.a
+      - name: Verify FFI artefacts exist (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          ls -la target/debug/libpangolin_ffi.dylib
+          ls -la target/debug/libpangolin_ffi.a
+      - name: Verify FFI artefacts exist (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path target/debug/pangolin_ffi.dll)) { throw "missing pangolin_ffi.dll" }
+          if (-not (Test-Path target/debug/pangolin_ffi.lib)) { throw "missing pangolin_ffi.lib (staticlib)" }
+
+      # uniffi-bindgen emits Swift on macOS + Kotlin on Linux. The
+      # foreign-language compile step (swiftc on macOS, kotlinc on
+      # Linux) is a parser smoke test only — we don't link against the
+      # FFI artefact. Windows runs the bindgen but skips the foreign-
+      # language compile (no swiftc/kotlinc by default; the artefact
+      # production is what we care about).
+      - name: Generate Swift bindings (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cargo run -p pangolin-ffi --bin uniffi-bindgen --features uniffi-cli -- \
+            generate \
+            --library target/debug/libpangolin_ffi.dylib \
+            --language swift \
+            --out-dir target/ffi-bindings/swift \
+            --no-format
+          test -s target/ffi-bindings/swift/pangolin_ffi.swift
+      - name: Swift parse smoke (macOS)
+        if: matrix.os == 'macos-latest'
+        run: swiftc -typecheck target/ffi-bindings/swift/pangolin_ffi.swift -import-objc-header target/ffi-bindings/swift/pangolin_ffiFFI.h
+        continue-on-error: true   # swiftc smoke only; not a hard gate at MVP-1.
+
+      - name: Generate Kotlin bindings (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo run -p pangolin-ffi --bin uniffi-bindgen --features uniffi-cli -- \
+            generate \
+            --library target/debug/libpangolin_ffi.so \
+            --language kotlin \
+            --out-dir target/ffi-bindings/kotlin \
+            --no-format
+          test -s target/ffi-bindings/kotlin/uniffi/pangolin_ffi/pangolin_ffi.kt
+
+      # cbindgen emits the C header on every OS — the resulting
+      # `pangolin.h` is OS-independent.
+      - name: Generate C header via cbindgen
+        run: cargo run -p pangolin-ffi --bin cbindgen-build --features cbindgen-cli
+
+      - name: cc -fsyntax-only on emitted header (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: cc -fsyntax-only target/ffi-bindings/c/pangolin.h
+      - name: cc -fsyntax-only on emitted header (macOS)
+        if: matrix.os == 'macos-latest'
+        run: cc -fsyntax-only target/ffi-bindings/c/pangolin.h
+
+      # Run the in-crate FFI smoke tests (roundtrip + error_taxonomy).
+      - name: Run pangolin-ffi tests
+        run: cargo test -p pangolin-ffi

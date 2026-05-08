@@ -1,0 +1,137 @@
+[package]
+name = "pangolin-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "FFI surface for Pangolin — UniFFI for Swift/Kotlin, cbindgen for C / Tauri."
+
+# MVP-1 issue 1.1 (Q3) isolated the FFI surface in this crate so the
+# `forbid(unsafe_code)` attribute on `pangolin-core` and the HIGH-1
+# zero-serde invariant on `pangolin-crypto` are preserved. UniFFI's
+# proc-macro mode injects `unsafe extern` blocks; this crate is the
+# only one in the workspace that allows `unsafe`. See `src/lib.rs`
+# crate-doc for the call-site discipline.
+[lib]
+name = "pangolin_ffi"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# `uniffi-bindgen` binary entry point for Swift / Kotlin emission.
+# Standard UniFFI pattern: each crate that wants foreign-language
+# bindings ships its own bindgen binary that calls `uniffi::uniffi_bindgen_main`.
+# Run with:
+#   cargo run -p pangolin-ffi --bin uniffi-bindgen -- generate \
+#       --library target/debug/libpangolin_ffi.<so|dylib|dll> \
+#       --language swift   --out-dir target/ffi-bindings/swift
+#   cargo run -p pangolin-ffi --bin uniffi-bindgen -- generate \
+#       --library target/debug/libpangolin_ffi.<so|dylib|dll> \
+#       --language kotlin  --out-dir target/ffi-bindings/kotlin
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi_bindgen.rs"
+required-features = ["uniffi-cli"]
+
+# `cbindgen-build` emits `pangolin.h` from the `extern "C"` surface in
+# `src/cabi.rs`. Run with:
+#   cargo run -p pangolin-ffi --bin cbindgen-build --features cbindgen-cli
+[[bin]]
+name = "cbindgen-build"
+path = "src/bin/cbindgen_build.rs"
+required-features = ["cbindgen-cli"]
+
+# MVP-1 issue 1.1 §E: `pangolin-ffi` is the **only** crate in the
+# workspace that allows `unsafe_code`. UniFFI's proc-macro mode and
+# `cbindgen`'s `extern "C"` surface both require unsafe at the FFI
+# boundary; isolating them here preserves the workspace-wide invariant
+# that no other crate can use unsafe (the workspace lint stays
+# `unsafe_code = "deny"`; this crate locally overrides). The
+# `deny(unsafe_op_in_unsafe_fn)` discipline (set in `src/lib.rs`)
+# ensures every unsafe operation is at a documented call site, never
+# implicitly via `unsafe fn` body inheritance.
+[lints.rust]
+unsafe_code = "allow"
+missing_debug_implementations = "warn"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+missing_const_for_fn = "allow"
+multiple_crate_versions = "allow"
+# FFI signatures must use owned types (`String`, `Arc<T>`, owned
+# records) because UniFFI's bindgen and `cbindgen`'s C surface emit
+# value-typed arguments — there is no foreign-language analog of a
+# Rust borrow. The `needless_pass_by_value` and
+# `needless_pass_by_ref_mut` lints fire on every FFI export by
+# design; allow them at the crate scope.
+needless_pass_by_value = "allow"
+# `PasswordPolicy` is a pure-data flag bundle (uppercase / lowercase /
+# digits / symbols); the per-flag struct shape is the FFI contract.
+# Refactoring into an enum-of-bitflags would break the wire format.
+struct_excessive_bools = "allow"
+
+[features]
+# Default: build the FFI library only. Bindgen binaries are gated behind
+# their own features so the default `cargo build -p pangolin-ffi` does
+# not pull the cbindgen / uniffi-bindgen build-only dep tree into a
+# downstream consumer that only wants the `cdylib`/`staticlib` artefacts.
+default = []
+uniffi-cli = ["uniffi/cli"]
+cbindgen-cli = ["dep:cbindgen"]
+
+[dependencies]
+# Workspace-internal dependencies: the FFI surface re-exports / wraps
+# types from the core engine, the per-domain RFC 6238 crate, and the
+# KDBX import crate. Dependency arrows go ffi → {core, totp, kdbx,
+# crypto, store}; the reverse direction is forbidden so UniFFI's
+# transitive deps cannot reach `pangolin-core`'s tree (per success
+# criterion 4 of `docs/issue-plans/1.1.md`).
+pangolin-core   = { path = "../pangolin-core" }
+pangolin-crypto = { path = "../pangolin-crypto" }
+pangolin-store  = { path = "../pangolin-store" }
+pangolin-totp   = { path = "../pangolin-totp" }
+pangolin-kdbx   = { path = "../pangolin-kdbx" }
+
+# UniFFI: proc-macro mode (the modern path; not UDL). Pinned to the
+# latest stable at the time of MVP-1 issue 1.1 freeze. Apache-2.0 +
+# MIT licensed; pulls `uniffi-macros`, `uniffi-meta`, `uniffi-core`
+# transitively. UniFFI does pull `serde` in some configurations —
+# isolation in this crate is intentional (see crate-doc) and
+# preserves HIGH-1 (`pangolin-crypto` zero-serde) by virtue of the
+# directional dep arrow: ffi → crypto, never the reverse.
+uniffi = { version = "=0.31.1", default-features = false }
+
+# Workspace deps used by the FFI surface itself.
+thiserror = { workspace = true }
+zeroize   = { workspace = true }
+
+[build-dependencies]
+# `uniffi_build::generate_scaffolding` is invoked from build.rs to emit
+# the crate-internal scaffolding module that the proc-macros wire up at
+# compile time. Same pin as the `uniffi` runtime dep. Note the crate
+# name on crates.io is `uniffi_build` (underscore), not `uniffi-build`.
+uniffi_build = { version = "=0.31.1" }
+
+# `cbindgen` is build-time-only: the `cbindgen-build` binary invokes it
+# to emit `pangolin.h` from `src/cabi.rs`. Gated behind the
+# `cbindgen-cli` feature so the default `cargo build -p pangolin-ffi`
+# does not pull cbindgen into the dep graph. Pinned to the latest
+# 0.27.x at the time of MVP-1 issue 1.1 freeze.
+[dependencies.cbindgen]
+version = "=0.29.2"
+optional = true
+default-features = false
+
+[dev-dependencies]
+# `tests/error_taxonomy.rs` does an exhaustive match on
+# `pangolin_core::Error` and verifies every variant maps to a non-
+# `Internal` `FfiError` variant.
+pangolin-core = { path = "../pangolin-core" }
