@@ -43,6 +43,13 @@ Thumbs.db
 *.key
 secrets/
 deployments/*.local.json
+# Pangolin vault files (encrypted user data — never commit even though
+# the AEAD-sealed contents are protected at rest; metadata + structure
+# would still leak, and a committed vault surprises verifiers)
+*.pvf
+*.pvf-wal
+*.pvf-shm
+*.pvf.lock
 
 # Test artifacts
 *.profraw
