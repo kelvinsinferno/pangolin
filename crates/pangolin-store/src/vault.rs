@@ -180,6 +180,85 @@ fn release_lock(vault_path: &Path) {
     let _ = std::fs::remove_file(&lp);
 }
 
+// ---------------------------------------------------------------------
+// P11B fix-pass M-1: umask shim around `Vault::create`.
+//
+// The audit identified a race window: `Vault::create` opens the `.pvf`
+// via `OpenOptions::create_new(true)` (inside `rusqlite`'s
+// `OpenFlags::SQLITE_OPEN_CREATE`), and on a typical Unix host the
+// process default umask is `0o022`, which means the file is created
+// at mode `0o644` (world-readable). `pangolin-cli`'s
+// `restrict_vault_file_mode` then chmods it to `0o600`, but in the
+// window between create and chmod an attacker with a pre-positioned
+// `inotify_add_watch` can read the freshly-written file. The file
+// content includes the offline-Argon2id-bruteforce preconditions
+// (`kdf_salt`, `kdf_params`, `wrapped_ciphertext`, `wrap_nonce`).
+// Strong passwords are defended by Argon2id RECOMMENDED expense;
+// weak passwords are exposed.
+//
+// The fix is to install `umask(0o077)` BEFORE the file is created,
+// so the kernel applies the restrictive bits at creation time.
+// We do this in `Vault::create` itself (not the CLI) so that ALL
+// callers of `Vault::create` benefit, and so the CLI's existing
+// `restrict_vault_file_mode` chmod becomes belt-and-braces defense-
+// in-depth rather than the primary defense.
+//
+// Implementation uses the `nix` crate's safe `sys::stat::umask`
+// wrapper so we do not need any `unsafe` block at our call site —
+// this preserves `pangolin-store`'s `forbid(unsafe_code)` attribute
+// (which `#[allow(unsafe_code)]` cannot relax). The guard is
+// `cfg(unix)`-gated; on Windows umask is meaningless and the call
+// is omitted (the existing CLI Windows behavior — file ACLs
+// inherited from the parent — is unchanged).
+//
+// Concurrency caveat: `umask` is process-global, so concurrent
+// threads in the same process that create files during
+// `Vault::create`'s execution would observe the restrictive umask.
+// In practice, `pangolin-cli vault create` is the only documented
+// caller, runs in a single-threaded context for the create step,
+// and is mutually exclusive with itself via `acquire_lock`'s
+// `OpenOptions::create_new(true)` lock-file (the P2 sidecar lock).
+// The guard restores the previous umask on `Drop`, including on
+// panic, so any subsequent unrelated file creation in the same
+// process resumes with the user's normal umask.
+// ---------------------------------------------------------------------
+
+/// Installs `0o077` as the process umask for the lifetime of this
+/// guard, restoring the previous umask on `Drop`. Unix-only; on
+/// Windows callers should not construct this type (umask is not a
+/// Windows concept).
+#[cfg(unix)]
+struct UmaskGuard {
+    previous: nix::sys::stat::Mode,
+}
+
+#[cfg(unix)]
+impl UmaskGuard {
+    /// Install `0o077` (`S_IRWXG | S_IRWXO`) as the umask, capturing
+    /// the previous value for restoration on `Drop`. The `nix::umask`
+    /// wrapper is safe (no `unsafe` block here); the underlying
+    /// FFI's `unsafe` lives inside `nix`.
+    fn restrict_to_owner_only() -> Self {
+        use nix::sys::stat::Mode;
+        // 0o077 == S_IRWXG | S_IRWXO. Files created while this is
+        // installed get their group + world permission bits cleared,
+        // yielding 0o600 for a 0o666 default-create mode.
+        let restrictive = Mode::S_IRWXG | Mode::S_IRWXO;
+        let previous = nix::sys::stat::umask(restrictive);
+        Self { previous }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        // Restore the previous umask. `nix::umask` itself returns
+        // the prior value; we ignore the return because we are
+        // restoring, not capturing.
+        let _ = nix::sys::stat::umask(self.previous);
+    }
+}
+
 struct ActiveState {
     vdk: VdkKey,
     cache: DecryptedCache,
@@ -217,6 +296,19 @@ impl Vault {
                 format!("vault file already exists at {}", path.display()),
             )));
         }
+
+        // **P11B fix-pass M-1.** Install a `0o077` umask BEFORE any
+        // file-creating syscall fires inside this function. This
+        // applies to both the sidecar lock file (`acquire_lock`) and
+        // the `.pvf` itself (`open_connection` → SQLite create), so
+        // both are born at mode `0o600` on Unix without any
+        // intervening `chmod`. The previous umask is restored when
+        // `_umask_guard` drops at the end of this function (or on
+        // any panic). On Windows the guard is omitted — umask is
+        // not a Windows concept and file ACLs are inherited from
+        // the parent directory.
+        #[cfg(unix)]
+        let _umask_guard = UmaskGuard::restrict_to_owner_only();
 
         let lock_file = acquire_lock(path)?;
         let result = (|| -> Result<Self> {
@@ -6596,6 +6688,91 @@ mod tests {
         assert!(
             revs[0].is_tombstone,
             "matching payload account_id must yield is_tombstone = 1"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // P11B fix-pass M-1: umask shim regression tests.
+    // ---------------------------------------------------------------
+
+    /// **P11B fix-pass M-1.** `Vault::create` installs a `0o077`
+    /// umask BEFORE the `.pvf` file is created on disk, so the file
+    /// is born at mode `0o600` without any intervening `chmod`.
+    /// This test reads the file's permissions IMMEDIATELY after
+    /// `Vault::create` returns — no chmod is applied by
+    /// `pangolin-store` itself, so a `0o600` reading here must come
+    /// from the umask, not from a follow-up permission tweak.
+    /// (`pangolin-cli`'s `restrict_vault_file_mode` chmod is now
+    /// belt-and-braces defense-in-depth, but it is not invoked by
+    /// the library.)
+    #[cfg(unix)]
+    #[test]
+    fn umask_set_to_0o077_around_vault_create_unix() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v-umask.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "expected mode 0o600 from umask shim, got: {:o}",
+            mode & 0o777,
+        );
+    }
+
+    /// **P11B fix-pass M-1.** The `UmaskGuard` restores the previous
+    /// umask on `Drop`, so file creation in the same process AFTER
+    /// `Vault::create` returns observes the user's normal umask
+    /// (typically `0o022`), not the restrictive `0o077` we install
+    /// during create. Without the restoration, every subsequent
+    /// `File::create` in the same process would silently produce
+    /// `0o600` files, which would be a surprising side-effect
+    /// outside the vault-provisioning code path.
+    ///
+    /// We capture the user's umask via a sacrificial file BEFORE
+    /// `Vault::create` runs, then create a second file AFTER and
+    /// compare. The two modes must match — anything else means the
+    /// guard's `Drop` did not restore correctly.
+    #[cfg(unix)]
+    #[test]
+    fn umask_restored_after_vault_create() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TempDir::new().unwrap();
+
+        // Probe 1: capture the user's current umask via a file
+        // created BEFORE `Vault::create` runs. We don't care what
+        // the absolute value is — we only need to compare it to
+        // probe 2 below.
+        let probe1 = dir.path().join("probe-before.txt");
+        std::fs::File::create(&probe1).unwrap();
+        let mode_before = std::fs::metadata(&probe1).unwrap().permissions().mode() & 0o777;
+
+        // Run `Vault::create` — this installs `0o077` for its
+        // duration and (under the M-1 fix) restores the previous
+        // value on `Drop`.
+        let p = vault_path(&dir, "v-umask-restore.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+
+        // Probe 2: a fresh file created AFTER `Vault::create`
+        // returns must observe the SAME umask as probe 1.
+        let probe2 = dir.path().join("probe-after.txt");
+        std::fs::File::create(&probe2).unwrap();
+        let mode_after = std::fs::metadata(&probe2).unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(
+            mode_before, mode_after,
+            "umask must be restored after Vault::create (before: {mode_before:o}, after: {mode_after:o})",
+        );
+        // Belt-and-braces: probe 2 must NOT be `0o600`, otherwise
+        // the guard leaked. (Pathological case: a user with an
+        // unusually-restrictive default umask of `0o077` would
+        // already see `0o600` here. We accept that false-positive
+        // narrowness because the typical CI host runs at `0o022`.)
+        assert_ne!(
+            mode_after, 0o600,
+            "umask 0o077 leaked past Vault::create; subsequent file creation observed 0o600. \
+             (If your test host's default umask is 0o077, this test is a false alarm.)",
         );
     }
 }

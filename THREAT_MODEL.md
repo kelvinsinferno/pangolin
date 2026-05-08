@@ -902,3 +902,59 @@ the PR.
     `vault_create_then_account_add_round_trip` (spawns
     the binary, pipes the password via stdin, asserts
     the produced vault is consumable by `account add`).
+    **P11B fix-pass updates (audit M-1, M-2, L-1):** the §16.5
+    fix-pass closed two MEDIUM findings against this row.
+    M-1 (chmod race window) — the previous design relied on a
+    post-create `chmod 0o600` to tighten the file from the
+    process-default `0o644` (under a typical `0o022` umask). The
+    audit identified a window between `Vault::create`'s
+    `OpenOptions::create_new(true)` and `pangolin-cli`'s
+    `restrict_vault_file_mode` chmod during which an attacker with
+    a pre-positioned `inotify_add_watch` (or equivalent) could read
+    the freshly-written `.pvf`. The file content includes the
+    offline-Argon2id-bruteforce preconditions (`kdf_salt`,
+    `kdf_params`, `wrapped_ciphertext`, `wrap_nonce`); strong
+    passwords are still defended by the Argon2id RECOMMENDED expense,
+    but weak passwords would be exposed to an offline cracking
+    attempt. The fix moved the umask install into `Vault::create`
+    itself: an RAII `UmaskGuard` (built on `nix::sys::stat::umask`,
+    which is a safe wrapper — no `unsafe` needed at our call site)
+    sets `0o077` BEFORE the lock-file or `.pvf` are created and
+    restores the previous umask on `Drop`. Both files are now born
+    at mode `0o600` on Unix without any intervening permission
+    tweak. `nix` is `cfg(unix)`-gated so Windows does not pull it,
+    and the workspace `unsafe_code = "deny"` plus
+    `pangolin-store`'s `forbid(unsafe_code)` and `pangolin-cli`'s
+    `forbid(unsafe_code)` lints are unchanged. The CLI's existing
+    `restrict_vault_file_mode` chmod is preserved as belt-and-
+    braces defense-in-depth (e.g., for hosts with an unusual
+    `0o000` default umask that would still leave the file at a
+    too-permissive mode), but it is no longer the primary defense.
+    Test pins: `umask_set_to_0o077_around_vault_create_unix` (the
+    new file is `0o600` immediately on `Vault::create` return,
+    BEFORE any chmod), `umask_restored_after_vault_create` (a
+    sacrificial probe-file created after the call observes the
+    user's normal umask, confirming the guard's `Drop` restored
+    correctly), plus the existing `vault_create_chmod_0600_on_unix`
+    which continues to pass against the now-redundant CLI chmod.
+    M-2 (symlinked `--path` redirect) — the previous overwrite
+    pre-flight used `Path::exists()`, which follows symlinks. A
+    `--path` pointing at a *dangling* symlink (target missing) slid
+    past the check and `Vault::create` would then write through the
+    symlink to the target, silently provisioning the vault at an
+    unintended location. The fix replaces the pre-flight with a
+    `std::fs::symlink_metadata` match: a symlink at the final
+    component is refused with `"refusing to create vault at
+    <path>: path is a symlink; resolve to the real target and pass
+    that explicitly"` — matching `git init`'s discipline. A
+    pre-existing regular file still surfaces the original
+    `"vault file already exists"` overwrite-refuse error.
+    Parent-component symlinks remain intentionally followed (the
+    existing `parent.canonicalize()` resolves them, which is the
+    documented `--path` semantics). Test pin:
+    `vault_create_refuses_symlinked_path` (cfg(unix); plants a
+    dangling symlink and asserts both refusal AND that no vault
+    leaked through to the target). L-1 — the chmod-failure
+    warning prefix is now `WARNING:` (all caps) per the project
+    rubric; previously it was `warning:`. Cosmetic, no semantic
+    change.

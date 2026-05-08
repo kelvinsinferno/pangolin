@@ -66,16 +66,45 @@ pub async fn run(global: &GlobalArgs, args: VaultArgs) -> Result<()> {
 async fn run_create(global: &GlobalArgs, args: VaultCreateArgs) -> Result<()> {
     let canonical_path = canonicalize_target_path(&args.path)?;
 
-    // Pre-flight overwrite check (§A3). Saves a wasted password
-    // prompt against an already-occupied path. The library's own
-    // `path.exists()` + `acquire_lock`'s `create_new(true)` close
-    // any TOCTOU race (per §A8); the pre-flight is a UX
-    // optimization, not the race defense.
-    if canonical_path.exists() {
-        bail!(
-            "vault file already exists at {}; refusing to overwrite",
-            canonical_path.display()
-        );
+    // Pre-flight overwrite + symlink check (§A3, P11B fix-pass M-2).
+    //
+    // The original `Path::exists()` call followed symlinks, so a
+    // `--path` pointing at a *dangling* symlink (target missing)
+    // would slip past the overwrite-refuse guard and `Vault::create`
+    // would then write through the symlink to the target's
+    // location, silently creating the vault somewhere the user did
+    // not intend. The fix-pass M-2 audit finding closes this:
+    // `symlink_metadata` does NOT follow the final component, so we
+    // can distinguish "regular file already there" (refuse with
+    // overwrite error) from "symlink at this path" (refuse with the
+    // symlink-specific error message) from "nothing here, proceed".
+    //
+    // Matches `git init`'s discipline: the user is expected to
+    // resolve the symlink themselves and pass the real target.
+    // The library's `Vault::create` `path.exists()` +
+    // `acquire_lock`'s `create_new(true)` still close the TOCTOU
+    // race against a concurrent symlink swap (per §A8); the
+    // pre-flight check is the UX-affordance + symlink guard, not
+    // the race defense.
+    match std::fs::symlink_metadata(&canonical_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!(
+                "refusing to create vault at {}: path is a symlink; resolve to the real target and pass that explicitly",
+                canonical_path.display()
+            );
+        }
+        Ok(_) => {
+            bail!(
+                "vault file already exists at {}; refusing to overwrite",
+                canonical_path.display()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Path does not exist — proceed with creation.
+        }
+        Err(e) => {
+            bail!("could not stat path {}: {e}", canonical_path.display());
+        }
     }
 
     // Acquire the master password via one of the two exclusive
@@ -113,11 +142,22 @@ async fn run_create(global: &GlobalArgs, args: VaultCreateArgs) -> Result<()> {
     // fails (e.g., on a filesystem that does not honor POSIX
     // permission bits), warn but do not abort — the vault content
     // is already encrypted under the password the user supplied.
+    //
+    // **P11B fix-pass M-1.** `Vault::create` itself now installs a
+    // `0o077` umask in `pangolin-store`, so the `.pvf` is born at
+    // mode `0o600` BEFORE this chmod ever runs. The chmod is
+    // preserved as belt-and-braces defense-in-depth: it still
+    // fires on every successful create, but the M-1 audit window
+    // (the gap between create and chmod under a default `0o022`
+    // umask) is now structurally closed at the library boundary.
     #[cfg(unix)]
     {
         if let Err(e) = restrict_vault_file_mode(&canonical_path) {
+            // **P11B fix-pass L-1.** Use `WARNING:` (all caps) per
+            // the project rubric; the previous lowercase prefix
+            // was a stylistic miss that the audit flagged.
             eprintln!(
-                "warning: could not set vault file mode 0600 at {}: {e}; \
+                "WARNING: could not set vault file mode 0600 at {}: {e}; \
                  the vault content remains encrypted under your password",
                 canonical_path.display()
             );
@@ -527,6 +567,59 @@ mod tests {
             0o600,
             "expected mode 0o600 after vault create, got: {:o}",
             mode & 0o777,
+        );
+    }
+
+    /// **P11B fix-pass M-2.** A `--path` whose final component is a
+    /// symlink is refused before any password prompt or file write.
+    /// The pre-flight check uses `symlink_metadata` (not
+    /// `Path::exists`), which does NOT follow the final component,
+    /// so dangling-symlink redirection is caught even when the
+    /// target is missing. Matches `git init`'s discipline: the user
+    /// is expected to resolve the symlink themselves.
+    ///
+    /// Unix-only: `std::os::unix::fs::symlink` is the cleanest
+    /// symlink-creation surface; Windows symlink semantics differ
+    /// and require elevated privileges in many configurations.
+    /// `cfg(unix)` keeps the test deterministic on the CI hosts
+    /// that matter for this audit row.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vault_create_refuses_symlinked_path() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Plant a symlink at the would-be vault path. The target
+        // (`elsewhere.pvf`) is intentionally NOT created, so this
+        // is a *dangling* symlink — the case `Path::exists()` would
+        // miss but `symlink_metadata` catches.
+        let link_path = dir.path().join("v-symlink.pvf");
+        let elsewhere = dir.path().join("elsewhere.pvf");
+        symlink(&elsewhere, &link_path).expect("create symlink");
+
+        let _guard = WithInjectedPassword::set(TEST_PWD);
+        let err = run_create(&global(), args(link_path.clone()))
+            .await
+            .expect_err("symlinked path rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("path is a symlink") && msg.contains("resolve to the real target"),
+            "expected symlink-refuse error, got: {msg}"
+        );
+        // The would-be target was never created — no vault snuck
+        // through to the symlink's destination.
+        assert!(
+            !elsewhere.exists(),
+            "symlink target must not have been written through to ({})",
+            elsewhere.display()
+        );
+        // The symlink itself is left intact — we did not unlink it
+        // as a side-effect of the refusal.
+        assert!(
+            std::fs::symlink_metadata(&link_path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            "symlink at {} must remain after refusal",
+            link_path.display()
         );
     }
 }
