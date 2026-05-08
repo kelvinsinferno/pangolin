@@ -195,4 +195,6 @@ known quirk is closed by a clearly-named MVP-N work item.
 
 ## License
 
-Apache-2.0. See `LICENSE`.
+AGPL-3.0-or-later for the core code (vault engine, sync, credential
+management, local storage). See `LICENSE` and `LICENSE-RATIONALE.md` for
+the per-layer license map.

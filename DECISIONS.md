@@ -94,6 +94,13 @@
 **Why:** Closes §3.9 PoC → MVP gate criterion (4): "Contract redeployed at least once (proves redeploy-on-bug is real)." Per Q1 of P12 plan-gate, locked option (a) — actually redeploy rather than argue latent capability. Verified the existing `contracts/script/DeployRevisionLogV0.s.sol` script + Kelvin's `pangolin-dev` Foundry keystore + Base Sepolia testnet pipeline still works end-to-end as of 2026-05-08, two days after D-014.
 **Spec ref:** Master plan §3.9 PoC → MVP gate; full metadata in `contracts/deployments/base-sepolia.json` under the `RevisionLogV0_redeploy_proof` key.
 
+## D-016 · Per-IP-spec relicense (supersedes D-002)
+**Date locked:** 2026-05-08
+**Decision:** Core code in this repository is licensed under **GNU Affero General Public License v3.0 or later** (AGPL-3.0-or-later). The Pangolin Licensing & Intellectual Property Specification mandates a per-layer license map: AGPLv3 for core applications (vault engine, sync logic, recovery logic, capture authority, local storage, session policy, TOTP handling, credential management); Apache-2.0 for SDKs, hardware integration specs, extension/agent APIs, client libraries, and protocol wrappers; CC BY-SA for documentation; trademark protection for Pangolin branding. The current PoC codebase falls entirely within the "core applications" layer, so the entire workspace ships under AGPL-3.0-or-later as of this commit. Apache-2.0 will apply to integration-surface crates as they land in MVP-1+ (FFI/UniFFI bindings, hardware integration helpers, agent SDKs). Per-crate `Cargo.toml` `license` fields are the canonical declaration; `LICENSE-RATIONALE.md` documents the layer map for verifiers and contributors.
+**Why:** D-002 (locked at P0 on 2026-05-05) chose Apache-2.0 across the board because the IP spec had not yet been authored. The IP spec is the load-bearing source of truth for licensing strategy; AGPLv3 ensures hosted forks must publish modifications, modifications to security-critical behavior remain inspectable, and the ecosystem stays transparent — properties Apache-2.0 cannot guarantee. Re-licensing before the first GitHub push is materially less disruptive than re-licensing after public clones exist.
+**Supersedes:** D-002 (Apache-2.0). D-002 stays as historical record; subsequent license discussion references D-016.
+**Spec ref:** `Pangolin Licensing & Intellectual Property Specification` (`Desktop/Kelvinsinferno studio/Pangolin/Pangolin Licensing & Intellectual Property Specification.pdf`); see also `LICENSE-RATIONALE.md` at repo root.
+
 ---
 
 ## PoC retrospective: PoC → MVP mapping

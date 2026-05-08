@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // @dev Exact-pinned pragma (NOT `^0.8.24`): per docs/issue-plans/P5-1.md
 //      "Solidity compiler regression" failure-mode mitigation, the
 //      contract must build with the exact compiler version it was

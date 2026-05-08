@@ -48,7 +48,13 @@ ignore = [
 version = 2
 # Permissive licenses we accept across the workspace dependency tree.
 # Anything outside this list triggers a manual review per the plan.
+# AGPL-3.0-or-later was added 2026-05-08 alongside the per-IP-spec
+# relicense (D-016). It applies ONLY to first-party Pangolin crates;
+# transitive dependencies are still expected to ship under permissive
+# terms per the original allow-list.
 allow = [
+    "AGPL-3.0",
+    "AGPL-3.0-or-later",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "MIT",

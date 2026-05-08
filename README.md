@@ -42,4 +42,11 @@ See `CONTRIBUTING.md` for the full protocol.
 
 ## License
 
-Apache-2.0. See `LICENSE`.
+GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later) for the
+core code shipped in this repository — vault engine, sync logic, recovery
+logic, credential management, local storage, session policy, and TOTP
+handling. See `LICENSE` for the full license text and `LICENSE-RATIONALE.md`
+for the per-layer license map (AGPL core, Apache-2.0 future SDKs and
+integrations, CC BY-SA documentation, trademark-protected branding) and
+the rationale per the Pangolin Licensing & Intellectual Property
+Specification.

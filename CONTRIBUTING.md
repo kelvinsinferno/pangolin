@@ -162,4 +162,14 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 
 ## License
 
-By contributing, you agree that your contributions are licensed under Apache-2.0.
+By contributing, you agree that your contributions to the core repository
+are licensed under AGPL-3.0-or-later (matching the rest of the core code per
+the Pangolin Licensing & Intellectual Property Specification). Future
+integration-surface crates (SDKs, hardware specs, extension/agent APIs,
+client libraries, protocol wrappers) will land under Apache-2.0; that
+license boundary is enforced per-crate via `Cargo.toml` `license` fields.
+
+If your contribution touches multiple license layers (e.g., adds a new
+helper that's used by both core and SDK code), discuss the placement with
+maintainers before opening the PR. See `LICENSE-RATIONALE.md` for the
+per-layer license map.

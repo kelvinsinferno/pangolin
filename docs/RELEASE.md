@@ -11,7 +11,8 @@ binary" — that's the audience the manifest signature is for.
 
 > **Spec reference:** `docs/issue-plans/P12.md` §A1 (signing approach),
 > §A2 (target OS), §A3 (versioning), §A15 (pre-flight gate).
-> Decisions D-002 (Apache-2.0) and D-013 (Windows host).
+> Decisions D-002 / D-016 (AGPL-3.0-or-later for core, per IP spec) and
+> D-013 (Windows host).
 
 ---
 

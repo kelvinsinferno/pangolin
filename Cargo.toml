@@ -97,7 +97,7 @@ async-trait       = "=0.1.89"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.83"
-license = "Apache-2.0"
+license = "AGPL-3.0-or-later"
 authors = ["Kelvinsinferno Studio"]
 repository = "https://github.com/kelvinsinferno/pangolin"
 publish = false
