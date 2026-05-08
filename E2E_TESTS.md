@@ -366,6 +366,10 @@ production chain integration.
   structurally in `sync::pull_all`'s loop body and asserted by the
   defense-in-depth check in `signing::verify_signed_revision`.
 
+### Reproducibility
+
+Non-author dev path: `docs/E2E_REPRODUCER.md` § Scenario 1 — Two-vault sync round trip.
+
 ---
 
 ## E2E-004: pangolin-cli resolve convergence after fork+freeze
@@ -488,6 +492,10 @@ integration.
 - **`--dry-run`.** No chain side effects; freeze flag unchanged.
   Verified by `sync::tests::dry_run_does_not_publish_or_clear`.
 
+### Reproducibility
+
+Non-author dev path: `docs/E2E_REPRODUCER.md` § Scenario 2 — Conflict + resolve convergence.
+
 ---
 
 ## E2E-005: pangolin-cli offline-edit-then-online-publish
@@ -546,9 +554,9 @@ integration.
        --vault-path ~/pangolin-test/v.pvf \
        --account pangolin-dev
    ```
-   Add an account first via the host application (or directly via
-   `pangolin-store`'s `add_account` API; the CLI does not currently
-   expose an `add` subcommand — that's MVP-1 polish).
+   Add an account first via `pangolin-cli account add` (P11A
+   shipped the CLI surface; see `docs/E2E_REPRODUCER.md` § Scenario
+   3 for the literal invocation).
 
 2. **Disconnect from the network.** Either kill the local network
    interface, switch to a network without internet, or stop the
@@ -622,6 +630,10 @@ integration.
   event whose `canonical_hash` differs and lands as a co-fork
   rather than a silent duplicate. THREAT_MODEL row #20 documents
   this thoroughly.
+
+### Reproducibility
+
+Non-author dev path: `docs/E2E_REPRODUCER.md` § Scenario 3 — Offline edit then online publish.
 
 ---
 
@@ -722,6 +734,20 @@ local-vault-only).
 
 ### Automated equivalent
 `tools/pangolin-cli/tests/account_lifecycle.rs`
+
+### Reproducibility
+
+Non-author dev path: `docs/E2E_REPRODUCER.md` exercises the
+`account add` / `account list` verbs in every scenario's setup;
+Scenario 1 § "Step 2. Add an account on vault A" and § "Step 8.
+Confirm vault B sees the frozen account" cover the add + list
+surface end-to-end, and Scenario 3 exercises multiple `account
+add` invocations under offline-then-reconnect conditions. The
+`account show` / `account update` / `account delete` verbs are
+not currently rehearsed in the reproducer (their automated
+coverage in `account_lifecycle.rs` is the safety net); a future
+P11 docs pass may add a § Scenario 4 walkthrough if a reviewer
+or rehearsal agent surfaces a gap.
 
 ---
 

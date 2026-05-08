@@ -1196,3 +1196,111 @@ unit tests), and P11B-3 leaves it unchanged at 401.
 12. No new D-NNN entries — every architectural decision
     in the P11B plan is local to the CLI surface and
     documented in `docs/issue-plans/P11B.md` §A1..§A14.
+
+---
+
+## 2026-05-08 · P11 — E2E Reproducer Documentation  ✅ SIGNOFF
+
+**Date:** 2026-05-08
+**Tip:** this entry's commit (P11-5 fix-pass)
+**Status:** SHIPPED
+
+### Commits
+
+- `ad54185` — docs: P11-1 E2E_REPRODUCER scaffold
+- `db9d33d` — docs: P11-2 E2E_TESTS cross-references
+- `5a063e7` — docs: P11-3 POC_README entry point
+- this entry — docs: P11-5 close P11-4 rehearsal gaps + DEVLOG SIGNOFF
+
+### Deliverables
+
+- `docs/E2E_REPRODUCER.md` (~990 lines after P11-5 fix-pass):
+  three scenarios documented in Mock + Live modes using only
+  `pangolin-cli` invocations.
+- `POC_README.md` (~140 lines): non-author entry point at the
+  repository root.
+- `E2E_TESTS.md`: cross-reference subsections added to
+  E2E-003 / E2E-004 / E2E-005 / E2E-006.
+
+### Non-author rehearsal (P11-4)
+
+- **Scope:** Scenario 1 only (per locked Q3 answer; Scenarios
+  2 and 3 deferred per plan).
+- **Mode:** Mock.
+- **Verdict:** PASS-WITH-FIXES — three minor doc gaps surfaced.
+- All three gaps closed in this P11-5 fix-pass:
+  - **G1.** Scenario 1 Mock-mode expected count corrected
+    from "3 passed" to "5 passed" with one-line explanation
+    that the test file also houses Scenario 2's resolve test
+    + P10's tombstone round-trip test.
+  - **G2.** Setup section split into Mock-mode-required
+    (§3a) and Live-mode-required (§3b) subsections with
+    explicit "skip §3b if Mock-only" callout — saves a
+    cold-read non-author dev ~5 minutes of release-build
+    time they don't need.
+  - **G3.** Smoke-test expected output now explains cargo's
+    per-crate summary lines; reader sums them rather than
+    reading just the last one (which would show ~142 passed
+    for the largest crate and cause unwarranted panic).
+
+### Critical invariants preserved
+
+1. Zero Rust code modified across P11-1..P11-5 — documentation-
+   only.
+2. Workspace test count unchanged at 401/401 on Windows
+   (~405 on Linux); the smoke baseline from the P11B SIGNOFF
+   tip carries through unchanged.
+3. HIGH-1 invariant — `cargo tree -p pangolin-crypto |
+   grep -ci serde` → 0.
+4. No new `unsafe`. `forbid(unsafe_code)` preserved at every
+   P0..P11B crate root.
+5. §3.5 forbidden-user-facing-terms invariant — none of the
+   listed terms appear in any new doc text. (E2E_REPRODUCER.md
+   uses "the chain" and "publish" / "pull" / "resolve" — all
+   permitted under §3.5; "blockchain", "transaction",
+   "decentralized storage", "gas", and the bare nouns
+   "hashes" and "revisions" are absent from user-facing
+   prose.)
+6. `cargo fmt --all --check` clean.
+7. `cargo clippy --workspace --all-targets -- -D warnings`
+   clean.
+8. `cargo test --workspace --lib` — 401/401 on Windows.
+9. `cargo test --workspace --tests` — green.
+10. `cargo audit` — clean.
+11. `cargo deny check` — clean.
+
+### Out of scope (per plan)
+
+- Recorded screencast — deferred to P12-3.
+- Signed binary — deferred to P12-1.
+- Live-chain rehearsal in CI — too costly; documented as
+  "opt-in, not rehearsed in CI" in the doc itself.
+- Scenarios 2 and 3 non-author rehearsal — deferred per the
+  locked Q3 answer (scenario 1 only on first pass).
+
+### MVP-1 polish opportunities surfaced during build
+
+These are NOT P11 bugs (P11 is doc-only); they are quirks of
+the underlying CLI that the reproducer documents around. Each
+becomes a candidate MVP-1 polish item:
+
+- `account show` does not currently expose `revision_id`
+  directly; Scenario 2 must save the publish-summary stderr
+  to recover it.
+- Binary-level network-disconnect simulation absent;
+  Scenario 3 Live mode requires OS-level "disable wifi"
+  rather than a `pangolin-cli --simulate-disconnect` flag.
+- The generated password from `account add --generate-password`
+  prints only on stderr; rehearsal-friendly capture would
+  benefit from a `--print-password-on-stdout` flag (or the
+  existing `--json` global flag, which already includes it
+  in the JSON envelope, could be advertised more
+  prominently).
+
+### Unblocks
+
+P11 unblocks **P12** (signed binary + screencast + final
+`POC_README.md` polish). With the reproducer in `main`, P12
+can quote line ranges from `docs/E2E_REPRODUCER.md` rather
+than re-derive them, and the screencast author has a
+verified script to follow.
