@@ -95,8 +95,22 @@ if (-not $SkipPreflight) {
     if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed; aborting release." }
 
     Write-Host "==> Pre-flight: cargo test --workspace --lib" -ForegroundColor Cyan
-    cargo test --workspace --lib
-    if ($LASTEXITCODE -ne 0) { throw "cargo test --lib failed; aborting release." }
+    # Redirect all streams to a log file rather than the console. Some lib
+    # tests (notably P11A MED-4's account_show_json_reveals_non_utf8_password_via_b64_suffix)
+    # use stdout().lock().write_all() to emit raw non-UTF-8 password bytes by
+    # design; PowerShell 7's UTF-8 console rejects these with InvalidData and
+    # fails the pre-flight even though the tests themselves pass. Logging to
+    # a file bypasses the console-mode check while preserving exit-code
+    # semantics. The log file is written under $env:TEMP because $distDir
+    # is not yet created at pre-flight time.
+    $testLog = Join-Path $env:TEMP "pangolin-poc-preflight-test-output.log"
+    cargo test --workspace --lib *> $testLog
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "    Test log saved to: $testLog" -ForegroundColor Yellow
+        throw "cargo test --lib failed; aborting release. See $testLog for details."
+    }
+    # Surface the test summary lines so the operator can see the count.
+    Get-Content $testLog | Select-String -Pattern '^test result' | ForEach-Object { Write-Host "    $_" }
 } else {
     Write-Host "==> Pre-flight SKIPPED (--SkipPreflight)" -ForegroundColor Yellow
 }
