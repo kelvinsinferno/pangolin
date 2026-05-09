@@ -134,4 +134,7 @@ default-features = false
 # `tests/error_taxonomy.rs` does an exhaustive match on
 # `pangolin_core::Error` and verifies every variant maps to a non-
 # `Internal` `FfiError` variant.
-pangolin-core = { path = "../pangolin-core" }
+pangolin-core   = { path = "../pangolin-core" }
+# 1.2 integration tests build a real on-disk vault file.
+pangolin-crypto = { path = "../pangolin-crypto" }
+tempfile        = { workspace = true }

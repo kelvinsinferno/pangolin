@@ -1,6 +1,10 @@
 # Pangolin FFI surface (frozen at MVP-1 issue 1.1)
 
 > **Status:** Frozen 2026-05-08 by MVP-1 issue 1.1 (`docs/issue-plans/1.1.md`).
+> Amended 2026-05-08 by MVP-1 issue 1.2 per Q1 of
+> `docs/issue-plans/1.2.md` to widen `AccountDraft` /
+> `AccountPatch` / `AccountSnapshot` to the production multi-username,
+> multi-URL, tags, password-history, TOTP shape Whitepaper §6 mandates.
 > Bodies of the listed entry points land issue-by-issue (1.2 → 1.11);
 > *signatures* are locked. After-MVP-1 changes are additive only —
 > never field/variant removals, never argument-type changes.
@@ -101,13 +105,16 @@ the right-most column.
 | Type | UniFFI shape | Carries user data | Schema-version slot |
 |---|---|---|---|
 | `SecretPassword` | Object (`Arc<Self>`) | Yes (password bytes) | n/a (opaque) |
+| `TotpSecret` | Object (`Arc<Self>`) | Yes (totp bytes) | n/a (opaque) |
 | `PresenceProof` | Record | Yes (proof bytes) | `schema_version: u16` |
 | `SessionInfo` | Record | No | `schema_version: u16` |
 | `VaultHandle` | Object (`Arc<Self>`) | Indirect (holds vault state) | n/a (opaque) |
 | `AccountId` | Record | No | `schema_version: u16` |
-| `AccountDraft` | Record | Yes (full account at create) | `schema_version: u16` |
-| `AccountPatch` | Record | Yes (partial update) | `schema_version: u16` |
-| `AccountSnapshot` | Record | Yes (read-back account) | `schema_version: u16` |
+| `DeviceId` | Record | No | `schema_version: u16` |
+| `AccountDraft` | Record | Yes (full account at create — multi-username, multi-URL, tags, password, optional TOTP) | `schema_version: u16` |
+| `AccountPatch` | Record | Yes (partial update; password change appends to history) | `schema_version: u16` |
+| `AccountSnapshot` | Record | Yes (read-back account; carries full password history with timestamps + originating-device ids) | `schema_version: u16` |
+| `PasswordHistoryEntry` | Record | Yes (one historical password value) | `schema_version: u16` |
 | `RevisionId` | Record | No | `schema_version: u16` |
 | `RevisionMeta` | Record | No | `schema_version: u16` |
 | `TotpCode` | Record | Yes (decimal code + window) | `schema_version: u16` |
@@ -117,6 +124,58 @@ the right-most column.
 | `PlaintextExportConfirmation` | Record | Yes (confirmation token) | `schema_version: u16` |
 | `CaptureAuthority` | Record | No | `schema_version: u16` |
 | `CaptureContext` | Record | No | `schema_version: u16` |
+
+### Issue 1.2 amendment: production AccountIdentity shape
+
+```rust
+pub struct AccountDraft {
+    pub schema_version: u16,
+    pub display_name: String,                        // ≤ 256 chars; non-empty after trim
+    pub tags: Vec<String>,                           // ≤ 32 entries; ≤ 64 chars each
+    pub usernames: Vec<String>,                      // ≥ 1; ≤ 16 entries; ≤ 320 chars each
+    pub urls: Vec<String>,                           // ≤ 32 entries; any RFC-3986 scheme
+    pub notes: Option<String>,                       // ≤ 65 536 chars when Some
+    pub current_password: Arc<SecretPassword>,
+    pub totp_secret: Option<Arc<TotpSecret>>,
+}
+
+pub struct AccountPatch {
+    pub schema_version: u16,
+    pub display_name: Option<String>,
+    pub tags: Option<Vec<String>>,                   // Some(replace), None(unchanged)
+    pub usernames: Option<Vec<String>>,
+    pub urls: Option<Vec<String>>,
+    pub notes: Option<String>,
+    pub current_password: Option<Arc<SecretPassword>>, // triggers history append
+    pub totp_secret: Option<Option<Arc<TotpSecret>>>,  // doubled Option: clear vs unchanged
+}
+
+pub struct AccountSnapshot {
+    pub schema_version: u16,
+    pub id: AccountId,
+    pub display_name: String,
+    pub tags: Vec<String>,
+    pub usernames: Vec<String>,
+    pub urls: Vec<String>,
+    pub notes: Option<String>,
+    pub current_password: Arc<SecretPassword>,       // head of history
+    pub password_history: Vec<PasswordHistoryEntry>,
+    pub totp_secret: Option<Arc<TotpSecret>>,
+    pub head_revision_id: RevisionId,
+}
+
+pub struct PasswordHistoryEntry {
+    pub schema_version: u16,
+    pub password: Arc<SecretPassword>,
+    pub set_at: UnixTimestamp,
+    pub originating_device: DeviceId,
+}
+
+pub struct DeviceId {
+    pub schema_version: u16,
+    pub bytes: Vec<u8>,                              // 32 bytes
+}
+```
 
 Schema-version policy text is locked in MVP-1 issue 1.6 (master plan
 §18.7). Issue 1.1 commits to the *slot* — every record listed above

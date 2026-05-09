@@ -88,6 +88,7 @@ impl From<StoreError> for Error {
             | StoreError::SessionPending
             | StoreError::PresenceProofRequired
             | StoreError::NotUnlocked => Self::Session(err.to_string()),
+            StoreError::Validation { kind, message } => Self::Validation { kind, message },
             other => Self::Store(other.to_string()),
         }
     }

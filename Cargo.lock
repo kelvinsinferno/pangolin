@@ -2943,6 +2943,7 @@ dependencies = [
  "pangolin-kdbx",
  "pangolin-store",
  "pangolin-totp",
+ "tempfile",
  "thiserror 2.0.18",
  "uniffi",
  "uniffi_build",
@@ -2977,6 +2978,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
+ "url",
  "zeroize",
 ]
 

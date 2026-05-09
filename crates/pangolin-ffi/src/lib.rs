@@ -60,6 +60,7 @@
 pub mod cabi;
 pub mod error;
 pub mod identity;
+mod identity_bridge;
 pub mod kdbx;
 pub mod revision;
 pub mod session;
@@ -69,7 +70,14 @@ pub use error::FfiError;
 
 // MVP-1 issue 1.1: scaffolding-only re-export so 1.2-1.11 have a single
 // import path for FFI types. Bodies arrive in the per-domain modules.
-pub use identity::{AccountDraft, AccountId, AccountPatch, AccountSnapshot};
+//
+// MVP-1 issue 1.2 widens AccountDraft / AccountPatch / AccountSnapshot
+// to the production multi-* shape (see docs/issue-plans/1.2.md Q1) and
+// adds DeviceId, PasswordHistoryEntry, TotpSecret.
+pub use identity::{
+    AccountDraft, AccountId, AccountPatch, AccountSnapshot, DeviceId, PasswordHistoryEntry,
+    TotpSecret,
+};
 pub use kdbx::{CaptureAuthority, CaptureContext, KdbxImportReport};
 pub use revision::{RevisionId, RevisionMeta};
 pub use session::{

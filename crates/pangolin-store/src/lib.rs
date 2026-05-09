@@ -48,7 +48,11 @@ pub(crate) mod meta;
 pub(crate) mod schema;
 pub(crate) mod search;
 
-pub use account::{AccountId, AccountSnapshot};
+pub use account::{
+    AccountId, AccountIdentity, AccountIdentityDraft, AccountIdentityPatch, AccountIdentitySummary,
+    AccountSnapshot, PasswordEntry, PasswordHistorySummaryEntry, ACCOUNT_IDENTITY_SCHEMA_VERSION,
+    PAYLOAD_VERSION_V0, PAYLOAD_VERSION_V1,
+};
 pub use blob::TombstonePayload;
 pub use conflict::ConflictReport;
 pub use dirty::{DirtyEntry, IngestOutcome, RevisionPublishPayload};
