@@ -111,6 +111,17 @@ fn account_history_lists_revisions() {
     account_update(handle.clone(), id.clone(), patch).expect("update");
     let history = account_history(handle.clone(), id.clone()).expect("history");
     assert_eq!(history.len(), 2);
+    // Audit M-2: pin oldest-first temporal ordering. `Vault::
+    // account_history` routes through `revisions_for` which uses
+    // `ORDER BY created_at ASC` — so index 0 is the genesis revision
+    // and index 1 is the password-rotation revision. The sequence
+    // must satisfy `created_at_unix[0] <= created_at_unix[1]`.
+    assert!(
+        history[0].created_at_unix <= history[1].created_at_unix,
+        "account_history must be oldest-first: got {} then {}",
+        history[0].created_at_unix,
+        history[1].created_at_unix
+    );
 }
 
 #[test]

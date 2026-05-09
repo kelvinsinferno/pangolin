@@ -117,7 +117,10 @@ fn account_snapshot_record_round_trip() {
         tags: vec!["work".into()],
         usernames: vec!["alice".into()],
         urls: vec!["https://github.com".into()],
-        notes: None,
+        // Note: `AccountSnapshot` deliberately has no `notes` field
+        // (audit C-1). `notes` are recovery-class secrets per spec
+        // §5.4 and reach the binding only through the presence-gated
+        // `reveal_notes` entry point landing in 1.4.
         current_password: SecretPassword::new(b"hunter2".to_vec()),
         password_history: vec![PasswordHistoryEntry {
             schema_version: 1,
@@ -135,6 +138,35 @@ fn account_snapshot_record_round_trip() {
     assert_eq!(original.head_revision_id, cloned.head_revision_id);
     assert_eq!(cloned.head_revision_id, head);
     assert_eq!(cloned.password_history.len(), 1);
+}
+
+/// Regression test for audit C-1: the FFI `AccountSnapshot` MUST NOT
+/// expose `notes`. This test would fail to compile if a future
+/// refactor accidentally added a `notes` field — the lack of `notes:`
+/// in the struct literal compiles only when no such field exists.
+#[test]
+fn account_snapshot_has_no_notes_field() {
+    // Construct without a `notes` field; if a `notes` field is
+    // re-added (without a default), this struct literal will fail to
+    // compile and the regression is caught at build time.
+    let _snap = AccountSnapshot {
+        schema_version: 1,
+        id: AccountId {
+            schema_version: 1,
+            bytes: vec![0xAA; 32],
+        },
+        display_name: "X".into(),
+        tags: vec![],
+        usernames: vec!["u".into()],
+        urls: vec![],
+        current_password: SecretPassword::new(b"p".to_vec()),
+        password_history: vec![],
+        totp_secret: None,
+        head_revision_id: RevisionId {
+            schema_version: 1,
+            bytes: vec![0xBB; 32],
+        },
+    };
 }
 
 #[test]

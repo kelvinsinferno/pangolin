@@ -645,12 +645,38 @@ impl ZeroizeOnDrop for AccountIdentity {}
 /// returned canonical form requires. Errors map to
 /// [`StoreError::Validation`] with stable `kind` labels matching the
 /// `docs/issue-plans/1.2.md` §E table.
+///
+/// # Unicode NFC normalisation (audit H-1 / plan §E)
+///
+/// `display_name`, `tags`, and `usernames` are NFC-normalised before
+/// further processing so visually-identical inputs compare equal:
+///
+/// - `"Café"` (precomposed `U+00E9`) and `"Cafe\u{0301}"` (decomposed
+///   `e` + combining acute) produce the same stored bytes.
+/// - For tags, this combines with the lowercase + dedup pipeline to
+///   eliminate "look-alike duplicate tag" entries that differ only in
+///   precomposed vs. decomposed form.
+///
+/// Notes and URLs are intentionally NOT NFC-normalised — notes are
+/// free-form prose that may legitimately contain decomposed forms a
+/// user pasted, and URL canonicalisation is delegated to `url::Url`
+/// (which does its own host/path canonicalisation).
 pub mod validate {
     use super::{limits, Result, StoreError};
+    use unicode_normalization::UnicodeNormalization;
 
-    /// Validate a display name. Returns the canonical (trimmed) form.
+    /// NFC-normalise a `&str` and return an owned `String`.
+    fn nfc(s: &str) -> String {
+        s.nfc().collect()
+    }
+
+    /// Validate a display name. Returns the canonical (NFC + trimmed)
+    /// form. Audit H-1: NFC runs BEFORE the trim + length check so
+    /// equivalent precomposed / decomposed inputs produce identical
+    /// stored bytes.
     pub fn display_name(input: &str) -> Result<String> {
-        let trimmed = input.trim();
+        let normalised = nfc(input);
+        let trimmed = normalised.trim();
         if trimmed.is_empty() {
             return Err(StoreError::Validation {
                 kind: "display_name".into(),
@@ -675,8 +701,13 @@ pub mod validate {
         Ok(trimmed.to_owned())
     }
 
-    /// Validate a tag set. Returns the canonical (trimmed, lowercased,
-    /// deduplicated, order-preserving) form.
+    /// Validate a tag set.
+    ///
+    /// Returns the canonical (NFC + trimmed + lowercased +
+    /// deduplicated, order-preserving) form. Audit H-1: pipeline
+    /// order is NFC → trim → lowercase → dedup so e.g.
+    /// `["Café", "Cafe\u{0301}"]` produces a single `"café"` after
+    /// deduplication.
     pub fn tags(input: &[String]) -> Result<Vec<String>> {
         if input.len() > limits::TAGS_MAX_COUNT {
             return Err(StoreError::Validation {
@@ -686,7 +717,8 @@ pub mod validate {
         }
         let mut out: Vec<String> = Vec::with_capacity(input.len());
         for raw in input {
-            let trimmed = raw.trim();
+            let normalised = nfc(raw);
+            let trimmed = normalised.trim();
             if trimmed.is_empty() {
                 return Err(StoreError::Validation {
                     kind: "tags".into(),
@@ -714,6 +746,12 @@ pub mod validate {
     }
 
     /// Validate a username set.
+    ///
+    /// Returns the canonical (trimmed + NFC) form. Audit H-1: trim
+    /// runs first (cheap), then NFC on the trimmed slice, then the
+    /// length / control-char checks against the post-NFC string so
+    /// any sequence-length growth from composition is counted
+    /// accurately.
     pub fn usernames(input: &[String]) -> Result<Vec<String>> {
         if input.is_empty() {
             return Err(StoreError::Validation {
@@ -736,19 +774,20 @@ pub mod validate {
                     message: "empty username rejected".into(),
                 });
             }
-            if trimmed.chars().count() > limits::USERNAME_MAX_CHARS {
+            let normalised = nfc(trimmed);
+            if normalised.chars().count() > limits::USERNAME_MAX_CHARS {
                 return Err(StoreError::Validation {
                     kind: "usernames".into(),
                     message: format!("username exceeds {} chars", limits::USERNAME_MAX_CHARS),
                 });
             }
-            if has_disallowed_control(trimmed) {
+            if has_disallowed_control(&normalised) {
                 return Err(StoreError::Validation {
                     kind: "usernames".into(),
                     message: "username contains disallowed control chars".into(),
                 });
             }
-            out.push(trimmed.to_owned());
+            out.push(normalised);
         }
         Ok(out)
     }
@@ -1025,6 +1064,15 @@ impl AccountIdentityPatch {
 /// Fields are public for the FFI bridge module; this type is part of
 /// the crate's public API but is not surfaced through the
 /// `pangolin_core` re-export until 1.4's session rewrite.
+///
+/// **Notes are deliberately absent.** This type is FFI-bound (the
+/// `pangolin-ffi::identity_bridge` module consumes it). Free-form
+/// notes are recovery-class secrets per spec §5.4 — exposing them
+/// through a non-presence-gated read path would short-circuit the
+/// presence-escalation discipline. The presence-gated `reveal_notes`
+/// entry point lands in MVP-1 issue 1.4 (audit C-1 / plan §D). The
+/// underlying [`AccountIdentity::notes`] field still persists; only
+/// the FFI summary surface is closed.
 pub struct AccountIdentitySummary {
     /// Schema-version slot.
     pub schema_version: u16,
@@ -1040,9 +1088,6 @@ pub struct AccountIdentitySummary {
     pub usernames: Vec<String>,
     /// URL set.
     pub urls: Vec<String>,
-    /// Notes — `None` if no notes were set, `Some(empty)` if explicit
-    /// empty notes were stored.
-    pub notes: Option<String>,
     /// Password-history entries. The HEAD entry is the current
     /// password.
     pub password_history: Vec<PasswordHistorySummaryEntry>,
@@ -1063,7 +1108,6 @@ impl fmt::Debug for AccountIdentitySummary {
                 &format!("<{} usernames>", self.usernames.len()),
             )
             .field("urls", &format!("<{} urls>", self.urls.len()))
-            .field("notes", &"<redacted>")
             .field(
                 "password_history",
                 &format!("<{} entries>", self.password_history.len()),
@@ -1232,6 +1276,39 @@ mod identity_tests {
             "app://settings".into(),
         ])
         .expect("any-scheme accepted");
+    }
+
+    // -- audit H-1: NFC normalisation tests ----------------------------
+
+    /// Two visually-identical display names — one with the precomposed
+    /// `é` (U+00E9), one with `e` + combining acute (U+0301) — produce
+    /// the same stored `display_name` after NFC normalisation.
+    #[test]
+    fn display_name_nfc_equivalence() {
+        let precomposed = validate::display_name("Café").expect("precomposed");
+        let decomposed = validate::display_name("Cafe\u{0301}").expect("decomposed");
+        assert_eq!(precomposed, decomposed);
+        // The canonical (NFC) form is the precomposed bytes.
+        assert_eq!(precomposed.as_bytes(), b"Caf\xc3\xa9");
+    }
+
+    /// `["Café", "Cafe\u{0301}"]` → single tag after NFC + lowercase +
+    /// dedup. Pipeline order: NFC → trim → lowercase → dedup.
+    #[test]
+    fn tags_nfc_dedup() {
+        let canon = validate::tags(&["Café".into(), "Cafe\u{0301}".into()]).expect("validate");
+        assert_eq!(canon.len(), 1);
+        assert_eq!(canon[0], "café");
+    }
+
+    /// Usernames: precomposed and decomposed forms produce the same
+    /// stored bytes (post-NFC).
+    #[test]
+    fn usernames_nfc_normalised() {
+        let v1 = validate::usernames(&["café@example.com".into()]).expect("v1");
+        let v2 = validate::usernames(&["cafe\u{0301}@example.com".into()]).expect("v2");
+        assert_eq!(v1, v2);
+        assert_eq!(v1[0], "café@example.com");
     }
 
     #[test]

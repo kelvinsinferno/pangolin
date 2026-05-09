@@ -1400,11 +1400,49 @@ mod tests {
         let vault = [0x11u8; 32];
         let acct = AccountId::from_bytes([0x22u8; 32]);
         let aad = build_aad(&vault, &acct, &RevisionId::GENESIS_PARENT, 0);
-        let identity = fixture_identity();
+        // Build a fixture with a 2-entry password history so the
+        // ordering pin (audit M-1) actually has something to pin.
+        // HEAD == newest, then older.
+        let mut identity = fixture_identity();
+        // Append an older entry by inserting at index 1 (older than HEAD).
+        let older = crate::account::PasswordEntry::new(
+            SecretBytes::new(b"old-hunter1".to_vec()),
+            1_600_000_000_000,
+            DeviceId([0x44u8; 32]),
+        );
+        identity.password_history.push(older);
+        // Now the order is `[hunter2 (newer), old-hunter1 (older)]`
+        // because the genesis password from fixture_identity is at
+        // index 0 with set_at_ms=1_700_000_000_000.
+
         let (ct, nonce) = super::seal_identity(&key, &identity, &aad).unwrap();
         match super::open_identity_payload(&key, &nonce, &ct, &aad).unwrap() {
             super::DecodedIdentityPayload::Live(recovered) => {
                 assert!(bool::from(identity.ct_eq(&recovered)));
+                // Audit M-1: pin password_history head-is-newest
+                // ordering through the round-trip. AccountIdentity's
+                // password_history is `pub(crate)`, so this assertion
+                // lives in the crate-internal blob.rs tests.
+                assert_eq!(
+                    recovered.password_history.len(),
+                    2,
+                    "expected 2 history entries"
+                );
+                assert_eq!(
+                    recovered.password_history[0].password.expose(),
+                    b"hunter2",
+                    "HEAD entry must be the newest password"
+                );
+                assert_eq!(
+                    recovered.password_history[1].password.expose(),
+                    b"old-hunter1",
+                    "older entry must follow HEAD"
+                );
+                assert!(
+                    recovered.password_history[0].set_at_ms
+                        > recovered.password_history[1].set_at_ms,
+                    "HEAD set_at_ms must be greater than older entry's set_at_ms"
+                );
             }
             super::DecodedIdentityPayload::Tombstone(_) => panic!("expected Live"),
         }

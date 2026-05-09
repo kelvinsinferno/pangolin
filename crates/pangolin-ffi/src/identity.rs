@@ -276,6 +276,13 @@ impl Clone for AccountPatch {
 /// password bytes are wrapped as `Arc<SecretPassword>` so binding-side
 /// shells can pass them back into a presence-gated reveal flow without
 /// the bytes ever appearing as a plain `Vec<u8>` on the wire.
+///
+/// **Notes are not exposed.** Per spec §5.4, free-form notes can carry
+/// recovery-class secrets (security-question answers, recovery
+/// phrases) and therefore fall under the same reveal-class umbrella as
+/// the password bytes. The `notes` field is deliberately absent here;
+/// the presence-gated `reveal_notes` entry point lands in MVP-1
+/// issue 1.4 (audit C-1 / plan §D).
 #[derive(Debug, uniffi::Record)]
 pub struct AccountSnapshot {
     /// Schema-version slot. 1.2 returns `1`.
@@ -290,8 +297,6 @@ pub struct AccountSnapshot {
     pub usernames: Vec<String>,
     /// Associated URLs.
     pub urls: Vec<String>,
-    /// Free-form notes.
-    pub notes: Option<String>,
     /// Current password (head of `password_history`). Wrapped as
     /// `Arc<SecretPassword>`; bytes zero on drop. Set on every
     /// snapshot — even when the caller is not in a presence-gated
@@ -316,7 +321,6 @@ impl Clone for AccountSnapshot {
             tags: self.tags.clone(),
             usernames: self.usernames.clone(),
             urls: self.urls.clone(),
-            notes: self.notes.clone(),
             current_password: Arc::clone(&self.current_password),
             password_history: self.password_history.clone(),
             totp_secret: self.totp_secret.as_ref().map(Arc::clone),

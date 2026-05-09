@@ -8,11 +8,11 @@
 
 | Constant | Value | Applies to | Validation |
 |----------|------:|------------|------------|
-| `DISPLAY_NAME_MAX_CHARS` | 256 | `AccountDraft.display_name`, `AccountPatch.display_name` | non-empty after trim; no control chars (except `\t`) |
-| `TAGS_MAX_COUNT` | 32 | `AccountDraft.tags`, `AccountPatch.tags` | trimmed + lowercased + deduplicated; preserved order |
-| `TAG_MAX_CHARS` | 64 | each tag | non-empty after trim; no control chars |
+| `DISPLAY_NAME_MAX_CHARS` | 256 | `AccountDraft.display_name`, `AccountPatch.display_name` | NFC-normalised → trimmed → non-empty → length ≤ cap; no control chars (except `\t`) |
+| `TAGS_MAX_COUNT` | 32 | `AccountDraft.tags`, `AccountPatch.tags` | NFC-normalised → trimmed → lowercased → deduplicated; preserved order |
+| `TAG_MAX_CHARS` | 64 | each tag | NFC-normalised → trimmed → non-empty → length ≤ cap; no control chars |
 | `USERNAMES_MAX_COUNT` | 16 | `AccountDraft.usernames`, `AccountPatch.usernames` | ≥ 1 entry required at create-time |
-| `USERNAME_MAX_CHARS` | 320 | each username | RFC-5321 email cap; trim; no control chars |
+| `USERNAME_MAX_CHARS` | 320 | each username | trim → NFC-normalised → length ≤ cap (RFC-5321 email cap); no control chars |
 | `URLS_MAX_COUNT` | 32 | `AccountDraft.urls`, `AccountPatch.urls` | parse via `url::Url::parse`; canonical re-serialised form stored |
 | `URL_MAX_CHARS` | 2 048 | each URL | per-scheme syntax checked by `url` crate (any scheme accepted per Q3) |
 | `NOTES_MAX_CHARS` | 65 536 | `AccountDraft.notes`, `AccountPatch.notes` | any UTF-8 |
@@ -38,6 +38,30 @@ label that maps 1:1 from `pangolin_core::Error::Validation { kind }` to
 | notes over-long | `notes` |
 | password empty / over-long | `password` |
 | TOTP secret over-long | `totp_secret` |
+
+## Unicode NFC normalisation (audit H-1)
+
+`display_name`, every `tag`, and every `username` are NFC-normalised
+on validation so visually-identical inputs compare equal regardless of
+the user's IME / paste source. For example:
+
+- `"Café"` (precomposed `U+00E9`) and `"Cafe\u{0301}"` (`e` + combining
+  acute) produce identical stored bytes.
+- For tags, NFC + lowercase + dedup eliminates "look-alike duplicate"
+  entries that differ only in precomposed vs. decomposed form.
+
+Pipeline order:
+
+| Field | Order |
+|-------|-------|
+| `display_name` | NFC → trim → empty-check → length ≤ cap → control-char check |
+| each tag | NFC → trim → empty-check → length ≤ cap → control-char check → lowercase → dedup |
+| each username | trim → empty-check → NFC → length ≤ cap → control-char check |
+
+Notes and URLs are intentionally NOT NFC-normalised — notes are
+free-form prose that may legitimately preserve a user's original byte
+sequence, and URL canonicalisation is delegated to the `url::Url`
+parser (which performs its own host / path canonicalisation).
 
 ## Forward-compatibility
 

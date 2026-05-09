@@ -85,15 +85,36 @@ fn device_id_to_ffi(id: pangolin_core::DeviceId) -> DeviceId {
 /// (their `ZeroizeOnDrop` discipline applies at the underlying buffer).
 /// Returns a `Result` so the FFI surface can grow validation-failure
 /// arms in 1.6 (Q4) without breaking the caller.
+///
+/// # Audit L-2: zeroising intermediate buffers
+///
+/// The intermediate `Vec<u8>` produced by `to_vec()` between the
+/// `bytes_for_bridge()` borrow and `SecretBytes::new(...)` is wrapped
+/// in `zeroize::Zeroizing` for the lifetime of that window. The
+/// wrapper zeroises its allocation on drop, so a panic between the
+/// `to_vec()` call and the `SecretBytes::new(...)` consumption does
+/// NOT leak plaintext bytes onto the unwound stack frame. We hand off
+/// to `SecretBytes::new` by `std::mem::take`-ing the inner `Vec` —
+/// the now-emptied `Zeroizing<Vec<u8>>` drops harmlessly (zeroising a
+/// zero-capacity Vec is a no-op).
 #[allow(clippy::unnecessary_wraps)]
 pub fn draft_into_store(
     draft: AccountDraft,
 ) -> Result<pangolin_core::AccountIdentityDraft, FfiError> {
-    let password_bytes = secret_password_bytes(&draft.current_password);
-    let totp_bytes = draft
-        .totp_secret
-        .as_ref()
-        .map_or_else(Vec::new, totp_secret_bytes);
+    let mut password_bytes =
+        zeroize::Zeroizing::new(secret_password_bytes(&draft.current_password));
+    let mut totp_bytes = zeroize::Zeroizing::new(
+        draft
+            .totp_secret
+            .as_ref()
+            .map_or_else(Vec::new, totp_secret_bytes),
+    );
+    // Move the inner Vec out of the Zeroizing wrapper directly into
+    // SecretBytes (which itself wraps the Vec in its own
+    // Zeroizing<Vec<u8>>). The Zeroizing wrappers we just emptied
+    // drop harmlessly at end of scope.
+    let password = SecretBytes::new(std::mem::take(&mut *password_bytes));
+    let totp_secret = SecretBytes::new(std::mem::take(&mut *totp_bytes));
     Ok(pangolin_core::AccountIdentityDraft {
         schema_version: draft.schema_version,
         display_name: draft.display_name,
@@ -101,25 +122,29 @@ pub fn draft_into_store(
         usernames: draft.usernames,
         urls: draft.urls,
         notes: draft.notes.unwrap_or_default(),
-        password: SecretBytes::new(password_bytes),
-        totp_secret: SecretBytes::new(totp_bytes),
+        password,
+        totp_secret,
     })
 }
 
 /// Convert an FFI [`AccountPatch`] into a
 /// `pangolin_core::AccountIdentityPatch`.
+///
+/// Audit L-2: intermediate `Vec<u8>` plaintext between `to_vec()` and
+/// `SecretBytes::new(...)` is held in `zeroize::Zeroizing` so a panic
+/// in that window cannot leak the allocation onto the unwound stack.
 #[allow(clippy::unnecessary_wraps)]
 pub fn patch_into_store(
     patch: AccountPatch,
 ) -> Result<pangolin_core::AccountIdentityPatch, FfiError> {
     let new_password = patch.current_password.as_ref().map(|p| {
-        let bytes = secret_password_bytes(p);
-        SecretBytes::new(bytes)
+        let mut bytes = zeroize::Zeroizing::new(secret_password_bytes(p));
+        SecretBytes::new(std::mem::take(&mut *bytes))
     });
     let totp = patch.totp_secret.map(|outer| {
         outer.map(|secret| {
-            let bytes = totp_secret_bytes(&secret);
-            SecretBytes::new(bytes)
+            let mut bytes = zeroize::Zeroizing::new(totp_secret_bytes(&secret));
+            SecretBytes::new(std::mem::take(&mut *bytes))
         })
     });
     Ok(pangolin_core::AccountIdentityPatch {
@@ -142,6 +167,10 @@ pub fn summary_to_ffi(
 ) -> Result<AccountSnapshot, FfiError> {
     // The summary already contains UTF-8 strings + SecretBytes;
     // wrap secret-bearing fields in the FFI envelopes.
+    //
+    // `notes` are deliberately NOT surfaced here — recovery-class per
+    // spec §5.4, presence-gated `reveal_notes` lands in 1.4
+    // (audit C-1 / plan §D).
     let pangolin_core::AccountIdentitySummary {
         id,
         head_revision_id,
@@ -149,31 +178,41 @@ pub fn summary_to_ffi(
         tags,
         usernames,
         urls,
-        notes,
         password_history,
         totp_secret,
         ..
     } = summary;
 
+    // Audit L-2: each `to_vec()` of plaintext password / totp bytes
+    // is held in `zeroize::Zeroizing` until ownership transfers into
+    // the FFI secret-handle constructor. A panic in the narrow window
+    // between the borrow and the constructor call cannot leak the
+    // intermediate Vec onto the unwound stack.
     let current_password = password_history.first().map_or_else(
         || SecretPassword::new(Vec::new()),
-        |e| SecretPassword::new(e.password.expose().to_vec()),
+        |e| {
+            let mut bytes = zeroize::Zeroizing::new(e.password.expose().to_vec());
+            SecretPassword::new(std::mem::take(&mut *bytes))
+        },
     );
 
     let history_ffi: Vec<PasswordHistoryEntry> = password_history
         .into_iter()
         .map(|entry| {
-            let bytes = entry.password.expose().to_vec();
+            let mut bytes = zeroize::Zeroizing::new(entry.password.expose().to_vec());
             PasswordHistoryEntry {
                 schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
-                password: SecretPassword::new(bytes),
+                password: SecretPassword::new(std::mem::take(&mut *bytes)),
                 set_at: entry.set_at_ms / 1000,
                 originating_device: device_id_to_ffi(entry.originating_device),
             }
         })
         .collect();
 
-    let totp_arc = totp_secret.map(|sb| TotpSecret::new(sb.expose().to_vec()));
+    let totp_arc = totp_secret.map(|sb| {
+        let mut bytes = zeroize::Zeroizing::new(sb.expose().to_vec());
+        TotpSecret::new(std::mem::take(&mut *bytes))
+    });
 
     Ok(AccountSnapshot {
         schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
@@ -182,7 +221,6 @@ pub fn summary_to_ffi(
         tags,
         usernames,
         urls,
-        notes,
         current_password,
         password_history: history_ffi,
         totp_secret: totp_arc,
@@ -199,4 +237,73 @@ fn secret_password_bytes(p: &Arc<SecretPassword>) -> Vec<u8> {
 
 fn totp_secret_bytes(s: &Arc<TotpSecret>) -> Vec<u8> {
     s.bytes_for_bridge().to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Audit L-4: pin the `set_at` ms→s conversion done in
+    //! `summary_to_ffi`. The summary carries `set_at_ms`
+    //! (unix-milliseconds, `i64`); the FFI `PasswordHistoryEntry.set_at`
+    //! is `UnixTimestamp` (unix-seconds, `i64`). The bridge divides by
+    //! 1000 — this test exercises a value with a sub-second remainder
+    //! to verify integer-division truncation matches `set_at_ms / 1000`.
+
+    use super::*;
+    use pangolin_core::{
+        AccountId as CoreAccountId, AccountIdentitySummary, DeviceId as CoreDeviceId,
+        PasswordHistorySummaryEntry, RevisionId as CoreRevisionId,
+    };
+
+    #[test]
+    fn set_at_ms_to_seconds_conversion_truncates_remainder() {
+        // 500 ms past the unix-second boundary; integer division by
+        // 1000 must yield the floored second.
+        let set_at_ms: i64 = 1_700_000_000_500;
+        let expected_set_at_s: i64 = set_at_ms / 1000;
+        assert_eq!(expected_set_at_s, 1_700_000_000_i64);
+
+        let summary = AccountIdentitySummary {
+            schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
+            id: CoreAccountId::from_bytes([0x11u8; 32]),
+            head_revision_id: CoreRevisionId::from_bytes([0x22u8; 32]),
+            display_name: "X".into(),
+            tags: vec![],
+            usernames: vec!["u".into()],
+            urls: vec![],
+            password_history: vec![PasswordHistorySummaryEntry {
+                password: pangolin_crypto::secret::SecretBytes::new(b"p".to_vec()),
+                set_at_ms,
+                originating_device: CoreDeviceId([0u8; 32]),
+            }],
+            totp_secret: None,
+        };
+
+        let snap = summary_to_ffi(summary).expect("summary_to_ffi");
+        assert_eq!(snap.password_history.len(), 1);
+        assert_eq!(snap.password_history[0].set_at, expected_set_at_s);
+        assert_eq!(snap.password_history[0].set_at, 1_700_000_000_i64);
+    }
+
+    #[test]
+    fn set_at_ms_to_seconds_conversion_handles_exact_second() {
+        // Exact-second boundary: no remainder.
+        let set_at_ms: i64 = 1_700_000_000_000;
+        let summary = AccountIdentitySummary {
+            schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
+            id: CoreAccountId::from_bytes([0x11u8; 32]),
+            head_revision_id: CoreRevisionId::from_bytes([0x22u8; 32]),
+            display_name: "X".into(),
+            tags: vec![],
+            usernames: vec!["u".into()],
+            urls: vec![],
+            password_history: vec![PasswordHistorySummaryEntry {
+                password: pangolin_crypto::secret::SecretBytes::new(b"p".to_vec()),
+                set_at_ms,
+                originating_device: CoreDeviceId([0u8; 32]),
+            }],
+            totp_secret: None,
+        };
+        let snap = summary_to_ffi(summary).expect("summary_to_ffi");
+        assert_eq!(snap.password_history[0].set_at, 1_700_000_000_i64);
+    }
 }

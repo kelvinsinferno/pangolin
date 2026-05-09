@@ -4141,12 +4141,10 @@ fn identity_to_summary(
         .iter()
         .map(|u| String::from_utf8(u.expose().to_vec()).unwrap_or_default())
         .collect();
-    let notes_bytes = identity.notes().expose();
-    let notes = if notes_bytes.is_empty() {
-        None
-    } else {
-        Some(String::from_utf8(notes_bytes.to_vec()).unwrap_or_default())
-    };
+    // `notes` are intentionally NOT surfaced on the summary (audit C-1
+    // / plan §D). The persisted `identity.notes` stays in the V1
+    // payload; only the FFI-bound summary is closed. The presence-
+    // gated `reveal_notes` lands in 1.4.
     // Move identity fields out for the summary.
     let crate::account::AccountIdentity {
         password_history,
@@ -4174,7 +4172,6 @@ fn identity_to_summary(
         tags,
         usernames,
         urls,
-        notes,
         password_history,
         totp_secret,
     }
