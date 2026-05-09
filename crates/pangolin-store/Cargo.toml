@@ -46,6 +46,25 @@ ciborium-io       = { workspace = true }
 thiserror         = { workspace = true }
 zeroize           = { workspace = true }
 subtle            = { workspace = true }
+# MVP-1 issue 1.2: URL parsing for AccountIdentity validation. Q3 of
+# 1.2 accepts any RFC-3986 scheme via `url::Url::parse`. Pinned with
+# `default-features = false` so url's serde feature is not enabled by
+# us; cargo's feature unification may still flip it on if a transitive
+# dep enables it (alloy → url-with-serde) — that affects pangolin-store's
+# tree but NOT pangolin-crypto's tree. HIGH-1 (`cargo tree -p pangolin-crypto
+# | grep -ci serde == 0`) is preserved by the directional dep arrow:
+# pangolin-store depends on pangolin-crypto, never the reverse.
+url               = { version = "=2.5.8", default-features = false }
+# MVP-1 issue 1.2 audit H-1: Unicode NFC normalisation on
+# `display_name`, `tags`, `usernames` so visually-identical inputs
+# (precomposed vs decomposed) compare equal. `unicode-normalization`
+# is a small, dependency-light crate that does NOT pull `serde` or
+# `uniffi`, so the HIGH-1 invariant
+# (`cargo tree -p pangolin-crypto | grep -ci serde == 0`) and the
+# Q3-of-1.1 invariant (`cargo tree -p pangolin-core | grep -ci uniffi
+# == 0` and `cargo tree -p pangolin-store | grep -ci uniffi == 0`)
+# both stay 0.
+unicode-normalization = { version = "=0.1.25", default-features = false, features = ["std"] }
 # P4 audit M-3: compile-time thread-safety assertions on `Vault`
 # (`Send` is asserted; `Sync` is asserted NOT to be implemented).
 static_assertions = { workspace = true }

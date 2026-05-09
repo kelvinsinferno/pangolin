@@ -65,6 +65,14 @@ impl SecretPassword {
     pub fn is_empty(&self) -> bool {
         self.bytes.as_slice().is_empty()
     }
+
+    /// Crate-private: borrow the raw bytes for the FFI bridge module.
+    /// External callers cannot reach the bytes directly off a
+    /// `&SecretPassword` reference — the only way out is through this
+    /// crate-private accessor or a presence-gated reveal entry point.
+    pub(crate) fn bytes_for_bridge(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
 }
 
 #[uniffi::export]
@@ -146,28 +154,91 @@ pub struct SessionInfo {
 /// Opaque vault handle. `UniFFI` Object; not cloneable on the foreign
 /// side (refcount lives on the Rust side via `Arc<VaultHandle>`).
 ///
-/// Issue 1.1 ships an empty handle so the FFI scaffolding compiles;
-/// 1.3 / 1.4 add the real backing state (a guarded `pangolin_core::Vault`
-/// reference + an unlock-cache slot).
-#[derive(Debug, uniffi::Object)]
-pub struct VaultHandle;
+/// Issue 1.2 widens the handle to carry an optional `Vault` slot so
+/// the `account_*` FFI bodies can route through real persistence.
+/// Production unlock (`vault_unlock`) and session lifecycle bodies
+/// still land in 1.3 / 1.4; 1.2 only commits to the *slot*.
+#[derive(uniffi::Object)]
+pub struct VaultHandle {
+    inner: std::sync::Mutex<Option<pangolin_core::Vault>>,
+}
+
+impl std::fmt::Debug for VaultHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultHandle")
+            .field("vault", &"<opaque>")
+            .finish()
+    }
+}
 
 impl VaultHandle {
     /// Construct an empty handle (scaffolding only). Real construction
     /// happens via `vault_open` / `vault_create` in 1.3 / 1.4.
     #[must_use]
     pub fn new_placeholder() -> Arc<Self> {
-        Arc::new(Self)
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Issue 1.2 helper: install a fully-prepared `Vault` (already
+    /// unlocked by the caller) into a fresh handle. Used by the
+    /// `account_*` FFI integration tests until 1.4's session-aware
+    /// `vault_open` / `vault_unlock` bodies land.
+    #[must_use]
+    pub fn from_vault(vault: pangolin_core::Vault) -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(Some(vault)),
+        })
+    }
+
+    /// Acquire a guard on the inner vault slot. The guard yields
+    /// `Some(&mut Vault)` when a vault has been installed and `None`
+    /// when the handle is still a placeholder.
+    pub(crate) fn lock_vault(&self) -> VaultGuard<'_> {
+        VaultGuard {
+            inner: self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        }
+    }
+
+    /// True when the handle currently has no vault installed (i.e., it
+    /// was constructed via [`Self::new_placeholder`] and the unlock
+    /// path has not yet wired a real vault in).
+    #[must_use]
+    pub fn is_placeholder_inner(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|guard| guard.is_none())
+            .unwrap_or(true)
+    }
+}
+
+/// RAII guard around the inner `Option<Vault>`. Crate-private so
+/// callers go through the typed `account_*` FFI surface.
+pub(crate) struct VaultGuard<'a> {
+    inner: std::sync::MutexGuard<'a, Option<pangolin_core::Vault>>,
+}
+
+impl VaultGuard<'_> {
+    /// Borrow the vault as `&mut`. Returns
+    /// `Err(FfiError::Session { .. })` when no vault is installed.
+    pub fn as_mut(&mut self) -> Result<&mut pangolin_core::Vault, FfiError> {
+        self.inner.as_mut().ok_or_else(|| FfiError::Session {
+            message: "vault is not unlocked".to_owned(),
+        })
     }
 }
 
 #[uniffi::export]
 impl VaultHandle {
-    /// Marker method so `UniFFI` emits a non-empty interface for the
-    /// handle. Real operations land in 1.3 / 1.4.
+    /// Marker method retained for the round-trip smoke test in
+    /// `tests/roundtrip.rs`.
     #[uniffi::method(name = "is_placeholder")]
     pub fn is_placeholder(&self) -> bool {
-        true
+        self.is_placeholder_inner()
     }
 }
 

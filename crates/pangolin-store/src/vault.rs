@@ -2493,6 +2493,372 @@ impl Vault {
     }
 
     // -----------------------------------------------------------------
+    // MVP-1 issue 1.2: V1 production AccountIdentity entry points.
+    //
+    // These methods are the FFI-facing surface (`account_add` /
+    // `account_update` / `account_get` / `account_search` /
+    // `account_history`). They produce / consume V1 CBOR payloads
+    // (8-key map with `payload_version=1`); the V0 PoC entry points
+    // (`add_account` / `update_account` / `get_account` / `search` /
+    // `revisions_for`) keep working for legacy internal callers and
+    // legacy on-disk vaults.
+    //
+    // Per `docs/issue-plans/1.2.md` Q2, the types live in
+    // `pangolin-store::account`; `pangolin-core` re-exports.
+    // -----------------------------------------------------------------
+
+    /// Add a new account identity (V1 production path). Returns the
+    /// freshly-generated [`AccountId`].
+    ///
+    /// Validates the supplied draft, builds an
+    /// [`crate::account::AccountIdentity`] with a single-entry password
+    /// history (genesis), encrypts the V1 payload, and writes a new
+    /// genesis revision. The decrypted-cache entry is also installed
+    /// (downgraded to a V0-shaped [`AccountSnapshot`] using the head
+    /// password / first username / first url) so existing internal
+    /// callers (`get_account` / `search` / `reveal_*`) keep working.
+    pub fn account_add(
+        &mut self,
+        draft: crate::account::AccountIdentityDraft,
+    ) -> Result<AccountId> {
+        // Same session discipline as the V0 add_account.
+        self.check_session_freshness()?;
+        let _ = self.require_active()?;
+
+        let now = current_unix_ms();
+        let device = self.device_id;
+        let identity = draft.validate_into_identity(now, device)?;
+
+        let account_id = self.derive_fresh_account_id()?;
+        let revision_id = RevisionId::from_bytes(random_32_via_sqlite(&self.conn)?);
+        let parent = RevisionId::GENESIS_PARENT;
+        let aad = build_aad(
+            &self.meta.vault_id,
+            &account_id,
+            &parent,
+            self.meta.wrap_context.schema_version,
+        );
+
+        let active = self.require_active()?;
+        let (ct, nonce) = crate::blob::seal_identity(active.vdk.aead_key(), &identity, &aad)?;
+
+        // Build the V0 cache shadow snapshot (head password / first
+        // username / first url). This keeps the existing cache-bearing
+        // read paths (search, reveal_*) functional during 1.2 while
+        // the production identity lives on disk in V1 form.
+        let cache_snapshot = downgrade_identity_to_snapshot(&identity);
+
+        // Persist (account_identities + revisions + dirty_accounts) in
+        // one transaction.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO account_identities (
+                account_id, created_at, last_modified_at, tombstoned, head_revision_id
+             ) VALUES (?1, ?2, ?2, 0, ?3)",
+            params![
+                account_id.as_bytes().as_slice(),
+                now,
+                revision_id.as_bytes().as_slice(),
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO revisions (
+                revision_id, account_id, parent_revision_id, device_id,
+                schema_version, created_at, enc_payload, enc_nonce, is_tombstone
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+            params![
+                revision_id.as_bytes().as_slice(),
+                account_id.as_bytes().as_slice(),
+                parent.as_bytes().as_slice(),
+                self.device_id.0.as_slice(),
+                i64::from(self.meta.wrap_context.schema_version),
+                now,
+                ct.as_bytes(),
+                nonce.as_bytes().as_slice(),
+            ],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO dirty_accounts
+                (account_id, revision_id, marked_at)
+             VALUES (?1, ?2, ?3)",
+            params![
+                account_id.as_bytes().as_slice(),
+                revision_id.as_bytes().as_slice(),
+                now,
+            ],
+        )?;
+        tx.commit()?;
+
+        let active_mut = self.require_active_mut()?;
+        active_mut.cache.insert(account_id, cache_snapshot);
+        self.touch_session();
+        Ok(account_id)
+    }
+
+    /// Apply a patch to an existing account identity (V1 production
+    /// path). Returns the new revision's id.
+    ///
+    /// Loads the current head as an [`AccountIdentity`] (auto-migrates
+    /// V0 payloads on read per the 1.2 schemata), applies the patch,
+    /// validates, encrypts as V1, writes a new revision pointed at
+    /// the previous head, and updates the cache.
+    pub fn account_update(
+        &mut self,
+        id: AccountId,
+        patch: crate::account::AccountIdentityPatch,
+    ) -> Result<RevisionId> {
+        self.check_session_freshness()?;
+        let _ = self.require_active()?;
+        self.refuse_if_frozen(id)?;
+
+        let account_row = self
+            .conn
+            .query_row(
+                "SELECT tombstoned, head_revision_id
+                 FROM account_identities WHERE account_id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| {
+                    let tombstoned: i64 = row.get(0)?;
+                    let head: Vec<u8> = row.get(1)?;
+                    Ok((tombstoned != 0, head))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::AccountNotFound)?;
+        if account_row.0 {
+            return Err(StoreError::AccountTombstoned);
+        }
+        let head_arr: [u8; REVISION_ID_LEN] = account_row
+            .1
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Corrupted("head_revision_id not 32 bytes".into()))?;
+        let parent = RevisionId::from_bytes(head_arr);
+
+        // Read + decrypt the current head as an AccountIdentity. Routes
+        // through the V1-aware open path which auto-migrates V0 → V1.
+        let mut identity = self.read_identity_at(id, parent)?;
+
+        // Apply the patch — validation runs first, mutations second.
+        let now = current_unix_ms();
+        patch.apply(&mut identity, now, self.device_id)?;
+
+        let revision_id = RevisionId::from_bytes(random_32_via_sqlite(&self.conn)?);
+        let aad = build_aad(
+            &self.meta.vault_id,
+            &id,
+            &parent,
+            self.meta.wrap_context.schema_version,
+        );
+        let active = self.require_active()?;
+        let (ct, nonce) = crate::blob::seal_identity(active.vdk.aead_key(), &identity, &aad)?;
+
+        let cache_snapshot = downgrade_identity_to_snapshot(&identity);
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO revisions (
+                revision_id, account_id, parent_revision_id, device_id,
+                schema_version, created_at, enc_payload, enc_nonce, is_tombstone
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+            params![
+                revision_id.as_bytes().as_slice(),
+                id.as_bytes().as_slice(),
+                parent.as_bytes().as_slice(),
+                self.device_id.0.as_slice(),
+                i64::from(self.meta.wrap_context.schema_version),
+                now,
+                ct.as_bytes(),
+                nonce.as_bytes().as_slice(),
+            ],
+        )?;
+        tx.execute(
+            "UPDATE account_identities
+             SET head_revision_id = ?1, last_modified_at = ?2
+             WHERE account_id = ?3",
+            params![
+                revision_id.as_bytes().as_slice(),
+                now,
+                id.as_bytes().as_slice(),
+            ],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO dirty_accounts
+                (account_id, revision_id, marked_at)
+             VALUES (?1, ?2, ?3)",
+            params![
+                id.as_bytes().as_slice(),
+                revision_id.as_bytes().as_slice(),
+                now,
+            ],
+        )?;
+        tx.commit()?;
+
+        let active_mut = self.require_active_mut()?;
+        active_mut.cache.insert(id, cache_snapshot);
+        self.touch_session();
+        Ok(revision_id)
+    }
+
+    /// Read the current head identity for `id` and surface it as a
+    /// summary (V1 production path).
+    pub fn account_get(&mut self, id: AccountId) -> Result<crate::account::AccountIdentitySummary> {
+        self.check_session_freshness()?;
+        let _ = self.require_active()?;
+        self.refuse_if_frozen(id)?;
+
+        let account_row = self
+            .conn
+            .query_row(
+                "SELECT tombstoned, head_revision_id
+                 FROM account_identities WHERE account_id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| {
+                    let tombstoned: i64 = row.get(0)?;
+                    let head: Vec<u8> = row.get(1)?;
+                    Ok((tombstoned != 0, head))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::AccountNotFound)?;
+        if account_row.0 {
+            return Err(StoreError::AccountTombstoned);
+        }
+        let head_arr: [u8; REVISION_ID_LEN] = account_row
+            .1
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Corrupted("head_revision_id not 32 bytes".into()))?;
+        let head = RevisionId::from_bytes(head_arr);
+
+        let identity = self.read_identity_at(id, head)?;
+        let summary = identity_to_summary(id, head, identity);
+        self.touch_session();
+        Ok(summary)
+    }
+
+    /// Search V1 account identities. Substring + case-insensitive
+    /// match across `display_name`, `tags`, and `urls` only — the
+    /// 1.3 FTS5 indexer must preserve this whitelist.
+    ///
+    /// Returns full summaries (not just ids) so the caller can render
+    /// directly without a follow-up `account_get` per result.
+    pub fn account_search(
+        &mut self,
+        query: &str,
+    ) -> Result<Vec<crate::account::AccountIdentitySummary>> {
+        self.check_session_freshness()?;
+        let _ = self.require_active()?;
+
+        let frozen = self.frozen_set().unwrap_or_default();
+        let mut stmt = self.conn.prepare(
+            "SELECT ai.account_id, ai.head_revision_id
+             FROM account_identities ai
+             WHERE ai.tombstoned = 0
+             ORDER BY ai.created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id_blob: Vec<u8> = row.get(0)?;
+            let head_blob: Vec<u8> = row.get(1)?;
+            Ok((id_blob, head_blob))
+        })?;
+
+        let mut hits = Vec::new();
+        let needle = query.to_lowercase();
+        for r in rows {
+            let (id_blob, head_blob) = r?;
+            let id_arr: [u8; ACCOUNT_ID_LEN] = id_blob
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Corrupted("account_id not 32 bytes".into()))?;
+            let head_arr: [u8; REVISION_ID_LEN] = head_blob
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Corrupted("head_revision_id not 32 bytes".into()))?;
+            let acct = AccountId::from_bytes(id_arr);
+            if frozen.contains(&acct) {
+                continue;
+            }
+            let head = RevisionId::from_bytes(head_arr);
+            let identity = self.read_identity_at(acct, head)?;
+            if needle.is_empty() || identity_matches_search(&identity, &needle) {
+                hits.push(identity_to_summary(acct, head, identity));
+            }
+        }
+        drop(stmt);
+        self.touch_session();
+        Ok(hits)
+    }
+
+    /// Read the revision history for an account (V1 alias for
+    /// [`Self::revisions_for`]).
+    pub fn account_history(&self, id: AccountId) -> Result<Vec<RevisionMeta>> {
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM account_identities WHERE account_id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(StoreError::AccountNotFound);
+        }
+        self.revisions_for(id)
+    }
+
+    /// Decrypt the on-disk payload at `(account_id, revision_id)` and
+    /// hydrate the V1 [`crate::account::AccountIdentity`]. Auto-
+    /// migrates V0 payloads per the 1.2 schemata.
+    fn read_identity_at(
+        &self,
+        id: AccountId,
+        revision_id: RevisionId,
+    ) -> Result<crate::account::AccountIdentity> {
+        let row: (Vec<u8>, Vec<u8>, Vec<u8>, i64) = self
+            .conn
+            .query_row(
+                "SELECT r.parent_revision_id, r.enc_payload, r.enc_nonce, r.schema_version
+                 FROM revisions r
+                 WHERE r.account_id = ?1 AND r.revision_id = ?2",
+                params![id.as_bytes().as_slice(), revision_id.as_bytes().as_slice(),],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::RevisionNotFound)?;
+        let parent_arr: [u8; REVISION_ID_LEN] = row
+            .0
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Corrupted("parent_revision_id not 32 bytes".into()))?;
+        let nonce_arr: [u8; NONCE_LEN] = row
+            .2
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Corrupted("enc_nonce length mismatch".into()))?;
+        let row_schema_version = u8::try_from(row.3).map_err(|_| {
+            StoreError::Corrupted("revisions.schema_version out of u8 range".into())
+        })?;
+
+        let parent = RevisionId::from_bytes(parent_arr);
+        let aad = build_aad(&self.meta.vault_id, &id, &parent, row_schema_version);
+        let ct = Ciphertext::from_vec(row.1);
+        let nonce = Nonce::from_storage_bytes(nonce_arr);
+        let active = self.require_active()?;
+        match crate::blob::open_identity_payload(active.vdk.aead_key(), &nonce, &ct, &aad)? {
+            crate::blob::DecodedIdentityPayload::Live(identity) => Ok(identity),
+            crate::blob::DecodedIdentityPayload::Tombstone(_) => Err(StoreError::AccountTombstoned),
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Revision graph + fork detection (P3)
     // -----------------------------------------------------------------
 
@@ -3722,6 +4088,120 @@ impl Drop for Vault {
         self.active.take();
         release_lock(&self.path);
     }
+}
+
+// =============================================================================
+// MVP-1 issue 1.2: V1 helpers
+// =============================================================================
+
+/// Downgrade an [`AccountIdentity`] to a V0 [`AccountSnapshot`] for
+/// the in-memory cache. Takes head-of-history password, first
+/// username, and first url. Empty-string fallbacks for empty
+/// collections.
+fn downgrade_identity_to_snapshot(identity: &crate::account::AccountIdentity) -> AccountSnapshot {
+    let display_name = SecretBytes::new(identity.display_name.expose().to_vec());
+    let username = identity.usernames.first().map_or_else(
+        || SecretBytes::new(Vec::new()),
+        |s| SecretBytes::new(s.expose().to_vec()),
+    );
+    let password = identity.current_password().map_or_else(
+        || SecretBytes::new(Vec::new()),
+        |s| SecretBytes::new(s.expose().to_vec()),
+    );
+    let url = identity.urls.first().map_or_else(
+        || SecretBytes::new(Vec::new()),
+        |s| SecretBytes::new(s.expose().to_vec()),
+    );
+    let notes = SecretBytes::new(identity.notes().expose().to_vec());
+    let totp_secret = SecretBytes::new(identity.totp_secret().expose().to_vec());
+    AccountSnapshot::new(display_name, username, password, url, notes, totp_secret)
+}
+
+/// Convert an [`AccountIdentity`] into an
+/// [`crate::account::AccountIdentitySummary`] for the FFI bridge.
+fn identity_to_summary(
+    id: AccountId,
+    head_revision_id: RevisionId,
+    identity: crate::account::AccountIdentity,
+) -> crate::account::AccountIdentitySummary {
+    let display_name =
+        String::from_utf8(identity.display_name.expose().to_vec()).unwrap_or_default();
+    let tags = identity
+        .tags
+        .iter()
+        .map(|t| String::from_utf8(t.expose().to_vec()).unwrap_or_default())
+        .collect();
+    let usernames = identity
+        .usernames
+        .iter()
+        .map(|u| String::from_utf8(u.expose().to_vec()).unwrap_or_default())
+        .collect();
+    let urls = identity
+        .urls
+        .iter()
+        .map(|u| String::from_utf8(u.expose().to_vec()).unwrap_or_default())
+        .collect();
+    // `notes` are intentionally NOT surfaced on the summary (audit C-1
+    // / plan §D). The persisted `identity.notes` stays in the V1
+    // payload; only the FFI-bound summary is closed. The presence-
+    // gated `reveal_notes` lands in 1.4.
+    // Move identity fields out for the summary.
+    let crate::account::AccountIdentity {
+        password_history,
+        totp_secret,
+        ..
+    } = identity;
+    let password_history = password_history
+        .into_iter()
+        .map(|e| crate::account::PasswordHistorySummaryEntry {
+            password: e.password,
+            set_at_ms: e.set_at_ms,
+            originating_device: e.originating_device,
+        })
+        .collect();
+    let totp_secret = if totp_secret.expose().is_empty() {
+        None
+    } else {
+        Some(totp_secret)
+    };
+    crate::account::AccountIdentitySummary {
+        schema_version: crate::account::ACCOUNT_IDENTITY_SCHEMA_VERSION,
+        id,
+        head_revision_id,
+        display_name,
+        tags,
+        usernames,
+        urls,
+        password_history,
+        totp_secret,
+    }
+}
+
+/// Substring + case-insensitive match against the search-whitelisted
+/// fields (`display_name`, `tags`, `urls`). Whitelist mirrored in the
+/// 1.3 FTS5 indexer; do NOT add `usernames` / `passwords` / `notes` /
+/// `totp_secret` — that would defeat the §1.3 indexing discipline.
+fn identity_matches_search(identity: &crate::account::AccountIdentity, needle_lower: &str) -> bool {
+    if contains_lower(identity.display_name.expose(), needle_lower) {
+        return true;
+    }
+    for t in &identity.tags {
+        if contains_lower(t.expose(), needle_lower) {
+            return true;
+        }
+    }
+    for u in &identity.urls {
+        if contains_lower(u.expose(), needle_lower) {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_lower(haystack: &[u8], needle_lower: &str) -> bool {
+    let lower = haystack.to_ascii_lowercase();
+    let s = String::from_utf8_lossy(&lower);
+    s.contains(needle_lower)
 }
 
 impl core::fmt::Debug for Vault {

@@ -47,9 +47,11 @@ pub use error::Error;
 // types under `pangolin_core::*`. Q2 (issue 1.1 plan-gate) defers the
 // physical relocation to 1.4; the namespace freezes today.
 pub use pangolin_store::{
-    AccountId, AccountSnapshot, Clock, ConflictReport, IdentityProof, PendingMerge,
-    PinIdentityProof, PresenceProof, PressYPresenceProof, RevisionGraph, RevisionId, RevisionMeta,
-    SessionState, SystemClock, Vault, VaultState,
+    AccountId, AccountIdentity, AccountIdentityDraft, AccountIdentityPatch, AccountIdentitySummary,
+    AccountSnapshot, Clock, ConflictReport, DeviceId, IdentityProof, PasswordEntry,
+    PasswordHistorySummaryEntry, PendingMerge, PinIdentityProof, PresenceProof,
+    PressYPresenceProof, RevisionGraph, RevisionId, RevisionMeta, SessionState, SystemClock, Vault,
+    VaultState, ACCOUNT_IDENTITY_SCHEMA_VERSION, PAYLOAD_VERSION_V0, PAYLOAD_VERSION_V1,
 };
 
 /// Returns the crate name. Useful for diagnostics and version reporting.

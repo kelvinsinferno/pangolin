@@ -180,6 +180,19 @@ pub enum StoreError {
     #[error("operation requires a fresh presence proof")]
     PresenceProofRequired,
 
+    /// **MVP-1 issue 1.2.** A draft / patch failed validation at the
+    /// public-API boundary (e.g., empty display name, unparseable URL,
+    /// over-long username list). The `kind` is a stable category
+    /// label drawn from the `docs/issue-plans/1.2.md` §E table; the
+    /// `message` is a UI-safe description.
+    #[error("validation error ({kind}): {message}")]
+    Validation {
+        /// Stable category label.
+        kind: String,
+        /// UI-safe description.
+        message: String,
+    },
+
     /// **P8 fix CRIT-1.** A user-facing read or edit was attempted
     /// against an account whose `account_identities.frozen_pending_resolve`
     /// flag is set. The flag is set by [`crate::vault::Vault::ingest_chain_revision`]
