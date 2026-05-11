@@ -7,7 +7,10 @@
 use std::process::Command;
 
 use pangolin_crypto::secret::SecretBytes;
-use pangolin_store::{AccountSnapshot, PinIdentityProof, PressYPresenceProof, StoreError, Vault};
+use pangolin_store::{
+    AccountIdentityDraft, AccountIdentityPatch, AccountSnapshot, PinIdentityProof,
+    PressYPresenceProof, StoreError, Vault, ACCOUNT_IDENTITY_SCHEMA_VERSION,
+};
 
 /// Build a fresh `PinIdentityProof` from `fresh_password()`. P4
 /// session-policy: every unlock requires both a presence proof and an
@@ -846,6 +849,393 @@ fn full_session_lifecycle() {
     // previously-added account is loaded back from disk.
     v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
     assert!(v.get_account(id).is_some());
+    v.lock();
+    v.close().unwrap();
+}
+
+// =====================================================================
+// MVP-1 issue 1.3: `:memory:` FTS5-backed account search.
+// =====================================================================
+
+/// Build a V1 account draft with the given display name, tags, urls,
+/// username and password marker. The password is the literal `pw` arg
+/// so the whitelist test can search for it.
+fn v1_draft(
+    display: &str,
+    tags: &[&str],
+    urls: &[&str],
+    username: &str,
+    pw: &str,
+) -> AccountIdentityDraft {
+    AccountIdentityDraft {
+        schema_version: ACCOUNT_IDENTITY_SCHEMA_VERSION,
+        display_name: display.to_owned(),
+        tags: tags.iter().map(|s| (*s).to_owned()).collect(),
+        usernames: vec![username.to_owned()],
+        urls: urls.iter().map(|s| (*s).to_owned()).collect(),
+        notes: format!("notes for {display}"),
+        password: SecretBytes::new(pw.as_bytes().to_vec()),
+        totp_secret: SecretBytes::new(Vec::new()),
+    }
+}
+
+fn empty_patch() -> AccountIdentityPatch {
+    AccountIdentityPatch {
+        schema_version: ACCOUNT_IDENTITY_SCHEMA_VERSION,
+        display_name: None,
+        tags: None,
+        usernames: None,
+        urls: None,
+        notes: None,
+        password: None,
+        totp_secret: None,
+    }
+}
+
+/// Convenience: search and return the display names of the hits.
+fn search_names(v: &mut Vault, q: &str) -> Vec<String> {
+    v.account_search(q)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.display_name)
+        .collect()
+}
+
+/// Criterion 6: a fresh 1.3-build vault has the `:memory:` FTS5 tables
+/// (`account_fts`, `accounts`, `meta_fts` with `fts_schema_version = 1`)
+/// once unlocked; `PRAGMA journal_mode` on disk still returns `wal`.
+#[test]
+fn fresh_vault_has_search_index_on_unlock() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("fresh.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+    let mut v = Vault::open(&path).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    // The index exists and is queryable (empty vault -> no hits).
+    assert!(v.account_search("anything").unwrap().is_empty());
+    v.lock();
+    v.close().unwrap();
+    // On-disk journal mode unchanged.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert!(mode.eq_ignore_ascii_case("wal"));
+}
+
+/// Criterion 8: add accounts; find each by display name, by each tag,
+/// and by the hostname of each URL (`https://github.com/foo` ⇒ found by
+/// `github`); case-insensitive; arbitrary-substring (`ithu` ⇒ github).
+#[test]
+fn search_by_display_name_tag_hostname() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("axes.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+    let mut v = Vault::open(&path).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    v.account_add(v1_draft(
+        "GitHub Work",
+        &["dev", "shared"],
+        &["https://github.com/foo"],
+        "alice@example.com",
+        "pw1",
+    ))
+    .unwrap();
+    v.account_add(v1_draft(
+        "Bank Account",
+        &["finance"],
+        &[
+            "https://mybank.example/login",
+            "mailto:support@mybank.example",
+        ],
+        "bob",
+        "pw2",
+    ))
+    .unwrap();
+
+    // Display name.
+    assert_eq!(search_names(&mut v, "github work"), vec!["GitHub Work"]);
+    // Arbitrary substring (trigram).
+    assert_eq!(search_names(&mut v, "ithu"), vec!["GitHub Work"]);
+    // Tag.
+    assert_eq!(search_names(&mut v, "shared"), vec!["GitHub Work"]);
+    assert_eq!(search_names(&mut v, "finance"), vec!["Bank Account"]);
+    // Hostname (host_str from the URL).
+    assert_eq!(search_names(&mut v, "github"), vec!["GitHub Work"]);
+    assert_eq!(search_names(&mut v, "mybank"), vec!["Bank Account"]);
+    // Case-insensitive.
+    assert_eq!(search_names(&mut v, "GITHUB"), vec!["GitHub Work"]);
+    // Empty query returns all live accounts.
+    let all = v.account_search("   ").unwrap();
+    assert_eq!(all.len(), 2);
+    v.lock();
+    v.close().unwrap();
+}
+
+/// Criterion 8: NFC equivalence — the index sees the NFC (precomposed)
+/// form 1.2's validator produces; a precomposed-`é` query matches.
+#[test]
+fn search_nfc_equivalence() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("nfc.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+    let mut v = Vault::open(&path).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    // Add with the DECOMPOSED form ("Cafe" + combining acute); the
+    // validator normalises to NFC before storing.
+    v.account_add(v1_draft("Cafe\u{0301} Connoisseur", &[], &[], "u@x", "pw"))
+        .unwrap();
+    // Query with the PRECOMPOSED form.
+    assert_eq!(
+        search_names(&mut v, "caf\u{00e9}"),
+        vec!["Café Connoisseur"]
+    );
+    v.lock();
+    v.close().unwrap();
+}
+
+/// Criterion 9: updating `display_name` / `tags` / `urls` reflects in
+/// search (new values present, old gone); tombstoning removes from search.
+#[test]
+fn update_and_tombstone_resync_search() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("resync.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+    let mut v = Vault::open(&path).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    let id = v
+        .account_add(v1_draft(
+            "Old Name",
+            &["oldtag"],
+            &["https://oldhost.example"],
+            "u@x",
+            "pw",
+        ))
+        .unwrap();
+    assert_eq!(search_names(&mut v, "oldtag"), vec!["Old Name"]);
+
+    let mut update_patch = empty_patch();
+    update_patch.display_name = Some("New Name".into());
+    update_patch.tags = Some(vec!["newtag".into()]);
+    update_patch.urls = Some(vec!["https://newhost.example".into()]);
+    v.account_update(id, update_patch).unwrap();
+
+    assert!(v.account_search("oldtag").unwrap().is_empty());
+    assert!(v.account_search("oldhost").unwrap().is_empty());
+    assert!(v.account_search("old name").unwrap().is_empty());
+    assert_eq!(search_names(&mut v, "newtag"), vec!["New Name"]);
+    assert_eq!(search_names(&mut v, "newhost"), vec!["New Name"]);
+    assert_eq!(search_names(&mut v, "new name"), vec!["New Name"]);
+
+    // Tombstone via the V0 delete_account path (the only tombstone path).
+    v.delete_account(id).unwrap();
+    assert!(v.account_search("newtag").unwrap().is_empty());
+    assert!(v.account_search("new name").unwrap().is_empty());
+    v.lock();
+    v.close().unwrap();
+}
+
+/// Criterion 10 (structural whitelist): a known username substring, a
+/// known password substring, and a known notes substring all return
+/// ZERO hits — the FTS5 schema simply has no columns for those fields.
+#[test]
+fn search_never_matches_username_password_notes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("whitelist.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+    let mut v = Vault::open(&path).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    // Distinctive marker tokens that do NOT appear in display/tags/hostnames.
+    v.account_add(AccountIdentityDraft {
+        schema_version: ACCOUNT_IDENTITY_SCHEMA_VERSION,
+        display_name: "Visible Display".into(),
+        tags: vec!["visibletag".into()],
+        usernames: vec!["zzuserzz@example.com".into()],
+        urls: vec!["https://visiblehost.example".into()],
+        notes: "zznotesecretzz recovery phrase".into(),
+        password: SecretBytes::new(b"zzpasswordsecretzz".to_vec()),
+        totp_secret: SecretBytes::new(Vec::new()),
+    })
+    .unwrap();
+    // Sanity: the whitelisted fields ARE searchable.
+    assert_eq!(
+        search_names(&mut v, "visible display"),
+        vec!["Visible Display"]
+    );
+    assert_eq!(search_names(&mut v, "visibletag"), vec!["Visible Display"]);
+    assert_eq!(search_names(&mut v, "visiblehost"), vec!["Visible Display"]);
+    // The non-whitelisted fields are NOT.
+    assert!(
+        v.account_search("zzuserzz").unwrap().is_empty(),
+        "username leaked into the index"
+    );
+    assert!(
+        v.account_search("zzpasswordsecretzz").unwrap().is_empty(),
+        "password leaked into the index"
+    );
+    assert!(
+        v.account_search("zznotesecretzz").unwrap().is_empty(),
+        "notes leaked into the index"
+    );
+    // The full URL (path) is not indexed either — only the host is.
+    assert!(v.account_search("login").unwrap().is_empty());
+    v.lock();
+    v.close().unwrap();
+}
+
+/// Criterion 11 (smoke): a 10k-account vault's `account_search` returns
+/// well under 50ms. `#[ignore]`'d so the normal test run isn't
+/// CI-flaky on a loaded runner; the `cargo bench` (`benches/search_10k.rs`)
+/// is the authoritative measurement. Run with:
+/// `cargo test -p pangolin-store --release --features test-utilities -- --ignored search_10k_smoke`
+#[test]
+#[ignore = "perf smoke; run with --release --features test-utilities -- --ignored"]
+fn search_10k_smoke() {
+    use std::time::Instant;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("perf10k.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+    let mut v = Vault::open(&path).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    for i in 0..10_000u32 {
+        v.account_add(v1_draft(
+            &format!("Service {i}"),
+            &[
+                "bench",
+                if i.is_multiple_of(7) {
+                    "rare"
+                } else {
+                    "common"
+                },
+            ],
+            &[&format!("https://host{i}.example/path")],
+            &format!("user{i}@example.com"),
+            "pw",
+        ))
+        .unwrap();
+    }
+    let t0 = Instant::now();
+    let hits = v.account_search("service").unwrap();
+    let dt = t0.elapsed();
+    eprintln!(
+        "[search_10k_smoke] account_search(\"service\") over 10k = {dt:?}, {} hits (capped)",
+        hits.len()
+    );
+    assert!(
+        dt < std::time::Duration::from_millis(40),
+        "account_search over 10k accounts took {dt:?}, expected < 40ms (generous headroom under the 50ms exit criterion)"
+    );
+    // A rarer term.
+    let t1 = Instant::now();
+    let _ = v.account_search("rare").unwrap();
+    eprintln!(
+        "[search_10k_smoke] account_search(\"rare\") over 10k = {:?}",
+        t1.elapsed()
+    );
+    v.lock();
+    v.close().unwrap();
+}
+
+/// Criterion 12 (corruption): an interrupted FTS5 sync (here simulated
+/// by dropping the search index mid-session and re-unlocking) leaves
+/// the index correct again — it is rebuilt from the intact blob table.
+/// The `:memory:` index puts nothing on disk, so an interrupted update
+/// can never desync persistently.
+#[test]
+fn search_index_rebuilds_on_reunlock() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("rebuild.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+    let mut v = Vault::open(&path).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    v.account_add(v1_draft(
+        "Alpha One",
+        &["t1"],
+        &["https://alpha.example"],
+        "u@x",
+        "pw",
+    ))
+    .unwrap();
+    v.account_add(v1_draft(
+        "Beta Two",
+        &["t2"],
+        &["https://beta.example"],
+        "u@x",
+        "pw",
+    ))
+    .unwrap();
+    assert_eq!(search_names(&mut v, "alpha"), vec!["Alpha One"]);
+
+    // Drop the in-RAM index by locking (frees the `:memory:` arena),
+    // then re-unlock — the index is rebuilt from the blob table.
+    v.lock();
+    // While locked, search errors (no `:memory:` index).
+    assert!(matches!(
+        v.account_search("alpha"),
+        Err(StoreError::NotUnlocked)
+    ));
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    // Index is correct again.
+    let mut names = search_names(&mut v, "");
+    names.sort();
+    assert_eq!(names, vec!["Alpha One".to_string(), "Beta Two".to_string()]);
+    assert_eq!(search_names(&mut v, "beta"), vec!["Beta Two"]);
+    v.lock();
+    v.close().unwrap();
+}
+
+/// V0-format precedent: a vault populated through the legacy V0
+/// `add_account` / `update_account` shims still gets a working search
+/// index built on unlock (the index is rebuilt from the decrypted
+/// blobs regardless of blob version). Also exercises the V0 sync hooks.
+#[test]
+fn v0_path_builds_and_syncs_search_index() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("v0.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+    let id;
+    {
+        let mut v = Vault::open(&path).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        id = v
+            .add_account(AccountSnapshot::new(
+                SecretBytes::new(b"Legacy V0 Service".to_vec()),
+                SecretBytes::new(b"alice".to_vec()),
+                SecretBytes::new(b"hunter2".to_vec()),
+                SecretBytes::new(b"https://legacyhost.example/x".to_vec()),
+                SecretBytes::new(b"v0 notes".to_vec()),
+                SecretBytes::new(b"".to_vec()),
+            ))
+            .unwrap();
+        // Same-session search works through the V0 sync hook.
+        assert_eq!(search_names(&mut v, "legacy v0"), vec!["Legacy V0 Service"]);
+        assert_eq!(
+            search_names(&mut v, "legacyhost"),
+            vec!["Legacy V0 Service"]
+        );
+        v.lock();
+        v.close().unwrap();
+    }
+    // Reopen: index rebuilt from the V0 blob.
+    let mut v = Vault::open(&path).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    assert_eq!(search_names(&mut v, "legacy"), vec!["Legacy V0 Service"]);
+    // Update via the V0 shim resyncs.
+    v.update_account(
+        id,
+        AccountSnapshot::new(
+            SecretBytes::new(b"Renamed V0".to_vec()),
+            SecretBytes::new(b"alice".to_vec()),
+            SecretBytes::new(b"hunter3".to_vec()),
+            SecretBytes::new(b"https://newv0host.example".to_vec()),
+            SecretBytes::new(b"v0 notes".to_vec()),
+            SecretBytes::new(b"".to_vec()),
+        ),
+    )
+    .unwrap();
+    assert!(v.account_search("legacy").unwrap().is_empty());
+    assert_eq!(search_names(&mut v, "renamed"), vec!["Renamed V0"]);
+    assert_eq!(search_names(&mut v, "newv0host"), vec!["Renamed V0"]);
     v.lock();
     v.close().unwrap();
 }

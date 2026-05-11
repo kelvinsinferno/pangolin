@@ -58,7 +58,7 @@ use crate::revision::{
     ChainAnchor, DeviceId, RevisionGraph, RevisionId, RevisionMeta, REVISION_ID_LEN,
 };
 use crate::schema;
-use crate::search::DecryptedCache;
+use crate::search::{DecryptedCache, SearchIndex, SearchProjection};
 use crate::session::{
     next_idle_deadline, Clock, IdentityProof, PresenceProof, SessionState, SystemClock,
     IDLE_TIMEOUT_DEFAULT,
@@ -262,6 +262,12 @@ impl Drop for UmaskGuard {
 struct ActiveState {
     vdk: VdkKey,
     cache: DecryptedCache,
+    /// MVP-1 issue 1.3: the `:memory:` FTS5 search index over the
+    /// non-secret searchable projection of every live account. Built
+    /// from the decrypted blobs on `unlock`; kept in sync from the
+    /// add / update / delete paths; `SQLite` frees the arena when this
+    /// `ActiveState` drops on `lock()` / expiry / `Drop`.
+    search_index: SearchIndex,
 }
 
 impl Vault {
@@ -639,14 +645,25 @@ impl Vault {
         // Authority was only needed to unwrap; drop immediately.
         drop(authority);
 
-        // Step 6: rebuild the decrypted cache.
-        let cache = build_decrypted_cache(&self.conn, &self.meta, vdk.aead_key())?;
+        // Step 6: rebuild the decrypted cache AND the `:memory:` FTS5
+        // search index in one decrypt pass over the live heads (1.3).
+        // The index is RAM-only and rebuilt fresh on every unlock, so an
+        // interrupted sync can never desync it persistently; V0-format
+        // and 1.2-V1-format vaults alike get a working index here
+        // regardless of blob version (the decrypt is V1-aware).
+        let (cache, search_index) =
+            build_active_state_data(&self.conn, &self.meta, vdk.aead_key())?;
 
         // Step 7: install the new ActiveState and session timer. If a
         // prior ActiveState exists (case 1 above), `Option::replace`
-        // drops the old one, which zeroizes its cache + VDK.
+        // drops the old one, which zeroizes its cache + VDK and frees
+        // the prior `:memory:` index.
         let now = self.clock.now();
-        self.active = Some(ActiveState { vdk, cache });
+        self.active = Some(ActiveState {
+            vdk,
+            cache,
+            search_index,
+        });
         self.session_state = SessionState::Active {
             expires_at: now + IDLE_TIMEOUT_DEFAULT,
             last_proof_at: now,
@@ -931,7 +948,11 @@ impl Vault {
         )?;
         tx.commit()?;
 
+        // 1.3: keep the `:memory:` FTS5 index in sync (V0 shim — no
+        // tags; the single `url` is host-extracted like a V1 URL).
+        let projection = SearchProjection::from_snapshot(&snapshot);
         let active = self.require_active_mut()?;
+        active.search_index.insert(account_id, now, &projection)?;
         active.cache.insert(account_id, snapshot);
         // P4: success path touches the session — extends the idle
         // deadline (capped at session_started_at + ABSOLUTE_MAX_DEFAULT).
@@ -1072,7 +1093,10 @@ impl Vault {
         )?;
         tx.commit()?;
 
+        // 1.3: resync the `:memory:` FTS5 index (V0 shim).
+        let projection = SearchProjection::from_snapshot(&new_snapshot);
         let active = self.require_active_mut()?;
+        active.search_index.update(id, now, &projection)?;
         active.cache.insert(id, new_snapshot);
         self.touch_session();
         Ok(revision_id)
@@ -1174,7 +1198,11 @@ impl Vault {
         )?;
         tx.commit()?;
 
+        // 1.3: a tombstoned account must not appear in search — drop
+        // its `:memory:` FTS5 row (makes the whitelist structural for
+        // deleted accounts too).
         let active = self.require_active_mut()?;
+        active.search_index.remove(id)?;
         let _ = active.cache.remove(id);
         self.touch_session();
         Ok(())
@@ -2589,7 +2617,17 @@ impl Vault {
         )?;
         tx.commit()?;
 
+        // 1.3: keep the `:memory:` FTS5 index in sync. Runs after the
+        // blob write commits, so the index never reflects an
+        // uncommitted revision; a crash before this line just means the
+        // next unlock rebuilds the (RAM-only) index from the committed
+        // blobs.
+        let projection = SearchProjection::from_identity(&identity);
+        drop(identity);
         let active_mut = self.require_active_mut()?;
+        active_mut
+            .search_index
+            .insert(account_id, now, &projection)?;
         active_mut.cache.insert(account_id, cache_snapshot);
         self.touch_session();
         Ok(account_id)
@@ -2694,7 +2732,11 @@ impl Vault {
         )?;
         tx.commit()?;
 
+        // 1.3: resync the `:memory:` FTS5 index for this account.
+        let projection = SearchProjection::from_identity(&identity);
+        drop(identity);
         let active_mut = self.require_active_mut()?;
+        active_mut.search_index.update(id, now, &projection)?;
         active_mut.cache.insert(id, cache_snapshot);
         self.touch_session();
         Ok(revision_id)
@@ -2737,12 +2779,28 @@ impl Vault {
         Ok(summary)
     }
 
-    /// Search V1 account identities. Substring + case-insensitive
-    /// match across `display_name`, `tags`, and `urls` only — the
-    /// 1.3 FTS5 indexer must preserve this whitelist.
+    /// Search V1 account identities, backed by the `:memory:` FTS5
+    /// index built at unlock (MVP-1 issue 1.3).
+    ///
+    /// Tokenises the query, runs an FTS5 `MATCH` over the non-secret
+    /// searchable projection (`display_name`, canonical `tags`, URL-
+    /// derived `hostnames` — the whitelist is structural; the index has
+    /// no columns for `usernames` / full URLs / `notes` / passwords /
+    /// `totp_secret`), orders by `bm25()` with a most-recently-modified
+    /// tiebreaker, applies default-AND multi-term semantics, and caps
+    /// the result count at [`crate::search::ACCOUNT_SEARCH_RESULT_CAP`].
+    /// A query whose `trim()` is empty returns every live account
+    /// ordered by recency (capped). Queries shorter than the `trigram`
+    /// 3-char minimum fall back to a `LIKE` substring scan over the same
+    /// projection columns.
+    ///
+    /// Tombstoned accounts are not in the index; frozen accounts are
+    /// filtered out at query time (preserving 1.2's behaviour).
     ///
     /// Returns full summaries (not just ids) so the caller can render
-    /// directly without a follow-up `account_get` per result.
+    /// directly without a follow-up `account_get` per result. If the
+    /// vault is not unlocked the usual session error surfaces (no
+    /// `:memory:` index exists when locked).
     pub fn account_search(
         &mut self,
         query: &str,
@@ -2751,41 +2809,36 @@ impl Vault {
         let _ = self.require_active()?;
 
         let frozen = self.frozen_set().unwrap_or_default();
-        let mut stmt = self.conn.prepare(
-            "SELECT ai.account_id, ai.head_revision_id
-             FROM account_identities ai
-             WHERE ai.tombstoned = 0
-             ORDER BY ai.created_at ASC",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let id_blob: Vec<u8> = row.get(0)?;
-            let head_blob: Vec<u8> = row.get(1)?;
-            Ok((id_blob, head_blob))
-        })?;
+        let candidates = self.require_active()?.search_index.search(query)?;
 
-        let mut hits = Vec::new();
-        let needle = query.to_lowercase();
-        for r in rows {
-            let (id_blob, head_blob) = r?;
-            let id_arr: [u8; ACCOUNT_ID_LEN] = id_blob
-                .as_slice()
-                .try_into()
-                .map_err(|_| StoreError::Corrupted("account_id not 32 bytes".into()))?;
+        let mut hits = Vec::with_capacity(candidates.len());
+        for (acct, _updated_at) in candidates {
+            if frozen.contains(&acct) {
+                continue;
+            }
+            // Re-read the head pointer from SQL (authoritative) rather
+            // than trusting the in-RAM index's notion of "current".
+            let head_blob: Option<Vec<u8>> = self
+                .conn
+                .query_row(
+                    "SELECT head_revision_id FROM account_identities
+                     WHERE account_id = ?1 AND tombstoned = 0",
+                    params![acct.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(head_blob) = head_blob else {
+                // Raced with a tombstone; skip.
+                continue;
+            };
             let head_arr: [u8; REVISION_ID_LEN] = head_blob
                 .as_slice()
                 .try_into()
                 .map_err(|_| StoreError::Corrupted("head_revision_id not 32 bytes".into()))?;
-            let acct = AccountId::from_bytes(id_arr);
-            if frozen.contains(&acct) {
-                continue;
-            }
             let head = RevisionId::from_bytes(head_arr);
             let identity = self.read_identity_at(acct, head)?;
-            if needle.is_empty() || identity_matches_search(&identity, &needle) {
-                hits.push(identity_to_summary(acct, head, identity));
-            }
+            hits.push(identity_to_summary(acct, head, identity));
         }
-        drop(stmt);
         self.touch_session();
         Ok(hits)
     }
@@ -4177,33 +4230,6 @@ fn identity_to_summary(
     }
 }
 
-/// Substring + case-insensitive match against the search-whitelisted
-/// fields (`display_name`, `tags`, `urls`). Whitelist mirrored in the
-/// 1.3 FTS5 indexer; do NOT add `usernames` / `passwords` / `notes` /
-/// `totp_secret` — that would defeat the §1.3 indexing discipline.
-fn identity_matches_search(identity: &crate::account::AccountIdentity, needle_lower: &str) -> bool {
-    if contains_lower(identity.display_name.expose(), needle_lower) {
-        return true;
-    }
-    for t in &identity.tags {
-        if contains_lower(t.expose(), needle_lower) {
-            return true;
-        }
-    }
-    for u in &identity.urls {
-        if contains_lower(u.expose(), needle_lower) {
-            return true;
-        }
-    }
-    false
-}
-
-fn contains_lower(haystack: &[u8], needle_lower: &str) -> bool {
-    let lower = haystack.to_ascii_lowercase();
-    let s = String::from_utf8_lossy(&lower);
-    s.contains(needle_lower)
-}
-
 impl core::fmt::Debug for Vault {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // Format vault_id inline as hex without pulling a hex crate.
@@ -4258,37 +4284,55 @@ fn random_32_via_sqlite(conn: &Connection) -> Result<[u8; 32]> {
         .map_err(|_| StoreError::Corrupted(format!("randomblob(32) returned {} bytes", blob.len())))
 }
 
-/// Pull all live (non-tombstoned) account heads, decrypt them, and
-/// build the in-memory cache.
-fn build_decrypted_cache(
+/// Pull all live (non-tombstoned) account heads, AEAD-decrypt them once,
+/// and build BOTH the in-memory [`DecryptedCache`] (V0-shaped snapshot —
+/// the legacy read-path cache) AND the `:memory:` FTS5 [`SearchIndex`]
+/// (MVP-1 issue 1.3 — over the non-secret searchable projection).
+///
+/// The decrypt routes through the V1-aware `open_identity_payload`, which
+/// auto-migrates V0 payloads to the `AccountIdentity` shape, so this
+/// single pass handles V0-format and 1.2-V1-format vaults alike — the
+/// cache snapshot is the `downgrade_identity_to_snapshot` projection and
+/// the index gets the whitelisted-fields projection. Decrypting once
+/// rather than twice keeps the unlock cost (the dominant 10k-account
+/// cost is the per-head AEAD decrypt) from doubling.
+///
+/// Recency stamp for the index is the row's `last_modified_at`. Frozen
+/// accounts are still indexed; the `account_search` query-side filter
+/// drops them (the freeze flag can flip at runtime via
+/// `ingest_chain_revision`, so filtering at query time is the only
+/// correct place).
+///
+/// MEDIUM-4 (P2 audit): the per-row `schema_version` is bound into the
+/// AAD on decrypt — tampering it on disk diverges the reconstructed AAD
+/// from the seal-time AAD and the AEAD open fails → `AuthenticationFailed`.
+fn build_active_state_data(
     conn: &Connection,
     meta: &VaultMeta,
     vdk_aead: &AeadKey,
-) -> Result<DecryptedCache> {
+) -> Result<(DecryptedCache, SearchIndex)> {
     let mut cache = DecryptedCache::new();
-    // MEDIUM-4 (P2 audit): include the per-row `schema_version` in the
-    // SELECT so we can bind the row's claimed schema version into the
-    // AAD on decrypt. If an attacker edits this column on disk the
-    // reconstructed AAD diverges from the seal-time AAD and the AEAD
-    // open fails → AuthenticationFailed. Without binding the per-row
-    // value, the column was inert (writes set it, reads ignored it).
+    let mut index = SearchIndex::new_empty()?;
     let mut stmt = conn.prepare(
-        "SELECT ai.account_id, r.parent_revision_id, r.enc_payload, r.enc_nonce, r.schema_version
+        "SELECT ai.account_id, ai.last_modified_at, r.parent_revision_id, r.enc_payload,
+                r.enc_nonce, r.schema_version
          FROM account_identities ai
          JOIN revisions r ON ai.head_revision_id = r.revision_id
          WHERE ai.tombstoned = 0",
     )?;
     let rows = stmt.query_map([], |row| {
-        let account_id: Vec<u8> = row.get(0)?;
-        let parent: Vec<u8> = row.get(1)?;
-        let payload: Vec<u8> = row.get(2)?;
-        let nonce: Vec<u8> = row.get(3)?;
-        let schema_version_i: i64 = row.get(4)?;
-        Ok((account_id, parent, payload, nonce, schema_version_i))
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+            row.get::<_, i64>(5)?,
+        ))
     })?;
-
     for raw in rows {
-        let (account_id_blob, parent_blob, payload, nonce_blob, schema_version_i) = raw?;
+        let (account_id_blob, last_modified_at, parent_blob, payload, nonce_blob, schema_version_i) =
+            raw?;
         let account_id_arr: [u8; ACCOUNT_ID_LEN] = account_id_blob
             .as_slice()
             .try_into()
@@ -4301,24 +4345,23 @@ fn build_decrypted_cache(
             .as_slice()
             .try_into()
             .map_err(|_| StoreError::Corrupted("enc_nonce length mismatch".into()))?;
-        // The per-row schema_version column is u8 in spirit; an out-of-
-        // range value indicates row-level corruption (or a deliberate
-        // tamper attempting to inject a value too large to fit). Either
-        // way, surface it as Corrupted rather than silently truncating.
         let row_schema_version = u8::try_from(schema_version_i).map_err(|_| {
             StoreError::Corrupted("revisions.schema_version out of u8 range".into())
         })?;
-
         let account_id = AccountId::from_bytes(account_id_arr);
         let parent = RevisionId::from_bytes(parent_arr);
         let aad = build_aad(&meta.vault_id, &account_id, &parent, row_schema_version);
         let ct = Ciphertext::from_vec(payload);
         let nonce = Nonce::from_storage_bytes(nonce_arr);
-        match open_payload(vdk_aead, &nonce, &ct, &aad)? {
-            DecodedPayload::Live(snapshot) => {
+        match crate::blob::open_identity_payload(vdk_aead, &nonce, &ct, &aad)? {
+            crate::blob::DecodedIdentityPayload::Live(identity) => {
+                let projection = SearchProjection::from_identity(&identity);
+                let snapshot = downgrade_identity_to_snapshot(&identity);
+                drop(identity);
+                index.insert(account_id, last_modified_at, &projection)?;
                 cache.insert(account_id, snapshot);
             }
-            DecodedPayload::Tombstone(_) => {
+            crate::blob::DecodedIdentityPayload::Tombstone(_) => {
                 // A tombstoned head should not have appeared because
                 // ai.tombstoned = 0 in the WHERE clause, but if it
                 // does we treat it as corruption.
@@ -4328,7 +4371,8 @@ fn build_decrypted_cache(
             }
         }
     }
-    Ok(cache)
+    drop(stmt);
+    Ok((cache, index))
 }
 
 /// **P9-1.** Helper struct factored out so the `query_row` body in

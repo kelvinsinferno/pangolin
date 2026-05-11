@@ -58,9 +58,30 @@ the right-most column.
 |---|---|
 | `account_add(h: &VaultHandle, draft: AccountDraft) -> Result<AccountId, FfiError>` | 1.2 |
 | `account_update(h: &VaultHandle, id: AccountId, patch: AccountPatch) -> Result<RevisionId, FfiError>` | 1.2 |
-| `account_search(h: &VaultHandle, query: &str) -> Result<Vec<AccountSnapshot>, FfiError>` | 1.2 |
+| `account_search(h: &VaultHandle, query: &str) -> Result<Vec<AccountSnapshot>, FfiError>` | 1.2 (impl 1.3) |
 | `account_get(h: &VaultHandle, id: AccountId) -> Result<AccountSnapshot, FfiError>` | 1.2 |
 | `account_history(h: &VaultHandle, id: AccountId) -> Result<Vec<RevisionMeta>, FfiError>` | 1.2 |
+
+**`account_search` behaviour (MVP-1 issue 1.3).** The signature is
+frozen at 1.1; 1.3 supplies the production body. Search is backed by an
+in-RAM (`:memory:`) SQLite FTS5 index over the *non-secret* searchable
+projection of every live account — `display_name`, the canonical
+`tags`, and the `url::Url::host_str()`-derived hostname of each URL,
+and **never** `usernames` / full URLs / `notes` / passwords / TOTP
+secrets (the whitelist is structural — the FTS5 schema has no columns
+for those). Tokenizer = `trigram` (true arbitrary-substring match —
+`"ithu"` finds `"github.com"`); results are `bm25()`-ranked with a
+most-recently-modified recency tiebreaker; multi-term queries are
+default-AND (`"git main"` ⇒ both); the result list is capped at 200
+(`pangolin_store::ACCOUNT_SEARCH_RESULT_CAP`). An empty / whitespace
+query returns every live account, recency-ordered, same cap. Queries
+shorter than 3 characters fall back to a substring scan over the same
+projection columns. Tombstoned accounts never appear; frozen accounts
+are filtered out. The index is rebuilt from the decrypted blobs on
+every `vault_unlock` (so V0-format and 1.2-V1-format vaults alike get a
+working index) and torn down on `vault_lock` / `vault_close` — nothing
+extra is written to disk. See `docs/architecture/search.md` for the
+full design. `FfiError::NotUnlocked` if the vault is locked.
 
 ### Session
 
