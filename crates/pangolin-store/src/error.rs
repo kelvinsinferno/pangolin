@@ -180,6 +180,21 @@ pub enum StoreError {
     #[error("operation requires a fresh presence proof")]
     PresenceProofRequired,
 
+    /// **MVP-1 issue 1.4 — Session spec §7.7.** A presence prompt
+    /// surfaced for a high-risk action expired before it was answered:
+    /// the supplied presence proof's construction timestamp is already
+    /// older than [`crate::session::PRESENCE_FRESHNESS`] / equivalently
+    /// past [`crate::session::PROMPT_TIMEOUT`] by the time it reaches a
+    /// reveal-class call site. Spec §8.2 mandates prompts never silently
+    /// fail; this is the loud, typed failure. Distinct from
+    /// `AuthenticationFailed` because a timed-out prompt is a UX signal
+    /// ("re-run the command"), not a content-class authentication
+    /// failure — it reveals nothing about any secret. The `PressYPresenceProof`
+    /// (CLI tier) models the timeout as a proof whose `created_at` has
+    /// aged past the freshness window.
+    #[error("presence prompt timed out; re-run the action")]
+    PromptTimedOut,
+
     /// **MVP-1 issue 1.2.** A draft / patch failed validation at the
     /// public-API boundary (e.g., empty display name, unparseable URL,
     /// over-long username list). The `kind` is a stable category

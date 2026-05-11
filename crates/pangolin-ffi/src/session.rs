@@ -137,18 +137,40 @@ pub struct PresenceProof {
 }
 
 /// Vault state + session metadata returned from `vault_unlock` /
-/// `session_status`. Field set is the locked-in-1.1 minimum;
-/// 1.4 may add fields (additive only — no field removals after lock).
+/// `session_status` / `session_extend`.
+///
+/// The first three fields are the locked-in-1.1 minimum; MVP-1 issue
+/// 1.4 adds the deadline / config fields (additive only — no field
+/// removals after lock; flagged in `docs/architecture/ffi-surface.md`
+/// as an additive amendment, same posture as 1.2's record widenings).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SessionInfo {
     /// Issue 1.1 schema-version slot.
     pub schema_version: u16,
-    /// Wall-clock timestamp the session was last refreshed. Foreign-
-    /// language sides treat this as opaque.
+    /// Wall-clock unix-second timestamp the session was last refreshed
+    /// (the most recent activity touch / proof). `0` when not active.
     pub last_refresh_unix: i64,
     /// Whether the session is currently active. `false` means the
     /// caller must re-supply both proofs to resume.
     pub is_active: bool,
+    /// **1.4 (additive).** Wall-clock unix-second instant the idle
+    /// timer fires. `0` when not active. For `SessionDuration::UntilDeviceLock`
+    /// this equals `absolute_deadline_unix` (no idle leg).
+    pub idle_deadline_unix: i64,
+    /// **1.4 (additive).** Wall-clock unix-second instant the absolute-
+    /// max ceiling (4 h, not configurable) fires regardless of
+    /// activity. `0` when not active.
+    pub absolute_deadline_unix: i64,
+    /// **1.4 (additive).** The configured idle duration in seconds
+    /// (Session spec §7.2: one of 300 / 900 / 1800 / 3600 / 14400) or
+    /// `-1` for "until device lock". Always present (a property of the
+    /// vault file, valid even when locked).
+    pub configured_idle_secs: i64,
+    /// **1.4 (additive).** Wall-clock unix-second instant until which
+    /// the last successful presence proof remains "fresh" (the 60 s
+    /// dedup window — a reveal-class op before this instant does not
+    /// re-prompt). `0` when not active.
+    pub last_presence_fresh_until_unix: i64,
 }
 
 /// Opaque vault handle. `UniFFI` Object; not cloneable on the foreign
@@ -230,6 +252,14 @@ impl VaultGuard<'_> {
             message: "vault is not unlocked".to_owned(),
         })
     }
+
+    /// Take the inner `Vault` out, leaving the handle empty. Used by
+    /// `vault_close` (which consumes the `Vault` to release the
+    /// `SQLite` connection). Returns `None` if the handle was already
+    /// empty (idempotent close).
+    pub fn take(&mut self) -> Option<pangolin_core::Vault> {
+        self.inner.take()
+    }
 }
 
 #[uniffi::export]
@@ -275,85 +305,209 @@ pub struct PlaintextExportConfirmation {
     pub token: Vec<u8>,
 }
 
-// -- Locked-in-1.1 vault lifecycle entry points -----------------------
-//
-// Bodies are `todo!()` until 1.3 / 1.4 land. `tests/roundtrip.rs`
-// asserts the FFI bindgen sees these signatures and emits non-empty
-// Swift / Kotlin scaffolding for them; the runtime panic is irrelevant
-// to that smoke test.
+// -- Vault lifecycle + session entry points (bodies: MVP-1 issue 1.4) -
 
-/// Create a fresh vault on disk. Body lands in 1.3.
+fn store_into_ffi(err: pangolin_store::StoreError) -> FfiError {
+    FfiError::from(pangolin_core::Error::from(err))
+}
+
+/// Convert a `SystemTime` to whole unix seconds, or `0` on under/overflow.
+fn system_time_to_unix(t: std::time::SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or(0)
+}
+
+/// A "not active" [`SessionInfo`] (vault locked / expired / no handle),
+/// carrying only the configured idle duration.
+fn not_active_session_info(configured_idle_secs: i64) -> SessionInfo {
+    SessionInfo {
+        schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
+        last_refresh_unix: 0,
+        is_active: false,
+        idle_deadline_unix: 0,
+        absolute_deadline_unix: 0,
+        configured_idle_secs,
+        last_presence_fresh_until_unix: 0,
+    }
+}
+
+/// Build the FFI [`SessionInfo`] from a `pangolin_core::Vault`'s
+/// current session state. Read-only; never touches the proof.
+fn session_info_from_vault(vault: &pangolin_core::Vault) -> SessionInfo {
+    use pangolin_core::SessionState;
+    let configured_idle_secs = vault.session_idle().to_meta_secs();
+    let SessionState::Active {
+        expires_at,
+        last_proof_at,
+        ..
+    } = vault.session_state()
+    else {
+        return not_active_session_info(configured_idle_secs);
+    };
+    let absolute = vault
+        .session_absolute_deadline()
+        .map_or(0, system_time_to_unix);
+    let presence_fresh_until = vault.last_presence_at().map_or(0, |p| {
+        system_time_to_unix(p + pangolin_core::PRESENCE_FRESHNESS)
+    });
+    SessionInfo {
+        schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
+        last_refresh_unix: system_time_to_unix(last_proof_at),
+        is_active: vault.is_session_active(),
+        idle_deadline_unix: system_time_to_unix(expires_at),
+        absolute_deadline_unix: absolute,
+        configured_idle_secs,
+        last_presence_fresh_until_unix: presence_fresh_until,
+    }
+}
+
+/// Create a fresh vault on disk at `path`.
 ///
-/// # Panics
-/// Panics with `todo!()` until 1.3 lands.
+/// Derives the authority from `password`. Returns the vault `Locked`
+/// (the caller must [`vault_open`] + [`vault_unlock`] before adding
+/// accounts). The password bytes zero on drop after the call returns.
+///
+/// # Errors
+///
+/// `FfiError::Store` for an I/O / `SQLite` failure (e.g. the file
+/// already exists); `FfiError::Validation { kind: "authentication" }`
+/// for a crypto-class failure.
 #[uniffi::export]
 pub fn vault_create(path: String, password: Arc<SecretPassword>) -> Result<(), FfiError> {
-    let _ = (path, password);
-    todo!("vault_create body lands in MVP-1 issue 1.3")
+    let mut pw = zeroize::Zeroizing::new(password.bytes_for_bridge().to_vec());
+    let secret = pangolin_crypto::secret::SecretBytes::new(std::mem::take(&mut *pw));
+    pangolin_core::Vault::create(std::path::Path::new(&path), &secret).map_err(store_into_ffi)?;
+    Ok(())
 }
 
-/// Open a previously-created vault file. Body lands in 1.3.
+/// Open a previously-created vault file. Returns an opaque
+/// [`VaultHandle`] holding the locked `Vault`.
 ///
-/// # Panics
-/// Panics with `todo!()` until 1.3 lands.
+/// # Errors
+///
+/// `FfiError::Store` for a bad magic / unsupported format version /
+/// already-open / `SQLite` failure.
 #[uniffi::export]
 pub fn vault_open(path: String) -> Result<Arc<VaultHandle>, FfiError> {
-    let _ = path;
-    todo!("vault_open body lands in MVP-1 issue 1.3")
+    let vault = pangolin_core::Vault::open(std::path::Path::new(&path)).map_err(store_into_ffi)?;
+    Ok(VaultHandle::from_vault(vault))
 }
 
-/// Unlock a vault with password + presence proof. Body lands in 1.4.
+/// Unlock a vault — the 2-proof start of the session invariant.
 ///
-/// # Panics
-/// Panics with `todo!()` until 1.4 lands.
+/// The password is the identity proof; `presence` is the presence
+/// proof (the CLI tier maps it to a fresh `PressYPresenceProof::confirmed()`;
+/// the `presence.bytes` field is the slot MVP-3/4 hardware proofs
+/// fill). Returns the resulting [`SessionInfo`]. The password bytes
+/// zero on drop after the call returns.
+///
+/// # Errors
+///
+/// `FfiError::Validation { kind: "authentication" }` for any proof- or
+/// crypto-class failure (wrong password, replayed/stale presence,
+/// tampered meta — all collapse, MEDIUM-1 indistinguishability);
+/// `FfiError::Session` if the handle has no vault installed.
+#[allow(clippy::significant_drop_tightening)]
 #[uniffi::export]
 pub fn vault_unlock(
     handle: Arc<VaultHandle>,
     password: Arc<SecretPassword>,
     presence: PresenceProof,
 ) -> Result<SessionInfo, FfiError> {
-    let _ = (handle, password, presence);
-    todo!("vault_unlock body lands in MVP-1 issue 1.4")
+    let _ = presence; // CLI tier ignores the bytes; see module note.
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    let mut pw = zeroize::Zeroizing::new(password.bytes_for_bridge().to_vec());
+    let identity = pangolin_core::PinIdentityProof::new(pangolin_crypto::secret::SecretBytes::new(
+        std::mem::take(&mut *pw),
+    ));
+    let presence_proof = pangolin_core::PressYPresenceProof::confirmed();
+    vault
+        .unlock(&presence_proof, &identity)
+        .map_err(store_into_ffi)?;
+    Ok(session_info_from_vault(vault))
 }
 
-/// Lock a vault, zeroing in-memory secrets. Body lands in 1.4.
+/// Lock a vault, zeroing the in-memory cache + VDK and tearing down the
+/// `:memory:` search index. Idempotent. The handle stays valid; a
+/// subsequent [`vault_unlock`] re-activates the session.
 ///
-/// # Panics
-/// Panics with `todo!()` until 1.4 lands.
+/// # Errors
+///
+/// `FfiError::Session` if the handle has no vault installed.
+#[allow(clippy::significant_drop_tightening)]
 #[uniffi::export]
 pub fn vault_lock(handle: Arc<VaultHandle>) -> Result<(), FfiError> {
-    let _ = handle;
-    todo!("vault_lock body lands in MVP-1 issue 1.4")
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    vault.lock();
+    Ok(())
 }
 
-/// Close a vault handle. Body lands in 1.4.
+/// Close a vault handle — locks it, then releases the `SQLite`
+/// connection (the inner `Vault` is consumed; the handle is left
+/// empty). Idempotent: closing an already-empty handle is a no-op.
 ///
-/// # Panics
-/// Panics with `todo!()` until 1.4 lands.
+/// # Errors
+///
+/// `FfiError::Store` on a close-path storage failure (rare).
+#[allow(clippy::significant_drop_tightening)]
 #[uniffi::export]
 pub fn vault_close(handle: Arc<VaultHandle>) -> Result<(), FfiError> {
-    let _ = handle;
-    todo!("vault_close body lands in MVP-1 issue 1.4")
+    let mut guard = handle.lock_vault();
+    if let Some(vault) = guard.take() {
+        vault.close().map_err(store_into_ffi)?;
+    }
+    Ok(())
 }
 
-/// Read session status without mutating the vault. Body lands in 1.4.
+/// Read the current session status without mutating the vault.
 ///
-/// # Panics
-/// Panics with `todo!()` until 1.4 lands.
+/// Infallible (matches the 1.1-frozen signature): a handle with no
+/// vault installed reports a "not active" status with the default
+/// configured idle duration.
+#[allow(clippy::significant_drop_tightening)]
 #[uniffi::export]
 pub fn session_status(handle: Arc<VaultHandle>) -> SessionInfo {
-    let _ = handle;
-    todo!("session_status body lands in MVP-1 issue 1.4")
+    let mut guard = handle.lock_vault();
+    guard.as_mut().map_or_else(
+        |_| not_active_session_info(pangolin_core::SessionDuration::DEFAULT.to_meta_secs()),
+        |vault| session_info_from_vault(vault),
+    )
 }
 
-/// Extend the active session's idle timer. Body lands in 1.4.
+/// Extend the active session's idle timer — the single-proof
+/// "maintain" leg of the session invariant.
 ///
-/// # Panics
-/// Panics with `todo!()` until 1.4 lands.
+/// **High-risk per Session spec §5.4 ("extend long sessions"):**
+/// requires a presence proof (1.4 amends the 1.1 signature to take one
+/// — additive argument, safe because nothing external binds the 1.1
+/// surface yet; flagged in `ffi-surface.md`). Re-extends the idle
+/// deadline (still capped at the absolute-max ceiling). Within the
+/// 60 s freshness window of the last successful presence (including
+/// the unlock's) no re-prompt is needed.
+///
+/// # Errors
+///
+/// `FfiError::Session` for a locked / expired session or a timed-out
+/// presence prompt; `FfiError::Validation { kind: "authentication" }`
+/// for any other proof failure.
+#[allow(clippy::significant_drop_tightening)]
 #[uniffi::export]
-pub fn session_extend(handle: Arc<VaultHandle>) -> Result<SessionInfo, FfiError> {
-    let _ = handle;
-    todo!("session_extend body lands in MVP-1 issue 1.4")
+pub fn session_extend(
+    handle: Arc<VaultHandle>,
+    presence: PresenceProof,
+) -> Result<SessionInfo, FfiError> {
+    let _ = presence; // CLI tier ignores the bytes; see module note.
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    let proof = pangolin_core::PressYPresenceProof::confirmed();
+    vault
+        .touch_session_explicit(&proof)
+        .map_err(store_into_ffi)?;
+    Ok(session_info_from_vault(vault))
 }
 
 /// Generate a password matching the supplied policy. Body lands in 1.8.

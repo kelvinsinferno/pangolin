@@ -60,8 +60,8 @@ use crate::revision::{
 use crate::schema;
 use crate::search::{DecryptedCache, SearchIndex, SearchProjection};
 use crate::session::{
-    next_idle_deadline, Clock, IdentityProof, PresenceProof, SessionState, SystemClock,
-    IDLE_TIMEOUT_DEFAULT,
+    next_idle_deadline, AuthError, Clock, IdentityProof, PresenceProof, SessionDuration,
+    SessionState, SystemClock, PRESENCE_FRESHNESS,
 };
 
 // ---------------------------------------------------------------------
@@ -137,6 +137,14 @@ pub struct Vault {
     /// inside `check_session_freshness` before returning
     /// [`StoreError::SessionExpired`].
     active: Option<ActiveState>,
+    /// **MVP-1 issue 1.4.** The session's configured idle duration
+    /// (Session spec §7.2). Read from `meta.session_idle_secs` on
+    /// `open` / `create` ([`crate::session::SessionDuration::from_meta_secs`]);
+    /// `meta` rows that predate 1.4 ⇒ [`crate::session::SessionDuration::DEFAULT`]
+    /// (15 min). `unlock` uses it for the first `expires_at`;
+    /// `touch_session` uses it on every extend; `set_session_idle`
+    /// updates both this field and the persisted column.
+    session_idle: SessionDuration,
     /// Time source. Production uses [`SystemClock`]; tests inject a
     /// mockable clock via [`Self::with_clock`] so the idle-timer +
     /// absolute-max behaviors can be driven deterministically without
@@ -268,6 +276,18 @@ struct ActiveState {
     /// add / update / delete paths; `SQLite` frees the arena when this
     /// `ActiveState` drops on `lock()` / expiry / `Drop`.
     search_index: SearchIndex,
+    /// **MVP-1 issue 1.4 — presence freshness + dedup (Session spec
+    /// §7.6 / §8.6).** Wall-clock instant of the most recent successful
+    /// presence proof for this session — set by `unlock` (the 2-proof
+    /// start counts) and by every presence-gated op that consumes a
+    /// fresh proof. A presence-gated op within
+    /// [`crate::session::PRESENCE_FRESHNESS`] of this instant proceeds
+    /// **without** consuming a new proof (prompt dedup: one proof
+    /// satisfies concurrent reveals); outside the window it must verify
+    /// a fresh proof and re-stamp this field. `None` immediately after
+    /// the field is created and never thereafter (unlock always stamps
+    /// it), but kept `Option` for explicitness.
+    last_presence_at: Option<SystemTime>,
 }
 
 impl Vault {
@@ -357,6 +377,10 @@ impl Vault {
                 device_id,
                 session_state: SessionState::Locked,
                 active: None,
+                // A freshly-created vault has no `session_idle_secs`
+                // column value (it isn't listed in `meta::write`'s
+                // INSERT), so it starts at the §7.1 default.
+                session_idle: SessionDuration::DEFAULT,
                 clock: Box::new(SystemClock),
                 _lock_file: lock_file,
             })
@@ -408,6 +432,13 @@ impl Vault {
             schema::assert_integrity(&conn)?;
             let meta = meta::read(&conn)?.ok_or(StoreError::BadMagic)?;
             let device_id = DeviceId(random_32_via_sqlite(&conn)?);
+            // MVP-1 issue 1.4: read the configured idle duration.
+            // Absent column (pre-1.4 vault) ⇒ NULL ⇒ 15-min default; an
+            // out-of-set on-disk value is also coerced to the default by
+            // `from_meta_secs` so a corrupt-but-decryptable meta field
+            // does not brick an otherwise-openable vault.
+            let session_idle =
+                SessionDuration::from_meta_secs(meta::read_session_idle_secs(&conn)?);
             Ok(Self {
                 path: path.to_path_buf(),
                 conn,
@@ -415,6 +446,7 @@ impl Vault {
                 device_id,
                 session_state: SessionState::Locked,
                 active: None,
+                session_idle,
                 clock: Box::new(SystemClock),
                 _lock_file: lock_file,
             })
@@ -657,19 +689,61 @@ impl Vault {
         // Step 7: install the new ActiveState and session timer. If a
         // prior ActiveState exists (case 1 above), `Option::replace`
         // drops the old one, which zeroizes its cache + VDK and frees
-        // the prior `:memory:` index.
+        // the prior `:memory:` index. The first `expires_at` derives
+        // from the configured idle duration (1.4) — capped at the
+        // absolute-max ceiling via `next_idle_deadline`, which for
+        // `SessionDuration::UntilDeviceLock` collapses to "the absolute
+        // ceiling, no idle leg". The unlock's presence proof is fresh
+        // *now*, so `last_presence_at = now` — a reveal-class op within
+        // `PRESENCE_FRESHNESS` of unlock won't re-prompt (Session spec
+        // §5.2's "access remains seamless"; §8.6 dedup).
         let now = self.clock.now();
         self.active = Some(ActiveState {
             vdk,
             cache,
             search_index,
+            last_presence_at: Some(now),
         });
         self.session_state = SessionState::Active {
-            expires_at: now + IDLE_TIMEOUT_DEFAULT,
+            expires_at: next_idle_deadline(now, now, self.session_idle),
             last_proof_at: now,
             session_started_at: now,
         };
         Ok(())
+    }
+
+    /// The session's configured idle duration (Session spec §7.2).
+    /// Read from `meta` on `open` / `create`; updated by
+    /// [`Self::set_session_idle`]. Defaults to
+    /// [`crate::session::SessionDuration::DEFAULT`] (15 min) for vaults
+    /// that predate MVP-1 issue 1.4.
+    #[must_use]
+    pub fn session_idle(&self) -> SessionDuration {
+        self.session_idle
+    }
+
+    /// Absolute-max deadline of the active session, or `None` if not
+    /// active. The session expires at this instant regardless of
+    /// activity (Session spec §7.4 — 4 h, not configurable). For a
+    /// host UI rendering a countdown alongside the idle deadline.
+    #[must_use]
+    pub fn session_absolute_deadline(&self) -> Option<SystemTime> {
+        match self.session_state {
+            SessionState::Active {
+                session_started_at, ..
+            } => session_started_at.checked_add(crate::session::ABSOLUTE_MAX_DEFAULT),
+            _ => None,
+        }
+    }
+
+    /// Instant of the most recent successful presence proof for the
+    /// active session (the 2-proof unlock counts), or `None` if not
+    /// active. A presence-gated op within
+    /// [`crate::session::PRESENCE_FRESHNESS`] of this instant does not
+    /// re-prompt (prompt dedup, Session spec §8.6).
+    #[must_use]
+    pub fn last_presence_at(&self) -> Option<SystemTime> {
+        self.active.as_ref().and_then(|a| a.last_presence_at)
     }
 
     /// Lock the vault. Drops the in-memory cache + VDK; transitions to
@@ -807,7 +881,7 @@ impl Vault {
         } = self.session_state
         {
             let now = self.clock.now();
-            let new_deadline = next_idle_deadline(now, session_started_at);
+            let new_deadline = next_idle_deadline(now, session_started_at, self.session_idle);
             self.session_state = SessionState::Active {
                 expires_at: new_deadline,
                 // Touch shifts last_proof_at to now, but never extends
@@ -821,6 +895,165 @@ impl Vault {
             let _ = expires_at;
             let _ = last_proof_at;
         }
+    }
+
+    /// **MVP-1 issue 1.4 — Session spec §7.6 / §8.6.** The single
+    /// source of truth for "is presence fresh *right now*", with prompt
+    /// deduplication built in.
+    ///
+    /// - If the active session's `last_presence_at` is within
+    ///   [`crate::session::PRESENCE_FRESHNESS`] of now, the op proceeds
+    ///   **without** consuming the supplied proof — the dedup case
+    ///   (§8.6: "if multiple triggers occur, only one prompt MUST
+    ///   appear; all queued actions resume after success"). The proof's
+    ///   single-use flag is preserved.
+    /// - Otherwise the supplied proof must `verify()`. On success,
+    ///   `last_presence_at = now`. On failure: a stale proof
+    ///   ([`AuthError::NotFresh`]) at a high-risk call site maps to
+    ///   [`StoreError::PromptTimedOut`] (§7.7 — the prompt expired
+    ///   before it was answered); any other proof failure (replayed,
+    ///   empty, generic) collapses to [`StoreError::AuthenticationFailed`]
+    ///   per the MEDIUM-1 indistinguishability discipline.
+    ///
+    /// Callers MUST run [`Self::check_session_freshness`] (and any
+    /// frozen-account check) *before* this so a session/frozen failure
+    /// surfaces with the proof un-consumed and recoverable.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] if no active session;
+    /// [`StoreError::PromptTimedOut`] for a stale proof at this site;
+    /// [`StoreError::AuthenticationFailed`] for any other proof failure.
+    fn ensure_presence_fresh(&mut self, presence: &dyn PresenceProof) -> Result<()> {
+        let now = self.clock.now();
+        let active = self.require_active()?;
+        if let Some(last) = active.last_presence_at {
+            // Saturating: a backward clock jump yields ZERO age (treated
+            // as "fresh"). Same wall-clock-skew posture as the rest of
+            // the session engine.
+            let age = now.duration_since(last).unwrap_or(Duration::ZERO);
+            if age <= PRESENCE_FRESHNESS {
+                return Ok(());
+            }
+        }
+        // Stale (or never set): the supplied proof must verify.
+        presence.verify().map_err(|e| reveal_site_auth_error(&e))?;
+        // Re-borrow mutably to stamp the freshness instant.
+        self.require_active_mut()?.last_presence_at = Some(now);
+        Ok(())
+    }
+
+    /// **MVP-1 issue 1.4 — Session spec §7.5 device-lock hook.**
+    /// Expire the active session immediately, as if the OS reported a
+    /// device-lock event. Drops the in-memory cache + VDK (zeroizing
+    /// every cached `AccountSnapshot`) and frees the `:memory:` FTS5
+    /// index, then flips the state to `Expired` — the same path as an
+    /// idle-timeout expiry, so the next op needs the full 2-proof
+    /// unlock.
+    ///
+    /// No-op when the vault is `Locked` / `Expired` / `PendingAuthorization`.
+    ///
+    /// For the CLI tier this is unused — a terminal has no OS-lock
+    /// signal; the explicit `lock()` covers the user-driven case. The
+    /// hook exists so MVP-3 (mobile) / MVP-4 (desktop) shells can wire
+    /// it to the platform lock-screen event without touching the engine.
+    pub fn device_locked(&mut self) {
+        if matches!(self.session_state, SessionState::Active { .. }) {
+            if let Some(active) = self.active.take() {
+                drop(active);
+            }
+            self.session_state = SessionState::Expired;
+        }
+    }
+
+    /// **MVP-1 issue 1.4 — Session spec §7.2.** Set the configured
+    /// idle-timeout duration, persisting it to `meta.session_idle_secs`.
+    ///
+    /// Lengthening the session is a high-risk action per §5.4 ("extend
+    /// long sessions") — the caller MUST supply a fresh presence proof
+    /// in `presence` (a `None` returns [`StoreError::PresenceProofRequired`]);
+    /// shortening (or setting the same value) is always allowed and may
+    /// pass `None`. A `Locked` vault is fine (the choice is a property
+    /// of the file, not the session); a present-but-expired session
+    /// surfaces the session error first so the proof is not burned.
+    ///
+    /// When the new value takes effect: it updates this handle's
+    /// in-memory `session_idle` immediately, and — if the session is
+    /// active — re-derives the current `expires_at` from the new idle
+    /// window (shortening can move the deadline earlier than now, which
+    /// the next freshness check will treat as an expiry).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::PresenceProofRequired`] if lengthening without a
+    /// proof; [`StoreError::PromptTimedOut`] / [`StoreError::AuthenticationFailed`]
+    /// if the supplied proof is stale / fails; [`StoreError::SessionExpired`]
+    /// if the session is active-but-expired; [`StoreError::Sqlite`] for
+    /// a persistence failure.
+    pub fn set_session_idle(
+        &mut self,
+        choice: SessionDuration,
+        presence: Option<&dyn PresenceProof>,
+    ) -> Result<()> {
+        let lengthening = choice.is_longer_than(self.session_idle);
+        if lengthening {
+            // High-risk: require a fresh presence proof. If the session
+            // is active-but-expired, surface that first (proof not
+            // burned). If `Locked`, there is no session-freshness gate
+            // — the proof still has to verify, but `ensure_presence_fresh`
+            // requires an active session, so we verify directly.
+            let proof = presence.ok_or(StoreError::PresenceProofRequired)?;
+            match self.session_state {
+                SessionState::Active { .. } => {
+                    self.check_session_freshness()?;
+                    self.ensure_presence_fresh(proof)?;
+                }
+                // Locked / Expired / Pending: verify the proof directly
+                // (no dedup window applies — there is no active session).
+                _ => {
+                    proof.verify().map_err(|e| reveal_site_auth_error(&e))?;
+                }
+            }
+        }
+        // Persist + apply.
+        meta::write_session_idle_secs(&self.conn, Some(choice.to_meta_secs()))?;
+        self.session_idle = choice;
+        // Re-derive the current deadline from the new idle window so a
+        // shortening takes effect immediately.
+        if let SessionState::Active {
+            session_started_at, ..
+        } = self.session_state
+        {
+            let now = self.clock.now();
+            self.session_state = SessionState::Active {
+                expires_at: next_idle_deadline(now, session_started_at, self.session_idle),
+                last_proof_at: now,
+                session_started_at,
+            };
+        }
+        Ok(())
+    }
+
+    /// **MVP-1 issue 1.4 — Session spec §5.4 "extend long sessions".**
+    /// The single-proof "maintain" leg of the session invariant exposed
+    /// as an explicit, presence-gated call (backs the FFI
+    /// `session_extend`). Verifies the presence proof (with prompt
+    /// dedup — within [`crate::session::PRESENCE_FRESHNESS`] of the last
+    /// successful presence, no re-prompt) and then `touch_session()`
+    /// to re-extend the idle deadline (still capped at the absolute-max
+    /// ceiling).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] / [`StoreError::SessionExpired`] if
+    /// the session is not active (proof not consumed);
+    /// [`StoreError::PromptTimedOut`] for a stale proof;
+    /// [`StoreError::AuthenticationFailed`] for any other proof failure.
+    pub fn touch_session_explicit(&mut self, presence: &dyn PresenceProof) -> Result<()> {
+        self.check_session_freshness()?;
+        self.ensure_presence_fresh(presence)?;
+        self.touch_session();
+        Ok(())
     }
 
     /// **P8 fix CRIT-1.** Look up `account_identities.frozen_pending_resolve`
@@ -2165,56 +2398,66 @@ impl Vault {
     }
 
     // -----------------------------------------------------------------
-    // P4: high-risk operations — presence escalation
+    // High-risk operations — presence escalation (Session spec §5.4)
     // -----------------------------------------------------------------
     //
-    // Per Pangolin §5.3 ("High-Risk Action Escalation"):
-    //   "For high-risk actions, explicit presence MUST be required"
+    // Per Session spec §5.4 ("High-Risk Actions"):
+    //   "High-risk actions MUST require presence proof even during an
+    //    active session. Examples: reveal password; export vault;
+    //    modify recovery; approve devices; extend long sessions."
     //
     // Even on an active session, ops that surface secret material to
-    // the host UI (reveal_password, export_payload) require the user
-    // to perform an explicit presence confirmation. This is the
-    // "step-up" pattern — the active 1-proof session authorizes
-    // routine credential access, but secrecy-revealing or vault-
-    // migrating ops re-prompt for presence.
+    // the host UI (`reveal_current_password`, `reveal_password_history`,
+    // `reveal_notes`, `reveal_totp_secret`, `export_payload`) require
+    // an explicit *fresh* presence proof — but "fresh" means "within
+    // PRESENCE_FRESHNESS (60 s) of the last successful presence", so a
+    // reveal moments after unlock, or a second reveal moments after the
+    // first, does NOT re-prompt (§5.2 "access remains seamless"; §8.6
+    // prompt dedup). The freshness window is the engine-side authority;
+    // `ensure_presence_fresh` is the single check.
     //
     // Order of operations (security-critical):
     //   1. check_session_freshness — session-state structural check.
     //      If the session is locked / expired, return immediately
     //      WITHOUT touching the supplied presence proof. The proof's
     //      single-use flag is preserved for the caller to retry after
-    //      reauth. (PressYPresenceProof::Confirmed is single-use; we
-    //      MUST NOT burn it on a freshness failure that the caller
-    //      can recover from.)
-    //   2. presence.verify() — actually check the proof. Single-use
-    //      replay rejection + freshness rejection live here. Burns
-    //      the proof's one-shot flag.
-    //   3. Perform the high-risk op against the cache / disk.
-    //   4. touch_session — extend the idle deadline.
+    //      reauth.
+    //   2. refuse_if_frozen — refuse a frozen account BEFORE the proof
+    //      is consumed (P8 fix CRIT-1).
+    //   3. ensure_presence_fresh — dedup-or-verify. Within the window,
+    //      no proof is consumed; outside it, the proof must verify
+    //      (NotFresh ⇒ PromptTimedOut; other ⇒ AuthenticationFailed).
+    //   4. Read the requested secret (from disk via the V1 identity for
+    //      `reveal_password_history`, from the in-memory cache shadow
+    //      for the head password / notes / totp).
+    //   5. touch_session — extend the idle deadline.
 
-    /// Reveal the plaintext password for an account.
+    /// Reveal the **current** (head-of-history) plaintext password for
+    /// an account. **High-risk operation** (Session spec §5.4).
     ///
-    /// **High-risk operation** (Pangolin §5.3). Requires:
-    /// - Active session (1-proof maintain, per the routine session
-    ///   policy).
-    /// - PLUS an explicit fresh presence proof passed in `presence`.
-    ///
-    /// Returns a freshly-allocated [`SecretBytes`] cloned from the
-    /// in-memory cache. The original cache entry is untouched; the
-    /// caller is responsible for the lifetime of the returned bytes
-    /// (which zero on drop).
+    /// Requires an active session + a fresh presence proof (dedup'd
+    /// within [`crate::session::PRESENCE_FRESHNESS`] — see the
+    /// section comment above). Returns a freshly-allocated
+    /// [`SecretBytes`] (zeroes on drop) cloned from the in-memory
+    /// cache shadow; the cache stays intact. For the **full** password
+    /// history (including superseded values, their timestamps, and the
+    /// device that authored each), use [`Self::reveal_password_history`].
     ///
     /// # Errors
     ///
     /// - [`StoreError::SessionExpired`] / [`StoreError::NotUnlocked`]
-    ///   if the session is not active (cache is zeroized as a
-    ///   side-effect of `check_session_freshness` if expiry was
-    ///   detected).
-    /// - [`StoreError::AuthenticationFailed`] if the supplied presence
-    ///   proof fails to verify (replayed, stale, or generic failure).
+    ///   if the session is not active (cache zeroized as a side-effect
+    ///   of the freshness check if expiry was detected; proof not
+    ///   consumed).
+    /// - [`StoreError::AccountFrozenPendingResolve`] if the account is
+    ///   frozen (proof not consumed).
+    /// - [`StoreError::PromptTimedOut`] if the supplied presence proof
+    ///   is stale (the prompt aged past the freshness window).
+    /// - [`StoreError::AuthenticationFailed`] for any other presence-
+    ///   proof failure (replayed, generic).
     /// - [`StoreError::AccountNotFound`] if `id` is unknown to the
-    ///   cache (either truly unknown or tombstoned).
-    pub fn reveal_password(
+    ///   cache (truly unknown or tombstoned).
+    pub fn reveal_current_password(
         &mut self,
         id: AccountId,
         presence: &dyn PresenceProof,
@@ -2222,23 +2465,65 @@ impl Vault {
         self.reveal_secret_field(id, presence, |snap| snap.password.expose().to_vec())
     }
 
-    /// Reveal the plaintext notes for an account.
+    /// Back-compat alias for [`Self::reveal_current_password`] — the
+    /// P4 / CLI / pre-1.4 name. Identical semantics.
+    pub fn reveal_password(
+        &mut self,
+        id: AccountId,
+        presence: &dyn PresenceProof,
+    ) -> Result<SecretBytes> {
+        self.reveal_current_password(id, presence)
+    }
+
+    /// Reveal the **full password history** for an account, surfacing
+    /// the production V1 model's data: every [`crate::account::PasswordEntry`]
+    /// — plaintext bytes + the `set_at_ms` timestamp + the originating
+    /// device id — newest first (the head entry is the current
+    /// password). **High-risk operation** (Session spec §5.4); the FFI
+    /// `AccountSnapshot` carries only the *count* (Q5b).
     ///
-    /// **High-risk operation** (Pangolin §5.4 — same reveal-class
-    /// umbrella as `reveal_password`). Notes can carry recovery
-    /// phrases or answers to security questions, so the same presence
-    /// gate applies. Returns a freshly-allocated [`SecretBytes`] cloned
-    /// from the in-memory cache.
-    ///
-    /// Added in P4-fix-pass-H-1 alongside making
-    /// [`crate::account::AccountSnapshot::notes`] crate-private. Without
-    /// this accessor, external callers would have no way to read notes
-    /// off an unlocked vault — which is the point: every secret-field
-    /// readout must route through a presence-gated entry point.
+    /// Reads the head identity from disk (V1-aware decrypt, auto-
+    /// migrating V0 payloads), not from the V0-shaped in-memory cache
+    /// shadow — the cache shadow only holds the head password.
     ///
     /// # Errors
     ///
-    /// Same set as [`Self::reveal_password`].
+    /// Same set as [`Self::reveal_current_password`], plus
+    /// [`StoreError::AccountTombstoned`] / [`StoreError::Corrupted`] /
+    /// [`StoreError::Sqlite`] for storage-level failures.
+    pub fn reveal_password_history(
+        &mut self,
+        id: AccountId,
+        presence: &dyn PresenceProof,
+    ) -> Result<Vec<crate::account::PasswordHistorySummaryEntry>> {
+        self.check_session_freshness()?;
+        self.refuse_if_frozen(id)?;
+        self.ensure_presence_fresh(presence)?;
+        let identity = self.read_head_identity(id)?;
+        let crate::account::AccountIdentity {
+            password_history, ..
+        } = identity;
+        let out = password_history
+            .into_iter()
+            .map(|e| crate::account::PasswordHistorySummaryEntry {
+                password: e.password,
+                set_at_ms: e.set_at_ms,
+                originating_device: e.originating_device,
+            })
+            .collect();
+        self.touch_session();
+        Ok(out)
+    }
+
+    /// Reveal the plaintext notes for an account. **High-risk operation**
+    /// (Session spec §5.4 — notes can carry recovery-class secrets:
+    /// recovery phrases, security-question answers). Returns a
+    /// freshly-allocated [`SecretBytes`] cloned from the in-memory
+    /// cache shadow.
+    ///
+    /// # Errors
+    ///
+    /// Same set as [`Self::reveal_current_password`].
     pub fn reveal_notes(
         &mut self,
         id: AccountId,
@@ -2247,21 +2532,17 @@ impl Vault {
         self.reveal_secret_field(id, presence, |snap| snap.notes.expose().to_vec())
     }
 
-    /// Reveal the plaintext TOTP secret for an account.
-    ///
-    /// **High-risk operation** (Pangolin §5.4 — same reveal-class
-    /// umbrella as `reveal_password`). The TOTP shared secret is
-    /// directly equivalent to a second-factor seed; revealing it lets
-    /// the caller generate codes, so it is gated identically to the
-    /// password.
-    ///
-    /// Returns a freshly-allocated [`SecretBytes`] cloned from the
-    /// in-memory cache. If the account has no TOTP configured the
-    /// returned `SecretBytes` is empty (`expose() == b""`).
+    /// Reveal the raw plaintext TOTP shared-secret seed for an account.
+    /// **High-risk operation** (Session spec §5.4 + the Phase-2 note —
+    /// the raw seed is reveal-class; 1.7's RFC-6238 generator consumes
+    /// it internally without a reveal, but exporting/revealing the
+    /// *seed* is high-risk). Returns a freshly-allocated [`SecretBytes`]
+    /// cloned from the in-memory cache shadow; empty (`expose() == b""`)
+    /// when no TOTP is configured.
     ///
     /// # Errors
     ///
-    /// Same set as [`Self::reveal_password`].
+    /// Same set as [`Self::reveal_current_password`].
     pub fn reveal_totp_secret(
         &mut self,
         id: AccountId,
@@ -2270,12 +2551,10 @@ impl Vault {
         self.reveal_secret_field(id, presence, |snap| snap.totp_secret.expose().to_vec())
     }
 
-    /// Shared implementation for the three `reveal_*` accessors.
-    ///
-    /// Order of operations is identical to the per-method docstring on
-    /// [`Self::reveal_password`] — the only thing that varies between
-    /// password / notes / totp is which `SecretBytes` field gets
-    /// cloned out at step 3.
+    /// Shared implementation for the cache-shadow `reveal_*` accessors
+    /// (head password / notes / totp). The only thing that varies is
+    /// which [`SecretBytes`] field gets cloned out at step 4. Order of
+    /// operations is the section comment above.
     fn reveal_secret_field<F>(
         &mut self,
         id: AccountId,
@@ -2285,29 +2564,59 @@ impl Vault {
     where
         F: FnOnce(&AccountSnapshot) -> Vec<u8>,
     {
-        // Step 1: structural session check. If this fails, the
-        // presence proof is NOT consumed — the caller can retry after
-        // reauthing.
+        // Step 1: structural session check (proof not consumed on fail).
         self.check_session_freshness()?;
-        // Step 1b (P8 fix CRIT-1): refuse before the presence proof
-        // is consumed — same single-use-flag preservation discipline
-        // as the session-freshness check above. A user prompted for
-        // "press Y" only to be told "this account is frozen" should
-        // still be able to retry the proof against a non-frozen
-        // account.
+        // Step 2: refuse a frozen account before the proof is consumed
+        // (P8 fix CRIT-1).
         self.refuse_if_frozen(id)?;
-        // Step 2: verify presence proof (consumes single-use flag).
-        presence.verify()?;
-        // Step 3: read from the in-memory cache. Clone the requested
-        // field's bytes into a fresh allocation for the caller; the
-        // original stays in the cache. Both copies zero on drop.
+        // Step 3: dedup-or-verify the presence proof (Session spec
+        // §7.6 / §8.6). Within PRESENCE_FRESHNESS of the last
+        // successful presence — including the unlock's — no proof is
+        // consumed; outside it, the proof verifies, NotFresh ⇒
+        // PromptTimedOut, other ⇒ AuthenticationFailed.
+        self.ensure_presence_fresh(presence)?;
+        // Step 4: read from the in-memory cache shadow. Clone the
+        // requested field into a fresh zeroizing allocation; the
+        // original stays cached.
         let active = self.require_active()?;
         let snapshot = active.cache.get(id).ok_or(StoreError::AccountNotFound)?;
         let bytes = extract(snapshot);
         let out = SecretBytes::new(bytes);
-        // Step 4: touch the session (extends the idle deadline).
+        // Step 5: touch the session (extends the idle deadline).
         self.touch_session();
         Ok(out)
+    }
+
+    /// Read + decrypt the current head identity (V1 model) for `id`,
+    /// auto-migrating a V0 payload. Looks up the head pointer in SQL,
+    /// rejects tombstoned accounts, and routes through the V1-aware
+    /// `read_identity_at`. Used by [`Self::reveal_password_history`];
+    /// distinct from `account_get`'s summary builder in that it returns
+    /// the in-memory model unchanged.
+    fn read_head_identity(&self, id: AccountId) -> Result<crate::account::AccountIdentity> {
+        let account_row = self
+            .conn
+            .query_row(
+                "SELECT tombstoned, head_revision_id
+                 FROM account_identities WHERE account_id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| {
+                    let tombstoned: i64 = row.get(0)?;
+                    let head: Vec<u8> = row.get(1)?;
+                    Ok((tombstoned != 0, head))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::AccountNotFound)?;
+        if account_row.0 {
+            return Err(StoreError::AccountTombstoned);
+        }
+        let head_arr: [u8; REVISION_ID_LEN] = account_row
+            .1
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Corrupted("head_revision_id not 32 bytes".into()))?;
+        self.read_identity_at(id, RevisionId::from_bytes(head_arr))
     }
 
     /// Run an operation under session-policy supervision; on
@@ -2409,9 +2718,10 @@ impl Vault {
     /// Export an account's sealed payload for future key migration /
     /// backup.
     ///
-    /// **High-risk operation** (Pangolin §5.3). Same proof discipline
-    /// as [`Self::reveal_password`]: active session + fresh presence
-    /// proof.
+    /// **High-risk operation** (Session spec §5.4). Same proof
+    /// discipline as [`Self::reveal_current_password`]: an active
+    /// session plus a fresh presence proof (dedup'd within
+    /// [`crate::session::PRESENCE_FRESHNESS`]).
     ///
     /// Returns the on-disk AEAD ciphertext + nonce concatenation for
     /// the account's current head revision: `[nonce (24B)] || [ct]`.
@@ -2419,12 +2729,11 @@ impl Vault {
     /// the same vault to decrypt — this primitive is for downstream
     /// migration tooling (P9 vault key rotation, MVP-1 multi-device
     /// re-wrap) rather than direct plaintext export. Plaintext export
-    /// requires a separate, even-more-dangerous primitive (deferred
-    /// to MVP-1).
+    /// requires a separate, even-more-dangerous primitive (1.10).
     ///
     /// # Errors
     ///
-    /// Same set as [`Self::reveal_password`], plus
+    /// Same set as [`Self::reveal_current_password`], plus
     /// [`StoreError::AccountTombstoned`] if the account is tombstoned
     /// and [`StoreError::Sqlite`] for any storage-level issue.
     pub fn export_payload(
@@ -2436,7 +2745,7 @@ impl Vault {
         // P8 fix CRIT-1: refuse before consuming the presence proof —
         // same discipline as `reveal_secret_field`.
         self.refuse_if_frozen(id)?;
-        presence.verify()?;
+        self.ensure_presence_fresh(presence)?;
 
         // Look up the account's current head and read its sealed
         // payload directly from the revisions table. We deliberately
@@ -2774,7 +3083,7 @@ impl Vault {
         let head = RevisionId::from_bytes(head_arr);
 
         let identity = self.read_identity_at(id, head)?;
-        let summary = identity_to_summary(id, head, identity);
+        let summary = identity_to_summary(id, head, &identity);
         self.touch_session();
         Ok(summary)
     }
@@ -2837,7 +3146,7 @@ impl Vault {
                 .map_err(|_| StoreError::Corrupted("head_revision_id not 32 bytes".into()))?;
             let head = RevisionId::from_bytes(head_arr);
             let identity = self.read_identity_at(acct, head)?;
-            hits.push(identity_to_summary(acct, head, identity));
+            hits.push(identity_to_summary(acct, head, &identity));
         }
         self.touch_session();
         Ok(hits)
@@ -4170,12 +4479,17 @@ fn downgrade_identity_to_snapshot(identity: &crate::account::AccountIdentity) ->
     AccountSnapshot::new(display_name, username, password, url, notes, totp_secret)
 }
 
-/// Convert an [`AccountIdentity`] into an
-/// [`crate::account::AccountIdentitySummary`] for the FFI bridge.
+/// Convert an [`AccountIdentity`] into the metadata-only
+/// [`crate::account::AccountIdentitySummary`] (MVP-1 issue 1.4, Q5b —
+/// the FFI projection carries zero secret material). Display name,
+/// tags, usernames and URLs are non-secret per the V1 model; the
+/// secret bytes (head password, full history, notes, raw TOTP seed)
+/// are reachable only via the presence-gated `Vault::reveal_*` entry
+/// points.
 fn identity_to_summary(
     id: AccountId,
     head_revision_id: RevisionId,
-    identity: crate::account::AccountIdentity,
+    identity: &crate::account::AccountIdentity,
 ) -> crate::account::AccountIdentitySummary {
     let display_name =
         String::from_utf8(identity.display_name.expose().to_vec()).unwrap_or_default();
@@ -4194,29 +4508,7 @@ fn identity_to_summary(
         .iter()
         .map(|u| String::from_utf8(u.expose().to_vec()).unwrap_or_default())
         .collect();
-    // `notes` are intentionally NOT surfaced on the summary (audit C-1
-    // / plan §D). The persisted `identity.notes` stays in the V1
-    // payload; only the FFI-bound summary is closed. The presence-
-    // gated `reveal_notes` lands in 1.4.
-    // Move identity fields out for the summary.
-    let crate::account::AccountIdentity {
-        password_history,
-        totp_secret,
-        ..
-    } = identity;
-    let password_history = password_history
-        .into_iter()
-        .map(|e| crate::account::PasswordHistorySummaryEntry {
-            password: e.password,
-            set_at_ms: e.set_at_ms,
-            originating_device: e.originating_device,
-        })
-        .collect();
-    let totp_secret = if totp_secret.expose().is_empty() {
-        None
-    } else {
-        Some(totp_secret)
-    };
+    let history = identity.password_history();
     crate::account::AccountIdentitySummary {
         schema_version: crate::account::ACCOUNT_IDENTITY_SCHEMA_VERSION,
         id,
@@ -4225,8 +4517,9 @@ fn identity_to_summary(
         tags,
         usernames,
         urls,
-        password_history,
-        totp_secret,
+        password_history_count: u32::try_from(history.len()).unwrap_or(u32::MAX),
+        has_totp: identity.has_totp(),
+        current_password_changed_at_ms: history.first().map_or(0, |e| e.set_at_ms),
     }
 }
 
@@ -4256,6 +4549,30 @@ impl core::fmt::Debug for Vault {
 // ---------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------
+
+/// **MVP-1 issue 1.4.** Map an [`AuthError`] surfaced at a high-risk
+/// (reveal-class / session-extend) call site to a [`StoreError`].
+///
+/// A stale proof ([`AuthError::NotFresh`]) at such a site means the
+/// presence prompt aged past [`crate::session::PROMPT_TIMEOUT`] before
+/// the user answered → [`StoreError::PromptTimedOut`] (Session spec
+/// §7.7 — loud, typed, never silent per §8.2). Every other proof
+/// failure (replayed, empty, generic) collapses to
+/// [`StoreError::AuthenticationFailed`] per the MEDIUM-1
+/// indistinguishability discipline — a caller MUST NOT be able to tell
+/// "wrong proof content" from "another structural reason".
+///
+/// `PromptTimedOut` is not an oracle: a timed-out prompt reveals
+/// nothing about any secret; it's a UX signal. The content-class
+/// collapse (wrong PIN etc.) is preserved.
+fn reveal_site_auth_error(err: &AuthError) -> StoreError {
+    match err {
+        AuthError::NotFresh => StoreError::PromptTimedOut,
+        AuthError::Failed | AuthError::PresenceAlreadyConsumed | AuthError::Empty => {
+            StoreError::AuthenticationFailed
+        }
+    }
+}
 
 fn open_connection(path: &Path) -> Result<Connection> {
     Connection::open_with_flags(
@@ -5222,16 +5539,18 @@ mod tests {
         assert!(v.is_session_active());
     }
 
-    /// Plan success criterion 6:
-    /// `vault::tests::reveal_password_requires_fresh_presence` — an
-    /// active session does NOT permit `reveal_password` without the
-    /// explicit presence proof.
+    /// Plan success criterion 6 (rewritten for 1.4's freshness + dedup
+    /// model): a reveal-class op requires a presence proof that is fresh
+    /// *now* — meaning within `PRESENCE_FRESHNESS` of the last
+    /// successful presence (which includes the unlock's). Within the
+    /// window no re-prompt is needed (dedup); outside it a fresh proof
+    /// is required, and a stale one surfaces `PromptTimedOut`.
     #[test]
     fn reveal_password_requires_fresh_presence() {
         let dir = TempDir::new().unwrap();
         let p = vault_path(&dir, "reveal.pvf");
         Vault::create(&p, &fresh_password()).unwrap();
-        let mut v = Vault::open(&p).unwrap();
+        let (mut v, clock) = open_vault_with_test_clock(&p);
         v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         let snap = AccountSnapshot::new(
             SecretBytes::new(b"display".to_vec()),
@@ -5243,63 +5562,371 @@ mod tests {
         );
         let id = v.add_account(snap).unwrap();
 
-        // Active session + valid presence → returns the plaintext.
-        let presence = fresh_presence();
-        let pwd = v.reveal_password(id, &presence).unwrap();
+        // Within the window of the unlock's presence — no re-prompt.
+        // A throwaway (even already-consumed) proof is fine because the
+        // engine does not consume it: dedup, not replay.
+        let already_consumed = PressYPresenceProof::confirmed();
+        let _ = <PressYPresenceProof as crate::session::PresenceProof>::verify(&already_consumed);
+        let pwd = v.reveal_password(id, &already_consumed).unwrap();
         assert_eq!(pwd.expose(), b"hunter2-the-secret");
+        // A second reveal moments later — still within the window —
+        // also no re-prompt.
+        let pwd2 = v
+            .reveal_password(id, &PressYPresenceProof::confirmed())
+            .unwrap();
+        assert_eq!(pwd2.expose(), b"hunter2-the-secret");
 
-        // The presence proof is consumed; reusing it returns
-        // AuthenticationFailed (single-use replay rejection).
-        let err = v.reveal_password(id, &presence).unwrap_err();
-        assert!(matches!(err, StoreError::AuthenticationFailed));
-
-        // A stale presence proof is rejected.
+        // Advance past PRESENCE_FRESHNESS (and stay under the idle
+        // deadline). Now a reveal needs a fresh proof. A stale proof
+        // (constructed in the past relative to the test clock's now)
+        // surfaces PromptTimedOut — but `PressYPresenceProof::verify`
+        // uses the *real* clock for its own staleness check, so a
+        // `__test_with_timestamp` proof pinned to "real now minus
+        // PRESENCE_FRESHNESS minus slack" is stale by that check too.
+        clock.advance(PRESENCE_FRESHNESS + Duration::from_secs(5));
         let stale = PressYPresenceProof::__test_with_timestamp(
             SystemTime::now() - PRESENCE_FRESHNESS - Duration::from_secs(10),
         );
         let err = v.reveal_password(id, &stale).unwrap_err();
-        assert!(matches!(err, StoreError::AuthenticationFailed));
+        assert!(
+            matches!(err, StoreError::PromptTimedOut),
+            "stale proof at a reveal site must be PromptTimedOut; got {err:?}"
+        );
 
-        // A fresh presence proof works again.
-        let presence2 = PressYPresenceProof::confirmed();
-        let pwd2 = v.reveal_password(id, &presence2).unwrap();
-        assert_eq!(pwd2.expose(), b"hunter2-the-secret");
+        // A fresh proof works again and re-opens the dedup window.
+        let pwd3 = v
+            .reveal_password(id, &PressYPresenceProof::confirmed())
+            .unwrap();
+        assert_eq!(pwd3.expose(), b"hunter2-the-secret");
     }
 
-    /// Plan success criterion 7:
-    /// `vault::tests::export_payload_requires_fresh_presence` — same
-    /// shape as criterion 6 but for the export primitive.
+    /// Plan success criterion 7: same shape as criterion 6 but for the
+    /// export primitive — and an export of a tombstoned account
+    /// surfaces `AccountTombstoned` (after the freshness check passes).
     #[test]
     fn export_payload_requires_fresh_presence() {
         let dir = TempDir::new().unwrap();
         let p = vault_path(&dir, "export.pvf");
         Vault::create(&p, &fresh_password()).unwrap();
-        let mut v = Vault::open(&p).unwrap();
+        let (mut v, clock) = open_vault_with_test_clock(&p);
         v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         let id = v.add_account(fresh_snapshot()).unwrap();
 
-        // Valid presence → returns the sealed payload.
-        let presence = fresh_presence();
-        let bytes = v.export_payload(id, &presence).unwrap();
-        // Must be at least nonce_len (24) + AEAD-tag (16) + minimum
-        // CBOR overhead for an empty struct (~8). 50 bytes is a
-        // generous lower bound for any non-degenerate snapshot.
+        // Within the unlock's presence window — no re-prompt.
+        let bytes = v
+            .export_payload(id, &PressYPresenceProof::confirmed())
+            .unwrap();
         assert!(
             bytes.len() > 50,
             "exported payload too short: {} bytes",
             bytes.len()
         );
 
-        // Replayed presence → AuthenticationFailed.
-        let err = v.export_payload(id, &presence).unwrap_err();
-        assert!(matches!(err, StoreError::AuthenticationFailed));
+        // Past the freshness window: a stale proof → PromptTimedOut.
+        clock.advance(PRESENCE_FRESHNESS + Duration::from_secs(5));
+        let stale = PressYPresenceProof::__test_with_timestamp(
+            SystemTime::now() - PRESENCE_FRESHNESS - Duration::from_secs(10),
+        );
+        let err = v.export_payload(id, &stale).unwrap_err();
+        assert!(matches!(err, StoreError::PromptTimedOut), "got {err:?}");
 
-        // Tombstoned account → AccountTombstoned (only after presence
-        // verifies, so we use a fresh proof).
+        // Tombstoned account → AccountTombstoned. A fresh proof re-opens
+        // the window; the tombstone check happens after the freshness
+        // gate (P8 CRIT-1 frozen-account check is what runs *before*
+        // the proof; tombstone is checked while reading the head).
         v.delete_account(id).unwrap();
-        let presence_after = PressYPresenceProof::confirmed();
-        let err = v.export_payload(id, &presence_after).unwrap_err();
-        assert!(matches!(err, StoreError::AccountTombstoned));
+        let err = v
+            .export_payload(id, &PressYPresenceProof::confirmed())
+            .unwrap_err();
+        assert!(matches!(err, StoreError::AccountTombstoned), "got {err:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // MVP-1 issue 1.4: configurable idle, device-lock, prompt timeout
+    // -----------------------------------------------------------------
+
+    /// Criterion 7 (variant): a non-default configured idle duration
+    /// drives the deadline. `set_session_idle(Min30, None)` (shortening
+    /// from the 15-min default is not "lengthening", so no presence
+    /// needed) — wait, 30 > 15 IS lengthening. Use the proof. Then a
+    /// re-`unlock` gives a 30-min window; advancing 20 min keeps the
+    /// session, 35 min expires it.
+    #[test]
+    fn idle_timeout_expires_session_with_configured_idle() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "idle-30.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let (mut v, clock) = open_vault_with_test_clock(&p);
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        // Lengthen to 30 min — high-risk; needs a fresh presence proof.
+        v.set_session_idle(
+            crate::session::SessionDuration::Min30,
+            Some(&PressYPresenceProof::confirmed()),
+        )
+        .unwrap();
+        // Right after set: deadline ≈ now + 30 min.
+        let r = v.session_remaining().unwrap();
+        assert!(r > Duration::from_secs(29 * 60) && r <= Duration::from_secs(30 * 60));
+        let id = v.add_account(fresh_snapshot()).unwrap();
+        // 20 min in (under 30-min idle): op succeeds.
+        clock.advance(Duration::from_secs(20 * 60));
+        v.update_account(id, fresh_snapshot()).unwrap();
+        // 35 more min (deadline was reset 20 min ago to now+30; 35 > 30):
+        // expired.
+        clock.advance(Duration::from_secs(35 * 60));
+        let err = v.update_account(id, fresh_snapshot()).unwrap_err();
+        assert!(matches!(err, StoreError::SessionExpired), "got {err:?}");
+        // Re-open: the 30-min choice persisted; a fresh unlock gives a
+        // 30-min window.
+        drop(v);
+        let v2 = Vault::open(&p).unwrap();
+        assert_eq!(v2.session_idle(), crate::session::SessionDuration::Min30);
+    }
+
+    /// Criterion 14: `set_session_idle` — lengthening requires a fresh
+    /// presence proof; shortening does not; an out-of-set value is
+    /// rejected. (The "out-of-set" path is the public-API validator
+    /// `SessionDuration::try_from_meta_secs`; `set_session_idle` itself
+    /// takes a typed variant, so the validator is the gate a caller
+    /// hits when it builds the variant from a raw number.)
+    #[test]
+    fn set_session_idle_presence_rules() {
+        use crate::session::SessionDuration;
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "set-idle.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        // Lengthen (15 → Hour1) without a proof → PresenceProofRequired.
+        let err = v
+            .set_session_idle(SessionDuration::Hour1, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::PresenceProofRequired),
+            "got {err:?}"
+        );
+        // Lengthen with a fresh proof → ok.
+        v.set_session_idle(
+            SessionDuration::Hour1,
+            Some(&PressYPresenceProof::confirmed()),
+        )
+        .unwrap();
+        assert_eq!(v.session_idle(), SessionDuration::Hour1);
+        // Shorten (Hour1 → Min5) without a proof → ok.
+        v.set_session_idle(SessionDuration::Min5, None).unwrap();
+        assert_eq!(v.session_idle(), SessionDuration::Min5);
+        // Out-of-set raw value → Validation { kind: "session_duration" }.
+        let err = SessionDuration::try_from_meta_secs(42).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Validation { ref kind, .. } if kind == "session_duration")
+        );
+    }
+
+    /// Criterion 15: `device_locked()` on an `Active` vault expires the
+    /// session (cache zeroized, `:memory:` index gone); on a `Locked` /
+    /// `Expired` vault it is a no-op.
+    #[test]
+    fn device_locked_expires_active_session() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "device-lock.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        // Locked: device_locked is a no-op.
+        v.device_locked();
+        assert!(matches!(
+            v.session_state(),
+            crate::session::SessionState::Locked
+        ));
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).unwrap();
+        assert!(v.get_account(id).is_some());
+        // Device locks → session expires; cache zeroized.
+        v.device_locked();
+        assert!(matches!(
+            v.session_state(),
+            crate::session::SessionState::Expired
+        ));
+        assert!(!v.is_session_active());
+        assert!(v.get_account(id).is_none());
+        assert!(v.list_accounts().is_empty());
+        // device_locked on the already-Expired vault → no-op.
+        v.device_locked();
+        assert!(matches!(
+            v.session_state(),
+            crate::session::SessionState::Expired
+        ));
+        // Next op needs a full 2-proof unlock.
+        let err = v.update_account(id, fresh_snapshot()).unwrap_err();
+        assert!(matches!(err, StoreError::SessionExpired));
+        // Re-unlock works (2-proof), and rebuilds the cache.
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        assert!(v.get_account(id).is_some());
+    }
+
+    /// Criterion 11/13: a presence proof whose `created_at` is already
+    /// stale (the prompt aged out) at a reveal site → `PromptTimedOut`,
+    /// distinct from `AuthenticationFailed`. Needs the dedup window to
+    /// be *closed* first (advance the test clock past
+    /// [`crate::session::PRESENCE_FRESHNESS`] since the unlock's presence).
+    #[test]
+    fn reveal_with_stale_proof_returns_prompt_timed_out() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "prompt-timeout.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let (mut v, clock) = open_vault_with_test_clock(&p);
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).unwrap();
+        // Close the dedup window opened by the unlock.
+        clock.advance(PRESENCE_FRESHNESS + Duration::from_secs(10));
+        // A proof constructed >60 s ago (in real time) at a reveal site.
+        let stale = PressYPresenceProof::__test_with_timestamp(
+            SystemTime::now() - PRESENCE_FRESHNESS - Duration::from_secs(30),
+        );
+        let err = v.reveal_notes(id, &stale).unwrap_err();
+        assert!(matches!(err, StoreError::PromptTimedOut), "got {err:?}");
+        // PromptTimedOut is distinct from AuthenticationFailed.
+        assert!(!matches!(err, StoreError::AuthenticationFailed));
+    }
+
+    /// Criterion 12 (new): `with_session(op, reauth)` where `reauth`
+    /// fails — `op` must NOT run and the reauth error propagates.
+    /// (`with_session_resumes_op_after_reauth` already covers the
+    /// happy path + the wrong-PIN-reauth case; this one is the
+    /// dedicated "op never runs" assertion via a panic in `op`.)
+    #[test]
+    fn with_session_reauth_err_does_not_run_op() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "ws-reauth-err.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let (mut v, clock) = open_vault_with_test_clock(&p);
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        v.add_account(fresh_snapshot()).unwrap();
+        clock.advance(IDLE_TIMEOUT_DEFAULT + Duration::from_secs(1));
+        let err = v
+            .with_session(
+                |_v| -> Result<(), StoreError> { panic!("op must not run when reauth errors") },
+                |_v| Err(StoreError::AuthenticationFailed),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::AuthenticationFailed));
+    }
+
+    /// Criterion 10 (dedup): two reveals within 60 s of the last
+    /// successful presence — the second does not consume a proof.
+    /// Demonstrated by passing an *already-consumed* proof to the
+    /// second reveal: if the engine called `verify()` it would reject
+    /// with `PresenceAlreadyConsumed` (→ `AuthenticationFailed`); since
+    /// the engine dedups, it never calls `verify()` and the reveal
+    /// succeeds.
+    #[test]
+    fn two_reveals_within_window_verify_proof_once() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "dedup.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let snap = AccountSnapshot::new(
+            SecretBytes::new(b"d".to_vec()),
+            SecretBytes::new(b"u".to_vec()),
+            SecretBytes::new(b"the-pw".to_vec()),
+            SecretBytes::new(b"https://x".to_vec()),
+            SecretBytes::new(b"".to_vec()),
+            SecretBytes::new(b"".to_vec()),
+        );
+        let id = v.add_account(snap).unwrap();
+        // First reveal: dedup'd against the unlock's presence (no
+        // verify) — succeeds.
+        assert_eq!(
+            v.reveal_password(id, &fresh_presence()).unwrap().expose(),
+            b"the-pw"
+        );
+        // Second reveal with an already-consumed proof: still dedup'd,
+        // never verified — succeeds.
+        let burned = PressYPresenceProof::confirmed();
+        let _ = <PressYPresenceProof as crate::session::PresenceProof>::verify(&burned);
+        assert_eq!(v.reveal_password(id, &burned).unwrap().expose(), b"the-pw");
+    }
+
+    /// Criterion 13: `reveal_password_history` returns the full V1
+    /// history — bytes + timestamps + originating device per entry,
+    /// newest first. Uses the V1 `account_add` / `account_update` path
+    /// (the V0 `add_account` shadow only carries the head).
+    #[test]
+    fn reveal_password_history_returns_full_history() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "pw-history.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let draft = crate::account::AccountIdentityDraft {
+            schema_version: crate::account::ACCOUNT_IDENTITY_SCHEMA_VERSION,
+            display_name: "GitHub".into(),
+            tags: vec!["work".into()],
+            usernames: vec!["alice@example.com".into()],
+            urls: vec!["https://github.com".into()],
+            notes: "n".into(),
+            password: SecretBytes::new(b"pw-genesis".to_vec()),
+            totp_secret: SecretBytes::new(Vec::new()),
+        };
+        let id = v.account_add(draft).unwrap();
+        for new in [b"pw-2".as_slice(), b"pw-3".as_slice()] {
+            let patch = crate::account::AccountIdentityPatch {
+                schema_version: crate::account::ACCOUNT_IDENTITY_SCHEMA_VERSION,
+                display_name: None,
+                tags: None,
+                usernames: None,
+                urls: None,
+                notes: None,
+                password: Some(SecretBytes::new(new.to_vec())),
+                totp_secret: None,
+            };
+            v.account_update(id, patch).unwrap();
+        }
+        let history = v.reveal_password_history(id, &fresh_presence()).unwrap();
+        assert_eq!(history.len(), 3);
+        // Newest first.
+        assert_eq!(history[0].password.expose(), b"pw-3");
+        assert_eq!(history[1].password.expose(), b"pw-2");
+        assert_eq!(history[2].password.expose(), b"pw-genesis");
+        // Each entry carries a 32-byte originating device + a timestamp.
+        assert_eq!(history[0].originating_device.0.len(), 32);
+        assert!(history[0].set_at_ms >= history[2].set_at_ms);
+        // reveal_current_password agrees with the head.
+        assert_eq!(
+            v.reveal_current_password(id, &fresh_presence())
+                .unwrap()
+                .expose(),
+            b"pw-3"
+        );
+    }
+
+    /// Criterion 13: reveal-class ops on a locked vault → `NotUnlocked`;
+    /// on an expired session → `SessionExpired` (cache zeroized); on a
+    /// frozen account → `AccountFrozenPendingResolve` (proof not
+    /// consumed — checked before `ensure_presence_fresh`).
+    #[test]
+    fn reveal_on_locked_and_expired_session_errors() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "reveal-errs.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let (mut v, clock) = open_vault_with_test_clock(&p);
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).unwrap();
+        // Locked: NotUnlocked.
+        v.lock();
+        let err = v.reveal_notes(id, &fresh_presence()).unwrap_err();
+        assert!(matches!(err, StoreError::NotUnlocked), "got {err:?}");
+        // Re-unlock, then expire the session: SessionExpired (cache gone).
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        clock.advance(IDLE_TIMEOUT_DEFAULT + Duration::from_secs(1));
+        let err = v.reveal_totp_secret(id, &fresh_presence()).unwrap_err();
+        assert!(matches!(err, StoreError::SessionExpired), "got {err:?}");
+        assert!(v.list_accounts().is_empty());
+        // history reveal on the expired session → also SessionExpired.
+        let err = v
+            .reveal_password_history(id, &fresh_presence())
+            .unwrap_err();
+        assert!(matches!(err, StoreError::SessionExpired));
     }
 
     /// Plan success criterion 8:

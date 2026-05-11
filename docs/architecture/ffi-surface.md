@@ -87,8 +87,37 @@ full design. `FfiError::NotUnlocked` if the vault is locked.
 
 | Function | Lands in |
 |---|---|
-| `session_status(h: &VaultHandle) -> SessionInfo` | 1.4 |
-| `session_extend(h: &VaultHandle) -> Result<SessionInfo, FfiError>` | 1.4 |
+| `session_status(h: &VaultHandle) -> SessionInfo` | 1.4 (bodies live; `SessionInfo` widened — see the 1.4 amendment) |
+| `session_extend(h: &VaultHandle, presence: PresenceProof) -> Result<SessionInfo, FfiError>` | 1.4 (**signature amended** — added the `presence` arg; §5.4 "extend long sessions" is high-risk) |
+
+### Reveal (presence-gated — MVP-1 issue 1.4 amendment)
+
+| Function | Lands in |
+|---|---|
+| `reveal_current_password(h: &VaultHandle, id: AccountId, presence: PresenceProof) -> Result<RevealedSecret, FfiError>` | 1.4 (**new** entry point) |
+| `reveal_password_history(h: &VaultHandle, id: AccountId, presence: PresenceProof) -> Result<Vec<PasswordHistoryEntry>, FfiError>` | 1.4 (**new** entry point) |
+| `reveal_notes(h: &VaultHandle, id: AccountId, presence: PresenceProof) -> Result<RevealedSecret, FfiError>` | 1.4 (**new** entry point) |
+| `reveal_totp_secret(h: &VaultHandle, id: AccountId, presence: PresenceProof) -> Result<RevealedSecret, FfiError>` | 1.4 (**new** entry point) |
+
+**Reveal-class behaviour (MVP-1 issue 1.4 — Session spec §5.4).** Each
+`reveal_*` requires an active session **plus** a presence proof that is
+*fresh now* — meaning within the 60 s `PRESENCE_FRESHNESS` window of the
+last successful presence (which includes the `vault_unlock`'s presence
+proof). Within that window no re-prompt is needed (prompt deduplication,
+§8.6 — two reveals moments apart use one proof). Outside it, the
+supplied proof must verify; a *stale* proof (the prompt aged past
+`PROMPT_TIMEOUT` ≈ 60 s before the user answered) surfaces
+`FfiError::Session` (the `PromptTimedOut` cause — §7.7, loud and typed,
+never silent per §8.2), while any other proof failure collapses to
+`FfiError::Validation { kind: "authentication" }`. A locked vault →
+`NotUnlocked`, an expired session → `SessionExpired`, a frozen account →
+`AccountFrozenPendingResolve` — all surfaced *before* the proof is
+consumed, so the caller can re-auth and retry. The CLI tier maps the
+1.1-frozen `PresenceProof` `{schema_version, bytes}` record to a fresh
+`PressYPresenceProof::confirmed()` (the `bytes` field is the slot
+MVP-3/4 hardware-backed presence proofs fill). Returned secret bytes
+zero on drop (`RevealedSecret` — a `byte_length()`-only Object, same
+discipline as `SecretPassword`).
 
 ### TOTP
 
@@ -127,15 +156,16 @@ full design. `FfiError::NotUnlocked` if the vault is locked.
 |---|---|---|---|
 | `SecretPassword` | Object (`Arc<Self>`) | Yes (password bytes) | n/a (opaque) |
 | `TotpSecret` | Object (`Arc<Self>`) | Yes (totp bytes) | n/a (opaque) |
+| `RevealedSecret` | Object (`Arc<Self>`) | Yes (a revealed secret byte string — head password / notes / raw TOTP seed; `byte_length()`-only) | n/a (opaque) |
 | `PresenceProof` | Record | Yes (proof bytes) | `schema_version: u16` |
-| `SessionInfo` | Record | No | `schema_version: u16` |
+| `SessionInfo` | Record | No (timestamps + flags + configured idle) | `schema_version: u16` |
 | `VaultHandle` | Object (`Arc<Self>`) | Indirect (holds vault state) | n/a (opaque) |
 | `AccountId` | Record | No | `schema_version: u16` |
 | `DeviceId` | Record | No | `schema_version: u16` |
 | `AccountDraft` | Record | Yes (full account at create — multi-username, multi-URL, tags, password, optional TOTP) | `schema_version: u16` |
 | `AccountPatch` | Record | Yes (partial update; password change appends to history) | `schema_version: u16` |
-| `AccountSnapshot` | Record | Yes (read-back account; carries full password history with timestamps + originating-device ids) | `schema_version: u16` |
-| `PasswordHistoryEntry` | Record | Yes (one historical password value) | `schema_version: u16` |
+| `AccountSnapshot` | Record | **No** (1.4 Q5b — metadata only: display name, tags, usernames, URLs, head revision id, password-history *count*, `has_totp` flag, current-password-changed-at timestamp; the secrets come from `reveal_*`) | `schema_version: u16` |
+| `PasswordHistoryEntry` | Record | Yes (one historical password value — returned only by the presence-gated `reveal_password_history`) | `schema_version: u16` |
 | `RevisionId` | Record | No | `schema_version: u16` |
 | `RevisionMeta` | Record | No | `schema_version: u16` |
 | `TotpCode` | Record | Yes (decimal code + window) | `schema_version: u16` |
@@ -202,6 +232,74 @@ Schema-version policy text is locked in MVP-1 issue 1.6 (master plan
 §18.7). Issue 1.1 commits to the *slot* — every record listed above
 that holds user data exposes a `schema_version: u16` field; 1.6 will
 finalise read-only-old / reject-future / migration semantics.
+
+### Issue 1.4 amendment: session-policy production (Q4 / Q5b)
+
+MVP-1 issue 1.4 promotes the session engine to production and adjusts
+the FFI surface in three additive ways (nothing external binds the 1.1
+surface yet, so removing the over-shared secret fields from a frozen
+shape is safe — same posture as 1.2's `AccountDraft` widening):
+
+1. **`AccountSnapshot` is tightened to metadata-only (Q5b — the strict
+   reveal-gated model).** It loses `current_password`, `password_history`,
+   and `totp_secret` (the over-sharing 1.2's plan §D intended to avoid)
+   and gains `password_history_count: u32`, `has_totp: bool`, and
+   `current_password_changed_at: UnixTimestamp` (the `set_at` of the
+   head history entry). Every secret crosses FFI **only** through the
+   presence-gated `reveal_*` entries — the search/list path never touches
+   an encrypted password blob and a binding shell never holds a secret
+   handle just because the user searched.
+2. **New `reveal_*` entry points** (see the "Reveal" table above) — the
+   canonical way reveal-class secrets cross FFI, each presence-gated.
+   They return `RevealedSecret` (a new zeroizing `byte_length()`-only
+   Object) / `Vec<PasswordHistoryEntry>`.
+3. **`session_extend` gains a `presence: PresenceProof` argument** —
+   extending a long session is high-risk per §5.4. And **`SessionInfo`
+   widens** (additive fields) to carry the idle / absolute deadlines, the
+   configured idle duration in seconds, and the presence-freshness
+   horizon, so a host UI can render a countdown / "session settings"
+   panel.
+
+```rust
+pub struct AccountSnapshot {
+    pub schema_version: u16,
+    pub id: AccountId,
+    pub display_name: String,                        // non-secret per the V1 model
+    pub tags: Vec<String>,
+    pub usernames: Vec<String>,
+    pub urls: Vec<String>,
+    pub head_revision_id: RevisionId,
+    pub password_history_count: u32,                 // count only; bytes via reveal_password_history
+    pub has_totp: bool,                              // flag only; seed via reveal_totp_secret
+    pub current_password_changed_at: UnixTimestamp,  // set_at of the head history entry; 0 if empty
+}
+
+pub struct SessionInfo {
+    pub schema_version: u16,
+    pub last_refresh_unix: i64,                       // most recent activity touch; 0 when not active
+    pub is_active: bool,
+    pub idle_deadline_unix: i64,                      // 1.4 (additive); 0 when not active
+    pub absolute_deadline_unix: i64,                  // 1.4 (additive); 4h ceiling; 0 when not active
+    pub configured_idle_secs: i64,                    // 1.4 (additive); 300/900/1800/3600/14400 or -1
+    pub last_presence_fresh_until_unix: i64,          // 1.4 (additive); 0 when not active
+}
+
+#[derive(uniffi::Object)]
+pub struct RevealedSecret { /* zeroizing byte buffer; byte_length() only */ }
+```
+
+The `pangolin_store::Vault` side adds `reveal_current_password` /
+`reveal_password_history` / `reveal_notes` / `reveal_totp_secret`
+(all presence-gated; `reveal_password` is kept as a back-compat alias
+for `reveal_current_password`), `touch_session_explicit(presence)`
+(backs `session_extend`), `set_session_idle(SessionDuration, Option<&dyn PresenceProof>)`
+(lengthening needs presence; shortening does not), and `device_locked()`
+(the §7.5 OS-lock hook — CLI unused). New public types live in
+`pangolin-store::session` and are re-exported via `pangolin_core::session`
+(`SessionDuration`, `PROMPT_TIMEOUT`, `SESSION_IDLE_UNTIL_DEVICE_LOCK`,
+`StoreError::PromptTimedOut`). See `docs/architecture/session.md` for
+the state machine, the freshness/timeout/dedup model, and the
+reveal-class taxonomy.
 
 ## `FfiError` — the §18.8 taxonomy
 
@@ -291,3 +389,13 @@ explicitly marked "C-only" with a reason.
 - Design Spec §15 — UI-safe error rendering.
 - `THREAT_MODEL.md` row #7 — indistinguishability discipline.
 - `docs/issue-plans/1.1.md` — issue plan + locked decisions Q1-Q5.
+- `docs/issue-plans/1.2.md` — `AccountIdentity` production model (the
+  `AccountDraft`/`AccountPatch`/`AccountSnapshot` widening amendment).
+- `docs/issue-plans/1.4.md` — session-policy production (Q1-Q5b: the
+  reveal-class entries, the `AccountSnapshot` tightening, the
+  `session_extend` presence arg).
+- `docs/architecture/session.md` — the session state machine, the
+  presence-freshness / prompt-timeout / dedup model, the reveal-class
+  taxonomy.
+- Session spec §2.3 / §5 / §7 / §8 — the session invariant, the
+  high-risk-action gate, the timing rules, the prompt behaviour.

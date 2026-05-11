@@ -62,6 +62,7 @@ pub mod error;
 pub mod identity;
 mod identity_bridge;
 pub mod kdbx;
+pub mod reveal;
 pub mod revision;
 pub mod session;
 pub mod totp;
@@ -79,6 +80,9 @@ pub use identity::{
     TotpSecret,
 };
 pub use kdbx::{CaptureAuthority, CaptureContext, KdbxImportReport};
+// MVP-1 issue 1.4: presence-gated reveal-class entry points + the
+// zeroizing `RevealedSecret` wrapper they return (Q4 amendment).
+pub use reveal::RevealedSecret;
 pub use revision::{RevisionId, RevisionMeta};
 pub use session::{
     PasswordPolicy, PlaintextExportConfirmation, PresenceProof, SecretPassword, SessionInfo,

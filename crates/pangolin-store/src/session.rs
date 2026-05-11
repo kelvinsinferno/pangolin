@@ -24,6 +24,11 @@
 //!   actually waiting 4 hours.
 //! - Timing constants per Session spec §7 (15-min idle, 4-hour absolute,
 //!   60-s presence freshness, 60-s prompt timeout).
+//! - The [`SessionDuration`] enum — the configurable idle-timeout
+//!   choices from Session spec §7.2 (`5/15/30/60/240 min` or "until
+//!   device lock") plus its `meta`-table serialisation. The choice is
+//!   persisted in the vault `meta` row; vaults that predate MVP-1
+//!   issue 1.4 have no row → [`IDLE_TIMEOUT_DEFAULT`] applies.
 //!
 //! # Security-critical invariants
 //!
@@ -71,10 +76,162 @@ pub const ABSOLUTE_MAX_DEFAULT: Duration = Duration::from_secs(4 * 3600);
 /// the vault inspects it.
 pub const PRESENCE_FRESHNESS: Duration = Duration::from_secs(60);
 
-/// Hard timeout on a UI-mediated prompt for re-auth. Spec §8.5. Not
-/// directly enforced inside the vault (the host UI runs the timer) but
-/// exposed here so callers don't pick a different value.
+/// Hard timeout on a UI-mediated prompt for re-auth. Spec §8.5 / §7.7.
+///
+/// The host UI runs the wall-clock timer; the storage layer's
+/// contribution is (a) this constant so callers don't pick a different
+/// value, and (b) a stale presence proof landing at a reveal site —
+/// because the host UI prompted, the user took >60 s, the proof's
+/// `created_at` is now stale — surfaces as [`crate::error::StoreError::PromptTimedOut`]
+/// rather than the generic authentication-failure variant.
 pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
+
+// ---------------------------------------------------------------------
+// SessionDuration — the configurable idle timeout (Session spec §7.2)
+// ---------------------------------------------------------------------
+
+/// Sentinel `meta.session_idle_secs` value meaning "until device lock".
+///
+/// No idle timeout at all; only the absolute-max ceiling
+/// ([`ABSOLUTE_MAX_DEFAULT`]) bounds the session, and a real device-lock
+/// signal ([`crate::vault::Vault::device_locked`]) expires it
+/// immediately. CLI builds have no OS-lock signal so this behaves like
+/// "until process exit". Stored as `-1` because all real idle durations
+/// are positive seconds.
+pub const SESSION_IDLE_UNTIL_DEVICE_LOCK: i64 = -1;
+
+/// User-selectable session idle duration. Session spec §7.2:
+///
+/// > "Users MAY choose: 5 min; 15 min (default); 30 min; 1 hour;
+/// > 4 hours; until device lock."
+///
+/// Persisted in the vault `meta` row via [`Self::to_meta_secs`]; read
+/// back via [`Self::from_meta_secs`]. A `meta` row absent the column ⇒
+/// [`Self::Min15`] (the spec default) for vaults that predate MVP-1
+/// issue 1.4. An out-of-set on-disk value (e.g. a tampered or
+/// corrupted-but-decryptable row) is treated as the default rather than
+/// bricking the vault — see [`Self::from_meta_secs`].
+///
+/// Picking [`Self::Hour4`] makes the idle deadline equal the
+/// absolute-max ceiling: the session simply cannot be extended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionDuration {
+    /// 5 minutes.
+    Min5,
+    /// 15 minutes — the Session spec §7.1 default.
+    Min15,
+    /// 30 minutes.
+    Min30,
+    /// 1 hour.
+    Hour1,
+    /// 4 hours — equals the absolute-max ceiling.
+    Hour4,
+    /// No idle timeout; only the absolute-max ceiling applies. On a real
+    /// device-lock signal the session expires immediately.
+    UntilDeviceLock,
+}
+
+impl SessionDuration {
+    /// The Session spec §7.1 default.
+    pub const DEFAULT: Self = Self::Min15;
+
+    /// Idle window this choice implies, or `None` for
+    /// [`Self::UntilDeviceLock`] (no idle window — only the absolute-max
+    /// ceiling). The returned duration is what
+    /// [`next_idle_deadline`] uses as the idle leg.
+    #[must_use]
+    pub const fn idle_window(self) -> Option<Duration> {
+        match self {
+            Self::Min5 => Some(Duration::from_secs(5 * 60)),
+            Self::Min15 => Some(Duration::from_secs(15 * 60)),
+            Self::Min30 => Some(Duration::from_secs(30 * 60)),
+            Self::Hour1 => Some(Duration::from_secs(60 * 60)),
+            Self::Hour4 => Some(Duration::from_secs(4 * 3600)),
+            Self::UntilDeviceLock => None,
+        }
+    }
+
+    /// `true` if `self` is a strictly longer idle window than `other`.
+    /// [`Self::UntilDeviceLock`] is treated as the longest (it is bounded
+    /// only by the 4 h absolute ceiling, but for the
+    /// "lengthening-needs-presence" rule it counts as longest because it
+    /// removes the idle timer entirely). Used by
+    /// [`crate::vault::Vault::set_session_idle`]: lengthening the session
+    /// is high-risk per §5.4 and requires a fresh presence proof;
+    /// shortening it is always allowed.
+    #[must_use]
+    pub fn is_longer_than(self, other: Self) -> bool {
+        let rank = |d: Self| -> u8 {
+            match d {
+                Self::Min5 => 0,
+                Self::Min15 => 1,
+                Self::Min30 => 2,
+                Self::Hour1 => 3,
+                Self::Hour4 => 4,
+                Self::UntilDeviceLock => 5,
+            }
+        };
+        rank(self) > rank(other)
+    }
+
+    /// Encode for the `meta.session_idle_secs` column. Positive seconds
+    /// for the finite choices; [`SESSION_IDLE_UNTIL_DEVICE_LOCK`] (`-1`)
+    /// for [`Self::UntilDeviceLock`].
+    #[must_use]
+    pub fn to_meta_secs(self) -> i64 {
+        // Every finite variant's seconds fits in i64 (max 14400);
+        // `try_from` can't fail but is the lint-clean way to widen.
+        self.idle_window()
+            .map_or(SESSION_IDLE_UNTIL_DEVICE_LOCK, |d| {
+                i64::try_from(d.as_secs()).unwrap_or(i64::MAX)
+            })
+    }
+
+    /// Decode from the `meta.session_idle_secs` column. `None` (column
+    /// absent — pre-1.4 vault) ⇒ [`Self::DEFAULT`]. An out-of-set value
+    /// ⇒ [`Self::DEFAULT`] too: a corrupt-but-decryptable meta field
+    /// must not brick an otherwise-openable vault. `-1` ⇒
+    /// [`Self::UntilDeviceLock`].
+    #[must_use]
+    pub fn from_meta_secs(raw: Option<i64>) -> Self {
+        match raw {
+            Some(SESSION_IDLE_UNTIL_DEVICE_LOCK) => Self::UntilDeviceLock,
+            Some(300) => Self::Min5,
+            Some(900) => Self::Min15,
+            Some(1800) => Self::Min30,
+            Some(3600) => Self::Hour1,
+            Some(14400) => Self::Hour4,
+            // None (absent column) or any out-of-set value ⇒ default.
+            None | Some(_) => Self::DEFAULT,
+        }
+    }
+
+    /// Validate a caller-supplied "raw seconds" value at the public-API
+    /// boundary (the §7 set or the `-1` sentinel only). Returns the
+    /// matching variant or a typed [`crate::error::StoreError::Validation`]
+    /// with `kind = "session_duration"`. Used by 1.6's §18.7
+    /// reject/migrate policy hook — 1.4 only adds the slot.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::StoreError::Validation`] for any value outside the
+    /// §7.2 set.
+    pub fn try_from_meta_secs(raw: i64) -> crate::error::Result<Self> {
+        match Self::from_meta_secs(Some(raw)) {
+            // `from_meta_secs` maps unknowns to DEFAULT; re-check the
+            // round-trip so an out-of-set value surfaces as an error
+            // here (rather than silently becoming the default, which is
+            // the *read*-path behaviour, not the *write*-path one).
+            d if d.to_meta_secs() == raw => Ok(d),
+            _ => Err(crate::error::StoreError::Validation {
+                kind: "session_duration".into(),
+                message: format!(
+                    "session idle duration {raw}s is not one of {{300, 900, 1800, 3600, 14400, -1}}"
+                ),
+            }),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------
 // AuthError
@@ -393,13 +550,21 @@ impl Clock for SystemClock {
 
 /// Test clock with caller-set time. Use [`TestClock::advance`] to walk
 /// the clock forward without sleeping the test thread.
-#[cfg(test)]
+///
+/// # Visibility
+///
+/// Gated behind `cfg(any(test, feature = "test-utilities"))` so
+/// production builds cannot link against it (a vault driven by a
+/// caller-controlled clock would be a security hazard). The
+/// `test-utilities` feature is what the `pangolin-store` e2e suite
+/// builds with; in-crate unit tests reach it via `cfg(test)`.
+#[cfg(any(test, feature = "test-utilities"))]
 #[derive(Debug)]
 pub struct TestClock {
     inner: std::sync::Mutex<SystemTime>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utilities"))]
 impl TestClock {
     /// Construct with `now` as the initial reading.
     #[must_use]
@@ -416,7 +581,7 @@ impl TestClock {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utilities"))]
 impl Clock for TestClock {
     fn now(&self) -> SystemTime {
         *self.inner.lock().unwrap()
@@ -491,11 +656,14 @@ impl SessionState {
 // Helpers
 // ---------------------------------------------------------------------
 
-/// Compute the next `expires_at` after a touch.
+/// Compute the next `expires_at` after a touch, given the session's
+/// configured idle window (`idle`).
 ///
 /// Caps at `session_started_at + ABSOLUTE_MAX_DEFAULT`. This helper is
 /// the single source of truth for the absolute-max ceiling — every code
-/// path that extends a deadline routes through it.
+/// path that extends a deadline routes through it. For
+/// [`SessionDuration::UntilDeviceLock`] the result is purely the
+/// absolute-max ceiling (no idle leg).
 ///
 /// # P4 audit L-2: overflow-safe saturating arithmetic
 ///
@@ -512,29 +680,35 @@ impl SessionState {
 /// past-or-equal-to-now deadline. The fail-safe is "expire now"
 /// rather than "extend forever".
 #[must_use]
-pub(crate) fn next_idle_deadline(now: SystemTime, session_started_at: SystemTime) -> SystemTime {
-    // Saturating fallback on `now`: if adding IDLE_TIMEOUT_DEFAULT
-    // overflows `SystemTime`, fall back to `now` itself — the next
-    // freshness check will see `now > expires_at` and expire the
-    // session. This is the correct fail-safe: never silently extend
-    // beyond representable time.
-    let idle_deadline = now.checked_add(IDLE_TIMEOUT_DEFAULT).unwrap_or(now);
-    // Same discipline for the absolute ceiling. A saturated value
-    // here is always <= `idle_deadline` because it was computed
-    // earlier — so the `min` below still produces a fail-safe
-    // deadline.
+pub(crate) fn next_idle_deadline(
+    now: SystemTime,
+    session_started_at: SystemTime,
+    idle: SessionDuration,
+) -> SystemTime {
+    // The absolute ceiling always applies. A saturated value here is
+    // <= `now` (in the year-262k overflow case), so the `min` below
+    // still produces a fail-safe deadline.
     let abs_max_deadline = session_started_at
         .checked_add(ABSOLUTE_MAX_DEFAULT)
         .unwrap_or(session_started_at);
-    idle_deadline.min(abs_max_deadline)
+    // Finite idle window ⇒ deadline = min(now + idle, abs ceiling), with
+    // a saturating fallback on `now` (a year-262k overflow falls back to
+    // `now` itself — the next freshness check expires; never silently
+    // extend beyond representable time). "Until device lock" ⇒ no idle
+    // leg; the deadline is purely the absolute-max ceiling (a device-lock
+    // signal expires it out-of-band, `Vault::device_locked`).
+    idle.idle_window().map_or(abs_max_deadline, |window| {
+        now.checked_add(window).unwrap_or(now).min(abs_max_deadline)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         next_idle_deadline, AuthError, Clock, IdentityProof, PinIdentityProof, PresenceProof,
-        PressYPresenceProof, SessionState, SystemClock, TestClock, ABSOLUTE_MAX_DEFAULT,
-        IDLE_TIMEOUT_DEFAULT, PRESENCE_FRESHNESS,
+        PressYPresenceProof, SessionDuration, SessionState, SystemClock, TestClock,
+        ABSOLUTE_MAX_DEFAULT, IDLE_TIMEOUT_DEFAULT, PRESENCE_FRESHNESS,
+        SESSION_IDLE_UNTIL_DEVICE_LOCK,
     };
     use core::time::Duration;
     use pangolin_crypto::secret::SecretBytes;
@@ -646,20 +820,88 @@ mod tests {
     #[test]
     fn touch_caps_at_absolute_max() {
         let started = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let idle = SessionDuration::DEFAULT;
         // Right at the start: deadline is now+IDLE.
-        let deadline = next_idle_deadline(started, started);
+        let deadline = next_idle_deadline(started, started, idle);
         assert_eq!(deadline, started + IDLE_TIMEOUT_DEFAULT);
 
         // 3 hours 50 min in: still under the 4-hour ceiling, deadline
         // would be 3h50m + 15m = 4h05m, but ceiling caps it at 4h.
         let almost_out = started + Duration::from_secs(3 * 3600 + 50 * 60);
-        let deadline = next_idle_deadline(almost_out, started);
+        let deadline = next_idle_deadline(almost_out, started, idle);
         assert_eq!(deadline, started + ABSOLUTE_MAX_DEFAULT);
 
         // Right at the start + 14m: 14+15 = 29m < 4h, so no cap.
         let mid = started + Duration::from_secs(14 * 60);
-        let deadline = next_idle_deadline(mid, started);
+        let deadline = next_idle_deadline(mid, started, idle);
         assert_eq!(deadline, mid + IDLE_TIMEOUT_DEFAULT);
+
+        // A 30-min configured idle: deadline = now + 30m (under cap).
+        let d30 = next_idle_deadline(started, started, SessionDuration::Min30);
+        assert_eq!(d30, started + Duration::from_secs(30 * 60));
+
+        // "Until device lock": the deadline is purely the absolute-max
+        // ceiling regardless of how far into the session we are.
+        let udl = SessionDuration::UntilDeviceLock;
+        assert_eq!(
+            next_idle_deadline(started, started, udl),
+            started + ABSOLUTE_MAX_DEFAULT
+        );
+        assert_eq!(
+            next_idle_deadline(started + Duration::from_secs(3600), started, udl),
+            started + ABSOLUTE_MAX_DEFAULT
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // SessionDuration — configurable idle (Session spec §7.2)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn session_duration_meta_round_trip() {
+        for d in [
+            SessionDuration::Min5,
+            SessionDuration::Min15,
+            SessionDuration::Min30,
+            SessionDuration::Hour1,
+            SessionDuration::Hour4,
+            SessionDuration::UntilDeviceLock,
+        ] {
+            assert_eq!(SessionDuration::from_meta_secs(Some(d.to_meta_secs())), d);
+        }
+        // Absent column ⇒ default (pre-1.4 vault).
+        assert_eq!(
+            SessionDuration::from_meta_secs(None),
+            SessionDuration::Min15
+        );
+        // Out-of-set value ⇒ default (corrupt-but-decryptable, don't brick).
+        assert_eq!(
+            SessionDuration::from_meta_secs(Some(99_999)),
+            SessionDuration::Min15
+        );
+        assert_eq!(SessionDuration::UntilDeviceLock.to_meta_secs(), -1);
+        assert_eq!(SESSION_IDLE_UNTIL_DEVICE_LOCK, -1);
+    }
+
+    #[test]
+    fn session_duration_try_from_meta_secs_rejects_out_of_set() {
+        assert!(SessionDuration::try_from_meta_secs(900).is_ok());
+        assert!(SessionDuration::try_from_meta_secs(-1).is_ok());
+        let err = SessionDuration::try_from_meta_secs(42).unwrap_err();
+        match err {
+            crate::error::StoreError::Validation { kind, .. } => {
+                assert_eq!(kind, "session_duration");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_duration_ordering_for_lengthening_rule() {
+        assert!(SessionDuration::Hour4.is_longer_than(SessionDuration::Min5));
+        assert!(SessionDuration::UntilDeviceLock.is_longer_than(SessionDuration::Hour4));
+        assert!(!SessionDuration::Min5.is_longer_than(SessionDuration::Min15));
+        assert!(!SessionDuration::Min15.is_longer_than(SessionDuration::Min15));
     }
 
     /// P4 audit L-2: a `now` close to `SystemTime`'s representable
@@ -674,7 +916,7 @@ mod tests {
     /// Unix uses `i64` seconds + nanos), so this test does a binary
     /// search for the largest representable `SystemTime` and uses
     /// that as `now`. The expected behavior is that
-    /// `next_idle_deadline(near_max, near_max)` returns
+    /// `next_idle_deadline(near_max, near_max, SessionDuration::DEFAULT)` returns
     /// `<= near_max` (i.e., past-or-equal-to-now), proving the
     /// saturating fallback engaged.
     #[test]
@@ -698,7 +940,7 @@ mod tests {
             // present in the function but unprovable from this test.
             // A normal-value sanity check is the most we can do.
             let normal = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-            let _ = next_idle_deadline(normal, normal);
+            let _ = next_idle_deadline(normal, normal, SessionDuration::DEFAULT);
             return;
         }
         // Binary search until lo+1 == hi: the boundary between
@@ -723,7 +965,7 @@ mod tests {
             "binary search did not converge to overflow boundary",
         );
         // The saturation guard must engage and produce <= near_max.
-        let deadline = next_idle_deadline(near_max, near_max);
+        let deadline = next_idle_deadline(near_max, near_max, SessionDuration::DEFAULT);
         assert!(
             deadline <= near_max,
             "saturating fallback must not extend past `now` on overflow",

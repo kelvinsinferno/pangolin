@@ -48,10 +48,12 @@ pub use error::Error;
 // physical relocation to 1.4; the namespace freezes today.
 pub use pangolin_store::{
     AccountId, AccountIdentity, AccountIdentityDraft, AccountIdentityPatch, AccountIdentitySummary,
-    AccountSnapshot, Clock, ConflictReport, DeviceId, IdentityProof, PasswordEntry,
+    AccountSnapshot, AuthError, Clock, ConflictReport, DeviceId, IdentityProof, PasswordEntry,
     PasswordHistorySummaryEntry, PendingMerge, PinIdentityProof, PresenceProof,
-    PressYPresenceProof, RevisionGraph, RevisionId, RevisionMeta, SessionState, SystemClock, Vault,
-    VaultState, ACCOUNT_IDENTITY_SCHEMA_VERSION, PAYLOAD_VERSION_V0, PAYLOAD_VERSION_V1,
+    PressYPresenceProof, RevisionGraph, RevisionId, RevisionMeta, SessionDuration, SessionState,
+    SystemClock, Vault, VaultState, ABSOLUTE_MAX_DEFAULT, ACCOUNT_IDENTITY_SCHEMA_VERSION,
+    IDLE_TIMEOUT_DEFAULT, PAYLOAD_VERSION_V0, PAYLOAD_VERSION_V1, PRESENCE_FRESHNESS,
+    PROMPT_TIMEOUT, SESSION_IDLE_UNTIL_DEVICE_LOCK,
 };
 
 /// Returns the crate name. Useful for diagnostics and version reporting.
@@ -67,5 +69,23 @@ mod tests {
     #[test]
     fn crate_name_is_set() {
         assert_eq!(name(), "pangolin-core");
+    }
+
+    /// MVP-1 issue 1.4 (Q1 = no physical move): the session engine is
+    /// reachable through the canonical `pangolin_core::session::*`
+    /// import path. This smoke test pins that the re-export modules
+    /// resolve so the §16.8 namespace intent is satisfied without the
+    /// physical relocation. It also touches the new 1.4 surface
+    /// (`SessionDuration`, `PROMPT_TIMEOUT`) via that path.
+    #[test]
+    fn session_module_resolves() {
+        use crate::session::{SessionDuration, SessionState, PROMPT_TIMEOUT};
+        assert_eq!(SessionDuration::DEFAULT, SessionDuration::Min15);
+        assert!(!SessionState::Locked.is_active());
+        assert_eq!(PROMPT_TIMEOUT, core::time::Duration::from_secs(60));
+        // Also reachable at the crate root.
+        let _ = crate::SessionDuration::Hour4;
+        // identity module re-exports resolve too.
+        let _ = crate::identity::ACCOUNT_IDENTITY_SCHEMA_VERSION;
     }
 }

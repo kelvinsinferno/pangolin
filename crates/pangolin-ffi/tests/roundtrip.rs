@@ -13,8 +13,8 @@
 use pangolin_ffi::{
     AccountDraft, AccountId, AccountPatch, AccountSnapshot, CaptureAuthority, CaptureContext,
     DeviceId, KdbxImportReport, PasswordHistoryEntry, PasswordPolicy, PlaintextExportConfirmation,
-    PresenceProof, RevisionId, RevisionMeta, SecretPassword, SessionInfo, TotpCode, TotpSecret,
-    UnixTimestamp, VaultHandle,
+    PresenceProof, RevealedSecret, RevisionId, RevisionMeta, SecretPassword, SessionInfo, TotpCode,
+    TotpSecret, UnixTimestamp, VaultHandle,
 };
 
 #[test]
@@ -45,14 +45,34 @@ fn presence_proof_record_round_trip() {
 
 #[test]
 fn session_info_record_round_trip() {
+    // MVP-1 issue 1.4 widened SessionInfo (additive fields).
     let original = SessionInfo {
-        schema_version: 0,
+        schema_version: 1,
         last_refresh_unix: 1_700_000_000,
         is_active: true,
+        idle_deadline_unix: 1_700_000_900,
+        absolute_deadline_unix: 1_700_014_400,
+        configured_idle_secs: 900,
+        last_presence_fresh_until_unix: 1_700_000_060,
     };
     let cloned = original.clone();
     assert_eq!(original.is_active, cloned.is_active);
     assert_eq!(original.last_refresh_unix, cloned.last_refresh_unix);
+    assert_eq!(original.idle_deadline_unix, cloned.idle_deadline_unix);
+    assert_eq!(original.configured_idle_secs, 900);
+}
+
+#[test]
+fn revealed_secret_object_round_trip() {
+    // MVP-1 issue 1.4: the zeroizing wrapper the reveal_* entries
+    // return. Length-only accessor; bytes zero on drop.
+    let s = RevealedSecret::new(b"top secret".to_vec());
+    assert_eq!(s.byte_length(), 10);
+    assert!(!s.is_empty());
+    drop(s);
+    let empty = RevealedSecret::new(Vec::new());
+    assert_eq!(empty.byte_length(), 0);
+    assert!(empty.is_empty());
 }
 
 #[test]
@@ -103,6 +123,11 @@ fn account_patch_record_round_trip() {
 
 #[test]
 fn account_snapshot_record_round_trip() {
+    // MVP-1 issue 1.4 (Q5b): the FFI AccountSnapshot is metadata-only —
+    // no secret-bearing fields. Display name / tags / usernames / URLs
+    // are non-secret per the V1 model; the password / history / notes /
+    // TOTP-seed bytes reach the binding ONLY through the presence-gated
+    // reveal_* entry points.
     let head = RevisionId {
         schema_version: 1,
         bytes: vec![0xBB; 32],
@@ -117,38 +142,28 @@ fn account_snapshot_record_round_trip() {
         tags: vec!["work".into()],
         usernames: vec!["alice".into()],
         urls: vec!["https://github.com".into()],
-        // Note: `AccountSnapshot` deliberately has no `notes` field
-        // (audit C-1). `notes` are recovery-class secrets per spec
-        // §5.4 and reach the binding only through the presence-gated
-        // `reveal_notes` entry point landing in 1.4.
-        current_password: SecretPassword::new(b"hunter2".to_vec()),
-        password_history: vec![PasswordHistoryEntry {
-            schema_version: 1,
-            password: SecretPassword::new(b"hunter2".to_vec()),
-            set_at: 1_700_000_000,
-            originating_device: DeviceId {
-                schema_version: 1,
-                bytes: vec![0u8; 32],
-            },
-        }],
-        totp_secret: None,
         head_revision_id: head.clone(),
+        password_history_count: 2,
+        has_totp: true,
+        current_password_changed_at: 1_700_000_000,
     };
     let cloned = original.clone();
     assert_eq!(original.head_revision_id, cloned.head_revision_id);
     assert_eq!(cloned.head_revision_id, head);
-    assert_eq!(cloned.password_history.len(), 1);
+    assert_eq!(cloned.password_history_count, 2);
+    assert!(cloned.has_totp);
+    assert_eq!(cloned.current_password_changed_at, 1_700_000_000);
 }
 
-/// Regression test for audit C-1: the FFI `AccountSnapshot` MUST NOT
-/// expose `notes`. This test would fail to compile if a future
-/// refactor accidentally added a `notes` field — the lack of `notes:`
-/// in the struct literal compiles only when no such field exists.
+/// Regression test for audit C-1 (`notes`) **and** MVP-1 issue 1.4
+/// Q5b (`current_password` / `password_history` / `totp_secret`): the
+/// FFI `AccountSnapshot` carries **zero secret-bearing fields**. This
+/// struct literal lists every field; if a secret-bearing field were
+/// re-added (without a default) this would fail to compile and the
+/// regression is caught at build time. Constructing it requires no
+/// secret material whatsoever.
 #[test]
-fn account_snapshot_has_no_notes_field() {
-    // Construct without a `notes` field; if a `notes` field is
-    // re-added (without a default), this struct literal will fail to
-    // compile and the regression is caught at build time.
+fn account_snapshot_has_no_secret_fields() {
     let _snap = AccountSnapshot {
         schema_version: 1,
         id: AccountId {
@@ -159,13 +174,13 @@ fn account_snapshot_has_no_notes_field() {
         tags: vec![],
         usernames: vec!["u".into()],
         urls: vec![],
-        current_password: SecretPassword::new(b"p".to_vec()),
-        password_history: vec![],
-        totp_secret: None,
         head_revision_id: RevisionId {
             schema_version: 1,
             bytes: vec![0xBB; 32],
         },
+        password_history_count: 0,
+        has_totp: false,
+        current_password_changed_at: 0,
     };
 }
 

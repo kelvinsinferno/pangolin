@@ -46,7 +46,15 @@ CREATE TABLE IF NOT EXISTS meta (
     kdf_salt          BLOB    NOT NULL,
     schema_version    INTEGER NOT NULL,
     wrapped_ct        BLOB    NOT NULL,
-    wrapped_nonce     BLOB    NOT NULL
+    wrapped_nonce     BLOB    NOT NULL,
+    -- MVP-1 issue 1.4: configurable idle-timeout choice (Session spec
+    -- 7.2). NULL means the 15-min default for vaults that predate 1.4;
+    -- otherwise one of {300, 900, 1800, 3600, 14400} seconds, or -1 for
+    -- until-device-lock. Additive column; absence is a valid (default)
+    -- state -- same doctrine as the sync_state / dirty_accounts additive
+    -- tables (no format_version bump). Legacy vault files get the column
+    -- via migrate_session_idle_secs_column at open time.
+    session_idle_secs INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS account_identities (
@@ -202,6 +210,12 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     // the table. Idempotent — checks `sqlite_master` first.
     migrate_pending_merges_table(conn)?;
 
+    // MVP-1 issue 1.4 migration: add `session_idle_secs` to `meta` on
+    // vaults written before 1.4. Idempotent — `PRAGMA table_info` check
+    // first. Nullable, no default → existing rows pick up NULL, which
+    // `SessionDuration::from_meta_secs(None)` maps to the 15-min default.
+    migrate_session_idle_secs_column(conn)?;
+
     Ok(())
 }
 
@@ -231,6 +245,31 @@ fn migrate_frozen_pending_resolve_column(conn: &Connection) -> Result<()> {
              ADD COLUMN frozen_pending_resolve INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
+    }
+    Ok(())
+}
+
+/// **MVP-1 issue 1.4 migration.** Add the nullable `session_idle_secs`
+/// column to `meta` on vaults that predate 1.4. Idempotent — checks
+/// `PRAGMA table_info(meta)` first. Existing rows pick up NULL, which
+/// the read path ([`crate::session::SessionDuration::from_meta_secs`])
+/// maps to the 15-min Session spec §7.1 default.
+fn migrate_session_idle_secs_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(meta)")?;
+    let rows = stmt.query_map([], |row| {
+        let name: String = row.get(1)?;
+        Ok(name)
+    })?;
+    let mut has_column = false;
+    for r in rows {
+        if r? == "session_idle_secs" {
+            has_column = true;
+            break;
+        }
+    }
+    drop(stmt);
+    if !has_column {
+        conn.execute("ALTER TABLE meta ADD COLUMN session_idle_secs INTEGER", [])?;
     }
     Ok(())
 }
