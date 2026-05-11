@@ -34,6 +34,7 @@
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
+pub mod device;
 pub mod error;
 pub mod identity;
 pub mod recovery;
@@ -48,12 +49,13 @@ pub use error::Error;
 // physical relocation to 1.4; the namespace freezes today.
 pub use pangolin_store::{
     AccountId, AccountIdentity, AccountIdentityDraft, AccountIdentityPatch, AccountIdentitySummary,
-    AccountSnapshot, AuthError, Clock, ConflictReport, DeviceId, IdentityProof, PasswordEntry,
-    PasswordHistorySummaryEntry, PendingMerge, PinIdentityProof, PresenceProof,
-    PressYPresenceProof, RevisionGraph, RevisionId, RevisionMeta, SessionDuration, SessionState,
-    SystemClock, Vault, VaultState, ABSOLUTE_MAX_DEFAULT, ACCOUNT_IDENTITY_SCHEMA_VERSION,
-    IDLE_TIMEOUT_DEFAULT, PAYLOAD_VERSION_V0, PAYLOAD_VERSION_V1, PRESENCE_FRESHNESS,
-    PROMPT_TIMEOUT, SESSION_IDLE_UNTIL_DEVICE_LOCK,
+    AccountSnapshot, AuthError, Clock, ConflictReport, DeviceCapabilities, DeviceId,
+    DeviceIdentity, IdentityProof, PasswordEntry, PasswordHistorySummaryEntry, PendingMerge,
+    PinIdentityProof, PresenceProof, PressYPresenceProof, RevisionGraph, RevisionId, RevisionMeta,
+    SessionDuration, SessionState, SystemClock, Vault, VaultState, ABSOLUTE_MAX_DEFAULT,
+    ACCOUNT_IDENTITY_SCHEMA_VERSION, DEVICE_IDENTITY_SCHEMA_VERSION, IDLE_TIMEOUT_DEFAULT,
+    PAYLOAD_VERSION_V0, PAYLOAD_VERSION_V1, PRESENCE_FRESHNESS, PROMPT_TIMEOUT,
+    SESSION_IDLE_UNTIL_DEVICE_LOCK,
 };
 
 /// Returns the crate name. Useful for diagnostics and version reporting.

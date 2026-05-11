@@ -36,6 +36,7 @@
 
 pub mod account;
 pub mod conflict;
+pub mod device;
 pub mod dirty;
 pub mod error;
 pub mod pending;
@@ -55,6 +56,7 @@ pub use account::{
 };
 pub use blob::TombstonePayload;
 pub use conflict::ConflictReport;
+pub use device::{DeviceCapabilities, DeviceIdentity, DEVICE_IDENTITY_SCHEMA_VERSION};
 pub use dirty::{DirtyEntry, IngestOutcome, RevisionPublishPayload};
 pub use error::{Result, StoreError};
 pub use pending::{PendingMerge, PENDING_MERGE_NONCE_LEN, PENDING_MERGE_SECRET_LEN};

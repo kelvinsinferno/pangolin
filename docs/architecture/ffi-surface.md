@@ -119,6 +119,43 @@ MVP-3/4 hardware-backed presence proofs fill). Returned secret bytes
 zero on drop (`RevealedSecret` — a `byte_length()`-only Object, same
 discipline as `SecretPassword`).
 
+### Device identity + trust list (MVP-1 issue 1.5 amendment)
+
+| Function | Lands in |
+|---|---|
+| `device_list(h: &VaultHandle) -> Result<Vec<DeviceInfo>, FfiError>` | 1.5 (**new** entry point) |
+| `device_current(h: &VaultHandle) -> Result<DeviceInfo, FfiError>` | 1.5 (**new** entry point) |
+| `device_set_label(h: &VaultHandle, id: DeviceId, label: String) -> Result<(), FfiError>` | 1.5 (**new** entry point) |
+
+**Device behaviour (MVP-1 issue 1.5 — Whitepaper §F).** The trust list
+is the engine's `devices` table — one row per device that has ever
+opened+unlocked this `.pvf`. The row is created **on first unlock**
+(register-on-unlock: the engine generates an Ed25519 `DeviceKey`, derives
+the `device_id` from its verifying-key bytes, persists the `devices` row
+and the AEAD-sealed device-key seed). It is **add-only** in MVP-1 — no
+revoke/remove path (device revocation needs authority rotation, which is
+MVP-3); the `revoked_at` column is the MVP-2/3 hook. It gates nothing
+destructive — it is the local record + the MVP-2 on-chain-authority-
+registry hook; `originating_device` on every post-1.5 revision is the
+open handle's real `device_id` (pre-1.5 revisions keep their throwaway-
+random value, accepted as-is). `device_list` / `device_current` work on a
+*locked* vault that has been unlocked at least once (the row is
+persisted); on a brand-new vault opened-but-never-unlocked there is no
+device row yet → `FfiError::Session`. `device_set_label` requires an
+**active (unlocked, non-expired) session only** — NOT a fresh presence
+proof (a label rename is not a Session spec §5.4 reveal-class action) —
+and validates the label (non-empty, ≤ 256 chars, NFC-normalised). The
+`DeviceKey` is generated + stored encrypted but **signs nothing in
+MVP-1** — it is the hook for MVP-2's signed-revision format / gas-payer
+role; `last_sync_at` is a **dormant column** (always `None` in MVP-1;
+MVP-2's chain sync fills it). These are an **additive 1.1-surface
+amendment** — the 1.1 freeze declared the `DeviceId` record but no
+`Device` / `DeviceInfo` shape and no `device_*` entries; nothing external
+binds the 1.1 surface yet (same posture as 1.2's `AccountDraft` widening
+and 1.4's `reveal_*` entries). The C-ABI mirror in `cabi.rs` is not yet
+extended for these (the cbindgen surface remains intentionally tiny —
+`device_*` are `UniFFI`-only for now, same as `account_*` / `reveal_*`).
+
 ### TOTP
 
 | Function | Backed by | Lands in |
@@ -162,6 +199,8 @@ discipline as `SecretPassword`).
 | `VaultHandle` | Object (`Arc<Self>`) | Indirect (holds vault state) | n/a (opaque) |
 | `AccountId` | Record | No | `schema_version: u16` |
 | `DeviceId` | Record | No | `schema_version: u16` |
+| `DeviceInfo` | Record | No (1.5 — device id, label, registered-at, dormant last-sync, capability flags, is-current, public verifying key) | `schema_version: u16` |
+| `DeviceCapabilities` | Enum (`uniffi::Enum`) | No (1.5 — `Full` in MVP-1; grows later) | n/a (closed enum) |
 | `AccountDraft` | Record | Yes (full account at create — multi-username, multi-URL, tags, password, optional TOTP) | `schema_version: u16` |
 | `AccountPatch` | Record | Yes (partial update; password change appends to history) | `schema_version: u16` |
 | `AccountSnapshot` | Record | **No** (1.4 Q5b — metadata only: display name, tags, usernames, URLs, head revision id, password-history *count*, `has_totp` flag, current-password-changed-at timestamp; the secrets come from `reveal_*`) | `schema_version: u16` |

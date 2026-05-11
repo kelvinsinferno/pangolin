@@ -58,6 +58,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod cabi;
+pub mod device;
 pub mod error;
 pub mod identity;
 mod identity_bridge;
@@ -79,6 +80,9 @@ pub use identity::{
     AccountDraft, AccountId, AccountPatch, AccountSnapshot, DeviceId, PasswordHistoryEntry,
     TotpSecret,
 };
+// MVP-1 issue 1.5: device-identity FFI shapes + entry points (additive
+// 1.1-surface amendment — see device.rs / ffi-surface.md).
+pub use device::{DeviceCapabilities, DeviceInfo};
 pub use kdbx::{CaptureAuthority, CaptureContext, KdbxImportReport};
 // MVP-1 issue 1.4: presence-gated reveal-class entry points + the
 // zeroizing `RevealedSecret` wrapper they return (Q4 amendment).
