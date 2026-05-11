@@ -1522,6 +1522,7 @@ fn revisions_stamp_real_device_id_after_register() {
 /// value (the per-session throwaway an older-build handle would have
 /// stamped).
 #[test]
+#[allow(clippy::too_many_lines)] // one coherent end-to-end migration scenario; splitting hurts readability
 fn poc_vault_migrates_and_registers() {
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join("poc-shaped.pvf");
