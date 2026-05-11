@@ -76,12 +76,13 @@ pub enum Error {
 
 impl From<StoreError> for Error {
     fn from(err: StoreError) -> Self {
-        // The mapping is intentionally conservative: every store-level
-        // error becomes a `Store(...)` or `Authentication` variant.
-        // Per-domain refinement (e.g., session-state errors mapping to
-        // `Session(...)`) happens in 1.4's session rewrite — at that
-        // point the store's session module is gone and the mapping
-        // shifts to the new per-domain enum.
+        // Per-domain mapping: session-state errors → `Session(...)`,
+        // validation errors → `Validation { .. }`, everything else →
+        // `Store(...)` or `Authentication`. (1.4 kept `pangolin-store`
+        // as the persistence crate — per the issue-1.4 Q1 decision the
+        // session module was *not* relocated to `pangolin-core` — so
+        // this stays a cross-crate `From` rather than collapsing into a
+        // single in-crate enum.)
         match err {
             StoreError::AuthenticationFailed => Self::Authentication,
             StoreError::SessionExpired
