@@ -101,3 +101,14 @@ hex      = { workspace = true }
 name = "e2e"
 path = "tests/e2e.rs"
 required-features = ["test-utilities"]
+
+# MVP-1 issue 1.3: 10k-account search benchmark (hand-rolled
+# `Instant`-timed harness — no `criterion` dependency, so no `deny.toml`
+# / `Cargo.lock` churn). `harness = false` because the body is a plain
+# `fn main()` rather than `#[bench]` fns. Needs `test-utilities` for the
+# same reason `e2e.rs` does (the bench builds + reopens a real vault).
+[[bench]]
+name = "search_10k"
+path = "benches/search_10k.rs"
+harness = false
+required-features = ["test-utilities"]

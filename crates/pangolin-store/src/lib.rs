@@ -59,6 +59,7 @@ pub use dirty::{DirtyEntry, IngestOutcome, RevisionPublishPayload};
 pub use error::{Result, StoreError};
 pub use pending::{PendingMerge, PENDING_MERGE_NONCE_LEN, PENDING_MERGE_SECRET_LEN};
 pub use revision::{ChainAnchor, DeviceId, RevisionGraph, RevisionId, RevisionMeta};
+pub use search::{ACCOUNT_SEARCH_RESULT_CAP, FTS_SCHEMA_VERSION};
 pub use session::{
     AuthError, Clock, IdentityProof, PinIdentityProof, PresenceProof, PressYPresenceProof,
     SessionState, SystemClock, ABSOLUTE_MAX_DEFAULT, IDLE_TIMEOUT_DEFAULT, PRESENCE_FRESHNESS,
