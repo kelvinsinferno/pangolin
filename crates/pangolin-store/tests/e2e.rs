@@ -90,8 +90,50 @@ fn no_plaintext_on_disk() {
     let path = tmp.path().join("vault.pvf");
 
     Vault::create(&path, &fresh_password()).unwrap();
+
+    // MVP-1 issue 1.5 criterion 5: the device key's secret seed is
+    // AEAD-sealed under the VDK in the `device_key` table — it must
+    // NOT appear in plaintext in the raw `.pvf`. The first unlock
+    // registers the device + writes the sealed seed; grab the seed
+    // bytes here (via the test-only accessor) and add them to the
+    // marker set scanned in every iteration below. Sub-slices of the
+    // 32-byte seed are also scanned (an 8-byte window) so even a
+    // partial leak would be caught.
+    let device_key_seed: [u8; 32] = {
+        let mut v = Vault::open(&path).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let seed = *v
+            .device_key_secret_seed()
+            .expect("device key present after unlock");
+        v.lock();
+        v.close().unwrap();
+        seed
+    };
+
     let mut total_bytes_scanned: u64 = 0;
     let n_iterations: usize = 100;
+
+    let scan_for_device_key = |bytes: &[u8], where_: &str| {
+        // Full 32-byte seed.
+        let full_hits = bytes
+            .windows(device_key_seed.len())
+            .filter(|w| *w == device_key_seed.as_slice())
+            .count();
+        assert_eq!(
+            full_hits, 0,
+            "device-key seed bytes found in {where_} — plaintext leaked! \
+             (issue 1.5 criterion 5 violation)",
+        );
+        // 8-byte sub-windows of the seed — a partial leak still fails.
+        for w8 in device_key_seed.windows(8) {
+            let hits = bytes.windows(8).filter(|w| *w == w8).count();
+            assert_eq!(
+                hits, 0,
+                "8-byte slice of the device-key seed found in {where_} — plaintext leaked! \
+                 (issue 1.5 criterion 5 violation)",
+            );
+        }
+    };
 
     for i in 0..n_iterations {
         let seed = format!("{i:08}-{}", random_suffix(i));
@@ -116,6 +158,7 @@ fn no_plaintext_on_disk() {
                  (cardinal principle 2 violation; iteration {i})",
             );
         }
+        scan_for_device_key(&bytes, "raw vault bytes");
         // Also scan the WAL sidecar if it exists.
         let wal = path.with_extension("pvf-wal");
         if wal.exists() {
@@ -133,13 +176,14 @@ fn no_plaintext_on_disk() {
                      (cardinal principle 2 violation; iteration {i})",
                 );
             }
+            scan_for_device_key(&wal_bytes, "WAL sidecar");
         }
     }
 
     let total_markers = n_iterations * 6;
     eprintln!(
-        "[no_plaintext_on_disk] {total_markers} markers across 6 secret fields × {n_iterations} \
-         iterations scanned over {total_bytes_scanned} bytes; 0 hits"
+        "[no_plaintext_on_disk] {total_markers} markers across 6 secret fields + the device-key \
+         seed × {n_iterations} iterations scanned over {total_bytes_scanned} bytes; 0 hits"
     );
 }
 
@@ -1407,6 +1451,255 @@ fn reveal_class_round_trip_v1() {
     assert_eq!(summary.password_history_count, 3);
     assert!(summary.has_totp);
     assert!(summary.current_password_changed_at_ms > 0);
+    v.lock();
+    v.close().unwrap();
+}
+
+// =====================================================================
+// MVP-1 issue 1.5: device identity + trust list (criteria 6, 9, 12).
+// =====================================================================
+
+/// Criterion 6 (e2e): after register-on-unlock, every new V1 revision
+/// (`account_add` / `account_update`) stamps `originating_device ==
+/// device_current().device_id` — a real (verifying-key-derived)
+/// `devices`-row id, not a per-session random — and `account_history`'s
+/// `RevisionMeta.device_id` reflects it. The reveal'd
+/// password-history's `originating_device` reflects it too.
+#[test]
+fn revisions_stamp_real_device_id_after_register() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("dev-stamp-e2e.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+    let mut v = Vault::open(&path).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    let real_id = v.device_current().unwrap().device_id;
+    let id = v
+        .account_add(v1_draft("GH", &["w"], &["https://gh.example"], "u@x", "p0"))
+        .unwrap();
+    v.account_update(
+        id,
+        AccountIdentityPatch {
+            schema_version: ACCOUNT_IDENTITY_SCHEMA_VERSION,
+            display_name: None,
+            tags: None,
+            usernames: None,
+            urls: None,
+            notes: None,
+            password: Some(SecretBytes::new(b"p1".to_vec())),
+            totp_secret: None,
+        },
+    )
+    .unwrap();
+    let metas = v.account_history(id).unwrap();
+    assert!(metas.len() >= 2);
+    for m in &metas {
+        assert_eq!(
+            m.device_id, real_id,
+            "post-1.5 revision stamps the real device_id"
+        );
+    }
+    let history = v.reveal_password_history(id, &fresh_presence()).unwrap();
+    for e in &history {
+        assert_eq!(e.originating_device, real_id);
+    }
+    v.lock();
+    v.close().unwrap();
+}
+
+/// Criterion 9: a "PoC-shaped" `.pvf` — one whose `devices` table is
+/// the legacy P2 stub (no `capabilities` / `last_sync_at` / `public_key`
+/// / `schema_version` columns, no `device_key` table), whose revisions
+/// carry a throwaway-random `originating_device` — still opens, unlocks
+/// (two-proof), searches, and reveals; its `devices` table is migrated
+/// to the new shape; a device entry is registered on the first unlock;
+/// the legacy `revisions.device_id` values are left untouched (Q6).
+///
+/// We synthesise the legacy shape by first writing a normal 1.5 vault,
+/// then opening a raw `rusqlite` connection to the same file and
+/// surgically reverting it: drop the new `devices` columns (recreate
+/// the table P2-style), drop the `device_key` table, drop the device
+/// row, and rewrite every revision's `device_id` to a fresh random
+/// value (the per-session throwaway an older-build handle would have
+/// stamped).
+#[test]
+#[allow(clippy::too_many_lines)] // one coherent end-to-end migration scenario; splitting hurts readability
+fn poc_vault_migrates_and_registers() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("poc-shaped.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+    let acct_id;
+    {
+        let mut v = Vault::open(&path).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        acct_id = v
+            .account_add(v1_draft(
+                "Legacy Svc",
+                &["old"],
+                &["https://legacyhost.example"],
+                "u@x",
+                "pw0",
+            ))
+            .unwrap();
+        v.lock();
+        v.close().unwrap();
+    }
+
+    // Surgically downgrade the file to the P2-era shape.
+    let throwaway_device_id: Vec<u8> = {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // 1. Rewrite every revision's device_id to a fresh random 32
+        //    bytes (mimics the per-session throwaway a PoC handle minted).
+        let throwaway: Vec<u8> = conn
+            .query_row("SELECT randomblob(32)", [], |row| row.get(0))
+            .unwrap();
+        conn.execute(
+            "UPDATE revisions SET device_id = ?1",
+            rusqlite::params![throwaway.as_slice()],
+        )
+        .unwrap();
+        // 2. Recreate `devices` in the P2 shape (drop the 1.5 columns).
+        conn.execute("DROP TABLE devices", []).unwrap();
+        conn.execute(
+            "CREATE TABLE devices (
+                device_id   BLOB PRIMARY KEY,
+                label       TEXT    NOT NULL DEFAULT '',
+                added_at    INTEGER NOT NULL,
+                revoked_at  INTEGER
+            )",
+            [],
+        )
+        .unwrap();
+        // 3. Drop the `device_key` table.
+        conn.execute("DROP TABLE device_key", []).unwrap();
+        throwaway
+    };
+
+    // Reopen with the current code: the migration adds the new columns
+    // back + recreates `device_key`; the first unlock registers a
+    // device; the legacy revisions are untouched; search + reveal work.
+    let mut v = Vault::open(&path).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    let cur = v.device_current().unwrap();
+    assert_eq!(v.device_list().unwrap().len(), 1);
+    assert!(cur.is_current);
+    assert_eq!(cur.last_sync_at, None);
+    // The migrated `devices` table has the new columns (queryable).
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(devices)").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for c in [
+            "capabilities",
+            "last_sync_at",
+            "public_key",
+            "schema_version",
+        ] {
+            assert!(cols.iter().any(|x| x == c), "migrated column {c} missing");
+        }
+    }
+    // Legacy revisions still carry the throwaway device_id (accepted
+    // as-is — Q6: no backfill).
+    let metas = v.account_history(acct_id).unwrap();
+    assert!(!metas.is_empty());
+    let throwaway_arr: [u8; 32] = throwaway_device_id.as_slice().try_into().unwrap();
+    assert_eq!(
+        metas[0].device_id.0, throwaway_arr,
+        "legacy revisions keep their throwaway originating_device (Q6)"
+    );
+    // The vault still searches + reveals.
+    assert_eq!(search_names(&mut v, "legacy svc"), vec!["Legacy Svc"]);
+    assert_eq!(
+        v.reveal_current_password(acct_id, &fresh_presence())
+            .unwrap()
+            .expose(),
+        b"pw0"
+    );
+    // A NEW revision written now stamps the real (registered) device_id.
+    v.account_update(
+        acct_id,
+        AccountIdentityPatch {
+            schema_version: ACCOUNT_IDENTITY_SCHEMA_VERSION,
+            display_name: None,
+            tags: None,
+            usernames: None,
+            urls: None,
+            notes: None,
+            password: Some(SecretBytes::new(b"pw1".to_vec())),
+            totp_secret: None,
+        },
+    )
+    .unwrap();
+    let metas = v.account_history(acct_id).unwrap();
+    assert_eq!(
+        metas.last().unwrap().device_id,
+        cur.device_id,
+        "new revisions stamp the real registered device_id"
+    );
+    v.lock();
+    v.close().unwrap();
+}
+
+/// Criterion 12: a 1.5-flavoured add/update + a device-label edit does
+/// not perturb the 1.3 `:memory:` FTS5 search-index lifecycle or the
+/// 1.4 session state machine — `account_search` still returns the right
+/// rows and the session transitions are unchanged (no new expiry /
+/// escalation behaviour introduced by 1.5).
+#[test]
+fn search_index_and_session_machine_untouched_by_device_ops() {
+    use pangolin_store::SessionState;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("dev-smoke.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+    let mut v = Vault::open(&path).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    assert!(matches!(v.session_state(), SessionState::Active { .. }));
+
+    let dev_id = v.device_current().unwrap().device_id;
+    let id = v
+        .account_add(v1_draft(
+            "Delta",
+            &["d"],
+            &["https://delta.example"],
+            "u@x",
+            "pw",
+        ))
+        .unwrap();
+    assert_eq!(search_names(&mut v, "delta"), vec!["Delta"]);
+    // A device-label edit: still Active afterwards, search still works.
+    v.device_set_label(dev_id, "Renamed device").unwrap();
+    assert!(matches!(v.session_state(), SessionState::Active { .. }));
+    assert_eq!(v.device_current().unwrap().label, "Renamed device");
+    assert_eq!(search_names(&mut v, "delta"), vec!["Delta"]);
+    // An update resyncs the index as before.
+    v.account_update(
+        id,
+        AccountIdentityPatch {
+            schema_version: ACCOUNT_IDENTITY_SCHEMA_VERSION,
+            display_name: Some("Delta Renamed".into()),
+            tags: None,
+            usernames: None,
+            urls: None,
+            notes: None,
+            password: None,
+            totp_secret: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(v.account_search("delta renamed").unwrap().len(), 1);
+    // lock → search index torn down (1.3 lifecycle preserved).
+    v.lock();
+    assert!(matches!(v.session_state(), SessionState::Locked));
+    assert!(matches!(
+        v.account_search("delta"),
+        Err(StoreError::NotUnlocked)
+    ));
+    // re-unlock rebuilds it.
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    assert_eq!(v.account_search("delta renamed").unwrap().len(), 1);
     v.lock();
     v.close().unwrap();
 }

@@ -32,7 +32,26 @@ use crate::error::{Result, StoreError};
 ///   ever runs against it except the `chain_anchor` columns once
 ///   `mark_published` lands a tx. The `chain_anchor_*` columns are
 ///   nullable until P7 fills them.
-/// - `devices` is a stub; full device-key plumbing arrives in MVP-1.
+/// - `devices` is the local trust list (MVP-1 issue 1.5). One row per
+///   device that has ever opened+unlocked this `.pvf`; `device_id` is
+///   the Ed25519 verifying-key bytes of the device's `DeviceKey`. The
+///   `capabilities` column is `INTEGER` (`0 = Full`; the enum grows in
+///   MVP-2/3). `last_sync_at` is a dormant column (always `NULL` in
+///   MVP-1; MVP-2's chain sync fills it). `public_key` is the 32-byte
+///   verifying key (non-secret; nullable for legacy rows). `revoked_at`
+///   is the MVP-2/3 revocation hook — never written in MVP-1 (the trust
+///   list is add-only). Legacy P2 vaults pick up the four new columns
+///   via `migrate_devices_columns`. `schema_version` is the §18.7 slot.
+/// - `device_key` is a single-row table holding the device's Ed25519
+///   secret seed, AEAD-sealed under the VDK (`enc_seed` ciphertext +
+///   `enc_nonce`; AAD binds the `device_id` — anti-transplant). Written
+///   on the first unlock that registers a device; read on subsequent
+///   unlocks. Unlike `pending_merges.device_secret` (ephemeral, stored
+///   un-sealed by the P9 plan's bounded-marginal-exposure argument), the
+///   device key is long-lived (the MVP-2 on-chain signing identity /
+///   gas wallet) so it gets the AEAD layer the `no_plaintext_on_disk`
+///   proptest enforces for every other secret. `schema_version` is the
+///   §18.7 slot.
 const SCHEMA_DDL: &str = r"
 CREATE TABLE IF NOT EXISTS meta (
     id                INTEGER PRIMARY KEY CHECK (id = 0),
@@ -95,10 +114,32 @@ CREATE INDEX IF NOT EXISTS idx_revisions_parent  ON revisions(parent_revision_id
 CREATE INDEX IF NOT EXISTS idx_revisions_unpub   ON revisions(chain_tx_hash) WHERE chain_tx_hash IS NULL;
 
 CREATE TABLE IF NOT EXISTS devices (
-    device_id   BLOB PRIMARY KEY,
-    label       TEXT    NOT NULL DEFAULT '',
-    added_at    INTEGER NOT NULL,
-    revoked_at  INTEGER
+    device_id      BLOB PRIMARY KEY,
+    label          TEXT    NOT NULL DEFAULT '',
+    added_at       INTEGER NOT NULL,
+    revoked_at     INTEGER,
+    -- MVP-1 issue 1.5 additive columns. Legacy P2 vaults get these via
+    -- migrate_devices_columns at open time. `capabilities` 0 = Full;
+    -- `last_sync_at` dormant (MVP-2 chain sync fills it); `public_key`
+    -- 32-byte Ed25519 verifying key (nullable for legacy rows);
+    -- `schema_version` is the §18.7 slot (1.6 locks the policy).
+    capabilities   INTEGER NOT NULL DEFAULT 0,
+    last_sync_at   INTEGER,
+    public_key     BLOB,
+    schema_version INTEGER NOT NULL DEFAULT 1
+);
+
+-- MVP-1 issue 1.5: single-row device-key table. Holds the device's
+-- Ed25519 secret seed AEAD-sealed under the VDK. `id = 0` CHECK
+-- enforces single-row by construction; INSERT OR REPLACE keyed on
+-- `id = 0` is what writes it (Vault::unlock's register branch).
+-- Additive `CREATE TABLE IF NOT EXISTS` (no format_version bump);
+-- legacy vaults pick it up on next open via migrate_device_key_table.
+CREATE TABLE IF NOT EXISTS device_key (
+    id             INTEGER PRIMARY KEY CHECK (id = 0),
+    enc_seed       BLOB    NOT NULL,
+    enc_nonce      BLOB    NOT NULL,
+    schema_version INTEGER NOT NULL
 );
 
 -- P7: single-row sync-state table for the `last_pulled_block`
@@ -216,6 +257,16 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     // `SessionDuration::from_meta_secs(None)` maps to the 15-min default.
     migrate_session_idle_secs_column(conn)?;
 
+    // MVP-1 issue 1.5 migrations: the `devices` table grows four
+    // additive columns (`capabilities`, `last_sync_at`, `public_key`,
+    // `schema_version`) on legacy P2 vaults, and the new single-row
+    // `device_key` table is ensured to exist. Both idempotent (the
+    // column migration does a `PRAGMA table_info` check; the table
+    // migration uses `CREATE TABLE IF NOT EXISTS`). No `format_version`
+    // bump — same additive doctrine as the four migrations above.
+    migrate_devices_columns(conn)?;
+    migrate_device_key_table(conn)?;
+
     Ok(())
 }
 
@@ -299,6 +350,63 @@ fn migrate_pending_merges_table(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// **MVP-1 issue 1.5 migration.** Add the four additive `devices`
+/// columns (`capabilities`, `last_sync_at`, `public_key`,
+/// `schema_version`) to legacy P2 vaults. Idempotent — checks
+/// `PRAGMA table_info(devices)` first and only runs each `ALTER TABLE`
+/// when its column is absent. Existing (legacy) rows pick up the
+/// `DEFAULT 0` / `DEFAULT 1` / `NULL` per column. The SQL column
+/// `added_at` is reused as the `DeviceIdentity` view's `registered_at`
+/// (no rename — needless churn).
+fn migrate_devices_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(devices)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut have: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in rows {
+        have.insert(r?);
+    }
+    drop(stmt);
+    if !have.contains("capabilities") {
+        conn.execute(
+            "ALTER TABLE devices ADD COLUMN capabilities INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !have.contains("last_sync_at") {
+        conn.execute("ALTER TABLE devices ADD COLUMN last_sync_at INTEGER", [])?;
+    }
+    if !have.contains("public_key") {
+        conn.execute("ALTER TABLE devices ADD COLUMN public_key BLOB", [])?;
+    }
+    if !have.contains("schema_version") {
+        conn.execute(
+            "ALTER TABLE devices ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// **MVP-1 issue 1.5 migration.** Ensure the single-row `device_key`
+/// table exists on legacy vaults. Idempotent — `CREATE TABLE IF NOT
+/// EXISTS` directly so re-running on an up-to-date file is a no-op. The
+/// `SCHEMA_DDL` string above already contains the same statement, so
+/// for new-build vaults this is structurally redundant; the value is
+/// pinning the migration intent for legacy files (same pattern as
+/// `migrate_pending_merges_table`).
+fn migrate_device_key_table(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS device_key (
+            id             INTEGER PRIMARY KEY CHECK (id = 0),
+            enc_seed       BLOB    NOT NULL,
+            enc_nonce      BLOB    NOT NULL,
+            schema_version INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
 /// Confirms the connection is in WAL journal mode. Used by
 /// `vault_test::wal_mode_set` (success criterion 10).
 ///
@@ -333,5 +441,92 @@ pub fn assert_integrity(conn: &Connection) -> Result<()> {
         Ok(())
     } else {
         Err(StoreError::Corrupted(messages.join("; ")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_pragmas_and_schema;
+    use rusqlite::Connection;
+
+    fn column_names(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1)).unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    fn table_exists(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    }
+
+    /// MVP-1 issue 1.5 success criterion 9b: `apply_pragmas_and_schema`
+    /// is idempotent — running it twice does not error and the new
+    /// `devices` columns appear exactly once.
+    #[test]
+    fn devices_migration_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_pragmas_and_schema(&conn).unwrap();
+        // Second run is a no-op.
+        apply_pragmas_and_schema(&conn).unwrap();
+        let cols = column_names(&conn, "devices");
+        for needed in [
+            "device_id",
+            "label",
+            "added_at",
+            "revoked_at",
+            "capabilities",
+            "last_sync_at",
+            "public_key",
+            "schema_version",
+        ] {
+            assert_eq!(
+                cols.iter().filter(|c| c.as_str() == needed).count(),
+                1,
+                "column {needed} should appear exactly once in devices"
+            );
+        }
+        assert!(table_exists(&conn, "device_key"));
+    }
+
+    /// A legacy-shaped `devices` table (the P2 stub: `device_id, label,
+    /// added_at, revoked_at` only, and no `device_key` table) gets the
+    /// four new columns + the new table on the next
+    /// `apply_pragmas_and_schema` run.
+    #[test]
+    fn legacy_devices_table_is_migrated() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Hand-build the P2-era schema (the subset that matters here).
+        conn.execute_batch(
+            "CREATE TABLE devices (
+                device_id   BLOB PRIMARY KEY,
+                label       TEXT    NOT NULL DEFAULT '',
+                added_at    INTEGER NOT NULL,
+                revoked_at  INTEGER
+            );",
+        )
+        .unwrap();
+        assert!(!table_exists(&conn, "device_key"));
+        apply_pragmas_and_schema(&conn).unwrap();
+        let cols = column_names(&conn, "devices");
+        for needed in [
+            "capabilities",
+            "last_sync_at",
+            "public_key",
+            "schema_version",
+        ] {
+            assert!(
+                cols.iter().any(|c| c.as_str() == needed),
+                "column {needed} missing after migration"
+            );
+        }
+        assert!(table_exists(&conn, "device_key"));
     }
 }

@@ -43,7 +43,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pangolin_crypto::aead::{AeadKey, Ciphertext, Nonce, NONCE_LEN};
 use pangolin_crypto::kdf::{self, KdfParams, KdfSalt};
-use pangolin_crypto::keys::{AuthorityKey, VdkKey, WrapContext, VAULT_ID_LEN};
+use pangolin_crypto::keys::{AuthorityKey, DeviceKey, VdkKey, WrapContext, VAULT_ID_LEN};
 use pangolin_crypto::secret::SecretBytes;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
@@ -51,6 +51,7 @@ use crate::account::{AccountId, AccountSnapshot, ACCOUNT_ID_LEN};
 use crate::blob::{
     build_aad, open_payload, seal_snapshot, seal_tombstone, DecodedPayload, TombstonePayload,
 };
+use crate::device::{self, DeviceIdentity};
 use crate::dirty::{IngestOutcome, RevisionPublishPayload};
 use crate::error::{Result, StoreError};
 use crate::meta::{self, VaultMeta};
@@ -118,9 +119,19 @@ pub struct Vault {
     conn: Connection,
     meta: VaultMeta,
     /// Authoring device id stamped into every revision row this handle
-    /// produces. P2 uses a per-handle random id; MVP-1 will replace
-    /// with the device's `pangolin_crypto::keys::DeviceKey` verifying
-    /// key bytes.
+    /// produces.
+    ///
+    /// **MVP-1 issue 1.5.** Before the first `unlock` this is a
+    /// throwaway per-handle random placeholder (no revision can be
+    /// written before `unlock` — `account_add`/`account_update` call
+    /// `require_active()` — so the placeholder is never stamped onto a
+    /// revision). The first `unlock` on a new vault file generates a
+    /// `DeviceKey`, derives the real `device_id` from its verifying-key
+    /// bytes, registers the `devices` row + the AEAD-sealed `device_key`
+    /// row, and overwrites this field; subsequent unlocks load the same
+    /// device and set this field to its persisted id. Pre-1.5 revisions
+    /// keep their old throwaway `originating_device` values (accepted
+    /// as-is — the trust list gates nothing in MVP-1).
     device_id: DeviceId,
     /// P4 session-policy state. Source of truth; the public
     /// [`VaultState`] view (returned by [`Self::state`]) is derived
@@ -276,6 +287,23 @@ struct ActiveState {
     /// add / update / delete paths; `SQLite` frees the arena when this
     /// `ActiveState` drops on `lock()` / expiry / `Drop`.
     search_index: SearchIndex,
+    /// **MVP-1 issue 1.5.** This device's Ed25519 [`DeviceKey`] — loaded
+    /// (decrypted from the `device_key` table under the VDK) on `unlock`,
+    /// or freshly generated + persisted on the first unlock that
+    /// registers a device. It does NOT sign anything in MVP-1 (Q4 — it
+    /// is the hook for MVP-2's signed-revision format / gas-payer role);
+    /// it is held here so every session-teardown path (`lock()` /
+    /// idle-or-absolute expiry / `Drop`) drops it alongside the cache +
+    /// search index. `DeviceKey` zeroizes on drop and redacts `Debug`
+    /// (P1 invariants); the on-disk form is only the AEAD ciphertext.
+    ///
+    /// Read only by the test/test-utilities accessor
+    /// [`Vault::device_key_verifying_key`] (verifies the in-memory key
+    /// matches the registered device + that teardown drops it); in a
+    /// production build it is a write-only MVP-2 hook, hence the
+    /// `dead_code` allow on the non-test cfg.
+    #[cfg_attr(not(any(test, feature = "test-utilities")), allow(dead_code))]
+    device_key: DeviceKey,
     /// **MVP-1 issue 1.4 — presence freshness + dedup (Session spec
     /// §7.6 / §8.6).** Wall-clock instant of the most recent successful
     /// presence proof for this session — set by `unlock` (the 2-proof
@@ -431,7 +459,20 @@ impl Vault {
             schema::assert_wal_mode(&conn)?;
             schema::assert_integrity(&conn)?;
             let meta = meta::read(&conn)?.ok_or(StoreError::BadMagic)?;
-            let device_id = DeviceId(random_32_via_sqlite(&conn)?);
+            // MVP-1 issue 1.5: if this vault file has already had a
+            // device registered (a prior `unlock` wrote the `devices`
+            // row + the AEAD-sealed `device_key` row), adopt that
+            // persisted id so a host can call `device_current` on a
+            // locked-but-previously-registered vault. A brand-new or
+            // never-unlocked vault has no `devices` row → fall back to
+            // a throwaway per-handle placeholder, overwritten by the
+            // first `unlock`'s register-on-unlock step. No revision can
+            // be written before `unlock` (`require_active`), so the
+            // placeholder is never stamped onto a revision.
+            let device_id = match device::read_registered_device_id(&conn)? {
+                Some(id) => id,
+                None => DeviceId(random_32_via_sqlite(&conn)?),
+            };
             // MVP-1 issue 1.4: read the configured idle duration.
             // Absent column (pre-1.4 vault) ⇒ NULL ⇒ 15-min default; an
             // out-of-set on-disk value is also coerced to the default by
@@ -686,22 +727,71 @@ impl Vault {
         let (cache, search_index) =
             build_active_state_data(&self.conn, &self.meta, vdk.aead_key())?;
 
+        // Step 6b (MVP-1 issue 1.5): register-on-first-unlock /
+        // load-on-subsequent-unlock for the device identity. Needs the
+        // unwrapped VDK (the device-key seed is AEAD-sealed under it).
+        // If the `device_key` table is empty (a brand-new vault, or a
+        // PoC vault whose `devices` stub never held a row), generate a
+        // `DeviceKey`, derive the real `device_id` from its verifying
+        // key, and INSERT the `devices` row + the sealed `device_key`
+        // row in one transaction; otherwise decrypt the stored seed and
+        // reconstruct the same key. Either way, `self.device_id` is set
+        // to the persisted id so revisions written this session stamp
+        // the real `originating_device`. The `DeviceKey` does not sign
+        // anything in MVP-1 (Q4); it is stashed in `ActiveState` so
+        // every session-teardown path drops it.
+        let now = self.clock.now();
+        let now_ms = system_time_to_unix_ms(now);
+        let device_key = if let Some(existing_id) = device::read_registered_device_id(&self.conn)? {
+            let key = device::load_device_key_with_id(
+                &self.conn,
+                &self.meta.vault_id,
+                vdk.aead_key(),
+                &existing_id,
+            )?
+            .ok_or_else(|| {
+                // A `devices` row exists but the `device_key` row does
+                // not — they are written together, so this is storage
+                // corruption.
+                StoreError::Corrupted("devices row present but device_key row missing".into())
+            })?;
+            self.device_id = existing_id;
+            key
+        } else {
+            let key = DeviceKey::generate();
+            // The CLI has no UI to prompt for a device label on first
+            // unlock (Q7 — CLI subcommands deferred), so the
+            // register-on-unlock entry gets a generated placeholder a
+            // user can rename later via `device_set_label`.
+            let label = device::validate_label("This device")?;
+            let registered = device::register_device(
+                &self.conn,
+                &self.meta.vault_id,
+                vdk.aead_key(),
+                &key,
+                &label,
+                now_ms,
+            )?;
+            self.device_id = registered;
+            key
+        };
+
         // Step 7: install the new ActiveState and session timer. If a
         // prior ActiveState exists (case 1 above), `Option::replace`
-        // drops the old one, which zeroizes its cache + VDK and frees
-        // the prior `:memory:` index. The first `expires_at` derives
-        // from the configured idle duration (1.4) — capped at the
-        // absolute-max ceiling via `next_idle_deadline`, which for
+        // drops the old one, which zeroizes its cache + VDK + device key
+        // and frees the prior `:memory:` index. The first `expires_at`
+        // derives from the configured idle duration (1.4) — capped at
+        // the absolute-max ceiling via `next_idle_deadline`, which for
         // `SessionDuration::UntilDeviceLock` collapses to "the absolute
         // ceiling, no idle leg". The unlock's presence proof is fresh
         // *now*, so `last_presence_at = now` — a reveal-class op within
         // `PRESENCE_FRESHNESS` of unlock won't re-prompt (Session spec
         // §5.2's "access remains seamless"; §8.6 dedup).
-        let now = self.clock.now();
         self.active = Some(ActiveState {
             vdk,
             cache,
             search_index,
+            device_key,
             last_presence_at: Some(now),
         });
         self.session_state = SessionState::Active {
@@ -744,6 +834,44 @@ impl Vault {
     #[must_use]
     pub fn last_presence_at(&self) -> Option<SystemTime> {
         self.active.as_ref().and_then(|a| a.last_presence_at)
+    }
+
+    /// **MVP-1 issue 1.5 (test/test-utilities only).** The 32-byte
+    /// Ed25519 verifying-key bytes of the in-memory [`DeviceKey`] held
+    /// by the active session, or `None` when the vault is not `Active`.
+    ///
+    /// Used by tests to confirm (a) the loaded/registered device key's
+    /// verifying key matches `device_current().device_id` (the
+    /// derived-from-the-key invariant) and (b) the key is dropped on
+    /// `lock()` / expiry (this accessor returns `None` afterwards).
+    /// Gated so production builds cannot link against it — the
+    /// `DeviceKey` itself signs nothing in MVP-1; it is the MVP-2 hook.
+    #[cfg(any(test, feature = "test-utilities"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn device_key_verifying_key(&self) -> Option<[u8; 32]> {
+        self.active
+            .as_ref()
+            .map(|a| a.device_key.verifying_key().to_bytes())
+    }
+
+    /// **MVP-1 issue 1.5 (test/test-utilities only).** The 32-byte
+    /// secret Ed25519 seed of the in-memory [`DeviceKey`] held by the
+    /// active session, or `None` when not `Active`. Wrapped in
+    /// [`zeroize::Zeroizing`] so it wipes on drop.
+    ///
+    /// Used by the `no_plaintext_on_disk` e2e proptest to confirm the
+    /// device-key seed bytes never appear in plaintext in the raw
+    /// `.pvf` (criterion 5 — the seed is AEAD-sealed under the VDK in
+    /// the `device_key` table). Gated so production builds cannot link
+    /// against it — exposing a secret seed is a test-only affordance.
+    #[cfg(any(test, feature = "test-utilities"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn device_key_secret_seed(&self) -> Option<zeroize::Zeroizing<[u8; 32]>> {
+        self.active
+            .as_ref()
+            .map(|a| a.device_key.secret_seed_bytes())
     }
 
     /// Lock the vault. Drops the in-memory cache + VDK; transitions to
@@ -2787,6 +2915,78 @@ impl Vault {
         Ok(out)
     }
 
+    // -----------------------------------------------------------------
+    // MVP-1 issue 1.5: device identity + local trust list.
+    //
+    // The trust list is the `devices` table; it is add-only (no
+    // revoke/remove path in MVP-1) and gates nothing destructive — it
+    // is the local record + the MVP-2 on-chain-authority-registry hook.
+    // `device_current` / `device_list` read it; they work on a locked
+    // vault that has been unlocked at least once (the `devices` row is
+    // persisted by register-on-unlock). `device_set_label` mutates the
+    // human-readable label only — Q5: it requires an active (unlocked,
+    // non-expired) session, NOT a fresh presence proof (it is not on
+    // the Session spec §5.4 reveal-class list).
+    // -----------------------------------------------------------------
+
+    /// The device this `Vault` is running on (a `devices`-table row).
+    ///
+    /// Works on a `Locked` vault that has been unlocked at least once on
+    /// this file (register-on-unlock persists the row + the AEAD-sealed
+    /// device key). On a brand-new vault that has been opened but never
+    /// unlocked there is no device row yet → returns
+    /// [`StoreError::NotUnlocked`] (unlock once to register).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] when no device has been registered;
+    /// [`StoreError::Sqlite`] / [`StoreError::Corrupted`] on a storage
+    /// failure.
+    pub fn device_current(&self) -> Result<DeviceIdentity> {
+        device::read_device(&self.conn, &self.device_id, &self.device_id)?
+            .ok_or(StoreError::NotUnlocked)
+    }
+
+    /// Every device in the trust list (one row in MVP-1). The
+    /// `is_current` flag is set on the row matching this handle's
+    /// `device_id`. Empty when no device has been registered yet
+    /// (brand-new vault never unlocked). Same locked-vault behaviour as
+    /// [`Self::device_current`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] / [`StoreError::Corrupted`] on a storage
+    /// failure.
+    pub fn device_list(&self) -> Result<Vec<DeviceIdentity>> {
+        device::list_devices(&self.conn, &self.device_id)
+    }
+
+    /// Rename a device in the trust list. Validates `label` (non-empty
+    /// after trim, ≤ [`crate::device::DEVICE_LABEL_MAX_CHARS`] chars,
+    /// NFC-normalised); persists. Survives close/reopen.
+    ///
+    /// **Q5:** requires an active (unlocked, non-expired) session — the
+    /// same gate as `account_update`'s display-name edit — NOT a fresh
+    /// presence proof. Renaming a device mutates only a human-readable
+    /// string; it is not a §5.4 reveal-class action.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] / [`StoreError::SessionExpired`] /
+    /// [`StoreError::SessionPending`] when the session is not active;
+    /// [`StoreError::Validation`] (`kind = "device_label"`) for an
+    /// empty / over-long / control-char label;
+    /// [`StoreError::AccountNotFound`] when `id` is not in the trust
+    /// list.
+    pub fn device_set_label(&mut self, id: DeviceId, label: &str) -> Result<()> {
+        self.check_session_freshness()?;
+        let _ = self.require_active()?;
+        let canonical = device::validate_label(label)?;
+        device::set_device_label(&self.conn, &id, &canonical)?;
+        self.touch_session();
+        Ok(())
+    }
+
     /// Walk the revision history for `id` from genesis to head. Returns
     /// in chronological order (oldest first). Includes the tombstone
     /// revision when the account is tombstoned.
@@ -4592,6 +4792,17 @@ fn current_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Convert a [`SystemTime`] (e.g. the vault clock's `now`) to whole unix
+/// milliseconds, or `0` on under/overflow. Used by the issue-1.5
+/// register-on-unlock path so the `devices.added_at` timestamp respects
+/// an injected test clock.
+fn system_time_to_unix_ms(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 /// Generate 32 random bytes via `SQLite`'s `randomblob(32)`. Routes a CSPRNG
 /// call we'd otherwise need a separate `rand` dep for.
 fn random_32_via_sqlite(conn: &Connection) -> Result<[u8; 32]> {
@@ -5761,6 +5972,219 @@ mod tests {
         // Re-unlock works (2-proof), and rebuilds the cache.
         v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         assert!(v.get_account(id).is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // MVP-1 issue 1.5: device identity + trust list (criteria 1..8, 12).
+    // -----------------------------------------------------------------
+
+    /// Criteria 1, 3, 5, 7, 8: first unlock on a new vault registers
+    /// exactly one device, marked current; `device_current` /
+    /// `device_list` agree; the in-memory `DeviceKey`'s verifying key
+    /// equals the registered `device_id`; the default capability is
+    /// `Full`; `last_sync_at` is `None` (MVP-2 fills it).
+    #[test]
+    fn register_on_first_unlock_creates_one_device() {
+        use crate::device::DeviceCapabilities;
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "dev-register.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        // No device registered before the first unlock.
+        assert!(matches!(
+            v.device_current().unwrap_err(),
+            StoreError::NotUnlocked
+        ));
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+
+        let cur = v.device_current().unwrap();
+        let listed = v.device_list().unwrap();
+        assert_eq!(listed.len(), 1, "exactly one device after first unlock");
+        assert_eq!(listed[0].device_id, cur.device_id);
+        assert!(cur.is_current);
+        assert!(listed[0].is_current);
+        assert_eq!(cur.capabilities, DeviceCapabilities::Full);
+        assert_eq!(cur.last_sync_at, None, "MVP-2 chain sync populates this");
+        assert!(cur.public_key.is_some());
+        // device_id == verifying-key bytes of the in-memory DeviceKey.
+        assert_eq!(
+            v.device_key_verifying_key().unwrap(),
+            cur.device_id.0,
+            "device_id must be the DeviceKey's verifying-key bytes"
+        );
+        // ...and == the stored public_key.
+        assert_eq!(cur.public_key.unwrap().to_bytes(), cur.device_id.0);
+    }
+
+    /// Criterion 2: re-open + re-unlock the same `.pvf` does NOT register
+    /// a second device; the `device_id` is stable and equals
+    /// `self.device_id` (the revision-stamping id).
+    #[test]
+    fn second_unlock_does_not_register_second_device() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "dev-stable.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let first_id = {
+            let mut v = Vault::open(&p).unwrap();
+            v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+            let id = v.device_current().unwrap().device_id;
+            v.close().unwrap();
+            id
+        };
+        // Reopen — even before unlock, `open` adopts the persisted id.
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        assert_eq!(v.device_list().unwrap().len(), 1, "no second device");
+        assert_eq!(v.device_current().unwrap().device_id, first_id);
+        assert_eq!(
+            v.device_key_verifying_key().unwrap(),
+            first_id.0,
+            "loaded DeviceKey's verifying key must match the persisted device_id"
+        );
+        // A revision written this session stamps the real device_id.
+        let acct = v.add_account(fresh_snapshot()).unwrap();
+        let revs = v.revisions_for(acct).unwrap();
+        assert_eq!(revs.last().unwrap().device_id, first_id);
+    }
+
+    /// Criterion 6: `originating_device` on a new (post-1.5) revision is
+    /// the current device's real (verifying-key-derived) `device_id`.
+    #[test]
+    fn revisions_stamp_real_device_id_after_register() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "dev-stamp.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let real_id = v.device_current().unwrap().device_id;
+        let acct = v.add_account(fresh_snapshot()).unwrap();
+        v.update_account(acct, fresh_snapshot()).unwrap();
+        let revs = v.revisions_for(acct).unwrap();
+        assert!(revs.len() >= 2);
+        for r in &revs {
+            assert_eq!(
+                r.device_id, real_id,
+                "every post-1.5 revision stamps the real device_id"
+            );
+        }
+    }
+
+    /// Criterion 4: `device_set_label` validates + persists; the new
+    /// label survives close/reopen; an empty / over-long label is
+    /// rejected; a locked-vault call errors (active session required).
+    #[test]
+    fn device_set_label_validates_persists_and_requires_active() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "dev-label.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let id = {
+            let mut v = Vault::open(&p).unwrap();
+            v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+            let id = v.device_current().unwrap().device_id;
+            // Empty rejected.
+            assert!(matches!(
+                v.device_set_label(id, "   ").unwrap_err(),
+                StoreError::Validation { kind, .. } if kind == "device_label"
+            ));
+            // Over-256 rejected.
+            assert!(matches!(
+                v.device_set_label(id, &"x".repeat(300)).unwrap_err(),
+                StoreError::Validation { kind, .. } if kind == "device_label"
+            ));
+            // NFC-normalised + trimmed on the way in.
+            v.device_set_label(id, "  Kelvin's Cafe\u{0301}  ").unwrap();
+            assert_eq!(v.device_current().unwrap().label, "Kelvin's Café");
+            // Locked → errors.
+            v.lock();
+            assert!(matches!(
+                v.device_set_label(id, "Whatever").unwrap_err(),
+                StoreError::NotUnlocked
+            ));
+            // device_current still readable on the locked vault.
+            assert_eq!(v.device_current().unwrap().label, "Kelvin's Café");
+            v.close().unwrap();
+            id
+        };
+        // Survives reopen.
+        let v = Vault::open(&p).unwrap();
+        assert_eq!(v.device_current().unwrap().device_id, id);
+        assert_eq!(v.device_current().unwrap().label, "Kelvin's Café");
+    }
+
+    /// Criterion 5: the in-memory `DeviceKey` is dropped on `lock()` —
+    /// the test/test-utilities accessor returns `None` afterwards — and
+    /// is re-loaded (decrypting the AEAD-sealed seed under the VDK) on
+    /// the next `unlock`, re-deriving the same `device_id`.
+    #[test]
+    fn device_key_dropped_on_lock_and_reloaded_on_unlock() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "dev-key-lifecycle.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let vk1 = v.device_key_verifying_key().expect("device key present");
+        v.lock();
+        assert_eq!(
+            v.device_key_verifying_key(),
+            None,
+            "DeviceKey must be dropped on lock()"
+        );
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let vk2 = v.device_key_verifying_key().expect("device key reloaded");
+        assert_eq!(vk1, vk2, "reloaded DeviceKey re-derives the same device_id");
+    }
+
+    /// Criterion 5 (expiry leg): the in-memory `DeviceKey` is also
+    /// dropped when the session expires (idle / absolute-max) — same
+    /// teardown path as the cache + `:memory:` index.
+    #[test]
+    fn device_key_dropped_on_session_expiry() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "dev-key-expiry.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let (mut v, clock) = open_vault_with_test_clock(&p);
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        assert!(v.device_key_verifying_key().is_some());
+        // Advance past the idle deadline; a cache-bearing `&mut self`
+        // op (`add_account`) runs `check_session_freshness`, which on
+        // expiry drops the `ActiveState` (cache + `:memory:` index +
+        // `DeviceKey`) and surfaces `SessionExpired`.
+        clock.advance(IDLE_TIMEOUT_DEFAULT + Duration::from_secs(1));
+        let err = v.add_account(fresh_snapshot()).unwrap_err();
+        assert!(matches!(err, StoreError::SessionExpired));
+        assert!(matches!(
+            v.session_state(),
+            crate::session::SessionState::Expired
+        ));
+        assert_eq!(
+            v.device_key_verifying_key(),
+            None,
+            "DeviceKey must be dropped on session expiry"
+        );
+    }
+
+    /// Criterion 8: `last_sync_at` stays `None` across N add/update/
+    /// lock/unlock cycles (the dormant-column shape — MVP-2's chain-sync
+    /// code is what populates it).
+    #[test]
+    fn last_sync_at_is_none_and_stays_none() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "dev-lastsync.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        assert_eq!(v.device_current().unwrap().last_sync_at, None);
+        for _ in 0..3 {
+            let acct = v.add_account(fresh_snapshot()).unwrap();
+            v.update_account(acct, fresh_snapshot()).unwrap();
+            v.lock();
+            v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+            assert_eq!(
+                v.device_current().unwrap().last_sync_at,
+                None,
+                "last_sync_at is dormant in MVP-1; MVP-2's chain sync fills it"
+            );
+        }
     }
 
     /// Criterion 11/13: a presence proof whose `created_at` is already

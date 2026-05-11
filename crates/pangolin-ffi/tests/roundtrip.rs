@@ -12,9 +12,9 @@
 
 use pangolin_ffi::{
     AccountDraft, AccountId, AccountPatch, AccountSnapshot, CaptureAuthority, CaptureContext,
-    DeviceId, KdbxImportReport, PasswordHistoryEntry, PasswordPolicy, PlaintextExportConfirmation,
-    PresenceProof, RevealedSecret, RevisionId, RevisionMeta, SecretPassword, SessionInfo, TotpCode,
-    TotpSecret, UnixTimestamp, VaultHandle,
+    DeviceCapabilities, DeviceId, DeviceInfo, KdbxImportReport, PasswordHistoryEntry,
+    PasswordPolicy, PlaintextExportConfirmation, PresenceProof, RevealedSecret, RevisionId,
+    RevisionMeta, SecretPassword, SessionInfo, TotpCode, TotpSecret, UnixTimestamp, VaultHandle,
 };
 
 #[test]
@@ -193,6 +193,32 @@ fn device_id_record_round_trip() {
     let cloned = original.clone();
     assert_eq!(original, cloned);
     assert_eq!(cloned.bytes.len(), 32);
+}
+
+#[test]
+fn device_info_record_round_trip() {
+    // MVP-1 issue 1.5: the device-identity record returned by
+    // device_current / device_list. Carries only non-secret material;
+    // last_sync_at is dormant (always None in MVP-1).
+    let original = DeviceInfo {
+        schema_version: 1,
+        id: DeviceId {
+            schema_version: 1,
+            bytes: vec![0xAB; 32],
+        },
+        label: "Kelvin's MacBook".into(),
+        registered_at: 1_700_000_000,
+        last_sync_at: None,
+        capabilities: DeviceCapabilities::Full,
+        is_current: true,
+        public_key: vec![0xAB; 32],
+    };
+    let cloned = original.clone();
+    assert_eq!(original.id, cloned.id);
+    assert_eq!(cloned.last_sync_at, None);
+    assert_eq!(cloned.capabilities, DeviceCapabilities::Full);
+    assert!(cloned.is_current);
+    assert_eq!(cloned.public_key, cloned.id.bytes);
 }
 
 #[test]
