@@ -360,8 +360,13 @@ pub fn account_update(
     Ok(crate::identity_bridge::revision_id_to_ffi(rev))
 }
 
-/// Search the account directory by display name / tags / urls
-/// (substring, case-insensitive).
+/// Search the account directory.
+///
+/// The index covers display name, tags, and URL-derived hostnames only
+/// (never usernames, full URLs, notes, or secrets) via an in-memory
+/// FTS5 trigram index — arbitrary substring matching, case-insensitive,
+/// ranked by relevance with a recency tiebreaker, capped at 200
+/// results. Errors with `NotUnlocked` if the vault is locked.
 #[allow(clippy::significant_drop_tightening)]
 #[uniffi::export]
 pub fn account_search(

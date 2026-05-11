@@ -1051,7 +1051,7 @@ fn search_never_matches_username_password_notes() {
         display_name: "Visible Display".into(),
         tags: vec!["visibletag".into()],
         usernames: vec!["zzuserzz@example.com".into()],
-        urls: vec!["https://visiblehost.example".into()],
+        urls: vec!["https://visiblehost.example/zzpathsecretzz/login".into()],
         notes: "zznotesecretzz recovery phrase".into(),
         password: SecretBytes::new(b"zzpasswordsecretzz".to_vec()),
         totp_secret: SecretBytes::new(Vec::new()),
@@ -1077,8 +1077,13 @@ fn search_never_matches_username_password_notes() {
         v.account_search("zznotesecretzz").unwrap().is_empty(),
         "notes leaked into the index"
     );
-    // The full URL (path) is not indexed either — only the host is.
-    assert!(v.account_search("login").unwrap().is_empty());
+    // The full URL (path) is not indexed either — only the host is. The
+    // URL above contains the literal substring `zzpathsecretzz`, but only
+    // `visiblehost.example` (the host) reaches the FTS5 `hostnames` column.
+    assert!(
+        v.account_search("zzpathsecretzz").unwrap().is_empty(),
+        "URL path leaked into the index"
+    );
     v.lock();
     v.close().unwrap();
 }
