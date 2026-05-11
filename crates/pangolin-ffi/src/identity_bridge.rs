@@ -161,16 +161,17 @@ pub fn patch_into_store(
 
 /// Convert a `pangolin_core::AccountIdentitySummary` into the FFI
 /// [`AccountSnapshot`] shape.
+///
+/// **MVP-1 issue 1.4 (Q5b):** the summary already carries zero secret
+/// material (the `pangolin-store` projection was tightened too), so
+/// this is a pure metadata copy — no `SecretBytes` is exposed, no
+/// `SecretPassword` / `TotpSecret` handle is constructed. The
+/// password / history / notes / TOTP-seed bytes are reachable only
+/// through the presence-gated `reveal_*` FFI entry points.
 #[allow(clippy::unnecessary_wraps)]
 pub fn summary_to_ffi(
     summary: pangolin_core::AccountIdentitySummary,
 ) -> Result<AccountSnapshot, FfiError> {
-    // The summary already contains UTF-8 strings + SecretBytes;
-    // wrap secret-bearing fields in the FFI envelopes.
-    //
-    // `notes` are deliberately NOT surfaced here — recovery-class per
-    // spec §5.4, presence-gated `reveal_notes` lands in 1.4
-    // (audit C-1 / plan §D).
     let pangolin_core::AccountIdentitySummary {
         id,
         head_revision_id,
@@ -178,41 +179,11 @@ pub fn summary_to_ffi(
         tags,
         usernames,
         urls,
-        password_history,
-        totp_secret,
+        password_history_count,
+        has_totp,
+        current_password_changed_at_ms,
         ..
     } = summary;
-
-    // Audit L-2: each `to_vec()` of plaintext password / totp bytes
-    // is held in `zeroize::Zeroizing` until ownership transfers into
-    // the FFI secret-handle constructor. A panic in the narrow window
-    // between the borrow and the constructor call cannot leak the
-    // intermediate Vec onto the unwound stack.
-    let current_password = password_history.first().map_or_else(
-        || SecretPassword::new(Vec::new()),
-        |e| {
-            let mut bytes = zeroize::Zeroizing::new(e.password.expose().to_vec());
-            SecretPassword::new(std::mem::take(&mut *bytes))
-        },
-    );
-
-    let history_ffi: Vec<PasswordHistoryEntry> = password_history
-        .into_iter()
-        .map(|entry| {
-            let mut bytes = zeroize::Zeroizing::new(entry.password.expose().to_vec());
-            PasswordHistoryEntry {
-                schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
-                password: SecretPassword::new(std::mem::take(&mut *bytes)),
-                set_at: entry.set_at_ms / 1000,
-                originating_device: device_id_to_ffi(entry.originating_device),
-            }
-        })
-        .collect();
-
-    let totp_arc = totp_secret.map(|sb| {
-        let mut bytes = zeroize::Zeroizing::new(sb.expose().to_vec());
-        TotpSecret::new(std::mem::take(&mut *bytes))
-    });
 
     Ok(AccountSnapshot {
         schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
@@ -221,11 +192,32 @@ pub fn summary_to_ffi(
         tags,
         usernames,
         urls,
-        current_password,
-        password_history: history_ffi,
-        totp_secret: totp_arc,
         head_revision_id: revision_id_to_ffi(head_revision_id),
+        password_history_count,
+        has_totp,
+        // ms → s, integer-truncated (matches the pre-1.4 PasswordHistoryEntry
+        // conversion discipline; audit L-4).
+        current_password_changed_at: current_password_changed_at_ms / 1000,
     })
+}
+
+/// Convert a `pangolin_core::PasswordHistorySummaryEntry` (the reveal
+/// result) into the FFI [`PasswordHistoryEntry`] shape. Used by the
+/// presence-gated `reveal_password_history` entry point. Audit L-2:
+/// the intermediate `Vec<u8>` plaintext between `expose().to_vec()`
+/// and the `SecretPassword` constructor is held in `zeroize::Zeroizing`
+/// so a panic in that window cannot leak the allocation.
+#[must_use]
+pub fn password_history_entry_to_ffi(
+    entry: pangolin_core::PasswordHistorySummaryEntry,
+) -> PasswordHistoryEntry {
+    let mut bytes = zeroize::Zeroizing::new(entry.password.expose().to_vec());
+    PasswordHistoryEntry {
+        schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
+        password: SecretPassword::new(std::mem::take(&mut *bytes)),
+        set_at: entry.set_at_ms / 1000,
+        originating_device: device_id_to_ffi(entry.originating_device),
+    }
 }
 
 /// Borrow the raw bytes of a [`SecretPassword`] across the FFI bridge
@@ -241,12 +233,12 @@ fn totp_secret_bytes(s: &Arc<TotpSecret>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    //! Audit L-4: pin the `set_at` ms→s conversion done in
-    //! `summary_to_ffi`. The summary carries `set_at_ms`
-    //! (unix-milliseconds, `i64`); the FFI `PasswordHistoryEntry.set_at`
-    //! is `UnixTimestamp` (unix-seconds, `i64`). The bridge divides by
-    //! 1000 — this test exercises a value with a sub-second remainder
-    //! to verify integer-division truncation matches `set_at_ms / 1000`.
+    //! MVP-1 issue 1.4 (Q5b): `summary_to_ffi` is now a pure
+    //! metadata copy — the FFI `AccountSnapshot` carries zero secret
+    //! material. These tests pin (a) the `current_password_changed_at`
+    //! ms→s conversion (audit L-4 discipline), (b) that no secret
+    //! handle is constructed, and (c) `password_history_entry_to_ffi`'s
+    //! `set_at` ms→s conversion (used by `reveal_password_history`).
 
     use super::*;
     use pangolin_core::{
@@ -254,56 +246,60 @@ mod tests {
         PasswordHistorySummaryEntry, RevisionId as CoreRevisionId,
     };
 
-    #[test]
-    fn set_at_ms_to_seconds_conversion_truncates_remainder() {
-        // 500 ms past the unix-second boundary; integer division by
-        // 1000 must yield the floored second.
-        let set_at_ms: i64 = 1_700_000_000_500;
-        let expected_set_at_s: i64 = set_at_ms / 1000;
-        assert_eq!(expected_set_at_s, 1_700_000_000_i64);
-
-        let summary = AccountIdentitySummary {
+    fn fixture_summary(
+        history_count: u32,
+        changed_at_ms: i64,
+        has_totp: bool,
+    ) -> AccountIdentitySummary {
+        AccountIdentitySummary {
             schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
             id: CoreAccountId::from_bytes([0x11u8; 32]),
             head_revision_id: CoreRevisionId::from_bytes([0x22u8; 32]),
             display_name: "X".into(),
-            tags: vec![],
+            tags: vec!["work".into()],
             usernames: vec!["u".into()],
-            urls: vec![],
-            password_history: vec![PasswordHistorySummaryEntry {
-                password: pangolin_crypto::secret::SecretBytes::new(b"p".to_vec()),
-                set_at_ms,
-                originating_device: CoreDeviceId([0u8; 32]),
-            }],
-            totp_secret: None,
-        };
-
-        let snap = summary_to_ffi(summary).expect("summary_to_ffi");
-        assert_eq!(snap.password_history.len(), 1);
-        assert_eq!(snap.password_history[0].set_at, expected_set_at_s);
-        assert_eq!(snap.password_history[0].set_at, 1_700_000_000_i64);
+            urls: vec!["https://example.com".into()],
+            password_history_count: history_count,
+            has_totp,
+            current_password_changed_at_ms: changed_at_ms,
+        }
     }
 
     #[test]
-    fn set_at_ms_to_seconds_conversion_handles_exact_second() {
-        // Exact-second boundary: no remainder.
-        let set_at_ms: i64 = 1_700_000_000_000;
-        let summary = AccountIdentitySummary {
-            schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
-            id: CoreAccountId::from_bytes([0x11u8; 32]),
-            head_revision_id: CoreRevisionId::from_bytes([0x22u8; 32]),
-            display_name: "X".into(),
-            tags: vec![],
-            usernames: vec!["u".into()],
-            urls: vec![],
-            password_history: vec![PasswordHistorySummaryEntry {
-                password: pangolin_crypto::secret::SecretBytes::new(b"p".to_vec()),
-                set_at_ms,
-                originating_device: CoreDeviceId([0u8; 32]),
-            }],
-            totp_secret: None,
+    fn summary_to_ffi_is_metadata_only_and_converts_timestamp() {
+        // 500 ms past the unix-second boundary; integer division by
+        // 1000 must yield the floored second.
+        let changed_at_ms: i64 = 1_700_000_000_500;
+        let snap = summary_to_ffi(fixture_summary(3, changed_at_ms, true)).expect("summary_to_ffi");
+        assert_eq!(snap.password_history_count, 3);
+        assert!(snap.has_totp);
+        assert_eq!(snap.current_password_changed_at, 1_700_000_000_i64);
+        assert_eq!(snap.display_name, "X");
+        assert_eq!(snap.tags, vec!["work".to_string()]);
+        // The FFI AccountSnapshot has no secret-bearing fields — this
+        // construction would not compile if it did (struct literal in
+        // `summary_to_ffi` lists every field). Belt + suspenders: the
+        // type carries no `Arc<SecretPassword>` / `Arc<TotpSecret>`.
+    }
+
+    #[test]
+    fn summary_to_ffi_handles_exact_second_and_empty_history() {
+        let snap = summary_to_ffi(fixture_summary(0, 1_700_000_000_000, false)).expect("ok");
+        assert_eq!(snap.current_password_changed_at, 1_700_000_000_i64);
+        assert_eq!(snap.password_history_count, 0);
+        assert!(!snap.has_totp);
+    }
+
+    #[test]
+    fn password_history_entry_to_ffi_converts_timestamp_and_carries_bytes() {
+        let entry = PasswordHistorySummaryEntry {
+            password: pangolin_crypto::secret::SecretBytes::new(b"hunter2".to_vec()),
+            set_at_ms: 1_700_000_000_750,
+            originating_device: CoreDeviceId([0xABu8; 32]),
         };
-        let snap = summary_to_ffi(summary).expect("summary_to_ffi");
-        assert_eq!(snap.password_history[0].set_at, 1_700_000_000_i64);
+        let ffi = password_history_entry_to_ffi(entry);
+        assert_eq!(ffi.set_at, 1_700_000_000_i64);
+        assert_eq!(ffi.password.byte_length(), 7);
+        assert_eq!(ffi.originating_device.bytes, vec![0xABu8; 32]);
     }
 }

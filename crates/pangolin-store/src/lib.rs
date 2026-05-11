@@ -62,8 +62,8 @@ pub use revision::{ChainAnchor, DeviceId, RevisionGraph, RevisionId, RevisionMet
 pub use search::{ACCOUNT_SEARCH_RESULT_CAP, FTS_SCHEMA_VERSION};
 pub use session::{
     AuthError, Clock, IdentityProof, PinIdentityProof, PresenceProof, PressYPresenceProof,
-    SessionState, SystemClock, ABSOLUTE_MAX_DEFAULT, IDLE_TIMEOUT_DEFAULT, PRESENCE_FRESHNESS,
-    PROMPT_TIMEOUT,
+    SessionDuration, SessionState, SystemClock, ABSOLUTE_MAX_DEFAULT, IDLE_TIMEOUT_DEFAULT,
+    PRESENCE_FRESHNESS, PROMPT_TIMEOUT, SESSION_IDLE_UNTIL_DEVICE_LOCK,
 };
 pub use vault::{Vault, VaultState};
 

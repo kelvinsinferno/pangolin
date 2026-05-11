@@ -1057,22 +1057,26 @@ impl AccountIdentityPatch {
 /// Read-only summary view of an [`AccountIdentity`] surfaced through
 /// the FFI.
 ///
-/// Carries non-secret display-only fields plus secret-bearing fields
-/// wrapped in `SecretBytes` (the FFI bridge wraps them in
-/// presence-gated handles before crossing the FFI boundary).
+/// **MVP-1 issue 1.4 (Q5b — the strict reveal-gated model):** this
+/// type carries **zero secret material**. The fields here are all
+/// non-secret display / metadata: display name, tags, usernames, URLs
+/// (the V1 model treats those as non-secret), plus the head revision
+/// id, the password-history *count*, a `has_totp` flag, and the
+/// timestamp the current password was last set. The actual secret
+/// bytes — the head password, the full password history with bytes
+/// and device ids, the notes, the raw TOTP seed — are reachable
+/// **only** through the presence-gated `Vault::reveal_*` entry points
+/// (`reveal_current_password` / `reveal_password_history` /
+/// `reveal_notes` / `reveal_totp_secret`), each of which checks a
+/// fresh presence proof. Under the old design `account_get` /
+/// `account_search` returned `Arc<SecretPassword>` / `Arc<TotpSecret>`
+/// handles for *every* matched account — a binding shell held those
+/// the moment the user searched or opened a detail panel. The strict
+/// model: the snapshot never touches an encrypted password blob; the
+/// search/list path is metadata-only; least exposure.
 ///
-/// Fields are public for the FFI bridge module; this type is part of
-/// the crate's public API but is not surfaced through the
-/// `pangolin_core` re-export until 1.4's session rewrite.
-///
-/// **Notes are deliberately absent.** This type is FFI-bound (the
-/// `pangolin-ffi::identity_bridge` module consumes it). Free-form
-/// notes are recovery-class secrets per spec §5.4 — exposing them
-/// through a non-presence-gated read path would short-circuit the
-/// presence-escalation discipline. The presence-gated `reveal_notes`
-/// entry point lands in MVP-1 issue 1.4 (audit C-1 / plan §D). The
-/// underlying [`AccountIdentity::notes`] field still persists; only
-/// the FFI summary surface is closed.
+/// The underlying [`AccountIdentity`] keeps **all** its fields — only
+/// this FFI projection is tightened.
 pub struct AccountIdentitySummary {
     /// Schema-version slot.
     pub schema_version: u16,
@@ -1088,11 +1092,18 @@ pub struct AccountIdentitySummary {
     pub usernames: Vec<String>,
     /// URL set.
     pub urls: Vec<String>,
-    /// Password-history entries. The HEAD entry is the current
-    /// password.
-    pub password_history: Vec<PasswordHistorySummaryEntry>,
-    /// TOTP secret bytes — `None` when not configured.
-    pub totp_secret: Option<SecretBytes>,
+    /// Number of password-history entries (the head entry is the
+    /// current password). The bytes themselves come from
+    /// [`crate::vault::Vault::reveal_password_history`] (presence-gated).
+    pub password_history_count: u32,
+    /// Whether a TOTP secret is configured. The seed itself comes from
+    /// [`crate::vault::Vault::reveal_totp_secret`] (presence-gated).
+    pub has_totp: bool,
+    /// Wall-clock unix-millisecond timestamp the current (head)
+    /// password was set — the `set_at_ms` of the head history entry.
+    /// `0` if the history is somehow empty (should not happen for a
+    /// well-formed V1 identity, which always has a genesis entry).
+    pub current_password_changed_at_ms: i64,
 }
 
 impl fmt::Debug for AccountIdentitySummary {
@@ -1108,16 +1119,15 @@ impl fmt::Debug for AccountIdentitySummary {
                 &format!("<{} usernames>", self.usernames.len()),
             )
             .field("urls", &format!("<{} urls>", self.urls.len()))
+            .field("password_history_count", &self.password_history_count)
+            .field("has_totp", &self.has_totp)
             .field(
-                "password_history",
-                &format!("<{} entries>", self.password_history.len()),
+                "current_password_changed_at_ms",
+                &self.current_password_changed_at_ms,
             )
-            .field("totp_secret", &"<redacted>")
             .finish()
     }
 }
-
-impl ZeroizeOnDrop for AccountIdentitySummary {}
 
 /// Non-secret-but-secret-bearing summary entry of a password history
 /// item. Mirrors [`PasswordEntry`] but is dimensioned for the FFI

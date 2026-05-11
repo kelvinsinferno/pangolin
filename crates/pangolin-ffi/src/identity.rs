@@ -265,68 +265,59 @@ impl Clone for AccountPatch {
     }
 }
 
-/// Read-only account snapshot returned from `account_get` / search.
+/// Read-only account snapshot returned from `account_get` /
+/// `account_search`.
 ///
-/// Widened in 1.2: carries multi-* fields and a non-empty
-/// `password_history`. Per the presence-escalation discipline (spec
-/// §5.4), the `password` bytes never appear directly — callers must
-/// route through presence-gated `reveal_*` entry points (landing in
-/// 1.4) for plaintext password access. The `password_history` field
-/// here records timestamps + originating-device ids only; the actual
-/// password bytes are wrapped as `Arc<SecretPassword>` so binding-side
-/// shells can pass them back into a presence-gated reveal flow without
-/// the bytes ever appearing as a plain `Vec<u8>` on the wire.
+/// **MVP-1 issue 1.4 (Q5b — the strict reveal-gated model):** this
+/// record carries **zero secret material**. The `account_get` /
+/// `account_search` path needs only an unlocked vault — *not* a fresh
+/// presence proof — so under the previous design it returned
+/// `Arc<SecretPassword>` / `Arc<TotpSecret>` handles for every matched
+/// account, and a binding shell held those handles the moment the user
+/// searched or opened a detail panel (the bytes were reveal-gated, but
+/// the *handle's presence* in the shell is exposure: coercible later
+/// byte-reveal, serialization-bug leak, debug-dump). The strict model:
+/// the snapshot carries only non-secret display / metadata, and every
+/// secret crosses FFI **only** through a fresh-presence-checked
+/// `reveal_*` call (`reveal_current_password` / `reveal_password_history`
+/// / `reveal_notes` / `reveal_totp_secret`) — and only the specific
+/// secret requested. The search/list path never touches an encrypted
+/// password blob.
 ///
-/// **Notes are not exposed.** Per spec §5.4, free-form notes can carry
-/// recovery-class secrets (security-question answers, recovery
-/// phrases) and therefore fall under the same reveal-class umbrella as
-/// the password bytes. The `notes` field is deliberately absent here;
-/// the presence-gated `reveal_notes` entry point lands in MVP-1
-/// issue 1.4 (audit C-1 / plan §D).
-#[derive(Debug, uniffi::Record)]
+/// **No `notes` field** (audit C-1, kept) and **no `current_password`
+/// / `password_history` / `totp_secret` fields** (1.4 Q5b — removed
+/// from the 1.1-frozen shape; safe because nothing external binds the
+/// 1.1 surface yet — same posture as 1.2's Q1 amendment). The metadata
+/// here lets a host UI render a list / detail panel (display name,
+/// tags, usernames, URLs, "this password was last changed at T",
+/// "N history entries", "TOTP configured") without ever holding a
+/// secret handle.
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct AccountSnapshot {
-    /// Schema-version slot. 1.2 returns `1`.
+    /// Schema-version slot. 1.2/1.4 return `1`.
     pub schema_version: u16,
     /// The account's id.
     pub id: AccountId,
-    /// User-visible display name.
+    /// User-visible display name. Non-secret per the V1 model.
     pub display_name: String,
-    /// Tags.
+    /// Tags. Non-secret per the V1 model.
     pub tags: Vec<String>,
-    /// Usernames / emails.
+    /// Usernames / emails. Non-secret per the V1 model.
     pub usernames: Vec<String>,
-    /// Associated URLs.
+    /// Associated URLs. Non-secret per the V1 model.
     pub urls: Vec<String>,
-    /// Current password (head of `password_history`). Wrapped as
-    /// `Arc<SecretPassword>`; bytes zero on drop. Set on every
-    /// snapshot — even when the caller is not in a presence-gated
-    /// reveal context, the *handle* travels so it can be passed into
-    /// 1.4's reveal flow.
-    pub current_password: Arc<SecretPassword>,
-    /// Full password history (newest first). Each entry carries its
-    /// own `Arc<SecretPassword>` + timestamp + originating device.
-    pub password_history: Vec<PasswordHistoryEntry>,
-    /// Optional TOTP secret slot.
-    pub totp_secret: Option<Arc<TotpSecret>>,
     /// Most recent revision id for this account.
     pub head_revision_id: RevisionId,
-}
-
-impl Clone for AccountSnapshot {
-    fn clone(&self) -> Self {
-        Self {
-            schema_version: self.schema_version,
-            id: self.id.clone(),
-            display_name: self.display_name.clone(),
-            tags: self.tags.clone(),
-            usernames: self.usernames.clone(),
-            urls: self.urls.clone(),
-            current_password: Arc::clone(&self.current_password),
-            password_history: self.password_history.clone(),
-            totp_secret: self.totp_secret.as_ref().map(Arc::clone),
-            head_revision_id: self.head_revision_id.clone(),
-        }
-    }
+    /// Number of password-history entries (the head entry is the
+    /// current password). The bytes come from `reveal_password_history`
+    /// (presence-gated).
+    pub password_history_count: u32,
+    /// Whether a TOTP secret is configured. The seed comes from
+    /// `reveal_totp_secret` (presence-gated).
+    pub has_totp: bool,
+    /// Wall-clock unix-second timestamp the current (head) password was
+    /// last set. `0` if the history is somehow empty.
+    pub current_password_changed_at: UnixTimestamp,
 }
 
 // -- Locked-in-1.1 entry points ---------------------------------------

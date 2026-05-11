@@ -814,21 +814,33 @@ fn full_session_lifecycle() {
     assert!(v.get_account(id).is_some());
     let _ = v.list_accounts();
 
-    // High-risk op (reveal_password) requires an explicit fresh
-    // presence proof EVEN during an active session (cardinal-principle
-    // 5: high-risk requires explicit presence even mid-session).
-    let presence = PressYPresenceProof::confirmed();
-    let pwd = v.reveal_password(id, &presence).unwrap();
+    // High-risk op (reveal_password) requires presence that is fresh
+    // *now* — the unlock's presence proof is still within the 60 s
+    // window, so this reveal does not re-prompt (Session spec §5.2's
+    // "access remains seamless"; §8.6 dedup). A throwaway proof works
+    // because the engine dedups rather than verifying it.
+    let pwd = v
+        .reveal_password(id, &PressYPresenceProof::confirmed())
+        .unwrap();
     assert_eq!(pwd.expose(), b"hunter2-real-time");
 
-    // Replayed presence proof → AuthenticationFailed (single-use
-    // replay rejection).
-    let err = v.reveal_password(id, &presence).unwrap_err();
-    assert!(matches!(err, StoreError::AuthenticationFailed));
+    // A second reveal moments later — still within the window — also
+    // succeeds without a re-prompt (prompt dedup).
+    let pwd2 = v
+        .reveal_password(id, &PressYPresenceProof::confirmed())
+        .unwrap();
+    assert_eq!(pwd2.expose(), b"hunter2-real-time");
+
+    // reveal_current_password is the V1-named entry; same head bytes.
+    let pwd3 = v
+        .reveal_current_password(id, &PressYPresenceProof::confirmed())
+        .unwrap();
+    assert_eq!(pwd3.expose(), b"hunter2-real-time");
 
     // Export-payload exercises the same proof discipline.
-    let presence_export = PressYPresenceProof::confirmed();
-    let bytes = v.export_payload(id, &presence_export).unwrap();
+    let bytes = v
+        .export_payload(id, &PressYPresenceProof::confirmed())
+        .unwrap();
     assert!(bytes.len() > 50);
 
     // Lock → session goes inactive.
@@ -1241,6 +1253,160 @@ fn v0_path_builds_and_syncs_search_index() {
     assert!(v.account_search("legacy").unwrap().is_empty());
     assert_eq!(search_names(&mut v, "renamed"), vec!["Renamed V0"]);
     assert_eq!(search_names(&mut v, "newv0host"), vec!["Renamed V0"]);
+    v.lock();
+    v.close().unwrap();
+}
+
+// =====================================================================
+// MVP-1 issue 1.4: session-policy production — config persistence,
+// device-lock, reveal-class, search-index lifecycle.
+// =====================================================================
+
+use pangolin_store::SessionDuration;
+
+/// Criterion 14: `set_session_idle` persists to `meta.session_idle_secs`
+/// and a subsequent `open` + `unlock` uses the new window. Lengthening
+/// (15 → 30 min) requires a fresh presence proof; the persisted value
+/// survives a close/reopen cycle.
+#[test]
+fn set_session_idle_persists_and_is_used_on_reopen() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("idle-persist.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+    {
+        let mut v = Vault::open(&path).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        // Default is 15 min for a fresh vault.
+        assert_eq!(v.session_idle(), SessionDuration::Min15);
+        // Lengthen to 30 min — high-risk, needs presence.
+        v.set_session_idle(
+            SessionDuration::Min30,
+            Some(&PressYPresenceProof::confirmed()),
+        )
+        .unwrap();
+        v.lock();
+        v.close().unwrap();
+    }
+    // Reopen: the 30-min choice persisted.
+    let mut v = Vault::open(&path).unwrap();
+    assert_eq!(v.session_idle(), SessionDuration::Min30);
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    // The session's deadline reflects ~30 min.
+    let r = v.session_remaining().unwrap();
+    assert!(
+        r > std::time::Duration::from_secs(29 * 60) && r <= std::time::Duration::from_secs(30 * 60),
+        "remaining {r:?} not ≈ 30 min"
+    );
+    // Shorten back to 5 min — no presence needed.
+    v.set_session_idle(SessionDuration::Min5, None).unwrap();
+    assert_eq!(v.session_idle(), SessionDuration::Min5);
+    // Shortening took effect immediately on the live session.
+    let r = v.session_remaining().unwrap();
+    assert!(
+        r <= std::time::Duration::from_secs(5 * 60),
+        "remaining {r:?} not ≤ 5 min"
+    );
+    v.lock();
+    v.close().unwrap();
+}
+
+/// Criterion 16: `device_locked()` tears down the `:memory:` FTS5
+/// search index (same path as a lock / idle expiry); a re-`unlock`
+/// rebuilds it. The 1.3 search-index lifecycle is preserved.
+#[test]
+fn device_locked_tears_down_search_index() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("device-lock-search.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+    let mut v = Vault::open(&path).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    v.account_add(v1_draft(
+        "Gamma",
+        &["g"],
+        &["https://gamma.example"],
+        "u@x",
+        "pw",
+    ))
+    .unwrap();
+    assert_eq!(search_names(&mut v, "gamma"), vec!["Gamma"]);
+    // Device locks → session expires, the `:memory:` index is freed.
+    v.device_locked();
+    assert!(matches!(
+        v.account_search("gamma"),
+        Err(StoreError::SessionExpired)
+    ));
+    // Re-unlock (2-proof) rebuilds the index.
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    assert_eq!(search_names(&mut v, "gamma"), vec!["Gamma"]);
+    v.lock();
+    v.close().unwrap();
+}
+
+/// Criterion 13: the V1 `reveal_password_history` returns the complete
+/// history (bytes + `set_at_ms` + device per entry) end-to-end through
+/// a real on-disk vault, and `reveal_current_password` / `reveal_notes`
+/// / `reveal_totp_secret` surface the head password / notes / raw seed.
+#[test]
+fn reveal_class_round_trip_v1() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("reveal-v1.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+    let mut v = Vault::open(&path).unwrap();
+    v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+    let mut draft = v1_draft(
+        "GitHub",
+        &["work"],
+        &["https://github.com"],
+        "alice@x",
+        "pw-0",
+    );
+    draft.notes = "recovery phrase: alpha bravo charlie".into();
+    draft.totp_secret = SecretBytes::new(b"jbswy3dpehpk3pxp".to_vec());
+    let id = v.account_add(draft).unwrap();
+    // Rotate twice.
+    for new in [b"pw-1".as_slice(), b"pw-2".as_slice()] {
+        v.account_update(
+            id,
+            AccountIdentityPatch {
+                schema_version: ACCOUNT_IDENTITY_SCHEMA_VERSION,
+                display_name: None,
+                tags: None,
+                usernames: None,
+                urls: None,
+                notes: None,
+                password: Some(SecretBytes::new(new.to_vec())),
+                totp_secret: None,
+            },
+        )
+        .unwrap();
+    }
+    let history = v.reveal_password_history(id, &fresh_presence()).unwrap();
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0].password.expose(), b"pw-2");
+    assert_eq!(history[2].password.expose(), b"pw-0");
+    assert_eq!(history[0].originating_device.0.len(), 32);
+    assert!(history[0].set_at_ms >= history[2].set_at_ms);
+    assert_eq!(
+        v.reveal_current_password(id, &fresh_presence())
+            .unwrap()
+            .expose(),
+        b"pw-2"
+    );
+    assert_eq!(
+        v.reveal_notes(id, &fresh_presence()).unwrap().expose(),
+        b"recovery phrase: alpha bravo charlie"
+    );
+    assert_eq!(
+        v.reveal_totp_secret(id, &fresh_presence())
+            .unwrap()
+            .expose(),
+        b"jbswy3dpehpk3pxp"
+    );
+    // The metadata-only summary carries the count + flag, no secrets.
+    let summary = v.account_get(id).unwrap();
+    assert_eq!(summary.password_history_count, 3);
+    assert!(summary.has_totp);
+    assert!(summary.current_password_changed_at_ms > 0);
     v.lock();
     v.close().unwrap();
 }

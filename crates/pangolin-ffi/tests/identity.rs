@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-#![allow(clippy::redundant_clone)]
-//! MVP-1 issue 1.2 integration tests for the `account_*` FFI bodies.
+#![allow(
+    clippy::redundant_clone,
+    clippy::cast_possible_truncation,
+    clippy::doc_markdown
+)]
+//! MVP-1 issue 1.2 + 1.4 integration tests for the `account_*` FFI
+//! bodies and the presence-gated `reveal_*` entry points.
 //!
 //! These tests build a real (unlocked) `Vault`, install it into a
-//! `VaultHandle`, and exercise the FFI surface end-to-end. The
-//! presence-gated reveal entry points are 1.4's scope; the tests here
-//! cover only the non-secret read-back path.
+//! `VaultHandle`, and exercise the FFI surface end-to-end. As of 1.4
+//! (Q5b) the `account_get` / `account_search` snapshot carries zero
+//! secret material; the password / history / notes / TOTP-seed bytes
+//! cross FFI only through the presence-gated `reveal_*` entries.
 
 use std::sync::Arc;
 
@@ -14,8 +20,20 @@ use pangolin_crypto::secret::SecretBytes;
 use pangolin_ffi::identity::{
     account_add, account_get, account_history, account_search, account_update,
 };
-use pangolin_ffi::{AccountDraft, AccountPatch, SecretPassword, TotpSecret, VaultHandle};
+use pangolin_ffi::reveal::{
+    reveal_current_password, reveal_notes, reveal_password_history, reveal_totp_secret,
+};
+use pangolin_ffi::{
+    AccountDraft, AccountPatch, PresenceProof, SecretPassword, TotpSecret, VaultHandle,
+};
 use tempfile::TempDir;
+
+fn presence_envelope() -> PresenceProof {
+    PresenceProof {
+        schema_version: 1,
+        bytes: Vec::new(),
+    }
+}
 
 fn make_unlocked_vault() -> (TempDir, Vault) {
     let tmp = TempDir::new().expect("tempdir");
@@ -61,8 +79,40 @@ fn account_add_get_roundtrip() {
     assert_eq!(snap.tags.len(), 2);
     assert_eq!(snap.usernames.len(), 2);
     assert_eq!(snap.urls.len(), 1);
-    assert_eq!(snap.password_history.len(), 1);
-    assert!(snap.totp_secret.is_some());
+    // Q5b: metadata only — count + flag, no secret bytes.
+    assert_eq!(snap.password_history_count, 1);
+    assert!(snap.has_totp);
+    assert!(snap.current_password_changed_at > 0);
+}
+
+/// MVP-1 issue 1.4 (Q5b): the FFI `AccountSnapshot` from `account_get`
+/// carries zero secret material — the head password, the full history
+/// bytes, the notes and the raw TOTP seed come ONLY from the
+/// presence-gated `reveal_*` entries. (The struct shape is checked at
+/// compile time in `roundtrip.rs`; this test confirms the runtime
+/// data flow: the snapshot has the metadata, the reveals have the
+/// secrets.)
+#[test]
+fn ffi_account_snapshot_has_no_plaintext_secrets() {
+    let (_tmp, handle) = fresh_handle();
+    let id = account_add(handle.clone(), fresh_draft("Reveal Test")).expect("add");
+
+    let snap = account_get(handle.clone(), id.clone()).expect("get");
+    assert_eq!(snap.password_history_count, 1);
+    assert!(snap.has_totp);
+
+    // The secrets come from the presence-gated reveals.
+    let pwd = reveal_current_password(handle.clone(), id.clone(), presence_envelope())
+        .expect("reveal_current_password");
+    assert_eq!(pwd.byte_length(), b"hunter2".len() as u32);
+
+    let totp = reveal_totp_secret(handle.clone(), id.clone(), presence_envelope())
+        .expect("reveal_totp_secret");
+    assert_eq!(totp.byte_length(), b"jbswy3dpehpk3pxp".len() as u32);
+
+    let notes =
+        reveal_notes(handle.clone(), id.clone(), presence_envelope()).expect("reveal_notes");
+    assert_eq!(notes.byte_length(), b"test notes".len() as u32);
 }
 
 #[test]
@@ -84,7 +134,56 @@ fn account_update_appends_password_history() {
     let _rev = account_update(handle.clone(), id.clone(), patch).expect("account_update");
 
     let snap = account_get(handle.clone(), id.clone()).expect("account_get");
-    assert_eq!(snap.password_history.len(), 2);
+    assert_eq!(snap.password_history_count, 2);
+}
+
+/// MVP-1 issue 1.4 (Q4): the presence-gated `reveal_password_history`
+/// returns the full history — head password + every superseded value,
+/// each with its timestamp + originating device. Newest first.
+#[test]
+fn ffi_reveal_password_history_round_trip() {
+    let (_tmp, handle) = fresh_handle();
+    let id = account_add(handle.clone(), fresh_draft("History")).expect("add");
+    // Rotate the password twice.
+    for new in [b"hunter3".as_slice(), b"hunter4".as_slice()] {
+        let patch = AccountPatch {
+            schema_version: 1,
+            display_name: None,
+            tags: None,
+            usernames: None,
+            urls: None,
+            notes: None,
+            current_password: Some(SecretPassword::new(new.to_vec())),
+            totp_secret: None,
+        };
+        account_update(handle.clone(), id.clone(), patch).expect("update");
+    }
+    let history = reveal_password_history(handle.clone(), id.clone(), presence_envelope())
+        .expect("reveal_password_history");
+    assert_eq!(history.len(), 3);
+    // Newest first: hunter4, hunter3, hunter2.
+    assert_eq!(history[0].password.byte_length(), b"hunter4".len() as u32);
+    assert_eq!(history[2].password.byte_length(), b"hunter2".len() as u32);
+    // Each entry carries a 32-byte device id and a timestamp.
+    assert_eq!(history[0].originating_device.bytes.len(), 32);
+    assert!(history[0].set_at >= history[2].set_at);
+}
+
+/// MVP-1 issue 1.4: `reveal_*` on a locked vault surfaces a session
+/// error (NotUnlocked) — and the FFI maps it to the Session category.
+#[test]
+fn ffi_reveal_on_locked_vault_errors() {
+    use pangolin_ffi::session::vault_lock;
+    let (_tmp, handle) = fresh_handle();
+    let id = account_add(handle.clone(), fresh_draft("Locked")).expect("add");
+    vault_lock(handle.clone()).expect("vault_lock");
+    let err = reveal_current_password(handle.clone(), id.clone(), presence_envelope())
+        .expect_err("must error on locked vault");
+    let msg = err.message();
+    assert!(
+        msg.contains("session") || msg.contains("unlock"),
+        "expected a session error, got {msg}"
+    );
 }
 
 #[test]

@@ -92,6 +92,41 @@ pub fn write(conn: &Connection, meta: &VaultMeta) -> Result<()> {
     Ok(())
 }
 
+/// Read the `meta.session_idle_secs` column (MVP-1 issue 1.4 — the
+/// configurable idle-timeout choice from Session spec §7.2).
+///
+/// Returns `Ok(None)` when the row is absent (fresh database not yet
+/// written) **or** the column is NULL (a vault that predates 1.4, or one
+/// that never explicitly set the choice). Both map to the 15-min
+/// default at the call site via
+/// [`crate::session::SessionDuration::from_meta_secs`]. A present value
+/// is returned verbatim; the caller validates it against the §7.2 set.
+pub fn read_session_idle_secs(conn: &Connection) -> Result<Option<i64>> {
+    let raw: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT session_idle_secs FROM meta WHERE id = 0",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    // Outer Option = "row present?"; inner Option = "column non-NULL?".
+    Ok(raw.flatten())
+}
+
+/// Persist (or clear, with `None`) the `meta.session_idle_secs` column.
+/// `Some(secs)` writes the raw seconds value (the caller is expected to
+/// have validated it against the §7.2 set / the `-1` sentinel);
+/// `None` writes SQL `NULL`, which the read path interprets as the
+/// 15-min default. UPDATE-only (the meta row exists by construction
+/// after `Vault::create`).
+pub fn write_session_idle_secs(conn: &Connection, secs: Option<i64>) -> Result<()> {
+    conn.execute(
+        "UPDATE meta SET session_idle_secs = ?1 WHERE id = 0",
+        params![secs],
+    )?;
+    Ok(())
+}
+
 /// Read the meta row. Returns `Ok(None)` when the row has not yet been
 /// written (fresh database).
 pub fn read(conn: &Connection) -> Result<Option<VaultMeta>> {
