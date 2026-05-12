@@ -230,9 +230,11 @@ pub enum AccountCommand {
 ///
 /// Password input has three exclusive paths:
 ///
-/// 1. `--generate-password` — auto-generate a 24-char password
-///    drawn from a 70-char alphabet. The generated value is
-///    printed to stderr inside a clearly-flagged save-this-now
+/// 1. `--generate-password` — auto-generate a 16-char password via
+///    the library generator (`pangolin_core::pwgen`, strong
+///    defaults: mixed case + digits + ASCII symbols, ambiguous
+///    chars excluded, unbiased CSPRNG draws). The generated value
+///    is printed to stderr inside a clearly-flagged save-this-now
 ///    block; copy it into the user's preferred password store.
 /// 2. `--password-stdin` — read the first line of stdin as the
 ///    password (CI / scripted use). Trailing newline is trimmed.
@@ -292,10 +294,11 @@ pub struct AccountAddArgs {
     #[arg(long, conflicts_with = "generate_password")]
     pub password_stdin: bool,
 
-    /// Auto-generate a 24-character password from a 70-char
-    /// alphabet. The generated value is printed to stderr inside
-    /// a save-this-now block. Mutually exclusive with
-    /// `--password-stdin`.
+    /// Auto-generate a 16-character password via the library
+    /// generator (strong defaults: mixed case + digits + ASCII
+    /// symbols, ambiguous chars excluded). The generated value is
+    /// printed to stderr inside a save-this-now block. Mutually
+    /// exclusive with `--password-stdin`.
     #[arg(long, conflicts_with = "password_stdin")]
     pub generate_password: bool,
 

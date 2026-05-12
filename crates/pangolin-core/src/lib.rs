@@ -37,6 +37,7 @@
 pub mod device;
 pub mod error;
 pub mod identity;
+pub mod pwgen;
 pub mod recovery;
 pub mod revision;
 pub mod session;

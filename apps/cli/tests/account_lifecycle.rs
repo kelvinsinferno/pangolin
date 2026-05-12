@@ -184,14 +184,17 @@ async fn account_lifecycle_round_trip() {
         let pwd = v
             .reveal_password(aid, &p)
             .expect("reveal_password at library layer");
-        // The auto-generated password is 24 bytes drawn from a
-        // 64-char alphabet; assert structural shape rather than
-        // specific bytes (the value is non-deterministic).
-        assert_eq!(
-            pwd.expose().len(),
-            24,
-            "auto-generated password is 24 chars"
-        );
+        // Issue 1.8: `--generate-password` routes through the library
+        // generator (`pangolin_core::pwgen`) — the strong default is a
+        // 16-char password with all four character classes. Assert
+        // structural shape rather than specific bytes (the value is
+        // non-deterministic).
+        let bytes = pwd.expose();
+        assert_eq!(bytes.len(), 16, "auto-generated password is 16 chars");
+        assert!(bytes.iter().any(u8::is_ascii_uppercase));
+        assert!(bytes.iter().any(u8::is_ascii_lowercase));
+        assert!(bytes.iter().any(u8::is_ascii_digit));
+        assert!(bytes.iter().any(u8::is_ascii_punctuation));
         v.close().expect("close");
     }
 

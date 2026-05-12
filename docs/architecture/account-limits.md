@@ -18,6 +18,7 @@
 | `NOTES_MAX_CHARS` | 65 536 | `AccountDraft.notes`, `AccountPatch.notes` | any UTF-8 |
 | `PASSWORD_MAX_BYTES` | 4 096 | `AccountDraft.current_password`, `AccountPatch.current_password` | non-empty; arbitrary bytes |
 | `TOTP_SECRET_MAX_BYTES` | 256 | `AccountDraft.totp_secret`, `AccountPatch.totp_secret` (when `Some`) | byte-length only — any non-empty seed up to the cap is accepted; **no minimum-length floor** (we do not enforce RFC 4226's ≥ 128-bit recommendation — real-world secrets are frequently shorter, and RFC 6238 generation is well-defined for any non-empty key). Empty == no TOTP configured. `pangolin_totp::MAX_SECRET_BYTES` (256) must equal this constant — an FFI integration test cross-checks. The configurable params (`algorithm ∈ {SHA1,SHA256,SHA512}`, `digits ∈ {6,7,8}`, `period ∈ 1..=3600`) are validated under `kind = "totp_params"` — see `docs/architecture/totp.md`. |
+| `PWGEN_LENGTH_MIN` / `PWGEN_LENGTH_MAX` (issue 1.8) | 8 / 128 | `PasswordPolicy.length` — the password *generator*'s output length | `length` must be in `[8, 128]` **and** ≥ the count of enabled character classes (so "≥1 of each enabled class" is satisfiable); at least one class must be enabled. `PWGEN_LENGTH_DEFAULT = 16`. **Distinct from `PASSWORD_MAX_BYTES`:** `PWGEN_*` bounds what the *generator produces*; `PASSWORD_MAX_BYTES = 4096` bounds what the *vault accepts* for a user-supplied `current_password`. A 128-char generated password is 128 bytes — well under 4096. Errors → `Validation { kind: "password_policy" }`. Alphabet + the `exclude_ambiguous` set (`0 O 1 l I |`) are documented in `docs/architecture/password-generator.md`. |
 
 ## Error mapping
 
@@ -39,6 +40,7 @@ label that maps 1:1 from `pangolin_core::Error::Validation { kind }` to
 | password empty / over-long | `password` |
 | TOTP secret over-long | `totp_secret` |
 | TOTP params out of range (bad digits / period) | `totp_params` |
+| `password_generate` / `password_entropy_bits` with an invalid policy (no class enabled / `length` out of `[8,128]` / `length` < enabled-class count) | `password_policy` |
 | `totp_generate` on an account with no TOTP | `totp_not_configured` |
 | `totp_generate` with a negative timestamp / `parse_totp_secret` malformed input | `totp` |
 

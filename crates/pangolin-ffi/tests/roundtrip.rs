@@ -293,10 +293,69 @@ fn password_policy_record_round_trip() {
         lowercase: true,
         digits: true,
         symbols: false,
+        exclude_ambiguous: true,
     };
     let cloned = original.clone();
     assert_eq!(original.length, cloned.length);
     assert_eq!(original.symbols, cloned.symbols);
+    assert_eq!(original.exclude_ambiguous, cloned.exclude_ambiguous);
+}
+
+#[test]
+fn password_strength_record_round_trip() {
+    let original = pangolin_ffi::PasswordStrength {
+        schema_version: pangolin_ffi::PASSWORD_POLICY_SCHEMA_VERSION,
+        score: 3,
+        guesses_log10: 12.5,
+        crack_time_seconds: 9_000.0,
+        feedback_warning: Some("This is a top-10 common password".to_string()),
+        feedback_suggestions: vec!["Add another word or two".to_string()],
+    };
+    let cloned = original.clone();
+    assert_eq!(original.score, cloned.score);
+    assert_eq!(original.feedback_warning, cloned.feedback_warning);
+    assert_eq!(original.feedback_suggestions, cloned.feedback_suggestions);
+}
+
+#[test]
+#[allow(clippy::suboptimal_flops)]
+fn password_generate_and_helpers() {
+    use pangolin_ffi::session::{
+        password_entropy_bits, password_generate, password_policy_default, password_strength,
+    };
+    use pangolin_ffi::FfiError;
+    let pol = password_policy_default();
+    assert_eq!(pol.length, 16);
+    assert!(pol.uppercase && pol.lowercase && pol.digits && pol.symbols && pol.exclude_ambiguous);
+
+    let pw = password_generate(pol.clone()).expect("default policy generates");
+    assert_eq!(pw.byte_length(), 16);
+
+    let bits = password_entropy_bits(pol.clone()).expect("entropy");
+    assert!((bits - 16.0 * 88f64.log2()).abs() < 1e-9, "bits={bits}");
+
+    // Invalid policy → Validation { kind: "password_policy" }.
+    let bad = PasswordPolicy {
+        uppercase: false,
+        lowercase: false,
+        digits: false,
+        symbols: false,
+        ..pol
+    };
+    match password_generate(bad.clone()) {
+        Err(FfiError::Validation { kind, .. }) => assert_eq!(kind, "password_policy"),
+        other => panic!("expected Validation, got {other:?}"),
+    }
+    match password_entropy_bits(bad) {
+        Err(FfiError::Validation { kind, .. }) => assert_eq!(kind, "password_policy"),
+        other => panic!("expected Validation, got {other:?}"),
+    }
+
+    let weak = password_strength("password".to_string());
+    assert!(weak.score <= 1);
+    let strong = password_strength("correct horse battery staple".to_string());
+    assert!(strong.score >= 3);
+    assert_eq!(password_strength(String::new()).score, 0);
 }
 
 #[test]

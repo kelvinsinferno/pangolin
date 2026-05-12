@@ -217,7 +217,18 @@ New records: `TotpCode { schema_version, code: String, seconds_remaining: u16 }`
 
 | Function | Lands in |
 |---|---|
-| `password_generate(policy: PasswordPolicy) -> SecretPassword` | 1.8 |
+| `password_generate(policy: PasswordPolicy) -> Result<SecretPassword, FfiError>` | 1.8 (return shape amended from `-> SecretPassword`; invalid policy → `Validation { kind: "password_policy" }`) |
+| `password_entropy_bits(policy: PasswordPolicy) -> Result<f64, FfiError>` | 1.8 (additive — `length × log2(alphabet_size)`; invalid policy → `Validation { kind: "password_policy" }`) |
+| `password_strength(password: String) -> PasswordStrength` | 1.8 (additive — zxcvbn-style estimate for arbitrary passwords; infallible; the `password` arg is zeroized after use) |
+| `password_policy_default() -> PasswordPolicy` | 1.8 (additive — the strong defaults: length 16, all four classes, `exclude_ambiguous: true`) |
+
+`PasswordPolicy` gained an `exclude_ambiguous: bool` field in 1.8
+(additive). `PasswordStrength` Record (1.8): `{ schema_version: u16,
+score: u8 (0–4), guesses_log10: f64, crack_time_seconds: f64 (the
+conservative offline-slow-hashing 10k-guesses/s estimate),
+feedback_warning: Option<String>, feedback_suggestions: Vec<String> }`.
+See `password-generator.md` for the generator's design + the
+unbiased-draw / CSPRNG guarantees.
 
 ### KDBX import
 
@@ -260,7 +271,8 @@ New records: `TotpCode { schema_version, code: String, seconds_remaining: u16 }`
 | `RevisionMeta` | Record | No | `schema_version: u16` |
 | `TotpCode` | Record | Yes (decimal code + window) | `schema_version: u16` |
 | `UnixTimestamp` | type alias for `i64` | No | n/a |
-| `PasswordPolicy` | Record | No (policy flags) | `schema_version: u16` |
+| `PasswordPolicy` | Record | No (policy flags — `length`, `uppercase`, `lowercase`, `digits`, `symbols`, `exclude_ambiguous` (1.8)) | `schema_version: u16` |
+| `PasswordStrength` | Record | No (1.8 — zxcvbn score, guesses-log10, conservative crack-time-seconds, optional feedback warning + suggestions) | `schema_version: u16` |
 | `KdbxImportReport` | Record | No (counts + category labels) | `schema_version: u16` |
 | `PlaintextExportConfirmation` | Record | Yes (confirmation token) | `schema_version: u16` |
 | `CaptureAuthority` | Record | No | `schema_version: u16` |

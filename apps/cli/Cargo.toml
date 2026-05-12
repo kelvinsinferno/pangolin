@@ -39,6 +39,9 @@ integration-tests = []
 pangolin-store  = { path = "../../crates/pangolin-store" }
 pangolin-chain  = { path = "../../crates/pangolin-chain" }
 pangolin-crypto = { path = "../../crates/pangolin-crypto" }
+# MVP-1 issue 1.8: `--generate-password` routes through the one true
+# generator (`pangolin_core::pwgen`) instead of a divergent local copy.
+pangolin-core   = { path = "../../crates/pangolin-core" }
 # MVP-1 issue 1.7: parse a TOTP secret (bare base32 or `otpauth://` URI)
 # from `--totp-stdin` / the interactive prompt into the decoded seed
 # bytes. `pangolin-totp` is a near-leaf (own `hmac`/`sha1`/`sha2`, no

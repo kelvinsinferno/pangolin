@@ -276,12 +276,20 @@ impl VaultHandle {
 /// `totp_generate` and `vault_export_*` paths.
 pub type UnixTimestamp = i64;
 
-/// Password-generator policy. Body lands in MVP-1 issue 1.8.
+/// Schema-version slot value for [`PasswordPolicy`] / [`PasswordStrength`].
+pub const PASSWORD_POLICY_SCHEMA_VERSION: u16 = 1;
+
+/// Password-generator policy. Implemented in MVP-1 issue 1.8.
+///
+/// `exclude_ambiguous` was added in 1.8 (additive — nothing external
+/// binds the record yet). [`password_policy_default`] returns the
+/// strong-defaults shape.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct PasswordPolicy {
     /// Issue 1.1 schema-version slot.
     pub schema_version: u16,
-    /// Total password length in characters.
+    /// Total password length in characters. Generator-valid range
+    /// `[8, 128]`; default 16.
     pub length: u16,
     /// Whether to include uppercase letters.
     pub uppercase: bool,
@@ -289,8 +297,62 @@ pub struct PasswordPolicy {
     pub lowercase: bool,
     /// Whether to include digits.
     pub digits: bool,
-    /// Whether to include symbol characters.
+    /// Whether to include symbol characters (the 32 ASCII punctuation
+    /// chars; `|` is also dropped when `exclude_ambiguous` is set).
     pub symbols: bool,
+    /// Drop visually-confusable characters (`0 O 1 l I |`) from the
+    /// enabled classes. Defaults to `true` in [`password_policy_default`].
+    pub exclude_ambiguous: bool,
+}
+
+impl PasswordPolicy {
+    /// Convert to the `pangolin-core` plain policy (drops the FFI-wire
+    /// `schema_version` slot — a transport concern the generator never
+    /// reads).
+    fn to_core(&self) -> pangolin_core::pwgen::PwgenPolicy {
+        pangolin_core::pwgen::PwgenPolicy {
+            length: self.length,
+            uppercase: self.uppercase,
+            lowercase: self.lowercase,
+            digits: self.digits,
+            symbols: self.symbols,
+            exclude_ambiguous: self.exclude_ambiguous,
+        }
+    }
+
+    fn from_core(p: pangolin_core::pwgen::PwgenPolicy) -> Self {
+        Self {
+            schema_version: PASSWORD_POLICY_SCHEMA_VERSION,
+            length: p.length,
+            uppercase: p.uppercase,
+            lowercase: p.lowercase,
+            digits: p.digits,
+            symbols: p.symbols,
+            exclude_ambiguous: p.exclude_ambiguous,
+        }
+    }
+}
+
+/// Strength estimate for an arbitrary (typed/imported) password.
+///
+/// A zxcvbn-style heuristic. Added in MVP-1 issue 1.8. Not sensitive
+/// (no secret in the record itself — the input password is consumed and
+/// zeroized by [`password_strength`]).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PasswordStrength {
+    /// Schema-version slot.
+    pub schema_version: u16,
+    /// zxcvbn score, 0 (weakest) .. 4 (strongest).
+    pub score: u8,
+    /// Base-10 logarithm of the estimated guess count.
+    pub guesses_log10: f64,
+    /// Conservative crack-time estimate, in seconds: an attacker with
+    /// the offline hash at 10k guesses/second.
+    pub crack_time_seconds: f64,
+    /// A top-level warning, if zxcvbn produced one.
+    pub feedback_warning: Option<String>,
+    /// Actionable suggestions for a stronger password.
+    pub feedback_suggestions: Vec<String>,
 }
 
 /// Plaintext-export second-confirmation envelope (Design Spec §11). The
@@ -510,14 +572,67 @@ pub fn session_extend(
     Ok(session_info_from_vault(vault))
 }
 
-/// Generate a password matching the supplied policy. Body lands in 1.8.
+/// Generate a password matching the supplied policy.
 ///
-/// # Panics
-/// Panics with `todo!()` until 1.8 lands.
+/// Draws entropy exclusively from the OS CSPRNG (via
+/// `pangolin_crypto::rng`), selects characters without modulo bias
+/// (rejection sampling), and guarantees ≥1 char of each enabled class.
+/// See `docs/architecture/password-generator.md`.
+///
+/// # Errors
+/// `FfiError::Validation { kind: "password_policy" }` for an invalid
+/// policy (no character class enabled; `length` outside `[8, 128]`;
+/// `length` below the count of enabled classes). The generator fails
+/// loudly rather than clamping — a generated password that silently
+/// matched a *different* policy than the caller asked for is a bad
+/// failure mode for a security artifact.
 #[uniffi::export]
-pub fn password_generate(policy: PasswordPolicy) -> Arc<SecretPassword> {
-    let _ = policy;
-    todo!("password_generate body lands in MVP-1 issue 1.8")
+pub fn password_generate(policy: PasswordPolicy) -> Result<Arc<SecretPassword>, FfiError> {
+    let mut generated = pangolin_core::pwgen::generate(&policy.to_core())?;
+    // Move the bytes out of the `Zeroizing<String>` into `SecretPassword`'s
+    // own zeroizing buffer; the (now-empty) `Zeroizing<String>` zeroes its
+    // freed allocation on drop, and `SecretPassword` zeroizes the bytes.
+    let bytes = std::mem::take(&mut *generated).into_bytes();
+    Ok(SecretPassword::new(bytes))
+}
+
+/// Exact bit-entropy of a password produced by `policy` —
+/// `length × log2(alphabet_size)`. A pure function of the policy;
+/// computable without generating.
+///
+/// # Errors
+/// `FfiError::Validation { kind: "password_policy" }` for an invalid
+/// policy (so this and [`password_generate`] agree on validity).
+#[uniffi::export]
+pub fn password_entropy_bits(policy: PasswordPolicy) -> Result<f64, FfiError> {
+    Ok(pangolin_core::pwgen::entropy_bits(&policy.to_core())?)
+}
+
+/// Heuristic (zxcvbn-style) strength estimate for an arbitrary
+/// (typed/imported) password.
+///
+/// Infallible — always returns a [`PasswordStrength`]. The `password`
+/// argument is consumed into Rust-owned memory and zeroized before this
+/// function returns.
+#[uniffi::export]
+pub fn password_strength(password: String) -> PasswordStrength {
+    let password = zeroize::Zeroizing::new(password);
+    let s = pangolin_core::pwgen::strength(&password);
+    PasswordStrength {
+        schema_version: PASSWORD_POLICY_SCHEMA_VERSION,
+        score: s.score,
+        guesses_log10: s.guesses_log10,
+        crack_time_seconds: s.crack_time_seconds,
+        feedback_warning: s.feedback_warning,
+        feedback_suggestions: s.feedback_suggestions,
+    }
+}
+
+/// The strong-defaults [`PasswordPolicy`]: length 16, all four
+/// character classes enabled, ambiguous characters excluded.
+#[uniffi::export]
+pub fn password_policy_default() -> PasswordPolicy {
+    PasswordPolicy::from_core(pangolin_core::pwgen::PwgenPolicy::default())
 }
 
 /// Export the vault encrypted with a fresh key (e.g., for backup).
