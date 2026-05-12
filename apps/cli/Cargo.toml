@@ -47,6 +47,12 @@ pangolin-core   = { path = "../../crates/pangolin-core" }
 # bytes. `pangolin-totp` is a near-leaf (own `hmac`/`sha1`/`sha2`, no
 # `uniffi`/`serde`).
 pangolin-totp   = { path = "../../crates/pangolin-totp" }
+# MVP-1 issue 1.9: `pangolin-cli import <file.kdbx>` — the hand-rolled
+# read-only KDBX parser + KeePassXC→AccountIdentity mapper. Leaf crate;
+# allowed consumers are `pangolin-ffi` (the frozen `kdbx_import` body)
+# and this CLI (per docs/issue-plans/1.9.md L2). Never reaches
+# `pangolin-store` / `pangolin-core` / `pangolin-crypto`'s trees.
+pangolin-kdbx   = { path = "../../crates/pangolin-kdbx" }
 
 # alloy is needed for the deployment-file loader Path resolution + the
 # Foundry-keystore loader. Same workspace pin chaincli uses; the audit
@@ -85,3 +91,6 @@ pangolin-chain     = { path = "../../crates/pangolin-chain", features = ["test-u
 # presence-proof helpers for driving a `Vault` through the publish/pull
 # flow without a real session prompt.
 pangolin-store     = { path = "../../crates/pangolin-store", features = ["test-utilities"] }
+# `pangolin-kdbx::test_writer` builds fixture `.kdbx` byte streams for
+# the `import` integration test.
+pangolin-kdbx      = { path = "../../crates/pangolin-kdbx", features = ["test-writer"] }

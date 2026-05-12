@@ -7,7 +7,62 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "KDBX (KeePass) import for Pangolin. Scaffolded by MVP-1 issue 1.1; body lands in 1.9."
+description = "Hand-rolled read-only KDBX (KeePass 2.x) parser + KeePassXC→AccountIdentity mapping for Pangolin. MVP-1 issue 1.9."
 
 [lints]
 workspace = true
+
+[features]
+default = []
+# Exposes `pangolin_kdbx::test_writer` — a self-contained KDBX 3.1 / 4.x
+# *encoder* used by this crate's own integration tests and by
+# `pangolin-ffi` / `apps/cli` integration tests (which build fixture
+# `.kdbx` bytes and feed them through the import path). Pure-Rust; no
+# new dep tree (it reuses the reader's own primitives). Not enabled in
+# production builds.
+test-writer = []
+
+[dependencies]
+# Container-format primitives — all already vendored via pangolin-crypto /
+# pangolin-store / pangolin-totp. No `deny.toml` change (denylist, not
+# allowlist; none of these are denied).
+aes       = { version = "=0.8.4", default-features = false }
+cbc       = { version = "=0.1.2", default-features = false, features = ["alloc"] }
+chacha20  = { version = "=0.9.1", default-features = false }
+salsa20   = { version = "=0.10.2", default-features = false }
+cipher    = { version = "=0.4.4", default-features = false }
+argon2    = { workspace = true }
+hmac      = { workspace = true }
+sha2      = { workspace = true }
+byteorder = { version = "=1.5.0", default-features = false }
+base64    = { version = "=0.22.1", default-features = false, features = ["alloc"] }
+zeroize   = { workspace = true }
+thiserror = { workspace = true }
+subtle    = { workspace = true }
+# Streaming XML parser — no DOM, entity-expansion disabled in our use.
+quick-xml = { version = "=0.37.5", default-features = false }
+# gzip inner-stream decompression (pulls miniz_oxide; pure Rust).
+flate2    = { version = "=1.0.35", default-features = false, features = ["rust_backend"] }
+
+# TOTP normalisation for KeePassXC `otp` / `TimeOtp-*` fields. `pangolin-totp`
+# is a near-leaf (own hmac/sha1/sha2; no uniffi/serde; no pangolin-store dep).
+pangolin-totp = { path = "../pangolin-totp" }
+
+[dev-dependencies]
+hex      = { workspace = true }
+tempfile = { workspace = true }
+# The test fixture *writer* (tests/writer/mod.rs) builds valid KDBX 3.1
+# / 4.x byte streams in memory. It reuses the same primitives the
+# reader does — declared here as dev-deps so the integration test crate
+# can link them.
+aes       = { version = "=0.8.4", default-features = false }
+cbc       = { version = "=0.1.2", default-features = false, features = ["alloc"] }
+chacha20  = { version = "=0.9.1", default-features = false }
+salsa20   = { version = "=0.10.2", default-features = false }
+cipher    = { version = "=0.4.4", default-features = false }
+argon2    = { workspace = true }
+hmac      = { workspace = true }
+sha2      = { workspace = true }
+base64    = { version = "=0.22.1", default-features = false, features = ["alloc"] }
+flate2    = { version = "=1.0.35", default-features = false, features = ["rust_backend"] }
+zeroize   = { workspace = true }

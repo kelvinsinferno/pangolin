@@ -111,6 +111,41 @@ pub enum Command {
     /// a user-specified path under a fresh master password. No
     /// chain calls.
     Vault(VaultArgs),
+
+    /// Import credentials from a `KeePass` 2.x `.kdbx` file into an
+    /// unlocked vault (MVP-1 issue 1.9). Prompts for the KDBX file's
+    /// own password on stderr; an optional `--keyfile` adds a keyfile
+    /// to the composite key. Prints the import counts (imported /
+    /// skipped / per-category failures) on stdout. No chain calls.
+    Import(ImportArgs),
+}
+
+/// `import` subcommand args.
+#[derive(Debug, Args)]
+pub struct ImportArgs {
+    /// Path to the destination `.pvf` vault file (must already exist;
+    /// the import unlocks it and adds the entries).
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Vault password (echoes in `ps`; CI use only). If omitted,
+    /// prompted at the terminal without echo.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+
+    /// Path to the `.kdbx` file to import.
+    #[arg(value_name = "FILE")]
+    pub kdbx_path: PathBuf,
+
+    /// Optional keyfile for the `.kdbx` (`KeePass` `.keyx` XML / 32-raw /
+    /// 64-hex / arbitrary file — hashed into the composite key).
+    #[arg(long)]
+    pub keyfile: Option<PathBuf>,
+
+    /// KDBX file password (echoes in `ps`; CI use only). If omitted,
+    /// prompted at the terminal without echo.
+    #[arg(long)]
+    pub kdbx_password: Option<String>,
 }
 
 /// `vault` subcommand — wraps the per-verb sub-subcommands.
