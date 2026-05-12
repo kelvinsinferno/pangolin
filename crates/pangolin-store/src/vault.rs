@@ -5537,6 +5537,18 @@ fn hydrate_account_into_state(
     };
     // Decode every leaf for authentication; remember the canonical
     // head's outcome for the cache/index.
+    //
+    // Leaves whose stored nonce is the placeholder zero nonce are
+    // foreign-ingested chain revisions sealed by another device — under
+    // the PoC two-key model this device legitimately cannot decrypt
+    // them, and `ingest_chain_revision` writes the placeholder
+    // (`[0u8; NONCE_LEN]`) on that path. That is the documented
+    // frozen-pending-resolve state, not tampering: skip them here. They
+    // are authenticated when the resolve flow consumes them. A
+    // genuinely-tampered leaf carries a *real* nonce with a mismatched
+    // AAD (e.g. a cross-account row transplant) — that still gets
+    // decoded below and still surfaces `AuthenticationFailed`,
+    // regardless of which leaf is canonical.
     let mut canonical_outcome: Option<HeadDecodeOutcome> = None;
     for leaf in &all_leaves {
         match decode_head_row(conn, meta, vdk_aead, account_id, *leaf)? {
@@ -5550,6 +5562,30 @@ fn hydrate_account_into_state(
             }
         }
     }
+    // If the canonical head is itself a foreign placeholder-nonce leaf
+    // (it can win the clock-free largest-`revision_id` head election),
+    // the account is not locally readable at its canonical head pending
+    // resolution. Fall back to the cached local-canonical-head pointer
+    // (`account_identities.head_revision_id`) — the resolve flow keeps
+    // that pointing at a leaf this device can decrypt — so the cache /
+    // index snapshot still reflects something locally readable, exactly
+    // as the pre-1.6 unlock path did for a forked frozen account. If
+    // that fallback is also undecryptable, drop the account from the
+    // cache/index (it surfaces via the freeze/resolve workflow, not as
+    // an aborted unlock).
+    if matches!(canonical_outcome, Some(HeadDecodeOutcome::PlaceholderNonce)) {
+        canonical_outcome = if cached_head == canonical_head {
+            None
+        } else {
+            Some(decode_head_row(
+                conn,
+                meta,
+                vdk_aead,
+                account_id,
+                cached_head,
+            )?)
+        };
+    }
     match canonical_outcome {
         Some(HeadDecodeOutcome::Live(identity)) => {
             let projection = SearchProjection::from_identity(&identity);
@@ -5561,8 +5597,10 @@ fn hydrate_account_into_state(
         // Canonical head is a tombstone (a forked account whose
         // largest-revision_id leaf is a resolve-to-tombstone), OR the
         // canonical head is future-versioned (already recorded in
-        // `requires_upgrade`): drop it from the index/cache.
-        Some(HeadDecodeOutcome::Tombstone) | None => {
+        // `requires_upgrade`), OR neither the canonical head nor the
+        // cached local head is locally decryptable (frozen pending
+        // resolve): drop it from the index/cache.
+        Some(HeadDecodeOutcome::Tombstone | HeadDecodeOutcome::PlaceholderNonce) | None => {
             let _ = cache.remove(account_id);
             index.remove(account_id)?;
         }
@@ -5581,6 +5619,12 @@ enum HeadDecodeOutcome {
     /// than this build understands (§18.7 — that account "requires
     /// upgrade"; not an abort-unlock condition).
     FutureVersion,
+    /// The revision's stored nonce is the placeholder zero nonce — a
+    /// foreign-ingested chain revision this device cannot decrypt under
+    /// the `PoC` two-key model. Not an abort-unlock condition: the
+    /// account is frozen pending resolve and this leaf is authenticated
+    /// when the resolve flow consumes it.
+    PlaceholderNonce,
 }
 
 /// Decode one revision row's blob at unlock time. Returns
@@ -5635,6 +5679,15 @@ fn decode_head_row(
         .map_err(|_| StoreError::Corrupted("revisions.schema_version out of u8 range".into()))?;
     if row_schema_version > crate::revision::REVISION_SCHEMA_VERSION_MAX {
         return Ok(HeadDecodeOutcome::FutureVersion);
+    }
+    // A foreign-ingested chain revision under the PoC two-key model
+    // carries the placeholder zero nonce (`ingest_chain_revision`'s
+    // genuine-foreign-INSERT path) — this device cannot decrypt it and
+    // is not expected to. Report it as such rather than attempting an
+    // AEAD open that would (correctly, for a real ciphertext under the
+    // wrong/zero nonce) fail as `Tampered`.
+    if nonce_arr == [0u8; NONCE_LEN] {
+        return Ok(HeadDecodeOutcome::PlaceholderNonce);
     }
     let parent = RevisionId::from_bytes(parent_arr);
     let aad = build_aad(&meta.vault_id, &account_id, &parent, row_schema_version);

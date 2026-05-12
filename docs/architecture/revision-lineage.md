@@ -55,6 +55,30 @@ cached pointer IS the single leaf, so the fast path is untouched.
 `account_get` / `account_search` likewise read the canonical head for a
 forked account.
 
+**Leaf authentication at unlock.** For a forked account the unlock cache
+build does not only decode the canonical head — it decodes (and thus
+AEAD-authenticates) every *decryptable* leaf of the revision graph, so a
+tampered leaf surfaces `AuthenticationFailed` and aborts the unlock
+regardless of which leaf is canonical (defends against a cross-account
+row transplant — the row's `account_id`/parent/`schema_version` are
+bound into the AEAD AAD — that lands on a non-canonical leaf). Leaves
+whose stored nonce is the **placeholder zero nonce** are *skipped*: those
+are foreign-ingested chain revisions sealed by another device that this
+device legitimately cannot decrypt under the PoC two-key model (the
+`ingest_chain_revision` genuine-foreign-INSERT path writes the
+placeholder) — that is the documented frozen-pending-resolve state, not
+tampering, and those leaves are authenticated when the resolve flow
+consumes them, not at unlock. The distinguisher is unambiguous: a
+genuinely-tampered leaf carries a *real* nonce with a mismatched AAD; a
+foreign placeholder leaf carries the all-zero nonce. If the *canonical*
+head itself is a placeholder-nonce leaf (it can win the clock-free
+largest-`revision_id` election), the cache/index snapshot falls back to
+the cached local-head pointer (`account_identities.head_revision_id`,
+which the resolve flow keeps pointing at a leaf this device can decrypt
+for a frozen account); if that too is undecryptable the account is left
+out of the cache/index (surfaced via the freeze/resolve workflow, never
+as an aborted unlock).
+
 ## Fork detection (Q2)
 
 `Vault::is_forked(id)` = `account_heads(id).len() > 1`. Cheap — the SQL
