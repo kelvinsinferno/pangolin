@@ -385,6 +385,10 @@ pub fn account_get(handle: Arc<VaultHandle>, id: AccountId) -> Result<AccountSna
 }
 
 /// Read the revision history for an account.
+///
+/// Each [`RevisionMeta`] is tagged with the 1.6 graph-derived bits
+/// (`is_head` / `is_canonical_head` / `on_canonical_chain`) computed
+/// from the account's revision graph.
 #[allow(clippy::significant_drop_tightening)]
 #[uniffi::export]
 pub fn account_history(
@@ -395,9 +399,10 @@ pub fn account_history(
     let vault = guard.as_mut()?;
     let store_id = crate::identity_bridge::account_id_from_ffi(&id)?;
     let metas = vault.account_history(store_id).map_err(store_into_ffi)?;
+    let graph = vault.revision_graph(store_id).map_err(store_into_ffi)?;
     Ok(metas
         .into_iter()
-        .map(crate::identity_bridge::revision_meta_to_ffi)
+        .map(|m| crate::identity_bridge::revision_meta_to_ffi_tagged(m, &graph))
         .collect())
 }
 

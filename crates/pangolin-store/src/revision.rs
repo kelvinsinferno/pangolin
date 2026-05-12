@@ -32,6 +32,22 @@ pub const REVISION_ID_LEN: usize = 32;
 /// Length of a [`DeviceId`] in bytes.
 pub const DEVICE_ID_LEN: usize = 32;
 
+/// Maximum revision-level schema version this build understands.
+///
+/// **MVP-1 issue 1.6 — §18.7 schema-versioning policy.** Two version
+/// fields gate a revision blob: the `revisions.schema_version` row
+/// column (a `u8` on disk, also a byte in the AEAD AAD) and the
+/// `payload_version` discriminator inside the V1 CBOR body
+/// (`PAYLOAD_VERSION_V0` = 0 / `PAYLOAD_VERSION_V1` = 1). On read, a
+/// value `<=` this constant is parsed (migrating V0→V1 as 1.2 already
+/// does); a value `>` this constant is rejected with a clean typed
+/// error ([`StoreError::UnsupportedRevisionSchemaVersion`]) — the
+/// *granularity* is per-account (that account "requires upgrade"; the
+/// rest of the vault keeps working). The file-level `format_version`
+/// (P2) is the separate whole-vault gate. See
+/// `docs/architecture/schema-versioning.md`.
+pub const REVISION_SCHEMA_VERSION_MAX: u8 = crate::account::PAYLOAD_VERSION_V1;
+
 /// A 32-byte revision identifier.
 ///
 /// Generated client-side as 32 random bytes for now (P2 scope). MVP-1
@@ -105,6 +121,16 @@ pub struct RevisionMeta {
     pub created_at: i64,
     /// True when this revision is a tombstone (`{ "deleted": true }`).
     pub is_tombstone: bool,
+    /// **MVP-1 issue 1.6.** When a fork was resolved, the merge revision
+    /// is parented at the *kept* leaf; every other leaf of the fork has
+    /// `superseded_by` set to the merge revision's id ("this branch was
+    /// closed in favour of <merge>"). The head detector treats a
+    /// superseded revision as a non-head, so a resolved fork reports a
+    /// single canonical head. `None` for the normal (not-superseded)
+    /// case. Append-only is preserved — the losing branch's rows stay
+    /// in the table (Q5); `superseded_by` is just a metadata pointer
+    /// like the chain-anchor columns.
+    pub superseded_by: Option<RevisionId>,
     /// Chain anchor when the revision has been published; `None` until
     /// `mark_published` is called.
     pub chain_anchor: Option<ChainAnchor>,
@@ -338,10 +364,15 @@ impl RevisionGraph {
             revisions.push(meta);
         }
 
-        // Heads = revisions with no children entry OR an empty one.
+        // Heads = revisions with no children entry (or an empty one)
+        // AND not superseded by a fork-resolution merge (1.6 — a
+        // superseded losing-branch leaf is no longer a head, so a
+        // resolved fork reports a single canonical head).
         let mut heads: Vec<RevisionId> = revisions
             .iter()
-            .filter(|m| children.get(&m.revision_id).is_none_or(Vec::is_empty))
+            .filter(|m| {
+                m.superseded_by.is_none() && children.get(&m.revision_id).is_none_or(Vec::is_empty)
+            })
             .map(|m| m.revision_id)
             .collect();
         heads.sort_by_key(|id| {
@@ -398,6 +429,50 @@ impl RevisionGraph {
     #[must_use]
     pub fn is_forked(&self) -> bool {
         self.heads.len() > 1
+    }
+
+    /// **MVP-1 issue 1.6 — the production canonical-head rule.**
+    ///
+    /// Returns the canonical head of this account's revision graph: the
+    /// leaf (a revision with no children) whose `revision_id` is
+    /// **lexicographically largest by byte order**. `None` only when the
+    /// graph is empty.
+    ///
+    /// - For a linear chain there is exactly one leaf — this is trivially
+    ///   that leaf.
+    /// - For a fork (≥ 2 leaves) the largest-`revision_id` leaf wins.
+    ///
+    /// **Clock-free (Q1).** `created_at` is *never* consulted in the
+    /// head election — it is device-stamped and not trustworthy across
+    /// devices. `revision_id` byte-order is the documented
+    /// device-independent total order: `revision_id` is the `revisions`
+    /// table PRIMARY KEY (32 bytes), so any two distinct leaves have
+    /// distinct id bytes and the order is total. This is the standard
+    /// CRDT "highest hash wins" tiebreak; it is what makes MVP-2's
+    /// chain replicas provably agree.
+    ///
+    /// Determinism: the `heads` list is itself deterministic at `build`
+    /// time, and `max_by` over byte-order is total — re-building the
+    /// graph from the same rows (in any input order) yields the same
+    /// answer. Stability: adding a non-leaf revision, or a revision to a
+    /// different account's graph, does not change which leaf wins.
+    ///
+    /// The per-account `account_identities.head_revision_id` column is a
+    /// *cache* of this value that the resolve flow advances; the SQL
+    /// `NOT EXISTS` query is the authoritative head-*set* detector.
+    #[must_use]
+    pub fn canonical_head(&self) -> Option<&RevisionId> {
+        self.heads.iter().max_by(|a, b| a.0.cmp(&b.0))
+    }
+
+    /// `true` iff `id` is an ancestor of (or equal to) the canonical
+    /// head — i.e., it lies on the canonical chain. `false` for a
+    /// revision on a losing fork branch, an unknown id, or an empty
+    /// graph.
+    #[must_use]
+    pub fn is_on_canonical_chain(&self, id: &RevisionId) -> bool {
+        self.canonical_head()
+            .is_some_and(|head| self.ancestors(head).contains(id))
     }
 
     /// The parent revision id of `id`, or `None` for a genesis or
@@ -625,6 +700,7 @@ mod tests {
             schema_version: 0,
             created_at,
             is_tombstone: false,
+            superseded_by: None,
             chain_anchor: None,
         }
     }
@@ -874,6 +950,119 @@ mod tests {
         assert_eq!(g.parent_of(&rev(0x05)), None);
         // M-2: the orphan IS reported in genesis_extra.
         assert_eq!(g.genesis_extra(), &[rev(0x05)]);
+    }
+
+    // -----------------------------------------------------------------
+    // canonical_head (MVP-1 issue 1.6) — clock-free largest-revision_id
+    // -----------------------------------------------------------------
+
+    /// 1.6 success criterion 1: a linear chain's canonical head is its
+    /// single leaf (the last revision).
+    #[test]
+    fn canonical_head_linear_is_single_head() {
+        let rows = vec![
+            meta(0x01, 0x00, 100),
+            meta(0x02, 0x01, 200),
+            meta(0x03, 0x02, 300),
+        ];
+        let g = RevisionGraph::build(rows).unwrap();
+        assert_eq!(g.canonical_head(), Some(&rev(0x03)));
+    }
+
+    /// 1.6 success criterion 1: a 2-way fork's canonical head is the
+    /// leaf with the lexicographically-largest `revision_id`.
+    #[test]
+    fn canonical_head_two_way_fork_picks_rule_winner() {
+        // R1 -> R2 -> {R3, R7}. Both R3, R7 are leaves; R7 > R3 by
+        // byte order, so R7 wins.
+        let rows = vec![
+            meta(0x01, 0x00, 100),
+            meta(0x02, 0x01, 200),
+            meta(0x03, 0x02, 300),
+            meta(0x07, 0x02, 350),
+        ];
+        let g = RevisionGraph::build(rows).unwrap();
+        assert!(g.is_forked());
+        assert_eq!(g.canonical_head(), Some(&rev(0x07)));
+    }
+
+    /// 1.6 success criteria 1, 2: a 3-way fork picks the largest leaf
+    /// deterministically regardless of input order.
+    #[test]
+    fn canonical_head_three_way_fork_deterministic() {
+        let rows_a = vec![
+            meta(0x01, 0x00, 100),
+            meta(0x02, 0x01, 200),
+            meta(0xAA, 0x01, 250),
+            meta(0x55, 0x01, 300),
+        ];
+        let mut rows_b = rows_a.clone();
+        rows_b.reverse();
+        let g_a = RevisionGraph::build(rows_a).unwrap();
+        let g_b = RevisionGraph::build(rows_b).unwrap();
+        assert_eq!(g_a.canonical_head(), Some(&rev(0xAA)));
+        assert_eq!(g_a.canonical_head(), g_b.canonical_head());
+    }
+
+    /// 1.6 success criterion 3: the rule has zero clock dependency on
+    /// its load-bearing component — all-equal `created_at` still picks
+    /// a deterministic head; mutating `created_at` does not change it.
+    #[test]
+    fn canonical_head_clock_independent_all_equal_created_at() {
+        let rows_equal = vec![
+            meta(0x01, 0x00, 7),
+            meta(0x02, 0x01, 7),
+            meta(0x09, 0x01, 7),
+            meta(0x04, 0x01, 7),
+        ];
+        let g_equal = RevisionGraph::build(rows_equal).unwrap();
+        assert_eq!(g_equal.canonical_head(), Some(&rev(0x09)));
+        // Same topology, wildly different timestamps — head unchanged.
+        let rows_skewed = vec![
+            meta(0x01, 0x00, 1),
+            meta(0x02, 0x01, i64::MAX),
+            meta(0x09, 0x01, 2),
+            meta(0x04, 0x01, i64::MAX - 1),
+        ];
+        let g_skewed = RevisionGraph::build(rows_skewed).unwrap();
+        assert_eq!(g_skewed.canonical_head(), Some(&rev(0x09)));
+    }
+
+    /// 1.6 success criterion 4: adding an unrelated revision (a child of
+    /// a non-canonical leaf, deepening the losing branch) does not move
+    /// the canonical head.
+    #[test]
+    fn canonical_head_stable_under_unrelated_addition() {
+        // R1 -> R2 -> {R3, R9}. R9 is canonical. Add R4 as a child of
+        // R3 (the losing branch). R9 is still canonical (it's still a
+        // leaf; R4 < R9).
+        let g1 = RevisionGraph::build(vec![
+            meta(0x01, 0x00, 100),
+            meta(0x02, 0x01, 200),
+            meta(0x03, 0x02, 300),
+            meta(0x09, 0x02, 350),
+        ])
+        .unwrap();
+        assert_eq!(g1.canonical_head(), Some(&rev(0x09)));
+        let g2 = RevisionGraph::build(vec![
+            meta(0x01, 0x00, 100),
+            meta(0x02, 0x01, 200),
+            meta(0x03, 0x02, 300),
+            meta(0x09, 0x02, 350),
+            meta(0x04, 0x03, 400),
+        ])
+        .unwrap();
+        assert_eq!(g2.canonical_head(), Some(&rev(0x09)));
+        assert!(!g2.is_on_canonical_chain(&rev(0x03)));
+        assert!(g2.is_on_canonical_chain(&rev(0x09)));
+        assert!(g2.is_on_canonical_chain(&rev(0x02)));
+    }
+
+    /// 1.6 success criterion 1: an empty graph has no canonical head.
+    #[test]
+    fn canonical_head_empty_graph_is_none() {
+        let g = RevisionGraph::build(Vec::new()).unwrap();
+        assert_eq!(g.canonical_head(), None);
     }
 
     /// M-2 (P3 audit): a graph with both a canonical genesis AND a

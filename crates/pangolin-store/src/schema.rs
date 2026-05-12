@@ -106,6 +106,17 @@ CREATE TABLE IF NOT EXISTS revisions (
     chain_tx_hash        BLOB,
     chain_block_number   INTEGER,
     chain_log_index      INTEGER,
+    -- MVP-1 issue 1.6: when a fork is resolved, the merge revision is
+    -- parented at the kept leaf; every OTHER leaf of the fork gets its
+    -- superseded_by set to the merge revision id, recording that the
+    -- branch was closed in favour of the merge. Append-only preserved
+    -- (a losing branch row is never deleted — Q5); this is a metadata
+    -- column like the chain-anchor columns. The head detector
+    -- (account_heads / is_forked / all_forked_accounts) excludes
+    -- superseded rows so a resolved fork reports a single canonical
+    -- head. NULL = not superseded (the normal case). Legacy vaults
+    -- pick up the column via migrate_revision_superseded_by_column.
+    superseded_by        BLOB,
     FOREIGN KEY (account_id) REFERENCES account_identities(account_id)
 );
 
@@ -267,6 +278,35 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     migrate_devices_columns(conn)?;
     migrate_device_key_table(conn)?;
 
+    // MVP-1 issue 1.6 migration: add the nullable `superseded_by` column
+    // to `revisions` on vaults that predate 1.6. Idempotent —
+    // `PRAGMA table_info` check first. Additive; no `format_version`
+    // bump (same doctrine as the migrations above). The column is
+    // recomputed implicitly — a legacy vault with an unresolved fork
+    // simply has all rows `superseded_by IS NULL` until the user runs
+    // `resolve_fork`.
+    migrate_revision_superseded_by_column(conn)?;
+
+    Ok(())
+}
+
+/// **MVP-1 issue 1.6 migration.** Add the nullable `superseded_by`
+/// column to `revisions` on vaults that predate 1.6. Idempotent —
+/// checks `PRAGMA table_info(revisions)` first.
+fn migrate_revision_superseded_by_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(revisions)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_column = false;
+    for r in rows {
+        if r? == "superseded_by" {
+            has_column = true;
+            break;
+        }
+    }
+    drop(stmt);
+    if !has_column {
+        conn.execute("ALTER TABLE revisions ADD COLUMN superseded_by BLOB", [])?;
+    }
     Ok(())
 }
 

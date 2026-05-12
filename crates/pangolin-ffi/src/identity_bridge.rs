@@ -53,19 +53,54 @@ pub fn revision_id_to_ffi(id: pangolin_core::RevisionId) -> RevisionId {
     }
 }
 
-/// Convert a `pangolin_core::RevisionMeta` to its FFI shape.
-pub fn revision_meta_to_ffi(meta: pangolin_core::RevisionMeta) -> RevisionMeta {
+/// Wire-form length of a [`RevisionId`]. Must be 32 bytes.
+const REVISION_ID_BYTES: usize = 32;
+
+/// Convert an FFI [`RevisionId`] to a `pangolin_core::RevisionId`.
+pub fn revision_id_from_ffi(id: &RevisionId) -> Result<pangolin_core::RevisionId, FfiError> {
+    let arr: [u8; REVISION_ID_BYTES] =
+        id.bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| FfiError::Validation {
+                kind: "argument".into(),
+                message: format!(
+                    "RevisionId.bytes must be {REVISION_ID_BYTES} bytes (got {})",
+                    id.bytes.len()
+                ),
+            })?;
+    Ok(pangolin_core::RevisionId::from_bytes(arr))
+}
+
+/// **MVP-1 issue 1.6.** Convert a `pangolin_core::RevisionMeta` to its
+/// FFI shape, tagging the graph-derived bits (`is_head` /
+/// `is_canonical_head` / `on_canonical_chain`) from the supplied
+/// [`pangolin_core::RevisionGraph`].
+#[must_use]
+pub fn revision_meta_to_ffi_tagged(
+    meta: pangolin_core::RevisionMeta,
+    graph: &pangolin_core::RevisionGraph,
+) -> RevisionMeta {
     let parent = if meta.parent_revision_id == pangolin_core::RevisionId::GENESIS_PARENT {
         None
     } else {
         Some(revision_id_to_ffi(meta.parent_revision_id))
     };
+    let canonical = graph.canonical_head().copied();
+    // `is_head` follows the graph's head set (which excludes a
+    // superseded losing-branch leaf — a resolved fork's losing tip is
+    // not a head).
+    let is_head = graph.heads().contains(&meta.revision_id);
     RevisionMeta {
         schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
         id: revision_id_to_ffi(meta.revision_id),
         created_at_unix: meta.created_at,
         parent_id: parent,
         device_id: meta.device_id.0.to_vec(),
+        is_tombstone: meta.is_tombstone,
+        is_head,
+        is_canonical_head: canonical == Some(meta.revision_id),
+        on_canonical_chain: graph.is_on_canonical_chain(&meta.revision_id),
     }
 }
 

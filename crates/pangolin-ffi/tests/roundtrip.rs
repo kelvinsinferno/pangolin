@@ -259,10 +259,15 @@ fn revision_meta_record_round_trip() {
         created_at_unix: 1_700_000_000,
         parent_id: None,
         device_id: vec![0xDD; 16],
+        is_tombstone: false,
+        is_head: true,
+        is_canonical_head: true,
+        on_canonical_chain: true,
     };
     let cloned = original.clone();
     assert_eq!(original.parent_id, cloned.parent_id);
     assert_eq!(original.device_id, cloned.device_id);
+    assert!(cloned.is_canonical_head);
 }
 
 #[test]
