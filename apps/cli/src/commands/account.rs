@@ -520,6 +520,19 @@ fn parse_totp_cli_input(raw: &[u8]) -> Result<SecretBytes> {
         .context("TOTP secret is not valid UTF-8 (expected base32 or an otpauth:// URI)")?;
     let parsed = pangolin_totp::parse_totp_secret(text)
         .map_err(|e| anyhow::anyhow!("invalid TOTP secret: {e}"))?;
+    // The CLI stores TOTP through the V0 `AccountSnapshot` path, which
+    // can't carry the configurable algorithm/digits/period — so it can
+    // only represent the RFC 6238 defaults (SHA-1 / 6 digits / 30 s).
+    // Refuse rather than silently coerce a non-default `otpauth://` URI's
+    // params, which would generate wrong codes with no signal. (A bare
+    // base32 secret always parses with the defaults, so it's fine.)
+    if parsed.params != pangolin_totp::TotpParams::default() {
+        anyhow::bail!(
+            "this otpauth:// URI uses non-default TOTP parameters \
+             (algorithm/digits/period other than SHA-1 / 6 digits / 30 s); \
+             the CLI cannot store those yet — set this TOTP from the desktop app"
+        );
+    }
     Ok(SecretBytes::new(parsed.secret_bytes.to_vec()))
 }
 
@@ -1360,9 +1373,9 @@ fn confirm_delete(display_name: &str, account_hex: &str) -> Result<bool> {
 mod tests {
     use super::{
         base64_encode, confirm_delete, describe_reveal_actions, generate_password,
-        insert_secret_field, reject_empty_password, reject_empty_totp, run_add, run_delete,
-        run_list, run_show, run_update, sanitize_for_display, AccountListStatus,
-        GENERATED_PASSWORD_ALPHABET, GENERATED_PASSWORD_LEN,
+        insert_secret_field, parse_totp_cli_input, reject_empty_password, reject_empty_totp,
+        run_add, run_delete, run_list, run_show, run_update, sanitize_for_display,
+        AccountListStatus, GENERATED_PASSWORD_ALPHABET, GENERATED_PASSWORD_LEN,
     };
     use crate::cli::{
         AccountAddArgs, AccountDeleteArgs, AccountListArgs, AccountShowArgs, AccountUpdateArgs,
@@ -2761,5 +2774,60 @@ mod tests {
             hint.contains(&id_hex),
             "hint includes the account id: {hint}"
         );
+    }
+
+    // `JBSWY3DP` is the canonical RFC 4648 base32 encoding of `b"Hello"`.
+    const BASE32_HELLO: &str = "JBSWY3DP";
+
+    #[test]
+    fn parse_totp_cli_input_bare_base32_decodes() {
+        let s = parse_totp_cli_input(BASE32_HELLO.as_bytes()).expect("bare base32 parses");
+        assert_eq!(s.expose(), b"Hello");
+        // lowercase + whitespace tolerated by the decoder
+        let s2 = parse_totp_cli_input(b" jbswy3dp ").expect("lowercase/whitespace base32 parses");
+        assert_eq!(s2.expose(), b"Hello");
+    }
+
+    #[test]
+    fn parse_totp_cli_input_default_otpauth_uri_decodes() {
+        let uri = format!("otpauth://totp/Example:alice?secret={BASE32_HELLO}&issuer=Example");
+        let s = parse_totp_cli_input(uri.as_bytes()).expect("default-params otpauth:// parses");
+        assert_eq!(s.expose(), b"Hello");
+    }
+
+    #[test]
+    fn parse_totp_cli_input_non_default_otpauth_uri_aborts() {
+        for q in [
+            "&algorithm=SHA256",
+            "&digits=8",
+            "&period=60",
+            "&algorithm=SHA512&digits=8&period=45",
+        ] {
+            let uri = format!("otpauth://totp/Example:alice?secret={BASE32_HELLO}{q}");
+            let err = parse_totp_cli_input(uri.as_bytes())
+                .expect_err("non-default otpauth:// must abort, not silently coerce");
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("non-default") && msg.contains("desktop"),
+                "abort message names the non-default-params limitation: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_totp_cli_input_garbage_aborts() {
+        // `!` is not a base32 character.
+        assert!(parse_totp_cli_input(b"not!base32!").is_err());
+        // Empty input is rejected (distinct from `--no-totp`, which never
+        // calls this).
+        assert!(parse_totp_cli_input(b"").is_err());
+        // A non-base32 `secret=` value in an otpauth:// URI is rejected.
+        assert!(parse_totp_cli_input(b"otpauth://totp/X?secret=not!base32").is_err());
+    }
+
+    #[test]
+    fn parse_totp_cli_input_non_utf8_aborts() {
+        let err = parse_totp_cli_input(&[0xff, 0xfe, 0x00]).expect_err("non-UTF-8 must abort");
+        assert!(err.to_string().to_lowercase().contains("utf-8"));
     }
 }
