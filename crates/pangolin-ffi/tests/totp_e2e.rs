@@ -84,13 +84,18 @@ const SECRET_SHA256: &[u8] = b"12345678901234567890123456789012";
 fn totp_generate_rfc6238_sha1_8digit() {
     let (_tmp, handle) = fresh_handle();
     let id = account_add(handle.clone(), draft("acct")).expect("add");
-    set_totp(&handle, &id, SECRET_SHA1, Some(params(TotpAlgorithm::Sha1, 8)));
+    set_totp(
+        &handle,
+        &id,
+        SECRET_SHA1,
+        Some(params(TotpAlgorithm::Sha1, 8)),
+    );
     // RFC 6238 SHA-1 @ T=59 → counter 1 → 8-digit 94287082.
     let code = totp_generate(handle.clone(), id.clone(), 59).expect("totp_generate");
     assert_eq!(code.code, "94287082");
     assert_eq!(code.seconds_remaining, 30 - (59 % 30)); // == 1
-    // @ T=1111111109 → 07081804.
-    let c2 = totp_generate(handle.clone(), id.clone(), 1_111_111_109).expect("ok");
+                                                        // @ T=1111111109 → 07081804.
+    let c2 = totp_generate(handle, id, 1_111_111_109).expect("ok");
     assert_eq!(c2.code, "07081804");
 }
 
@@ -98,9 +103,14 @@ fn totp_generate_rfc6238_sha1_8digit() {
 fn totp_generate_rfc6238_sha256_8digit() {
     let (_tmp, handle) = fresh_handle();
     let id = account_add(handle.clone(), draft("acct")).expect("add");
-    set_totp(&handle, &id, SECRET_SHA256, Some(params(TotpAlgorithm::Sha256, 8)));
+    set_totp(
+        &handle,
+        &id,
+        SECRET_SHA256,
+        Some(params(TotpAlgorithm::Sha256, 8)),
+    );
     // RFC 6238 SHA-256 @ T=59 → 46119246.
-    let code = totp_generate(handle.clone(), id.clone(), 59).expect("ok");
+    let code = totp_generate(handle, id, 59).expect("ok");
     assert_eq!(code.code, "46119246");
 }
 
@@ -115,7 +125,7 @@ fn totp_generate_default_params_6digit_and_window_boundary() {
     // Window boundary: 29 and 0 share window 0; 30 is window 1.
     let c0 = totp_generate(handle.clone(), id.clone(), 0).expect("ok");
     let c29 = totp_generate(handle.clone(), id.clone(), 29).expect("ok");
-    let c30 = totp_generate(handle.clone(), id.clone(), 30).expect("ok");
+    let c30 = totp_generate(handle, id, 30).expect("ok");
     assert_eq!(c0.code, c29.code);
     assert_ne!(c0.code, c30.code);
     assert_eq!(c0.seconds_remaining, 30);
@@ -125,9 +135,14 @@ fn totp_generate_default_params_6digit_and_window_boundary() {
 fn totp_generate_seven_digit() {
     let (_tmp, handle) = fresh_handle();
     let id = account_add(handle.clone(), draft("acct")).expect("add");
-    set_totp(&handle, &id, SECRET_SHA1, Some(params(TotpAlgorithm::Sha1, 7)));
+    set_totp(
+        &handle,
+        &id,
+        SECRET_SHA1,
+        Some(params(TotpAlgorithm::Sha1, 7)),
+    );
     // 7-digit @ T=59 → last 7 of 94287082 → 4287082.
-    let c = totp_generate(handle.clone(), id.clone(), 59).expect("ok");
+    let c = totp_generate(handle, id, 59).expect("ok");
     assert_eq!(c.code, "4287082");
 }
 
@@ -135,7 +150,7 @@ fn totp_generate_seven_digit() {
 fn totp_generate_no_totp_errors_cleanly() {
     let (_tmp, handle) = fresh_handle();
     let id = account_add(handle.clone(), draft("acct")).expect("add");
-    match totp_generate(handle.clone(), id.clone(), 59) {
+    match totp_generate(handle, id, 59) {
         Err(FfiError::Validation { kind, .. }) => assert_eq!(kind, "totp_not_configured"),
         other => panic!("expected Validation(totp_not_configured), got {other:?}"),
     }
@@ -147,7 +162,7 @@ fn totp_generate_locked_vault_errors() {
     let id = account_add(handle.clone(), draft("acct")).expect("add");
     set_totp(&handle, &id, SECRET_SHA1, None);
     vault_lock(handle.clone()).expect("vault_lock");
-    match totp_generate(handle.clone(), id.clone(), 59) {
+    match totp_generate(handle, id, 59) {
         Err(FfiError::Session { .. }) => {}
         other => panic!("expected Session error on locked vault, got {other:?}"),
     }
@@ -158,7 +173,7 @@ fn totp_generate_negative_timestamp_errors() {
     let (_tmp, handle) = fresh_handle();
     let id = account_add(handle.clone(), draft("acct")).expect("add");
     set_totp(&handle, &id, SECRET_SHA1, None);
-    match totp_generate(handle.clone(), id.clone(), -1) {
+    match totp_generate(handle, id, -1) {
         Err(FfiError::Validation { kind, .. }) => assert_eq!(kind, "totp"),
         other => panic!("expected Validation(totp), got {other:?}"),
     }
@@ -218,6 +233,6 @@ fn parsed_then_generate_round_trips() {
         totp_params: Some(parsed.params),
     };
     account_update(handle.clone(), id.clone(), patch).expect("update");
-    let code = totp_generate(handle.clone(), id.clone(), 59).expect("generate");
+    let code = totp_generate(handle, id, 59).expect("generate");
     assert_eq!(code.code, "94287082");
 }
