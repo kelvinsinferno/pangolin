@@ -29,7 +29,20 @@ issue follows when it adds or evolves a persisted record.
      (`account_history`, `account_status`, `is_forked`); reveals,
      edits, and head-decryption on that account are blocked with the
      typed error. The rest of the vault is fully usable. The unlock
-     itself succeeds.
+     itself succeeds (a *legitimately* future-versioned head's blob
+     still AEAD-authenticates — see below — so the unlock doesn't
+     abort; it just marks the account "requires upgrade").
+     **Authentication first (audit L1):** the `revisions.schema_version`
+     byte is bound into the AEAD AAD, so the `> MAX_KNOWN` reject runs
+     *after* the AEAD open, not before. A bare on-disk byte-flip of that
+     column yields an AAD this build never sealed under → the open fails
+     → `StoreError::AuthenticationFailed` (tampering — the unlock
+     aborts), never the misleading "requires upgrade" prompt. Only a
+     revision a newer Pangolin genuinely sealed (with that byte in its
+     AAD) opens successfully and then trips the reject. Same shape for
+     the `payload_version` discriminator: a tampered body fails the
+     open; a genuine future body authenticates and then trips the
+     `payload_version` / map-arity check in `blob.rs`.
    - **`fts_schema_version`** (1.3 `meta` value) → the `:memory:` FTS5
      index is `:memory:` and rebuilt every unlock, so a mismatch is
      handled at rebuild time; never reaches disk.

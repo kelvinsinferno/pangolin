@@ -142,10 +142,17 @@ pub enum StoreError {
     /// head with a future version *is* the account's current state, so
     /// "skip" would show stale data with no signal (a correctness bug).
     ///
-    /// A bare on-disk byte-flip of `schema_version` collapses to
-    /// [`Self::AuthenticationFailed`] first (the AEAD AAD binds the
-    /// byte); only a legitimately re-sealed future blob — i.e. one a
-    /// newer Pangolin wrote — reaches this check.
+    /// A bare on-disk byte-flip of the `revisions.schema_version` column
+    /// collapses to [`Self::AuthenticationFailed`] first: that byte is
+    /// bound into the AEAD AAD, and the `> MAX` reject runs *after* the
+    /// AEAD open (audit L1, fix-pass 2) — a flipped byte yields an AAD
+    /// this build never sealed under, so the open fails before the
+    /// reject can fire. Only a *legitimately* future-versioned revision
+    /// — one a newer Pangolin sealed with that byte in its AAD — opens
+    /// successfully and reaches this check. (Same shape as the
+    /// `payload_version`-inside-the-body case: a tampered body fails the
+    /// open; a genuine future body authenticates and then trips the
+    /// `payload_version` / map-arity check in `blob.rs`.)
     #[error(
         "revision schema version {found} is newer than this build supports ({supported}); \
          this account requires a newer Pangolin"

@@ -563,6 +563,59 @@ fn adversarial_per_row_schema_version_tamper_fails() {
 }
 
 // ---------------------------------------------------------------------
+// Audit L1 (MVP-1 issue 1.6 fix-pass 2): flipping `revisions.schema_version`
+// to a *future* value (> REVISION_SCHEMA_VERSION_MAX) on a row with a
+// REAL nonce must surface `AuthenticationFailed` (tampering), NOT
+// `UnsupportedRevisionSchemaVersion` ("this account requires a newer
+// Pangolin"). The byte is bound into the AEAD AAD; the reject check
+// runs *after* the open, so a bare on-disk byte-flip — which the open
+// catches — never short-circuits to the requires-upgrade outcome. A
+// *legitimately* future-versioned revision (one a future build sealed
+// with that byte in its AAD) still surfaces the requires-upgrade error,
+// because that build's open succeeds and the post-open check fires —
+// covered by the `read_revision_with_future_*_version_rejects` unit
+// tests via `__test_synthesize_future_version_revision`.
+// ---------------------------------------------------------------------
+#[test]
+fn adversarial_revision_schema_version_byte_flip_surfaces_auth_failed() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("schema_future.pvf");
+    let pwd = fresh_password();
+
+    Vault::create(&path, &pwd).unwrap();
+    {
+        let mut v = Vault::open(&path).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        v.add_account(snapshot_with_marker("schema-byte-flip"))
+            .unwrap();
+        v.lock();
+        v.close().unwrap();
+    }
+
+    // Surgically flip the head revision's `schema_version` column from
+    // its real value (0) to 255 — a value past
+    // `REVISION_SCHEMA_VERSION_MAX`. The ciphertext was sealed under an
+    // AAD carrying 0; the re-derived AAD on read carries 255 → AEAD
+    // must reject. The reject must NOT be pre-empted by a "future
+    // schema version → requires upgrade" short-circuit (audit L1).
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let n = conn
+            .execute("UPDATE revisions SET schema_version = 255", [])
+            .unwrap();
+        assert_eq!(n, 1, "expected exactly one revision row to update");
+    }
+
+    let mut v = Vault::open(&path).unwrap();
+    let err = v.unlock(&fresh_presence(), &fresh_pin()).unwrap_err();
+    assert!(
+        matches!(err, pangolin_store::StoreError::AuthenticationFailed),
+        "expected AuthenticationFailed for a flipped (future) per-row \
+         schema_version byte, NOT UnsupportedRevisionSchemaVersion; got {err:?}",
+    );
+}
+
+// ---------------------------------------------------------------------
 // Adversarial test §"File truncation":
 // Truncate `.pvf` at various offsets; open must return a clean error
 // (Sqlite, BadMagic, or Corrupted) without panicking.

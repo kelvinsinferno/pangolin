@@ -159,6 +159,23 @@ revision with version > our max"). `account_get` / `reveal_*` /
 surfaces `requires_upgrade`, `is_forked`, `is_frozen_pending_resolve`,
 `is_tombstoned` in one query.
 
+**Authentication precedes the reject (audit L1).** The
+`revisions.schema_version` byte is bound into the AEAD AAD, so the
+`> REVISION_SCHEMA_VERSION_MAX` reject — in `read_identity_at`,
+`decode_head_row`, and the chosen-leaf read inside `resolve_fork` — runs
+*after* the AEAD open, not before. A bare on-disk byte-flip of that
+column produces an AAD this build never sealed under → the open fails →
+`StoreError::AuthenticationFailed` (tampering — and at unlock, an abort,
+consistent with the cross-account-transplant defence above), never the
+misleading "requires upgrade" prompt. A *legitimately* future-versioned
+revision (one a newer Pangolin sealed with that byte in its AAD) opens
+successfully and only then trips the reject → `requires_upgrade`. The
+`resolve_fork` tombstone branch likewise authenticates the chosen leaf's
+ciphertext (via `read_identity_at`, which decodes a tombstone payload to
+`AccountTombstoned` *after* a successful open) before re-sealing the
+ratifying tombstone — a flipped `schema_version` byte on the chosen leaf
+surfaces `AuthenticationFailed` there too.
+
 ## MVP-1 boundary / MVP-2 hooks
 
 - A real multi-device fork cannot occur in MVP-1 — the machinery is

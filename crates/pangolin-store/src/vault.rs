@@ -3529,8 +3529,23 @@ impl Vault {
             StoreError::Corrupted("revisions.schema_version out of u8 range".into())
         })?;
 
-        // §18.7 (1.6): reject a future revision-row schema version
-        // before decrypting — typed error decorated with the ids.
+        let parent = RevisionId::from_bytes(parent_arr);
+        let aad = build_aad(&self.meta.vault_id, &id, &parent, row_schema_version);
+        let ct = Ciphertext::from_vec(row.1);
+        let nonce = Nonce::from_storage_bytes(nonce_arr);
+        let active = self.require_active()?;
+        // §18.7 (1.6), audit L1: the `revisions.schema_version` byte is
+        // bound into the AEAD AAD, so we authenticate first. A bare
+        // on-disk byte-flip of that column produces an AAD this build
+        // never sealed under → the open fails → `AuthenticationFailed`
+        // (tampering), not a misleading "this account requires a newer
+        // Pangolin" prompt. A *legitimately* future-versioned revision
+        // was sealed by a future build with that exact byte in its AAD,
+        // so the open succeeds; only then do we surface the typed
+        // requires-upgrade error — before attempting to CBOR-decode the
+        // (now-authenticated) future-shaped body.
+        let decoded = crate::blob::open_identity_payload(active.vdk.aead_key(), &nonce, &ct, &aad)
+            .map_err(|e| e.with_revision_context(id, revision_id))?;
         if row_schema_version > crate::revision::REVISION_SCHEMA_VERSION_MAX {
             return Err(StoreError::UnsupportedRevisionSchemaVersion {
                 account_id: id,
@@ -3539,13 +3554,6 @@ impl Vault {
                 supported: u32::from(crate::revision::REVISION_SCHEMA_VERSION_MAX),
             });
         }
-        let parent = RevisionId::from_bytes(parent_arr);
-        let aad = build_aad(&self.meta.vault_id, &id, &parent, row_schema_version);
-        let ct = Ciphertext::from_vec(row.1);
-        let nonce = Nonce::from_storage_bytes(nonce_arr);
-        let active = self.require_active()?;
-        let decoded = crate::blob::open_identity_payload(active.vdk.aead_key(), &nonce, &ct, &aad)
-            .map_err(|e| e.with_revision_context(id, revision_id))?;
         match decoded {
             crate::blob::DecodedIdentityPayload::Live(identity) => Ok(identity),
             crate::blob::DecodedIdentityPayload::Tombstone(_) => Err(StoreError::AccountTombstoned),
@@ -3778,6 +3786,25 @@ impl Vault {
         let now = current_unix_ms();
         let (ct, nonce, is_tombstone) = if chosen_is_tombstone {
             // Resolving to a tombstone ratifies the deletion (P9 §A5).
+            // Audit L1: still authenticate the chosen leaf's ciphertext
+            // first — `read_identity_at` does the AEAD open (the
+            // `revisions.schema_version` byte is in the AAD, so a bare
+            // byte-flip of that column surfaces `AuthenticationFailed`
+            // here; a legit future-version leaf surfaces
+            // `UnsupportedRevisionSchemaVersion`). A tombstone payload
+            // decodes to `Err(AccountTombstoned)` *after* a successful
+            // authenticated open — that's the expected, authenticated
+            // outcome for this branch; anything else propagates.
+            match self.read_identity_at(account_id, keep_revision_id) {
+                Err(StoreError::AccountTombstoned) => {}
+                Err(e) => return Err(e),
+                Ok(_) => {
+                    // The `is_tombstone` column said tombstone but the
+                    // (authenticated) payload decoded Live — a tampered
+                    // flag. Refuse to ratify.
+                    return Err(StoreError::AuthenticationFailed);
+                }
+            }
             let active = self.require_active()?;
             let merge_payload = TombstonePayload::new(account_id, u64::try_from(now).unwrap_or(0));
             let (ct, nonce) = seal_tombstone(active.vdk.aead_key(), &merge_aad, &merge_payload)?;
@@ -3786,6 +3813,9 @@ impl Vault {
             // Read the chosen leaf as an AccountIdentity (V1-aware,
             // auto-migrating V0 on read) and re-seal it under the merge
             // AAD with a fresh nonce. The identity zeroizes on drop.
+            // `read_identity_at` does the AEAD open first (audit L1):
+            // a flipped `schema_version` byte → `AuthenticationFailed`;
+            // a legit future leaf → `UnsupportedRevisionSchemaVersion`.
             let identity = self.read_identity_at(account_id, keep_revision_id)?;
             let active = self.require_active()?;
             let (ct, nonce) =
@@ -3858,14 +3888,15 @@ impl Vault {
         let chosen_schema_version = u8::try_from(chosen_sv_i64).map_err(|_| {
             StoreError::Corrupted("revisions.schema_version out of u8 range".into())
         })?;
-        if chosen_schema_version > crate::revision::REVISION_SCHEMA_VERSION_MAX {
-            return Err(StoreError::UnsupportedRevisionSchemaVersion {
-                account_id,
-                revision_id: keep_revision_id,
-                found: u32::from(chosen_schema_version),
-                supported: u32::from(crate::revision::REVISION_SCHEMA_VERSION_MAX),
-            });
-        }
+        // Audit L1: no `chosen_schema_version > MAX` pre-check here —
+        // the `revisions.schema_version` byte is bound into the AEAD
+        // AAD, so the authoritative check is the AEAD open of the chosen
+        // leaf in `resolve_fork` (via `read_identity_at`). A bare
+        // byte-flip of that column surfaces `AuthenticationFailed`
+        // there; a legit future-version leaf surfaces
+        // `UnsupportedRevisionSchemaVersion` there. Pre-checking here
+        // would let a flipped byte short-circuit to a misleading
+        // "requires upgrade" before authentication.
         let heads = self.account_heads(account_id)?;
         if heads.len() <= 1 {
             return Err(StoreError::Validation {
@@ -5677,15 +5708,14 @@ fn decode_head_row(
         .map_err(|_| StoreError::Corrupted("enc_nonce length mismatch".into()))?;
     let row_schema_version = u8::try_from(schema_version_i)
         .map_err(|_| StoreError::Corrupted("revisions.schema_version out of u8 range".into()))?;
-    if row_schema_version > crate::revision::REVISION_SCHEMA_VERSION_MAX {
-        return Ok(HeadDecodeOutcome::FutureVersion);
-    }
     // A foreign-ingested chain revision under the PoC two-key model
     // carries the placeholder zero nonce (`ingest_chain_revision`'s
     // genuine-foreign-INSERT path) — this device cannot decrypt it and
     // is not expected to. Report it as such rather than attempting an
     // AEAD open that would (correctly, for a real ciphertext under the
-    // wrong/zero nonce) fail as `Tampered`.
+    // wrong/zero nonce) fail as `Tampered`. This precedes the schema-
+    // version check: a zero-nonce row is frozen-pending-resolve
+    // regardless of its `schema_version`.
     if nonce_arr == [0u8; NONCE_LEN] {
         return Ok(HeadDecodeOutcome::PlaceholderNonce);
     }
@@ -5693,16 +5723,31 @@ fn decode_head_row(
     let aad = build_aad(&meta.vault_id, &account_id, &parent, row_schema_version);
     let ct = Ciphertext::from_vec(payload);
     let nonce = Nonce::from_storage_bytes(nonce_arr);
-    match crate::blob::open_identity_payload(vdk_aead, &nonce, &ct, &aad) {
+    // Audit L1: `revisions.schema_version` is bound into the AAD, so we
+    // authenticate before honouring it. A real-nonce row whose
+    // `schema_version` byte was flipped on disk yields an AAD this
+    // build never sealed under → the open fails → propagate
+    // `AuthenticationFailed` (the unlock aborts on tamper, consistent
+    // with the P2 transplant-defence test) rather than a misleading
+    // `FutureVersion`/"requires upgrade". A legit future revision was
+    // sealed by a future build with that byte in its AAD, so the open
+    // succeeds; only then do we report it as `FutureVersion`.
+    let outcome = match crate::blob::open_identity_payload(vdk_aead, &nonce, &ct, &aad) {
         Ok(crate::blob::DecodedIdentityPayload::Live(identity)) => {
-            Ok(HeadDecodeOutcome::Live(identity))
+            HeadDecodeOutcome::Live(identity)
         }
-        Ok(crate::blob::DecodedIdentityPayload::Tombstone(_)) => Ok(HeadDecodeOutcome::Tombstone),
+        Ok(crate::blob::DecodedIdentityPayload::Tombstone(_)) => HeadDecodeOutcome::Tombstone,
+        // The body's own `payload_version` / map-arity check tripped a
+        // future shape — still a "requires upgrade" signal.
         Err(StoreError::UnsupportedRevisionSchemaVersion { .. }) => {
-            Ok(HeadDecodeOutcome::FutureVersion)
+            return Ok(HeadDecodeOutcome::FutureVersion)
         }
-        Err(e) => Err(e),
+        Err(e) => return Err(e),
+    };
+    if row_schema_version > crate::revision::REVISION_SCHEMA_VERSION_MAX {
+        return Ok(HeadDecodeOutcome::FutureVersion);
     }
+    Ok(outcome)
 }
 
 /// Helper: the head set for `account_id` via the `NOT EXISTS` detector
