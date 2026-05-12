@@ -520,26 +520,51 @@ fn parse_kdf_variant_dict(buf: &[u8]) -> Result<Kdf, KdbxError> {
             let iterations =
                 iterations.ok_or_else(|| KdbxError::CorruptHeader("Argon2 I missing".into()))?;
             let version = version.unwrap_or(0x13);
+            // Reject an unknown Argon2 version word up front (before the
+            // KDF runs) — only 0x10 and 0x13 are defined.
+            if version != 0x10 && version != 0x13 {
+                return Err(KdbxError::KdfParamsRejected(format!(
+                    "Argon2 version {version:#x} not recognised"
+                )));
+            }
             // M is bytes; argon2 crate wants KiB.
             if memory % 1024 != 0 {
                 return Err(KdbxError::CorruptHeader("Argon2 M not KiB-aligned".into()));
             }
             let memory_kib_u64 = memory / 1024;
-            // Sanity clamps (KeePassXC defaults are ~64 MiB / a few
-            // iterations / 2 lanes). Refuse a memory/iteration bomb.
-            if memory_kib_u64 == 0 || memory_kib_u64 > 1024 * 1024 {
+            // Sanity clamps. KeePassXC's own defaults are ~64 MiB / a few
+            // iterations / 2 lanes, and its UI never goes near these
+            // ceilings; the bounds below still allow a genuinely-paranoid
+            // config but cap the pre-auth work a hostile file can demand
+            // to a few seconds of CPU / ~1 GiB of RAM (these params feed
+            // the HMAC-key derivation, so they run *before* the header /
+            // block HMAC is verified).
+            // Argon2 minimum memory is 8 KiB; ceiling 1 GiB.
+            if !(8..=1024 * 1024).contains(&memory_kib_u64) {
                 return Err(KdbxError::KdfParamsRejected(format!(
                     "Argon2 memory {memory} bytes out of range"
                 )));
             }
-            if iterations == 0 || iterations > 1000 {
+            if iterations == 0 || iterations > 64 {
                 return Err(KdbxError::KdfParamsRejected(format!(
                     "Argon2 iterations {iterations} out of range"
                 )));
             }
-            if parallelism == 0 || parallelism > 64 {
+            if parallelism == 0 || parallelism > 8 {
                 return Err(KdbxError::KdfParamsRejected(format!(
                     "Argon2 parallelism {parallelism} out of range"
+                )));
+            }
+            // Combined work ceiling: bound `iterations * memory_kib` so a
+            // file can't sit at the corner of both individual limits
+            // (e.g. 64 iters × 1 GiB ≈ a minute of Argon2). 4 GiB-worth
+            // of KiB-passes (`4 * 1024 * 1024`) is ≈ a couple seconds of
+            // Argon2 — comfortably above any real-world config (~64 MiB ×
+            // 10 iters ≈ 640k KiB-passes; even 1 GiB × 4 iters or 64 MiB
+            // × 64 iters fit) yet well below the pathological corner.
+            if iterations.saturating_mul(memory_kib_u64) > 4 * 1024 * 1024 {
+                return Err(KdbxError::KdfParamsRejected(format!(
+                    "Argon2 work factor too large (iterations {iterations} × memory {memory_kib_u64} KiB)"
                 )));
             }
             if salt.len() < 8 || salt.len() > 64 {
@@ -559,5 +584,131 @@ fn parse_kdf_variant_dict(buf: &[u8]) -> Result<Kdf, KdbxError> {
             })
         }
         _ => Err(KdbxError::UnsupportedKdf("unknown KDF UUID".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_kdf_variant_dict, KdbxError, Kdf, KDF_ARGON2ID};
+
+    /// Build a KDBX4 Argon2id `VariantDict` byte buffer with the given
+    /// `memory_kib`, `iterations`, `parallelism`, `version`. Mirrors the
+    /// on-wire layout (`u16` version word, then `tag|keylen|key|vallen|val`
+    /// entries, then a `0x00` terminator).
+    fn argon2_dict(memory_kib: u64, iterations: u64, parallelism: u32, version: u32) -> Vec<u8> {
+        let mut vd = Vec::new();
+        vd.extend_from_slice(&0x0100u16.to_le_bytes());
+        let push_bytes = |vd: &mut Vec<u8>, key: &[u8], val: &[u8]| {
+            vd.push(0x42);
+            vd.extend_from_slice(&u32::try_from(key.len()).unwrap().to_le_bytes());
+            vd.extend_from_slice(key);
+            vd.extend_from_slice(&u32::try_from(val.len()).unwrap().to_le_bytes());
+            vd.extend_from_slice(val);
+        };
+        let push_u32 = |vd: &mut Vec<u8>, key: &[u8], v: u32| {
+            vd.push(0x04);
+            vd.extend_from_slice(&u32::try_from(key.len()).unwrap().to_le_bytes());
+            vd.extend_from_slice(key);
+            vd.extend_from_slice(&4u32.to_le_bytes());
+            vd.extend_from_slice(&v.to_le_bytes());
+        };
+        let push_u64 = |vd: &mut Vec<u8>, key: &[u8], v: u64| {
+            vd.push(0x05);
+            vd.extend_from_slice(&u32::try_from(key.len()).unwrap().to_le_bytes());
+            vd.extend_from_slice(key);
+            vd.extend_from_slice(&8u32.to_le_bytes());
+            vd.extend_from_slice(&v.to_le_bytes());
+        };
+        push_bytes(&mut vd, b"$UUID", &KDF_ARGON2ID);
+        push_bytes(&mut vd, b"S", &[0x22u8; 32]);
+        push_u32(&mut vd, b"P", parallelism);
+        push_u64(&mut vd, b"M", memory_kib * 1024);
+        push_u64(&mut vd, b"I", iterations);
+        push_u32(&mut vd, b"V", version);
+        vd.push(0x00);
+        vd
+    }
+
+    /// A KeePassXC-default-ish config is accepted (and the KDF call is
+    /// never invoked from `parse_kdf_variant_dict`, so this is fast).
+    #[test]
+    fn argon2_sane_params_accepted() {
+        let dict = argon2_dict(64 * 1024 /* 64 MiB */, 10, 2, 0x13);
+        match parse_kdf_variant_dict(&dict).expect("sane params accepted") {
+            Kdf::Argon2 {
+                memory_kib,
+                iterations,
+                parallelism,
+                version,
+                ..
+            } => {
+                assert_eq!(memory_kib, 64 * 1024);
+                assert_eq!(iterations, 10);
+                assert_eq!(parallelism, 2);
+                assert_eq!(version, 0x13);
+            }
+            other @ Kdf::Aes { .. } => panic!("expected Argon2 KDF, got {other:?}"),
+        }
+    }
+
+    /// Iterations just over the new ceiling (64) → typed rejection, no
+    /// hang / panic, *before* any Argon2 call.
+    #[test]
+    fn argon2_iterations_over_limit_rejected() {
+        let dict = argon2_dict(64 * 1024, 65, 2, 0x13);
+        assert!(matches!(
+            parse_kdf_variant_dict(&dict),
+            Err(KdbxError::KdfParamsRejected(_))
+        ));
+    }
+
+    /// Parallelism just over the new ceiling (8) → typed rejection.
+    #[test]
+    fn argon2_parallelism_over_limit_rejected() {
+        let dict = argon2_dict(64 * 1024, 4, 9, 0x13);
+        assert!(matches!(
+            parse_kdf_variant_dict(&dict),
+            Err(KdbxError::KdfParamsRejected(_))
+        ));
+    }
+
+    /// The combined work ceiling: `iterations × memory_kib` over
+    /// `4 * 1024 * 1024` KiB-passes → typed rejection (here 64 iters ×
+    /// 1 GiB = 64M KiB-passes, ~16× over) — both per-axis caps pass, so
+    /// only the combined check catches this pathological corner.
+    #[test]
+    fn argon2_combined_work_over_limit_rejected() {
+        let dict = argon2_dict(1024 * 1024 /* 1 GiB */, 64, 2, 0x13);
+        assert!(matches!(
+            parse_kdf_variant_dict(&dict),
+            Err(KdbxError::KdfParamsRejected(_))
+        ));
+        // ...but 1 GiB × 1 iter (a genuinely-paranoid config) is still
+        // allowed (1M KiB-passes, well under the 4M ceiling).
+        let ok = argon2_dict(1024 * 1024, 1, 2, 0x13);
+        assert!(matches!(
+            parse_kdf_variant_dict(&ok),
+            Ok(Kdf::Argon2 { .. })
+        ));
+    }
+
+    /// Memory below the Argon2 minimum (8 KiB) → typed rejection.
+    #[test]
+    fn argon2_memory_below_minimum_rejected() {
+        let dict = argon2_dict(4 /* KiB */, 2, 2, 0x13);
+        assert!(matches!(
+            parse_kdf_variant_dict(&dict),
+            Err(KdbxError::KdfParamsRejected(_))
+        ));
+    }
+
+    /// An unknown Argon2 version word → typed rejection (before the KDF).
+    #[test]
+    fn argon2_unknown_version_rejected() {
+        let dict = argon2_dict(64 * 1024, 4, 2, 0x99);
+        assert!(matches!(
+            parse_kdf_variant_dict(&dict),
+            Err(KdbxError::KdfParamsRejected(_))
+        ));
     }
 }

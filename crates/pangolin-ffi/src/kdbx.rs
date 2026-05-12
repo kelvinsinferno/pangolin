@@ -88,6 +88,20 @@ pub fn kdbx_import(
     let mut pw_bytes = zeroize::Zeroizing::new(kdbx_password.bytes_for_bridge().to_vec());
     let creds = match &keyfile_path {
         Some(kp) => {
+            // Cap the keyfile size before reading it — a realistic
+            // keyfile is at most a few KiB; reuse the `.kdbx` ceiling so
+            // a multi-GB path can't OOM us. Fold a too-large keyfile into
+            // the no-oracle credentials error (it must not be a
+            // credential oracle).
+            if let Ok(meta) = std::fs::metadata(kp) {
+                if meta.len() > pangolin_kdbx::KDBX_MAX_FILE_BYTES as u64 {
+                    pw_bytes.zeroize();
+                    return Err(FfiError::Validation {
+                        kind: "kdbx_credentials".into(),
+                        message: "wrong password or keyfile for the KeePass database".into(),
+                    });
+                }
+            }
             let mut kf = std::fs::read(kp).map_err(|e| FfiError::Validation {
                 kind: "kdbx_io".into(),
                 message: format!("could not read keyfile: {e}"),
@@ -178,18 +192,24 @@ fn ingest_one(
     };
 
     // If there is history, install the OLDEST historical password as the
-    // genesis and rotate forward; otherwise install the current password
-    // directly. `account_update` with a new password moves the prior
-    // head into history[0].
-    let (genesis_pw, rotations): (Vec<u8>, Vec<Vec<u8>>) = if history_passwords.is_empty() {
-        (password.to_vec(), Vec::new())
-    } else {
-        let mut iter = history_passwords.iter();
-        let genesis = iter.next().expect("non-empty").0.to_vec();
-        let mut rot: Vec<Vec<u8>> = iter.map(|(p, _)| p.to_vec()).collect();
-        rot.push(password.to_vec());
-        (genesis, rot)
-    };
+    // genesis and replay the remaining historical passwords forward;
+    // otherwise install the current password directly. `account_update`
+    // with a new password moves the prior head into history[0].
+    //
+    // The historical replays are best-effort — if one fails the trail is
+    // simply truncated — but the *current* password is **always** applied
+    // last, and *its* failure is the entry's failure. Without that, a
+    // mid-replay failure would silently leave an old historical password
+    // as the account head (a silent wrong-import).
+    let (genesis_pw, historical_rotations): (Vec<u8>, Vec<Vec<u8>>) =
+        if history_passwords.is_empty() {
+            (password.to_vec(), Vec::new())
+        } else {
+            let mut iter = history_passwords.iter();
+            let genesis = iter.next().expect("non-empty").0.to_vec();
+            let rot: Vec<Vec<u8>> = iter.map(|(p, _)| p.to_vec()).collect();
+            (genesis, rot)
+        };
 
     let draft = pangolin_core::AccountIdentityDraft {
         schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
@@ -204,23 +224,32 @@ fn ingest_one(
     };
     let id = vault.account_add(draft)?;
 
-    for pw in rotations {
-        let patch = pangolin_core::AccountIdentityPatch {
-            schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
-            display_name: None,
-            tags: None,
-            usernames: None,
-            urls: None,
-            notes: None,
-            password: Some(SecretBytes::new(pw)),
-            totp_secret: None,
-            totp_params: None,
-        };
-        // A rotation failure is non-fatal to the entry — the account is
-        // already added; just stop replaying its history.
-        if vault.account_update(id, patch).is_err() {
+    let mk_patch = |pw: Vec<u8>| pangolin_core::AccountIdentityPatch {
+        schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
+        display_name: None,
+        tags: None,
+        usernames: None,
+        urls: None,
+        notes: None,
+        password: Some(SecretBytes::new(pw)),
+        totp_secret: None,
+        totp_params: None,
+    };
+
+    // Best-effort: replay historical passwords; on the first failure the
+    // history trail is truncated but the entry is not lost.
+    for pw in historical_rotations {
+        if vault.account_update(id, mk_patch(pw)).is_err() {
             break;
         }
+    }
+    // Always apply the *current* password last. If this fails the entry's
+    // head is wrong — propagate it so the entry is reported `failed`
+    // rather than silently mis-imported (only relevant when there was
+    // history; with no history `genesis_pw` already *is* the current
+    // password and this is a no-op patch we skip).
+    if !history_passwords.is_empty() {
+        vault.account_update(id, mk_patch(password.to_vec()))?;
     }
     Ok(())
 }

@@ -16,7 +16,8 @@
 #![allow(
     clippy::missing_panics_doc,
     clippy::unwrap_used,
-    clippy::field_reassign_with_default
+    clippy::field_reassign_with_default,
+    clippy::too_many_lines
 )]
 
 use std::path::PathBuf;
@@ -129,6 +130,25 @@ async fn cli_import_kdbx_roundtrip_and_no_plaintext_on_disk() {
         assert!(totp_entry.has_totp, "TOTP secret persisted");
         // current + 1 historical = 2 password-history entries.
         assert_eq!(totp_entry.password_history_count, 2, "history replayed");
+        // Audit Low-2: the *current* password — not an old historical
+        // one — must be the account head, and the historical password
+        // must sit in the history slot below it (oldest below, head =
+        // current). This makes the "always apply current last" fix
+        // non-regressible.
+        let id = totp_entry.id;
+        let presence = PressYPresenceProof::confirmed();
+        let current = v.reveal_current_password(id, &presence).unwrap();
+        assert_eq!(
+            current.expose(),
+            b"pw-totp-ccc",
+            "head must be the current KDBX password, not a replayed historical one"
+        );
+        let presence = PressYPresenceProof::confirmed();
+        let hist = v.reveal_password_history(id, &presence).unwrap();
+        assert_eq!(hist.len(), 2, "history depth");
+        // newest-first: [0] = current, [1] = the one historical revision.
+        assert_eq!(hist[0].password.expose(), b"pw-totp-ccc");
+        assert_eq!(hist[1].password.expose(), b"old-pw-marker-ddd");
         // (the group→tag / URL mapping is asserted at the parser layer
         // in pangolin-kdbx's own tests; the search-summary projection
         // here is a subset.)

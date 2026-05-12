@@ -40,9 +40,23 @@ pub async fn run(global: &GlobalArgs, args: ImportArgs) -> Result<()> {
         ),
     };
     let keyfile_bytes: Option<Vec<u8>> = match &args.keyfile {
-        Some(p) => Some(
-            std::fs::read(p).with_context(|| format!("failed to read keyfile {}", p.display()))?,
-        ),
+        Some(p) => {
+            // Cap the keyfile size before reading — a realistic keyfile
+            // is a few KiB; reuse the `.kdbx` ceiling so a giant path
+            // can't OOM us.
+            if let Ok(meta) = std::fs::metadata(p) {
+                anyhow::ensure!(
+                    meta.len() <= pangolin_kdbx::KDBX_MAX_FILE_BYTES as u64,
+                    "keyfile {} is too large (max {} bytes)",
+                    p.display(),
+                    pangolin_kdbx::KDBX_MAX_FILE_BYTES
+                );
+            }
+            Some(
+                std::fs::read(p)
+                    .with_context(|| format!("failed to read keyfile {}", p.display()))?,
+            )
+        }
         None => None,
     };
     let creds = pangolin_kdbx::KdbxCredentials {
@@ -152,15 +166,21 @@ fn ingest_one(
         ),
     };
 
-    let (genesis_pw, rotations): (Vec<u8>, Vec<Vec<u8>>) = if history_passwords.is_empty() {
-        (password.to_vec(), Vec::new())
-    } else {
-        let mut iter = history_passwords.iter();
-        let genesis = iter.next().expect("non-empty").0.to_vec();
-        let mut rot: Vec<Vec<u8>> = iter.map(|(p, _)| p.to_vec()).collect();
-        rot.push(password.to_vec());
-        (genesis, rot)
-    };
+    // Install the OLDEST historical password as the genesis, replay the
+    // remaining historical passwords best-effort, then **always** apply
+    // the current password last (its failure is the entry's failure) —
+    // mirrors the FFI copy. Without the unconditional final update, a
+    // mid-replay failure would silently leave an old historical password
+    // as the account head.
+    let (genesis_pw, historical_rotations): (Vec<u8>, Vec<Vec<u8>>) =
+        if history_passwords.is_empty() {
+            (password.to_vec(), Vec::new())
+        } else {
+            let mut iter = history_passwords.iter();
+            let genesis = iter.next().expect("non-empty").0.to_vec();
+            let rot: Vec<Vec<u8>> = iter.map(|(p, _)| p.to_vec()).collect();
+            (genesis, rot)
+        };
 
     let draft = pangolin_store::AccountIdentityDraft {
         schema_version: pangolin_store::ACCOUNT_IDENTITY_SCHEMA_VERSION,
@@ -174,21 +194,26 @@ fn ingest_one(
         totp_params,
     };
     let id = vault.account_add(draft)?;
-    for pw in rotations {
-        let patch = pangolin_store::AccountIdentityPatch {
-            schema_version: pangolin_store::ACCOUNT_IDENTITY_SCHEMA_VERSION,
-            display_name: None,
-            tags: None,
-            usernames: None,
-            urls: None,
-            notes: None,
-            password: Some(SecretBytes::new(pw)),
-            totp_secret: None,
-            totp_params: None,
-        };
-        if vault.account_update(id, patch).is_err() {
+
+    let mk_patch = |pw: Vec<u8>| pangolin_store::AccountIdentityPatch {
+        schema_version: pangolin_store::ACCOUNT_IDENTITY_SCHEMA_VERSION,
+        display_name: None,
+        tags: None,
+        usernames: None,
+        urls: None,
+        notes: None,
+        password: Some(SecretBytes::new(pw)),
+        totp_secret: None,
+        totp_params: None,
+    };
+
+    for pw in historical_rotations {
+        if vault.account_update(id, mk_patch(pw)).is_err() {
             break;
         }
+    }
+    if !history_passwords.is_empty() {
+        vault.account_update(id, mk_patch(password.to_vec()))?;
     }
     Ok(())
 }
