@@ -234,7 +234,21 @@ unbiased-draw / CSPRNG guarantees.
 
 | Function | Backed by | Lands in |
 |---|---|---|
-| `kdbx_import(h: &VaultHandle, path: &str, kdbx_password: &SecretPassword) -> Result<KdbxImportReport, FfiError>` | `pangolin-kdbx` | 1.9 |
+| `kdbx_import(handle: Arc<VaultHandle>, path: String, kdbx_password: Arc<SecretPassword>, keyfile_path: Option<String>) -> Result<KdbxImportReport, FfiError>` | `pangolin-kdbx` | **1.9 — implemented** |
+
+> **1.9 amendment (additive, per `docs/issue-plans/1.9.md` L11/L13):**
+> the 1.1-frozen `kdbx_import` signature grew an optional
+> `keyfile_path: Option<String>` argument so a `.kdbx` protected by a
+> keyfile (in addition to / instead of a password) can be imported.
+> Allowed since nothing external binds the FFI yet (same posture as the
+> 1.2 / 1.7 amendments). `KdbxImportReport { schema_version, imported,
+> skipped, failed, failure_kinds }` stays frozen. Parse-level failures
+> (bad file / wrong password / wrong-or-missing keyfile / corrupt
+> header) collapse to `FfiError::Validation` with a `kdbx_*` `kind`
+> label (no decryption oracle — wrong-password and wrong-keyfile are
+> indistinguishable); per-entry validation failures are non-fatal and
+> counted by category in `failure_kinds`. See
+> `docs/architecture/kdbx-import.md`.
 
 ### Encrypted export
 
