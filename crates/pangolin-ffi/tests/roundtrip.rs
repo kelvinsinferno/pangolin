@@ -97,6 +97,7 @@ fn account_draft_record_round_trip() {
         notes: None,
         current_password: SecretPassword::new(b"s3cret".to_vec()),
         totp_secret: None,
+        totp_params: None,
     };
     let cloned = original.clone();
     assert_eq!(original.display_name, cloned.display_name);
@@ -115,6 +116,7 @@ fn account_patch_record_round_trip() {
         notes: None,
         current_password: None,
         totp_secret: None,
+        totp_params: None,
     };
     let cloned = original.clone();
     assert_eq!(original.display_name, cloned.display_name);

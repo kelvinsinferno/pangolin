@@ -2900,6 +2900,7 @@ dependencies = [
  "pangolin-chain",
  "pangolin-crypto",
  "pangolin-store",
+ "pangolin-totp",
  "rpassword",
  "serde_json",
  "tempfile",
@@ -2972,6 +2973,7 @@ dependencies = [
  "nix",
  "pangolin-chain",
  "pangolin-crypto",
+ "pangolin-totp",
  "proptest",
  "rusqlite",
  "static_assertions",
@@ -2986,6 +2988,13 @@ dependencies = [
 [[package]]
 name = "pangolin-totp"
 version = "0.0.0"
+dependencies = [
+ "hmac",
+ "sha1",
+ "sha2",
+ "thiserror 2.0.18",
+ "zeroize",
+]
 
 [[package]]
 name = "parity-scale-codec"
@@ -3993,6 +4002,17 @@ checksum = "a84f14a19e9a014bb9f4512488d9829a68e04ecabffb0f9904cd1ace94598177"
 dependencies = [
  "base16ct",
  "serde",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest 0.10.7",
 ]
 
 [[package]]

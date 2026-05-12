@@ -95,7 +95,11 @@ pub use session::{
     PasswordPolicy, PlaintextExportConfirmation, PresenceProof, SecretPassword, SessionInfo,
     UnixTimestamp, VaultHandle,
 };
-pub use totp::TotpCode;
+// MVP-1 issue 1.7: TOTP engine wired — `totp_generate` body +
+// `parse_totp_secret` helper + the `ParsedTotpSecretFfi` /
+// `TotpParamsFfi` / `TotpAlgorithm` shapes (additive 1.1-surface
+// amendment; see totp.rs / ffi-surface.md).
+pub use totp::{ParsedTotpSecretFfi, TotpAlgorithm, TotpCode, TotpParamsFfi};
 
 // UniFFI scaffolding macro. Emits the `uniffi_pangolin_ffi_uniffi_contract_version`
 // symbol and other crate-internal book-keeping. This must appear exactly

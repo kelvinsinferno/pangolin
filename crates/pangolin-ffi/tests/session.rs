@@ -34,6 +34,7 @@ fn draft(display: &str) -> AccountDraft {
         notes: Some("secret notes".into()),
         current_password: SecretPassword::new(b"hunter2".to_vec()),
         totp_secret: Some(TotpSecret::new(b"jbswy3dpehpk3pxp".to_vec())),
+        totp_params: None,
     }
 }
 

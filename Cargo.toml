@@ -23,6 +23,14 @@ argon2            = { version = "=0.5.3", default-features = false, features = [
 ed25519-dalek     = { version = "=2.2.0", default-features = false, features = ["std", "zeroize", "rand_core"] }
 hkdf              = { version = "=0.12.4", default-features = false }
 sha2              = { version = "=0.10.9", default-features = false }
+# MVP-1 issue 1.7 — RFC 6238 TOTP. `pangolin-totp` pulls its own HMAC +
+# SHA-1/SHA-256/SHA-512 (Q1: blast-contained; never reaches
+# `pangolin-crypto` / `pangolin-core`). `hmac 0.12.1` is already in the
+# lock via `hkdf`; `sha1` is the only genuinely-new transitive. SHA-1's
+# collision weakness does not affect HMAC-SHA1. No `deny.toml` change —
+# that file is a denylist, not an allowlist; these crates aren't denied.
+hmac              = { version = "=0.12.1", default-features = false }
+sha1              = { version = "=0.10.6", default-features = false }
 zeroize           = { version = "=1.8.2", default-features = false, features = ["zeroize_derive", "alloc"] }
 subtle            = { version = "=2.6.1", default-features = false }
 rand_core         = { version = "=0.6.4", default-features = false, features = ["getrandom"] }

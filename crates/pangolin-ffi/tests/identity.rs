@@ -64,6 +64,7 @@ fn fresh_draft(display: &str) -> AccountDraft {
         notes: Some("test notes".into()),
         current_password: SecretPassword::new(b"hunter2".to_vec()),
         totp_secret: Some(TotpSecret::new(b"jbswy3dpehpk3pxp".to_vec())),
+        totp_params: None,
     }
 }
 
@@ -130,6 +131,7 @@ fn account_update_appends_password_history() {
         notes: None,
         current_password: Some(SecretPassword::new(b"hunter3".to_vec())),
         totp_secret: None,
+        totp_params: None,
     };
     let _rev = account_update(handle.clone(), id.clone(), patch).expect("account_update");
 
@@ -155,6 +157,7 @@ fn ffi_reveal_password_history_round_trip() {
             notes: None,
             current_password: Some(SecretPassword::new(new.to_vec())),
             totp_secret: None,
+            totp_params: None,
         };
         account_update(handle.clone(), id.clone(), patch).expect("update");
     }
@@ -206,6 +209,7 @@ fn account_history_lists_revisions() {
         notes: None,
         current_password: Some(SecretPassword::new(b"hunter3".to_vec())),
         totp_secret: None,
+        totp_params: None,
     };
     account_update(handle.clone(), id.clone(), patch).expect("update");
     let history = account_history(handle.clone(), id.clone()).expect("history");

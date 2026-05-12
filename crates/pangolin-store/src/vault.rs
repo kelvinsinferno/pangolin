@@ -2771,6 +2771,51 @@ impl Vault {
         self.reveal_secret_field(id, presence, |snap| snap.totp_secret.expose().to_vec())
     }
 
+    /// Generate the RFC 6238 TOTP code for an account at the given Unix
+    /// time. **Session-class** (MVP-1 issue 1.7 Q3): only an unlocked,
+    /// non-expired session is required — *no presence proof*. The TOTP
+    /// code is the ephemeral user-facing artifact (refreshed every
+    /// `period` seconds); the durable *seed* stays reveal-class via
+    /// [`Self::reveal_totp_secret`]. The seed is decrypted transiently
+    /// inside this call (and inside `pangolin-totp`) and zeroized
+    /// before returning; only the digit string crosses out.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] / [`StoreError::SessionExpired`] for a
+    /// locked / expired session; [`StoreError::FrozenAccount`] /
+    /// [`StoreError::UnsupportedRevisionSchemaVersion`] for a frozen /
+    /// requires-upgrade account; [`StoreError::Validation`] with
+    /// `kind = "totp_not_configured"` when the account has no TOTP
+    /// secret; storage-level failures otherwise.
+    pub fn totp_generate(
+        &mut self,
+        id: AccountId,
+        at_unix_secs: u64,
+    ) -> Result<pangolin_totp::TotpCode> {
+        self.check_session_freshness()?;
+        self.refuse_if_frozen(id)?;
+        self.refuse_if_requires_upgrade(id)?;
+        let identity = self.read_head_identity(id)?;
+        if !identity.has_totp() {
+            return Err(StoreError::Validation {
+                kind: "totp_not_configured".into(),
+                message: "no TOTP secret configured for this account".into(),
+            });
+        }
+        let params = identity.totp_params();
+        let secret = zeroize::Zeroizing::new(identity.totp_secret().expose().to_vec());
+        let code = pangolin_totp::totp_at(&secret, at_unix_secs, &params).map_err(|e| {
+            StoreError::Validation {
+                kind: "totp_params".into(),
+                message: e.to_string(),
+            }
+        })?;
+        // `identity` (ZeroizeOnDrop) and `secret` (Zeroizing) wipe here.
+        self.touch_session();
+        Ok(code)
+    }
+
     /// Shared implementation for the cache-shadow `reveal_*` accessors
     /// (head password / notes / totp). The only thing that varies is
     /// which [`SecretBytes`] field gets cloned out at step 4. Order of
@@ -7211,6 +7256,7 @@ mod tests {
             notes: "n".into(),
             password: SecretBytes::new(b"pw-genesis".to_vec()),
             totp_secret: SecretBytes::new(Vec::new()),
+            totp_params: crate::account::TotpParams::default(),
         };
         let id = v.account_add(draft).unwrap();
         for new in [b"pw-2".as_slice(), b"pw-3".as_slice()] {
@@ -7223,6 +7269,7 @@ mod tests {
                 notes: None,
                 password: Some(SecretBytes::new(new.to_vec())),
                 totp_secret: None,
+                totp_params: None,
             };
             v.account_update(id, patch).unwrap();
         }
@@ -9539,10 +9586,18 @@ mod tests {
         v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         let id = v.add_account(fresh_snapshot()).unwrap();
         // Row schema_version stays at the build's value (= MAX); the
-        // *payload_version* inside the V1 CBOR body is 2.
+        // *payload_version* inside the CBOR body is one past MAX (now 3,
+        // since 1.7 made V2 a known version).
         let row_v = crate::revision::REVISION_SCHEMA_VERSION_MAX;
-        v.__test_synthesize_future_version_revision(id, fresh_snapshot(), row_v, 2, true)
-            .unwrap();
+        let future_payload = crate::revision::REVISION_SCHEMA_VERSION_MAX + 1;
+        v.__test_synthesize_future_version_revision(
+            id,
+            fresh_snapshot(),
+            row_v,
+            future_payload,
+            true,
+        )
+        .unwrap();
         v.lock();
         v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         assert!(v.account_status(id).unwrap().requires_upgrade);

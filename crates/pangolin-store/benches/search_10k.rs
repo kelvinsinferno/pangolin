@@ -28,7 +28,7 @@ use std::time::Instant;
 
 use pangolin_crypto::secret::SecretBytes;
 use pangolin_store::{
-    AccountIdentityDraft, PinIdentityProof, PressYPresenceProof, Vault,
+    AccountIdentityDraft, PinIdentityProof, PressYPresenceProof, TotpParams, Vault,
     ACCOUNT_IDENTITY_SCHEMA_VERSION,
 };
 
@@ -62,6 +62,7 @@ fn draft(i: u32) -> AccountIdentityDraft {
         notes: String::new(),
         password: SecretBytes::new(b"pw".to_vec()),
         totp_secret: SecretBytes::new(Vec::new()),
+        totp_params: TotpParams::default(),
     }
 }
 

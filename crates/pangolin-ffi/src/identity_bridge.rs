@@ -150,6 +150,10 @@ pub fn draft_into_store(
     // drop harmlessly at end of scope.
     let password = SecretBytes::new(std::mem::take(&mut *password_bytes));
     let totp_secret = SecretBytes::new(std::mem::take(&mut *totp_bytes));
+    let totp_params = draft.totp_params.map_or_else(
+        pangolin_core::TotpParams::default,
+        crate::totp::TotpParamsFfi::into_core,
+    );
     Ok(pangolin_core::AccountIdentityDraft {
         schema_version: draft.schema_version,
         display_name: draft.display_name,
@@ -159,6 +163,7 @@ pub fn draft_into_store(
         notes: draft.notes.unwrap_or_default(),
         password,
         totp_secret,
+        totp_params,
     })
 }
 
@@ -182,6 +187,9 @@ pub fn patch_into_store(
             SecretBytes::new(std::mem::take(&mut *bytes))
         })
     });
+    // Carry params only when a secret is being set; a params-only update
+    // (no `totp_secret`) is also allowed and just updates the params.
+    let totp_params = patch.totp_params.map(crate::totp::TotpParamsFfi::into_core);
     Ok(pangolin_core::AccountIdentityPatch {
         schema_version: patch.schema_version,
         display_name: patch.display_name,
@@ -191,6 +199,7 @@ pub fn patch_into_store(
         notes: patch.notes,
         password: new_password,
         totp_secret: totp,
+        totp_params,
     })
 }
 

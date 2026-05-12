@@ -78,13 +78,38 @@ issue follows when it adds or evolves a persisted record.
    On chain (MVP-2): deploy the v2 contract, dual-read both event
    schemas for a transition period, then cut over.
 
-## The versioned-surface table (as of issue 1.6)
+### MVP-1 issue 1.7 — the V2 identity body (worked example of a payload bump)
+
+1.7 added the configurable TOTP params (algorithm / digits / period),
+which need durable storage. Rather than a *whole-vault* format bump, this
+rode the per-account `payload_version` discriminator (§18.7's intended
+use): the identity CBOR body's `totp_secret` byte-string key was replaced
+by a nested `totp` map `{algorithm: int, digits: int, period: int,
+secret: bytes}` in the same alphabetical slot, and `payload_version`
+became `2`. **Discrimination mechanism:** V1 and V2 are *both* the
+8-key arity, so the `payload_version` integer is the discriminator — and
+it is read *before* the `totp[_secret]` key in canonical key order
+(`payload_version` is the 4th key, `totp`/`totp_secret` the 6th). So an
+older Pangolin reading a V2 body reaches `payload_version = 2 >
+REVISION_SCHEMA_VERSION_MAX (= 1 on that build)` and emits the typed
+`UnsupportedRevisionSchemaVersion` ("requires upgrade", per-account)
+*before* it ever hits the unknown `totp` key — exactly the §18.7 ladder.
+The dual-read on this build: a V0 (arity-6) or V1 (arity-8 with
+`totp_secret` bytes) body hydrates the V2 in-memory shape with
+`TotpParams::default()` (SHA-1 / 6 / 30). New writes always emit V2. The
+AAD shape (`vault_id || account_id || parent_revision_id ||
+schema_version`) did **not** change — `payload_version` is inside the
+authenticated plaintext, not the AAD; the on-disk `schema_version` byte
+width (`u8`) is unchanged. `REVISION_SCHEMA_VERSION_MAX` is now `2`, so a
+synthesised V3 body is the new "future" that trips the reject.
+
+## The versioned-surface table (as of issue 1.7)
 
 | Surface | Where | Field | `MAX_KNOWN` (this build) | Error on a future value | Blast radius |
 |---|---|---|---|---|---|
 | Vault file format | `meta.format_version` (P2) | `u8` (stored as INTEGER) | `crate::meta::FORMAT_VERSION` | `StoreError::UnsupportedFormatVersion` | whole vault unopenable |
-| Revision row schema | `revisions.schema_version` (P2) | `u8` (stored as INTEGER; also a byte in the AEAD AAD) | `REVISION_SCHEMA_VERSION_MAX` (= 1) | `StoreError::UnsupportedRevisionSchemaVersion` | that account "requires upgrade" |
-| Revision payload discriminator | `payload_version` in the V1 CBOR body (1.2) | `u8` (V0 = 0 = arity-6 map; V1 = 1 = arity-8 map) | `REVISION_SCHEMA_VERSION_MAX` (= 1) | `StoreError::UnsupportedRevisionSchemaVersion` (a future `payload_version`, or a map arity > 8) | that account "requires upgrade" |
+| Revision row schema | `revisions.schema_version` (P2) | `u8` (stored as INTEGER; also a byte in the AEAD AAD) | `REVISION_SCHEMA_VERSION_MAX` (= **2** as of MVP-1 issue 1.7) | `StoreError::UnsupportedRevisionSchemaVersion` | that account "requires upgrade" |
+| Revision payload discriminator | `payload_version` in the identity CBOR body (1.2 / 1.7) | `u8` (V0 = 0 = arity-6 map; V1 = 1 = arity-8 map with `totp_secret` bytes; **V2 = 2 = arity-8 map with a nested `totp` map** `{algorithm, digits, period, secret}` carrying the configurable TOTP params — MVP-1 issue 1.7) | `REVISION_SCHEMA_VERSION_MAX` (= **2**) | `StoreError::UnsupportedRevisionSchemaVersion` (a future `payload_version` ≥ 3, or a map arity > 8) | that account "requires upgrade" |
 | FTS5 index schema | `meta` value `fts_schema_version` (1.3) | `u32` | `FTS_SCHEMA_VERSION` (= 1) | rebuilt every unlock; mismatch handled at rebuild | none on disk |
 | Device-identity record | `devices.schema_version` (1.5) | `u8` (stored as INTEGER; default 1) | `DEVICE_IDENTITY_SCHEMA_VERSION` (= 1) | clean reject at device load | that device record |
 | Device-key record | `device_key.schema_version` (1.5) | `u8` (stored as INTEGER) | `DEVICE_IDENTITY_SCHEMA_VERSION` (= 1) | clean reject at key load | that key record |

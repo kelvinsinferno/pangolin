@@ -204,11 +204,14 @@ not yet extended (UniFFI-only, same as `account_*` / `device_*`). The
 `docs/architecture/schema-versioning.md`; the lineage model in
 `docs/architecture/revision-lineage.md`.
 
-### TOTP
+### TOTP (MVP-1 issue 1.7 — body implemented + additive amendment)
 
-| Function | Backed by | Lands in |
+| Function | Backed by | Status |
 |---|---|---|
-| `totp_generate(h: &VaultHandle, id: AccountId, at: UnixTimestamp) -> Result<TotpCode, FfiError>` | `pangolin-totp` | 1.7 |
+| `totp_generate(h: &VaultHandle, id: AccountId, at: UnixTimestamp) -> Result<TotpCode, FfiError>` | `pangolin-totp` → `Vault::totp_generate` | **1.1-frozen signature — body implemented in 1.7.** Session-class (Q3): an unlocked, non-expired vault is enough, no presence proof. Errors: `Session` (locked / expired / frozen / requires-upgrade account); `Validation { kind: "totp_not_configured" }` (no TOTP secret on the account); `Validation { kind: "totp" }` (negative timestamp); `Store` (unknown / tombstoned account). The seed never crosses FFI — only the digit string does. |
+| `parse_totp_secret(input: String) -> Result<ParsedTotpSecretFfi, FfiError>` | `pangolin-totp::parse_totp_secret` | **new (additive amendment).** Parses a bare RFC 4648 base32 secret *or* a full `otpauth://totp/...` URI into `{ secret: Arc<TotpSecret>, params: TotpParamsFfi, label, issuer }`. No vault access. Errors: `Validation { kind: "totp" }` for any malformed input (bad base32, malformed URI, `otpauth://hotp/...`, unknown algorithm, out-of-range digits/period, empty secret). The shell calls this on the user's pasted string, then passes the parsed `secret` + `params` into `account_add` / `account_update`. |
+
+New records: `TotpCode { schema_version, code: String, seconds_remaining: u16 }` (1.1-frozen shape, now populated); `ParsedTotpSecretFfi { schema_version, secret: Arc<TotpSecret>, params: TotpParamsFfi, label: Option<String>, issuer: Option<String> }`; `TotpParamsFfi { schema_version, algorithm: TotpAlgorithm, digits: u8, period_seconds: u32 }`; `TotpAlgorithm` enum `{ Sha1, Sha256, Sha512 }`. `AccountDraft` / `AccountPatch` grow a `totp_params: Option<TotpParamsFfi>` field (additive — `None` when a secret is present means "RFC 6238 defaults" — SHA-1 / 6 / 30; ignored when `totp_secret` is `None`). `reveal_totp_secret` (1.4) is unchanged — still the only path the raw seed crosses FFI, presence-gated. `account_update`'s `totp_secret` doubled-`Option` semantics are unchanged. The C-ABI mirror is not yet extended (UniFFI-only, same posture as `account_*` / `device_*`). See `docs/architecture/totp.md`.
 
 ### Password generator
 

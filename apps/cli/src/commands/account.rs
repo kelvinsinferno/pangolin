@@ -161,13 +161,18 @@ async fn run_add(global: &GlobalArgs, args: AccountAddArgs) -> Result<()> {
         prompt_password_with_confirmation()?
     };
 
-    // TOTP: --totp-stdin OR --no-totp OR interactive prompt.
+    // TOTP: --totp-stdin OR --no-totp OR interactive prompt. MVP-1 issue
+    // 1.7: the input is a *base32* secret or a full `otpauth://` URI —
+    // parse it through `pangolin-totp` into the decoded seed bytes
+    // before storing (the prompt always said "base32" but the PoC stored
+    // the typed string verbatim — a known-broken path 1.7 closes).
     let totp_secret = if args.no_totp {
         SecretBytes::new(Vec::new())
     } else if args.totp_stdin {
-        read_secret_first_line_from_stdin()
+        let raw = read_secret_first_line_from_stdin()
             .context("--totp-stdin read failed")
-            .and_then(reject_empty_totp)?
+            .and_then(reject_empty_totp)?;
+        parse_totp_cli_input(raw.expose())?
     } else {
         prompt_totp_secret()?
     };
@@ -489,11 +494,33 @@ pub(crate) fn prompt_password_with_confirmation() -> Result<SecretBytes> {
 
 /// Interactive TOTP-secret prompt. Empty input is accepted as "no
 /// TOTP for this entry" — the user can `--no-totp` to skip the
-/// prompt entirely.
+/// prompt entirely. MVP-1 issue 1.7: a non-empty entry is parsed
+/// through `pangolin-totp` (bare base32 secret OR `otpauth://` URI) and
+/// stored as the decoded seed bytes.
 fn prompt_totp_secret() -> Result<SecretBytes> {
-    let entered = rpassword::prompt_password("TOTP secret (base32; leave empty to skip): ")
-        .context("failed to read TOTP secret from terminal")?;
-    Ok(SecretBytes::new(entered.into_bytes()))
+    let entered =
+        rpassword::prompt_password("TOTP secret (base32 or otpauth:// URI; leave empty to skip): ")
+            .context("failed to read TOTP secret from terminal")?;
+    if entered.trim().is_empty() {
+        return Ok(SecretBytes::new(Vec::new()));
+    }
+    parse_totp_cli_input(entered.as_bytes())
+}
+
+/// Parse a CLI-supplied TOTP secret string into the decoded seed bytes.
+///
+/// Accepts a bare RFC 4648 base32 secret or a full `otpauth://totp/...`
+/// URI. The proof-of-concept `V0` `AccountSnapshot` write path stores
+/// only the seed bytes (not the algorithm, digits, or period); the
+/// configurable-param `V2` storage path is reached through the FFI layer
+/// / the future command-line-v1 wiring. On a parse error the subcommand
+/// aborts cleanly with a non-zero exit.
+fn parse_totp_cli_input(raw: &[u8]) -> Result<SecretBytes> {
+    let text = std::str::from_utf8(raw)
+        .context("TOTP secret is not valid UTF-8 (expected base32 or an otpauth:// URI)")?;
+    let parsed = pangolin_totp::parse_totp_secret(text)
+        .map_err(|e| anyhow::anyhow!("invalid TOTP secret: {e}"))?;
+    Ok(SecretBytes::new(parsed.secret_bytes.to_vec()))
 }
 
 /// **A12.** Generate a 24-char password drawn from
@@ -1049,14 +1076,15 @@ async fn run_update(global: &GlobalArgs, args: AccountUpdateArgs) -> Result<()> 
     // ----- Step 5: TOTP (stdin form, --totp-clear, or unchanged).
     // **MED-1 fix.** Reject empty-string TOTP on the stdin path.
     // **MED-2 fix.** Use first-line stdin helper.
+    // MVP-1 issue 1.7: parse the stdin form (base32 secret or
+    // `otpauth://` URI) into the decoded seed bytes before storing.
     let totp_override: Option<SecretBytes> = if args.totp_clear {
         Some(SecretBytes::new(Vec::new()))
     } else if args.totp_stdin {
-        Some(
-            read_secret_first_line_from_stdin()
-                .context("--totp-stdin read failed")
-                .and_then(reject_empty_totp)?,
-        )
+        let raw = read_secret_first_line_from_stdin()
+            .context("--totp-stdin read failed")
+            .and_then(reject_empty_totp)?;
+        Some(parse_totp_cli_input(raw.expose())?)
     } else {
         None
     };
