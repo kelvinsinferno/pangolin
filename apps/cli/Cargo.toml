@@ -39,6 +39,11 @@ integration-tests = []
 pangolin-store  = { path = "../../crates/pangolin-store" }
 pangolin-chain  = { path = "../../crates/pangolin-chain" }
 pangolin-crypto = { path = "../../crates/pangolin-crypto" }
+# MVP-1 issue 1.7: parse a TOTP secret (bare base32 or `otpauth://` URI)
+# from `--totp-stdin` / the interactive prompt into the decoded seed
+# bytes. `pangolin-totp` is a near-leaf (own `hmac`/`sha1`/`sha2`, no
+# `uniffi`/`serde`).
+pangolin-totp   = { path = "../../crates/pangolin-totp" }
 
 # alloy is needed for the deployment-file loader Path resolution + the
 # Foundry-keystore loader. Same workspace pin chaincli uses; the audit

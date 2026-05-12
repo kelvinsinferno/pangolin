@@ -37,16 +37,19 @@ pub const DEVICE_ID_LEN: usize = 32;
 /// **MVP-1 issue 1.6 — §18.7 schema-versioning policy.** Two version
 /// fields gate a revision blob: the `revisions.schema_version` row
 /// column (a `u8` on disk, also a byte in the AEAD AAD) and the
-/// `payload_version` discriminator inside the V1 CBOR body
-/// (`PAYLOAD_VERSION_V0` = 0 / `PAYLOAD_VERSION_V1` = 1). On read, a
-/// value `<=` this constant is parsed (migrating V0→V1 as 1.2 already
-/// does); a value `>` this constant is rejected with a clean typed
+/// `payload_version` discriminator inside the identity CBOR body
+/// (`PAYLOAD_VERSION_V0` = 0 / `PAYLOAD_VERSION_V1` = 1 /
+/// `PAYLOAD_VERSION_V2` = 2 — MVP-1 issue 1.7 bumped this to 2 when the
+/// V2 body, carrying the configurable TOTP params, became a real version
+/// this build understands). On read, a value `<=` this constant is
+/// parsed (migrating V0/V1 → V2 by filling in the RFC-default TOTP
+/// params); a value `>` this constant is rejected with a clean typed
 /// error ([`StoreError::UnsupportedRevisionSchemaVersion`]) — the
 /// *granularity* is per-account (that account "requires upgrade"; the
 /// rest of the vault keeps working). The file-level `format_version`
 /// (P2) is the separate whole-vault gate. See
 /// `docs/architecture/schema-versioning.md`.
-pub const REVISION_SCHEMA_VERSION_MAX: u8 = crate::account::PAYLOAD_VERSION_V1;
+pub const REVISION_SCHEMA_VERSION_MAX: u8 = crate::account::PAYLOAD_VERSION_V2;
 
 /// A 32-byte revision identifier.
 ///

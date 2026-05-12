@@ -9,7 +9,7 @@ use std::process::Command;
 use pangolin_crypto::secret::SecretBytes;
 use pangolin_store::{
     AccountIdentityDraft, AccountIdentityPatch, AccountSnapshot, PinIdentityProof,
-    PressYPresenceProof, StoreError, Vault, ACCOUNT_IDENTITY_SCHEMA_VERSION,
+    PressYPresenceProof, StoreError, TotpParams, Vault, ACCOUNT_IDENTITY_SCHEMA_VERSION,
 };
 
 /// Build a fresh `PinIdentityProof` from `fresh_password()`. P4
@@ -985,6 +985,7 @@ fn v1_draft(
         notes: format!("notes for {display}"),
         password: SecretBytes::new(pw.as_bytes().to_vec()),
         totp_secret: SecretBytes::new(Vec::new()),
+        totp_params: TotpParams::default(),
     }
 }
 
@@ -998,6 +999,7 @@ fn empty_patch() -> AccountIdentityPatch {
         notes: None,
         password: None,
         totp_secret: None,
+        totp_params: None,
     }
 }
 
@@ -1164,6 +1166,7 @@ fn search_never_matches_username_password_notes() {
         notes: "zznotesecretzz recovery phrase".into(),
         password: SecretBytes::new(b"zzpasswordsecretzz".to_vec()),
         totp_secret: SecretBytes::new(Vec::new()),
+        totp_params: TotpParams::default(),
     })
     .unwrap();
     // Sanity: the whitelisted fields ARE searchable.
@@ -1473,6 +1476,7 @@ fn reveal_class_round_trip_v1() {
                 notes: None,
                 password: Some(SecretBytes::new(new.to_vec())),
                 totp_secret: None,
+                totp_params: None,
             },
         )
         .unwrap();
@@ -1540,6 +1544,7 @@ fn revisions_stamp_real_device_id_after_register() {
             notes: None,
             password: Some(SecretBytes::new(b"p1".to_vec())),
             totp_secret: None,
+            totp_params: None,
         },
     )
     .unwrap();
@@ -1683,6 +1688,7 @@ fn poc_vault_migrates_and_registers() {
             notes: None,
             password: Some(SecretBytes::new(b"pw1".to_vec())),
             totp_secret: None,
+            totp_params: None,
         },
     )
     .unwrap();
@@ -1739,6 +1745,7 @@ fn search_index_and_session_machine_untouched_by_device_ops() {
             notes: None,
             password: None,
             totp_secret: None,
+            totp_params: None,
         },
     )
     .unwrap();

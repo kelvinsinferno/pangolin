@@ -44,7 +44,8 @@ use pangolin_crypto::secret::SecretBytes;
 use zeroize::Zeroizing;
 
 use crate::account::{
-    AccountId, AccountIdentity, AccountSnapshot, PasswordEntry, ACCOUNT_ID_LEN, PAYLOAD_VERSION_V1,
+    AccountId, AccountIdentity, AccountSnapshot, PasswordEntry, TotpAlgorithm, TotpParams,
+    ACCOUNT_ID_LEN, PAYLOAD_VERSION_V2,
 };
 use crate::error::{Result, StoreError};
 use crate::revision::{
@@ -97,6 +98,15 @@ const FIELD_USERNAMES: &str = "usernames";
 const FIELD_URLS: &str = "urls";
 const FIELD_PASSWORD_HISTORY: &str = "password_history";
 const FIELD_PAYLOAD_VERSION: &str = "payload_version";
+/// MVP-1 issue 1.7: V2 nested-TOTP map key (replaces `totp_secret` in
+/// the V1 8-key arity-8 body; alphabetically between `tags` and `urls`,
+/// same slot the V1 `totp_secret` key occupied). Nested map keys (also
+/// alphabetical): `algorithm`, `digits`, `period`, `secret`.
+const FIELD_TOTP: &str = "totp";
+const FIELD_TOTP_ALGORITHM: &str = "algorithm";
+const FIELD_TOTP_DIGITS: &str = "digits";
+const FIELD_TOTP_PERIOD: &str = "period";
+const FIELD_TOTP_SECRET_NESTED: &str = "secret";
 /// Tombstone discriminator key. Also second alphabetically in the
 /// widened three-entry tombstone payload (after `account_id`, before
 /// `tombstoned_at_ms`).
@@ -594,26 +604,48 @@ fn pull_bytes(dec: &mut Decoder<&[u8]>) -> Result<Vec<u8>> {
 // MVP-1 issue 1.2: V1 payload codec
 // =============================================================================
 
-/// Encode an [`AccountIdentity`] as canonical V1 CBOR.
+/// Encode an [`AccountIdentity`] as canonical V2 CBOR (MVP-1 issue 1.7).
 ///
-/// Wire shape (per `docs/issue-plans/1.2.md` §B): a fixed-arity 8 map
-/// with text keys in alphabetical order:
+/// Wire shape: a fixed-arity 8 map with text keys in alphabetical order:
 /// ```text
 /// display_name      => text
 /// notes             => text
 /// password_history  => array of [bytes (password), i64 (set_at_ms),
 ///                                bytes32 (originating_device)]
-/// payload_version   => positive integer (always 1 for this encoder)
+/// payload_version   => positive integer (2 for this encoder)
 /// tags              => array of text
-/// totp_secret       => bytes
+/// totp              => map { algorithm: int(0=SHA1,1=SHA256,2=SHA512),
+///                            digits: int, period: int, secret: bytes }
 /// urls              => array of text
 /// usernames         => array of text
 /// ```
 ///
+/// V1 (8-key, `totp_secret` byte-string instead of the nested `totp`
+/// map, `payload_version = 1`) still decodes for backward-compat. Both
+/// V1 and V2 are arity-8; the decoder distinguishes them by the
+/// `payload_version` integer (read before the `totp[_secret]` key in
+/// canonical key order). An older Pangolin reading a V2 body therefore
+/// sees `payload_version = 2 > MAX` and surfaces "requires upgrade"
+/// (§18.7) before it ever reaches the unknown `totp` key.
+///
 /// The result is wrapped in [`Zeroizing`] because every secret-bearing
-/// byte (`passwords`, `totp_secret`, `notes`, `display_name`) is in
+/// byte (`passwords`, the TOTP `secret`, `notes`, `display_name`) is in
 /// the buffer.
 fn encode_identity_cbor(identity: &AccountIdentity) -> Zeroizing<Vec<u8>> {
+    encode_identity_cbor_with_payload_version(identity, PAYLOAD_VERSION_V2)
+}
+
+/// Like [`encode_identity_cbor`] but with an explicit `payload_version`
+/// integer. For `payload_version >= 2` the V2 (nested-`totp`) shape is
+/// emitted; for `payload_version <= 1` the legacy V1 (`totp_secret`
+/// byte-string) shape is emitted. Used by the §18.7 forward-compat test
+/// helper [`seal_identity_with_payload_version`].
+#[allow(clippy::too_many_lines)]
+fn encode_identity_cbor_with_payload_version(
+    identity: &AccountIdentity,
+    payload_version: u8,
+) -> Zeroizing<Vec<u8>> {
+    let nested_totp = payload_version >= PAYLOAD_VERSION_V2;
     let mut out: Vec<u8> = Vec::with_capacity(512);
     {
         let mut enc = Encoder::from(&mut out);
@@ -661,7 +693,7 @@ fn encode_identity_cbor(identity: &AccountIdentity) -> Zeroizing<Vec<u8>> {
 
         // 4. payload_version (positive integer)
         enc.text(FIELD_PAYLOAD_VERSION, None).expect("infallible");
-        enc.push(Header::Positive(u64::from(PAYLOAD_VERSION_V1)))
+        enc.push(Header::Positive(u64::from(payload_version)))
             .expect("infallible");
 
         // 5. tags (array of text)
@@ -672,8 +704,35 @@ fn encode_identity_cbor(identity: &AccountIdentity) -> Zeroizing<Vec<u8>> {
             write_text_value(&mut enc, t.expose());
         }
 
-        // 6. totp_secret (bytes)
-        enc.text(FIELD_TOTP_SECRET, None).expect("infallible");
+        // 6. totp (V2: nested map) / totp_secret (V1: bytes). Both end
+        // by writing the raw secret byte-string under the appropriate
+        // key; only the wrapping differs.
+        if nested_totp {
+            enc.text(FIELD_TOTP, None).expect("infallible");
+            enc.push(Header::Map(Some(4))).expect("infallible");
+            // algorithm (int)
+            enc.text(FIELD_TOTP_ALGORITHM, None).expect("infallible");
+            enc.push(Header::Positive(u64::from(
+                identity.totp_params().algorithm.to_wire(),
+            )))
+            .expect("infallible");
+            // digits (int)
+            enc.text(FIELD_TOTP_DIGITS, None).expect("infallible");
+            enc.push(Header::Positive(u64::from(identity.totp_params().digits)))
+                .expect("infallible");
+            // period (int)
+            enc.text(FIELD_TOTP_PERIOD, None).expect("infallible");
+            enc.push(Header::Positive(u64::from(
+                identity.totp_params().period_seconds,
+            )))
+            .expect("infallible");
+            // secret key (nested-map "secret")
+            enc.text(FIELD_TOTP_SECRET_NESTED, None)
+                .expect("infallible");
+        } else {
+            // secret key (top-level "totp_secret")
+            enc.text(FIELD_TOTP_SECRET, None).expect("infallible");
+        }
         enc.push(Header::Bytes(Some(identity.totp_secret.expose().len())))
             .expect("infallible");
         enc.write_all(identity.totp_secret.expose())
@@ -726,12 +785,14 @@ pub fn seal_identity(
     Ok((ct, nonce))
 }
 
-/// **Test-only (MVP-1 issue 1.6).** Seal an identity as a V1 8-key map
-/// but with an arbitrary `payload_version` discriminator — the only way
-/// to synthesise a future-versioned revision blob from inside the crate
-/// (the production encoder always emits `payload_version = 1`). Used by
-/// the §18.7 forward-compat tests; gated so production builds cannot
-/// link against it.
+/// **Test-only (MVP-1 issue 1.6 / 1.7).** Seal an identity payload with
+/// an arbitrary `payload_version` discriminator — the only way to
+/// synthesise a future-versioned revision blob from inside the crate
+/// (the production encoder always emits `payload_version =
+/// PAYLOAD_VERSION_V2`). For `payload_version >= 2` the V2 (nested
+/// `totp` map) shape is emitted; for `<= 1` the legacy V1 (`totp_secret`
+/// byte-string) shape. Used by the §18.7 forward-compat tests; gated so
+/// production builds cannot link against it.
 #[cfg(any(test, feature = "test-utilities"))]
 #[doc(hidden)]
 pub fn seal_identity_with_payload_version(
@@ -740,31 +801,7 @@ pub fn seal_identity_with_payload_version(
     aad: &[u8; REV_AAD_LEN],
     payload_version: u8,
 ) -> Result<(Ciphertext, Nonce)> {
-    // Encode the canonical V1 shape, then overwrite the
-    // `payload_version` integer. The V1 encoder emits it as a
-    // single-byte Positive header (`enc.push(Header::Positive(1))`),
-    // which CBOR-encodes the value 1 inline in the initial byte 0x01.
-    // For any version 0..=23 the replacement is also a single inline
-    // byte; we restrict to that range (sufficient for the tests).
-    assert!(
-        payload_version <= 23,
-        "test helper supports versions 0..=23"
-    );
-    let mut buf = encode_identity_cbor(identity).to_vec();
-    // Find the `payload_version` key bytes ("payload_version" preceded
-    // by its text-string header byte 0x6f = text(15)) and replace the
-    // value byte that immediately follows the 15 key bytes.
-    let key = FIELD_PAYLOAD_VERSION.as_bytes();
-    let mut idx = None;
-    for i in 0..buf.len().saturating_sub(key.len()) {
-        if &buf[i..i + key.len()] == key {
-            idx = Some(i + key.len());
-            break;
-        }
-    }
-    let value_pos = idx.expect("payload_version key present in canonical V1 encoding");
-    buf[value_pos] = payload_version;
-    let plaintext = Zeroizing::new(buf);
+    let plaintext = encode_identity_cbor_with_payload_version(identity, payload_version);
     let nonce = Nonce::random();
     let ct = vdk_aead.seal(&nonce, &plaintext, aad)?;
     Ok((ct, nonce))
@@ -829,7 +866,7 @@ fn decode_identity_payload(buf: &[u8]) -> Result<DecodedIdentityPayload> {
         let snapshot = decode_v0_live_inline(&mut dec, entries)?;
         Ok(DecodedIdentityPayload::Live(hydrate_v0_to_v1(&snapshot)))
     } else if entries == 8 {
-        decode_v1_live_inline(&mut dec)
+        decode_v1_or_v2_live_inline(&mut dec)
     } else if entries > 8 {
         // MVP-1 issue 1.6: a higher map arity is, by construction, a
         // future payload shape — reject it as an unsupported revision
@@ -927,15 +964,20 @@ fn hydrate_v0_to_v1(snapshot: &AccountSnapshot) -> AccountIdentity {
     )
 }
 
-/// Decode the V1 8-entry map (after the map header has been consumed).
-/// Strict alphabetical key order; arity exactly 8.
-fn decode_v1_live_inline(dec: &mut Decoder<&[u8]>) -> Result<DecodedIdentityPayload> {
+/// Decode the V1/V2 8-entry identity map (after the map header has been
+/// consumed). Strict alphabetical key order; arity exactly 8. V1 carries
+/// a `totp_secret` byte-string key; V2 (MVP-1 issue 1.7) carries a nested
+/// `totp` map `{ algorithm, digits, period, secret }` in that same slot
+/// — the two are distinguished by the `payload_version` integer.
+#[allow(clippy::too_many_lines)]
+fn decode_v1_or_v2_live_inline(dec: &mut Decoder<&[u8]>) -> Result<DecodedIdentityPayload> {
     let mut display_name: Option<Vec<u8>> = None;
     let mut notes: Option<Vec<u8>> = None;
     let mut password_history: Option<Vec<PasswordEntry>> = None;
     let mut payload_version: Option<u8> = None;
     let mut tags: Option<Vec<SecretBytes>> = None;
     let mut totp_secret: Option<Vec<u8>> = None;
+    let mut totp_params: Option<TotpParams> = None;
     let mut urls: Option<Vec<SecretBytes>> = None;
     let mut usernames: Option<Vec<SecretBytes>> = None;
     let mut last_key: Option<String> = None;
@@ -945,7 +987,7 @@ fn decode_v1_live_inline(dec: &mut Decoder<&[u8]>) -> Result<DecodedIdentityPayl
         if let Some(prev) = &last_key {
             if prev.as_str() >= key.as_str() {
                 return Err(StoreError::Cbor(format!(
-                    "non-canonical V1 key order: {prev:?} then {key:?}"
+                    "non-canonical V1/V2 key order: {prev:?} then {key:?}"
                 )));
             }
         }
@@ -961,9 +1003,21 @@ fn decode_v1_live_inline(dec: &mut Decoder<&[u8]>) -> Result<DecodedIdentityPayl
             }
             FIELD_PAYLOAD_VERSION => match pull_header(dec)? {
                 Header::Positive(v) => {
-                    payload_version = Some(u8::try_from(v).map_err(|_| {
+                    let pv = u8::try_from(v).map_err(|_| {
                         StoreError::Cbor(format!("payload_version {v} out of u8 range"))
-                    })?);
+                    })?;
+                    // MVP-1 issue 1.6 §18.7: reject a future payload
+                    // version *before* dispatching the TOTP slot, so an
+                    // older Pangolin reading a V2 (or later) body fails
+                    // with the typed "requires upgrade" marker rather
+                    // than an opaque "unknown field" error. The `tags`
+                    // key precedes `totp[_secret]` alphabetically and
+                    // `payload_version` precedes `tags`, so by the time
+                    // a `totp`/`totp_secret` key arrives we know `pv`.
+                    if pv > REVISION_SCHEMA_VERSION_MAX {
+                        return Err(unsupported_revision_schema_version(u32::from(pv)));
+                    }
+                    payload_version = Some(pv);
                 }
                 other => {
                     return Err(StoreError::Cbor(format!(
@@ -975,7 +1029,24 @@ fn decode_v1_live_inline(dec: &mut Decoder<&[u8]>) -> Result<DecodedIdentityPayl
                 tags = Some(pull_text_array(dec)?);
             }
             FIELD_TOTP_SECRET => {
+                // V1 shape.
+                if payload_version.is_some_and(|v| v >= PAYLOAD_VERSION_V2) {
+                    return Err(StoreError::Cbor(
+                        "V2 body must use nested `totp` map, not `totp_secret`".into(),
+                    ));
+                }
                 totp_secret = Some(pull_bytes(dec)?);
+            }
+            FIELD_TOTP => {
+                // V2 shape: nested map.
+                if payload_version.is_none_or(|v| v < PAYLOAD_VERSION_V2) {
+                    return Err(StoreError::Cbor(
+                        "nested `totp` map present but payload_version < 2".into(),
+                    ));
+                }
+                let (secret, params) = pull_totp_map(dec)?;
+                totp_secret = Some(secret);
+                totp_params = Some(params);
             }
             FIELD_URLS => {
                 urls = Some(pull_text_array(dec)?);
@@ -985,7 +1056,7 @@ fn decode_v1_live_inline(dec: &mut Decoder<&[u8]>) -> Result<DecodedIdentityPayl
             }
             other => {
                 return Err(StoreError::Cbor(format!(
-                    "unknown V1 identity field {other:?}"
+                    "unknown V1/V2 identity field {other:?}"
                 )))
             }
         }
@@ -993,33 +1064,27 @@ fn decode_v1_live_inline(dec: &mut Decoder<&[u8]>) -> Result<DecodedIdentityPayl
     }
 
     let display_name =
-        display_name.ok_or_else(|| StoreError::Cbor("V1: missing display_name".into()))?;
-    let notes = notes.ok_or_else(|| StoreError::Cbor("V1: missing notes".into()))?;
-    let password_history =
-        password_history.ok_or_else(|| StoreError::Cbor("V1: missing password_history".into()))?;
-    // MVP-1 issue 1.6 — §18.7 reject policy (replaces the 1.2 "Q4
-    // accept-and-record" stanza). A `payload_version` `<=`
-    // REVISION_SCHEMA_VERSION_MAX is parsed; a value above it is a
-    // future payload shape this build cannot understand → typed
-    // reject (the `vault.rs` caller re-decorates the marker with the
-    // real account/revision ids). A bare on-disk byte-flip of this
-    // field collapses to AuthenticationFailed first (the AEAD AAD
-    // binds the `schema_version` byte); only a legitimately re-sealed
-    // future blob reaches here.
+        display_name.ok_or_else(|| StoreError::Cbor("V1/V2: missing display_name".into()))?;
+    let notes = notes.ok_or_else(|| StoreError::Cbor("V1/V2: missing notes".into()))?;
+    let password_history = password_history
+        .ok_or_else(|| StoreError::Cbor("V1/V2: missing password_history".into()))?;
     let payload_version =
-        payload_version.ok_or_else(|| StoreError::Cbor("V1: missing payload_version".into()))?;
-    if payload_version > REVISION_SCHEMA_VERSION_MAX {
-        return Err(unsupported_revision_schema_version(u32::from(
-            payload_version,
-        )));
-    }
-    let tags = tags.ok_or_else(|| StoreError::Cbor("V1: missing tags".into()))?;
+        payload_version.ok_or_else(|| StoreError::Cbor("V1/V2: missing payload_version".into()))?;
+    let tags = tags.ok_or_else(|| StoreError::Cbor("V1/V2: missing tags".into()))?;
     let totp_secret =
-        totp_secret.ok_or_else(|| StoreError::Cbor("V1: missing totp_secret".into()))?;
-    let urls = urls.ok_or_else(|| StoreError::Cbor("V1: missing urls".into()))?;
-    let usernames = usernames.ok_or_else(|| StoreError::Cbor("V1: missing usernames".into()))?;
+        totp_secret.ok_or_else(|| StoreError::Cbor("V1/V2: missing totp/totp_secret".into()))?;
+    let urls = urls.ok_or_else(|| StoreError::Cbor("V1/V2: missing urls".into()))?;
+    let usernames = usernames.ok_or_else(|| StoreError::Cbor("V1/V2: missing usernames".into()))?;
+    // A V1 body has no params on disk → RFC defaults (SHA-1 / 6 / 30).
+    let totp_params = totp_params.unwrap_or_default();
+    if payload_version >= PAYLOAD_VERSION_V2 {
+        // Defensive: a re-sealed V2 body with out-of-range params.
+        totp_params
+            .validate()
+            .map_err(|e| StoreError::Cbor(format!("V2 totp params invalid: {e}")))?;
+    }
 
-    let identity = AccountIdentity::new_unchecked(
+    let identity = AccountIdentity::new_unchecked_with_totp_params(
         SecretBytes::new(display_name),
         tags,
         SecretBytes::new(notes),
@@ -1027,8 +1092,92 @@ fn decode_v1_live_inline(dec: &mut Decoder<&[u8]>) -> Result<DecodedIdentityPayl
         usernames,
         password_history,
         SecretBytes::new(totp_secret),
+        totp_params,
     );
     Ok(DecodedIdentityPayload::Live(identity))
+}
+
+/// Pull a V2 nested `totp` map `{ algorithm, digits, period, secret }`
+/// (the map header has not yet been consumed). Returns the secret bytes
+/// + the parsed [`TotpParams`].
+fn pull_totp_map(dec: &mut Decoder<&[u8]>) -> Result<(Vec<u8>, TotpParams)> {
+    let n = match pull_header(dec)? {
+        Header::Map(Some(n)) => n,
+        Header::Map(None) => {
+            return Err(StoreError::Cbor(
+                "indefinite-length totp map rejected".into(),
+            ))
+        }
+        other => return Err(StoreError::Cbor(format!("totp slot not a map: {other:?}"))),
+    };
+    let mut algorithm: Option<TotpAlgorithm> = None;
+    let mut digits: Option<u8> = None;
+    let mut period: Option<u32> = None;
+    let mut secret: Option<Vec<u8>> = None;
+    let mut last_key: Option<String> = None;
+    for _ in 0..n {
+        let key = pull_text(dec)?;
+        if let Some(prev) = &last_key {
+            if prev.as_str() >= key.as_str() {
+                return Err(StoreError::Cbor(format!(
+                    "non-canonical totp map key order: {prev:?} then {key:?}"
+                )));
+            }
+        }
+        match key.as_str() {
+            FIELD_TOTP_ALGORITHM => {
+                let v = pull_positive_u64(dec, "totp.algorithm")?;
+                let w = u8::try_from(v)
+                    .map_err(|_| StoreError::Cbor(format!("totp.algorithm {v} out of range")))?;
+                algorithm = Some(
+                    TotpAlgorithm::from_wire(w)
+                        .map_err(|e| StoreError::Cbor(format!("totp.algorithm: {e}")))?,
+                );
+            }
+            FIELD_TOTP_DIGITS => {
+                let v = pull_positive_u64(dec, "totp.digits")?;
+                digits = Some(
+                    u8::try_from(v)
+                        .map_err(|_| StoreError::Cbor(format!("totp.digits {v} out of range")))?,
+                );
+            }
+            FIELD_TOTP_PERIOD => {
+                let v = pull_positive_u64(dec, "totp.period")?;
+                period = Some(
+                    u32::try_from(v)
+                        .map_err(|_| StoreError::Cbor(format!("totp.period {v} out of range")))?,
+                );
+            }
+            FIELD_TOTP_SECRET_NESTED => {
+                secret = Some(pull_bytes(dec)?);
+            }
+            other => {
+                return Err(StoreError::Cbor(format!(
+                    "unknown totp map field {other:?}"
+                )))
+            }
+        }
+        last_key = Some(key);
+    }
+    let secret = secret.ok_or_else(|| StoreError::Cbor("totp map: missing secret".into()))?;
+    let params = TotpParams {
+        algorithm: algorithm
+            .ok_or_else(|| StoreError::Cbor("totp map: missing algorithm".into()))?,
+        digits: digits.ok_or_else(|| StoreError::Cbor("totp map: missing digits".into()))?,
+        period_seconds: period
+            .ok_or_else(|| StoreError::Cbor("totp map: missing period".into()))?,
+    };
+    Ok((secret, params))
+}
+
+/// Pull a CBOR positive-integer value as `u64`.
+fn pull_positive_u64(dec: &mut Decoder<&[u8]>, what: &str) -> Result<u64> {
+    match pull_header(dec)? {
+        Header::Positive(v) => Ok(v),
+        other => Err(StoreError::Cbor(format!(
+            "{what} not a positive integer: {other:?}"
+        ))),
+    }
 }
 
 /// Pull a CBOR text string and return the underlying bytes.
@@ -1455,7 +1604,9 @@ mod tests {
 
     // -- MVP-1 issue 1.2: V1 codec tests ----------------------------------
 
-    use crate::account::{AccountIdentity, AccountIdentityDraft, ACCOUNT_IDENTITY_SCHEMA_VERSION};
+    use crate::account::{
+        AccountIdentity, AccountIdentityDraft, TotpParams, ACCOUNT_IDENTITY_SCHEMA_VERSION,
+    };
     use crate::revision::DeviceId;
 
     fn fixture_identity() -> AccountIdentity {
@@ -1468,6 +1619,7 @@ mod tests {
             notes: "test notes".into(),
             password: SecretBytes::new(b"hunter2".to_vec()),
             totp_secret: SecretBytes::new(b"totp-bytes".to_vec()),
+            totp_params: TotpParams::default(),
         };
         draft
             .validate_into_identity(1_700_000_000_000, DeviceId([0x33u8; 32]))
@@ -1637,12 +1789,13 @@ mod tests {
         ));
     }
 
-    /// A V1 8-key body whose `payload_version` is one past
-    /// `REVISION_SCHEMA_VERSION_MAX` → typed
-    /// `UnsupportedRevisionSchemaVersion` on decode (no crash, no
-    /// silent skip).
+    /// An 8-key identity body whose `payload_version` is one past
+    /// `REVISION_SCHEMA_VERSION_MAX` (now 2 → the synthesised future is
+    /// 3) → typed `UnsupportedRevisionSchemaVersion` on decode (no crash,
+    /// no silent skip) — the §18.7 "requires upgrade" path. After 1.7
+    /// V2 is a *known* version, so V3 is the new "future".
     #[test]
-    fn decode_v1_payload_version_2_rejects() {
+    fn decode_future_payload_version_rejects() {
         let key = AeadKey::generate();
         let vault = [0x11u8; 32];
         let acct = AccountId::from_bytes([0x22u8; 32]);
@@ -1664,6 +1817,51 @@ mod tests {
             }
             other => panic!("expected UnsupportedRevisionSchemaVersion, got {other:?}"),
         }
+    }
+
+    /// MVP-1 issue 1.7: a V2 body (nested `totp` map with non-default
+    /// params) round-trips byte-identically through seal/open, preserving
+    /// the algorithm / digits / period; and a V1 body (no params on disk)
+    /// hydrates to the RFC defaults.
+    #[test]
+    fn v2_totp_params_round_trip_and_v1_defaults() {
+        let key = AeadKey::generate();
+        let vault = [0x33u8; 32];
+        let acct = AccountId::from_bytes([0x44u8; 32]);
+        let aad = build_aad(&vault, &acct, &RevisionId::GENESIS_PARENT, 0);
+
+        // V2: a configured-params identity.
+        let mut identity = fixture_identity();
+        identity.totp_params = TotpParams {
+            algorithm: crate::account::TotpAlgorithm::Sha256,
+            digits: 8,
+            period_seconds: 60,
+        };
+        let (ct, nonce) = super::seal_identity(&key, &identity, &aad).unwrap();
+        let super::DecodedIdentityPayload::Live(id) =
+            super::open_identity_payload(&key, &nonce, &ct, &aad).unwrap()
+        else {
+            panic!("expected Live");
+        };
+        assert_eq!(
+            id.totp_params().algorithm,
+            crate::account::TotpAlgorithm::Sha256
+        );
+        assert_eq!(id.totp_params().digits, 8);
+        assert_eq!(id.totp_params().period_seconds, 60);
+        assert!(id.has_totp());
+
+        // V1: encode with payload_version 1 (legacy shape, no params) →
+        // decode fills the RFC defaults.
+        let v1_identity = fixture_identity();
+        let (ct1, nonce1) =
+            super::seal_identity_with_payload_version(&key, &v1_identity, &aad, 1).unwrap();
+        let super::DecodedIdentityPayload::Live(id1) =
+            super::open_identity_payload(&key, &nonce1, &ct1, &aad).unwrap()
+        else {
+            panic!("expected Live");
+        };
+        assert_eq!(id1.totp_params(), TotpParams::default());
     }
 
     /// A map arity of 9 is, by construction, a future payload shape →

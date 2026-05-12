@@ -186,9 +186,17 @@ pub struct AccountDraft {
     /// zero on drop after the call returns.
     pub current_password: Arc<SecretPassword>,
     /// Optional TOTP secret slot. `None` means no TOTP configured. The
-    /// 1.7 RFC-6238 generator consumes these bytes; 1.2 only stores
-    /// + reveals.
+    /// 1.7 RFC-6238 generator consumes these bytes (`totp_generate`);
+    /// the raw seed itself is reveal-class (`reveal_totp_secret`). Build
+    /// it via [`crate::totp::parse_totp_secret`] from the user's pasted
+    /// base32 / `otpauth://` string.
     pub totp_secret: Option<Arc<TotpSecret>>,
+    /// TOTP parameters (algorithm / digits / period). MVP-1 issue 1.7
+    /// additive amendment: `None` here means "use the RFC 6238 defaults"
+    /// (SHA-1 / 6 / 30) when `totp_secret` is present; ignored when
+    /// `totp_secret` is `None`. Populate from
+    /// [`crate::totp::parse_totp_secret`]'s result.
+    pub totp_params: Option<crate::totp::TotpParamsFfi>,
 }
 
 impl Clone for AccountDraft {
@@ -202,6 +210,7 @@ impl Clone for AccountDraft {
             notes: self.notes.clone(),
             current_password: Arc::clone(&self.current_password),
             totp_secret: self.totp_secret.as_ref().map(Arc::clone),
+            totp_params: self.totp_params,
         }
     }
 }
@@ -245,6 +254,12 @@ pub struct AccountPatch {
     /// TOTP slot operation: `None` = leave unchanged; `Some(None)` =
     /// clear; `Some(Some(secret))` = set/replace.
     pub totp_secret: Option<Option<Arc<TotpSecret>>>,
+    /// TOTP parameters to apply alongside a `totp_secret = Some(Some(_))`
+    /// set (MVP-1 issue 1.7 additive amendment). `None` here when
+    /// leaving TOTP unchanged or clearing it, or to set a secret with
+    /// the RFC 6238 defaults. Populate from
+    /// [`crate::totp::parse_totp_secret`]'s result.
+    pub totp_params: Option<crate::totp::TotpParamsFfi>,
 }
 
 impl Clone for AccountPatch {
@@ -261,6 +276,7 @@ impl Clone for AccountPatch {
                 .totp_secret
                 .as_ref()
                 .map(|inner| inner.as_ref().map(Arc::clone)),
+            totp_params: self.totp_params,
         }
     }
 }

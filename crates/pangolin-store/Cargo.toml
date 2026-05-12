@@ -40,6 +40,13 @@ pangolin-crypto = { path = "../pangolin-crypto" }
 # on pangolin-store in production code.
 pangolin-chain  = { path = "../pangolin-chain" }
 
+# MVP-1 issue 1.7: the V2 `AccountIdentity` TOTP slot carries
+# `pangolin_totp::TotpParams` (algorithm / digits / period). Dep arrow
+# is one-way (store → totp); `pangolin-totp` is a near-leaf (no
+# `uniffi`, no `serde`) so this preserves the uniffi/serde tree
+# invariants. Its own `hmac`/`sha1`/`sha2` crates are blast-contained.
+pangolin-totp   = { path = "../pangolin-totp" }
+
 rusqlite          = { workspace = true }
 ciborium-ll       = { workspace = true }
 ciborium-io       = { workspace = true }

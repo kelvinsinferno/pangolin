@@ -52,10 +52,11 @@ pub use pangolin_store::{
     AccountSnapshot, AccountStatus, AuthError, Clock, ConflictReport, DeviceCapabilities, DeviceId,
     DeviceIdentity, IdentityProof, PasswordEntry, PasswordHistorySummaryEntry, PendingMerge,
     PinIdentityProof, PresenceProof, PressYPresenceProof, RevisionGraph, RevisionId, RevisionMeta,
-    SessionDuration, SessionState, SystemClock, Vault, VaultState, ABSOLUTE_MAX_DEFAULT,
-    ACCOUNT_IDENTITY_SCHEMA_VERSION, DEVICE_IDENTITY_SCHEMA_VERSION, IDLE_TIMEOUT_DEFAULT,
-    PAYLOAD_VERSION_V0, PAYLOAD_VERSION_V1, PRESENCE_FRESHNESS, PROMPT_TIMEOUT,
-    REVISION_SCHEMA_VERSION_MAX, SESSION_IDLE_UNTIL_DEVICE_LOCK,
+    SessionDuration, SessionState, SystemClock, TotpAlgorithm, TotpParams, Vault, VaultState,
+    ABSOLUTE_MAX_DEFAULT, ACCOUNT_IDENTITY_SCHEMA_VERSION, DEVICE_IDENTITY_SCHEMA_VERSION,
+    IDLE_TIMEOUT_DEFAULT, PAYLOAD_VERSION_V0, PAYLOAD_VERSION_V1, PAYLOAD_VERSION_V2,
+    PRESENCE_FRESHNESS, PROMPT_TIMEOUT, REVISION_SCHEMA_VERSION_MAX,
+    SESSION_IDLE_UNTIL_DEVICE_LOCK,
 };
 
 /// Returns the crate name. Useful for diagnostics and version reporting.
