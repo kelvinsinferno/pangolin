@@ -92,8 +92,8 @@ pub use reveal::RevealedSecret;
 // see revision.rs / ffi-surface.md).
 pub use revision::{AccountStatus, ForkBranch, RevisionId, RevisionMeta};
 pub use session::{
-    PasswordPolicy, PlaintextExportConfirmation, PresenceProof, SecretPassword, SessionInfo,
-    UnixTimestamp, VaultHandle,
+    PasswordPolicy, PasswordStrength, PlaintextExportConfirmation, PresenceProof, SecretPassword,
+    SessionInfo, UnixTimestamp, VaultHandle, PASSWORD_POLICY_SCHEMA_VERSION,
 };
 // MVP-1 issue 1.7: TOTP engine wired — `totp_generate` body +
 // `parse_totp_secret` helper + the `ParsedTotpSecretFfi` /
