@@ -47,7 +47,24 @@ use crate::account::{
     AccountId, AccountIdentity, AccountSnapshot, PasswordEntry, ACCOUNT_ID_LEN, PAYLOAD_VERSION_V1,
 };
 use crate::error::{Result, StoreError};
-use crate::revision::{DeviceId, RevisionId, DEVICE_ID_LEN, REVISION_ID_LEN};
+use crate::revision::{
+    DeviceId, RevisionId, DEVICE_ID_LEN, REVISION_ID_LEN, REVISION_SCHEMA_VERSION_MAX,
+};
+
+/// **MVP-1 issue 1.6.** Build a [`StoreError::UnsupportedRevisionSchemaVersion`]
+/// marker from the blob layer, which does not know the `account_id` /
+/// `revision_id`. The decode callers in `vault.rs` re-wrap with the
+/// real ids via [`StoreError::with_revision_context`]. `found` is the
+/// future `payload_version` / map-arity-derived schema version observed
+/// in the CBOR body.
+fn unsupported_revision_schema_version(found: u32) -> StoreError {
+    StoreError::UnsupportedRevisionSchemaVersion {
+        account_id: AccountId::from_bytes([0u8; ACCOUNT_ID_LEN]),
+        revision_id: RevisionId::from_bytes([0u8; REVISION_ID_LEN]),
+        found,
+        supported: u32::from(REVISION_SCHEMA_VERSION_MAX),
+    }
+}
 
 /// 8-byte AAD domain separator. Distinct from `pangolin-crypto`'s
 /// VDK-wrap domain separator so a wrap-AEAD blob cannot be replayed as
@@ -709,6 +726,50 @@ pub fn seal_identity(
     Ok((ct, nonce))
 }
 
+/// **Test-only (MVP-1 issue 1.6).** Seal an identity as a V1 8-key map
+/// but with an arbitrary `payload_version` discriminator — the only way
+/// to synthesise a future-versioned revision blob from inside the crate
+/// (the production encoder always emits `payload_version = 1`). Used by
+/// the §18.7 forward-compat tests; gated so production builds cannot
+/// link against it.
+#[cfg(any(test, feature = "test-utilities"))]
+#[doc(hidden)]
+pub fn seal_identity_with_payload_version(
+    vdk_aead: &AeadKey,
+    identity: &AccountIdentity,
+    aad: &[u8; REV_AAD_LEN],
+    payload_version: u8,
+) -> Result<(Ciphertext, Nonce)> {
+    // Encode the canonical V1 shape, then overwrite the
+    // `payload_version` integer. The V1 encoder emits it as a
+    // single-byte Positive header (`enc.push(Header::Positive(1))`),
+    // which CBOR-encodes the value 1 inline in the initial byte 0x01.
+    // For any version 0..=23 the replacement is also a single inline
+    // byte; we restrict to that range (sufficient for the tests).
+    assert!(
+        payload_version <= 23,
+        "test helper supports versions 0..=23"
+    );
+    let mut buf = encode_identity_cbor(identity).to_vec();
+    // Find the `payload_version` key bytes ("payload_version" preceded
+    // by its text-string header byte 0x6f = text(15)) and replace the
+    // value byte that immediately follows the 15 key bytes.
+    let key = FIELD_PAYLOAD_VERSION.as_bytes();
+    let mut idx = None;
+    for i in 0..buf.len().saturating_sub(key.len()) {
+        if &buf[i..i + key.len()] == key {
+            idx = Some(i + key.len());
+            break;
+        }
+    }
+    let value_pos = idx.expect("payload_version key present in canonical V1 encoding");
+    buf[value_pos] = payload_version;
+    let plaintext = Zeroizing::new(buf);
+    let nonce = Nonce::random();
+    let ct = vdk_aead.seal(&nonce, &plaintext, aad)?;
+    Ok((ct, nonce))
+}
+
 /// V1-aware authenticate-and-decode. Returns [`DecodedIdentityPayload`]:
 /// either a live [`AccountIdentity`] (hydrated from V0 if the on-disk
 /// payload is V0 arity-6, or decoded from V1 arity-8) or a tombstone.
@@ -769,6 +830,15 @@ fn decode_identity_payload(buf: &[u8]) -> Result<DecodedIdentityPayload> {
         Ok(DecodedIdentityPayload::Live(hydrate_v0_to_v1(&snapshot)))
     } else if entries == 8 {
         decode_v1_live_inline(&mut dec)
+    } else if entries > 8 {
+        // MVP-1 issue 1.6: a higher map arity is, by construction, a
+        // future payload shape — reject it as an unsupported revision
+        // schema version rather than a generic CBOR error. (Arities
+        // {1,3} are V0 tombstone shapes; {6} is V0 live; {8} is V1
+        // live — those keep their handling above.)
+        Err(unsupported_revision_schema_version(
+            u32::try_from(entries).unwrap_or(u32::MAX),
+        ))
     } else {
         Err(StoreError::Cbor(format!(
             "unexpected map arity for identity payload: {entries}"
@@ -927,12 +997,22 @@ fn decode_v1_live_inline(dec: &mut Decoder<&[u8]>) -> Result<DecodedIdentityPayl
     let notes = notes.ok_or_else(|| StoreError::Cbor("V1: missing notes".into()))?;
     let password_history =
         password_history.ok_or_else(|| StoreError::Cbor("V1: missing password_history".into()))?;
-    // Q4: accept-and-record. We do NOT reject unknown payload_versions
-    // — 1.6 owns the reject policy. The version is read but not
-    // currently propagated upward (the caller owns the FFI
-    // schema_version slot).
-    let _ =
+    // MVP-1 issue 1.6 — §18.7 reject policy (replaces the 1.2 "Q4
+    // accept-and-record" stanza). A `payload_version` `<=`
+    // REVISION_SCHEMA_VERSION_MAX is parsed; a value above it is a
+    // future payload shape this build cannot understand → typed
+    // reject (the `vault.rs` caller re-decorates the marker with the
+    // real account/revision ids). A bare on-disk byte-flip of this
+    // field collapses to AuthenticationFailed first (the AEAD AAD
+    // binds the `schema_version` byte); only a legitimately re-sealed
+    // future blob reaches here.
+    let payload_version =
         payload_version.ok_or_else(|| StoreError::Cbor("V1: missing payload_version".into()))?;
+    if payload_version > REVISION_SCHEMA_VERSION_MAX {
+        return Err(unsupported_revision_schema_version(u32::from(
+            payload_version,
+        )));
+    }
     let tags = tags.ok_or_else(|| StoreError::Cbor("V1: missing tags".into()))?;
     let totp_secret =
         totp_secret.ok_or_else(|| StoreError::Cbor("V1: missing totp_secret".into()))?;
@@ -1520,6 +1600,99 @@ mod tests {
             bytes.len() < 4096,
             "V1 encoding too big: {} bytes",
             bytes.len()
+        );
+    }
+
+    // -- MVP-1 issue 1.6: §18.7 forward-compat reject tests ---------------
+
+    /// A V0 (arity-6) body and a V1 (arity-8, `payload_version` 1) body
+    /// parse exactly as before (regression guard for the 1.2 migration —
+    /// the 1.6 reject must not touch the known shapes).
+    #[test]
+    fn decode_v0_arity6_and_v1_arity8_still_parse() {
+        // V1: round-trips above; here just confirm the decode succeeds.
+        let key = AeadKey::generate();
+        let vault = [0x11u8; 32];
+        let acct = AccountId::from_bytes([0x22u8; 32]);
+        let aad = build_aad(&vault, &acct, &RevisionId::GENESIS_PARENT, 0);
+        let identity = fixture_identity();
+        let (ct, nonce) = super::seal_identity(&key, &identity, &aad).unwrap();
+        assert!(matches!(
+            super::open_identity_payload(&key, &nonce, &ct, &aad).unwrap(),
+            super::DecodedIdentityPayload::Live(_)
+        ));
+        // V0: a 6-field snapshot decodes through the V1-aware path.
+        let snap = AccountSnapshot::new(
+            SecretBytes::new(b"X".to_vec()),
+            SecretBytes::new(b"u".to_vec()),
+            SecretBytes::new(b"p".to_vec()),
+            SecretBytes::new(b"https://x".to_vec()),
+            SecretBytes::new(b"n".to_vec()),
+            SecretBytes::new(b"".to_vec()),
+        );
+        let cbor = encode_snapshot_cbor(&snap);
+        assert!(matches!(
+            super::decode_identity_payload(&cbor).unwrap(),
+            super::DecodedIdentityPayload::Live(_)
+        ));
+    }
+
+    /// A V1 8-key body whose `payload_version` is one past
+    /// `REVISION_SCHEMA_VERSION_MAX` → typed
+    /// `UnsupportedRevisionSchemaVersion` on decode (no crash, no
+    /// silent skip).
+    #[test]
+    fn decode_v1_payload_version_2_rejects() {
+        let key = AeadKey::generate();
+        let vault = [0x11u8; 32];
+        let acct = AccountId::from_bytes([0x22u8; 32]);
+        let aad = build_aad(&vault, &acct, &RevisionId::GENESIS_PARENT, 0);
+        let identity = fixture_identity();
+        let future = crate::revision::REVISION_SCHEMA_VERSION_MAX + 1;
+        let (ct, nonce) =
+            super::seal_identity_with_payload_version(&key, &identity, &aad, future).unwrap();
+        let err = super::open_identity_payload(&key, &nonce, &ct, &aad).unwrap_err();
+        match err {
+            crate::error::StoreError::UnsupportedRevisionSchemaVersion {
+                found, supported, ..
+            } => {
+                assert_eq!(found, u32::from(future));
+                assert_eq!(
+                    supported,
+                    u32::from(crate::revision::REVISION_SCHEMA_VERSION_MAX)
+                );
+            }
+            other => panic!("expected UnsupportedRevisionSchemaVersion, got {other:?}"),
+        }
+    }
+
+    /// A map arity of 9 is, by construction, a future payload shape →
+    /// the same typed `UnsupportedRevisionSchemaVersion` (not the
+    /// generic CBOR-arity error).
+    #[test]
+    fn decode_map_arity_9_rejects_as_unsupported_version() {
+        use ciborium_io::Write as _;
+        use ciborium_ll::Header;
+        // Hand-build a 9-entry map of dummy text key/value pairs.
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut enc = ciborium_ll::Encoder::from(&mut buf);
+            enc.push(Header::Map(Some(9))).unwrap();
+            for i in 0..9u8 {
+                let k = format!("k{i}");
+                enc.text(&k, None).unwrap();
+                enc.push(Header::Text(Some(1))).unwrap();
+                enc.write_all(b"v").unwrap();
+            }
+        }
+        let err = super::decode_identity_payload(&buf).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::StoreError::UnsupportedRevisionSchemaVersion { found, .. }
+                    if found == 9
+            ),
+            "expected UnsupportedRevisionSchemaVersion with found=9, got {err:?}"
         );
     }
 }

@@ -87,7 +87,10 @@ pub use kdbx::{CaptureAuthority, CaptureContext, KdbxImportReport};
 // MVP-1 issue 1.4: presence-gated reveal-class entry points + the
 // zeroizing `RevealedSecret` wrapper they return (Q4 amendment).
 pub use reveal::RevealedSecret;
-pub use revision::{RevisionId, RevisionMeta};
+// MVP-1 issue 1.6: revision-lineage finalisation — enriched RevisionMeta
+// + the fork/resolve/status FFI shapes (additive 1.1-surface amendment;
+// see revision.rs / ffi-surface.md).
+pub use revision::{AccountStatus, ForkBranch, RevisionId, RevisionMeta};
 pub use session::{
     PasswordPolicy, PlaintextExportConfirmation, PresenceProof, SecretPassword, SessionInfo,
     UnixTimestamp, VaultHandle,

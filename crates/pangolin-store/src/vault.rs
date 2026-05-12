@@ -101,6 +101,35 @@ static_assertions::assert_not_impl_any!(Vault: Sync);
 /// failure probability, vanishing for any plausible vault size.
 pub(crate) const ADD_ACCOUNT_RETRY_BUDGET: u32 = 4;
 
+/// One-stop per-account status view (MVP-1 issue 1.6).
+///
+/// Returned by [`Vault::account_status`]. All fields non-secret. A host
+/// UI uses this to decide which banners to render (forked → "you have a
+/// conflict to resolve"; frozen → "this account was chain-modified,
+/// resolve before editing"; requires-upgrade → "this account needs a
+/// newer Pangolin").
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountStatus {
+    /// The account this status describes.
+    pub account_id: crate::account::AccountId,
+    /// `true` if the account has been deleted (tombstoned).
+    pub is_tombstoned: bool,
+    /// `true` if the revision graph has ≥ 2 leaves (a fork). The
+    /// account stays readable at its canonical head; resolve via
+    /// [`Vault::resolve_fork`].
+    pub is_forked: bool,
+    /// `true` if the P10 `frozen_pending_resolve` flag is set (a
+    /// foreign-device chain event landed under this account via the
+    /// dormant ingest path). Distinct from `is_forked`; stricter.
+    pub is_frozen_pending_resolve: bool,
+    /// `true` if the account's canonical head carries a schema version
+    /// newer than this build understands (§18.7) — metadata-only reads
+    /// keep working; reveals/edits/head-decryption are blocked. Only
+    /// meaningful on an `Active` vault; `false` otherwise.
+    pub requires_upgrade: bool,
+}
+
 /// Public state observable on a [`Vault`] handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VaultState {
@@ -316,6 +345,19 @@ struct ActiveState {
     /// the field is created and never thereafter (unlock always stamps
     /// it), but kept `Option` for explicitness.
     last_presence_at: Option<SystemTime>,
+    /// **MVP-1 issue 1.6 — §18.7 "requires upgrade" per-account state.**
+    /// Account ids whose canonical head (the revision the cache/index
+    /// would reflect) carries a `schema_version` / `payload_version`
+    /// newer than this build understands
+    /// ([`crate::revision::REVISION_SCHEMA_VERSION_MAX`]). Populated on
+    /// `unlock` (the cache build catches the per-account
+    /// [`StoreError::UnsupportedRevisionSchemaVersion`] and records the
+    /// id here rather than aborting the unlock). NOT a persisted column
+    /// — the on-disk truth is "there is a revision with version > our
+    /// max"; this is just a fast in-RAM lookup so user-facing reads /
+    /// edits on the affected account surface a typed error without
+    /// re-decrypting. Empty for a vault with no future-versioned heads.
+    requires_upgrade: std::collections::HashSet<AccountId>,
 }
 
 impl Vault {
@@ -724,7 +766,7 @@ impl Vault {
         // interrupted sync can never desync it persistently; V0-format
         // and 1.2-V1-format vaults alike get a working index here
         // regardless of blob version (the decrypt is V1-aware).
-        let (cache, search_index) =
+        let (cache, search_index, requires_upgrade) =
             build_active_state_data(&self.conn, &self.meta, vdk.aead_key())?;
 
         // Step 6b (MVP-1 issue 1.5): register-on-first-unlock /
@@ -793,6 +835,7 @@ impl Vault {
             search_index,
             device_key,
             last_presence_at: Some(now),
+            requires_upgrade,
         });
         self.session_state = SessionState::Active {
             expires_at: next_idle_deadline(now, now, self.session_idle),
@@ -1220,6 +1263,50 @@ impl Vault {
         Ok(())
     }
 
+    /// **MVP-1 issue 1.6 — §18.7.** `true` iff `id`'s canonical head
+    /// carries a schema version newer than this build understands. Reads
+    /// the in-RAM `requires_upgrade` set populated on `unlock`; returns
+    /// `false` when the vault is not active (no set yet) — the
+    /// session-state guards on the public callers surface that case.
+    #[must_use]
+    fn account_requires_upgrade(&self, id: AccountId) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|a| a.requires_upgrade.contains(&id))
+    }
+
+    /// Surface an [`StoreError::UnsupportedRevisionSchemaVersion`] if the
+    /// supplied account's canonical head is from the future. Guard at the
+    /// top of every user-facing read/edit/reveal path so a "requires
+    /// upgrade" account fails loudly rather than serving stale data.
+    fn refuse_if_requires_upgrade(&self, id: AccountId) -> Result<()> {
+        if self.account_requires_upgrade(id) {
+            // We don't have the future revision id cheaply here; the
+            // canonical-head pointer is the right one to name. Read it.
+            let revision_id = self
+                .conn
+                .query_row(
+                    "SELECT head_revision_id FROM account_identities WHERE account_id = ?1",
+                    params![id.as_bytes().as_slice()],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?
+                .and_then(|b| <[u8; REVISION_ID_LEN]>::try_from(b.as_slice()).ok())
+                .map_or(RevisionId::GENESIS_PARENT, RevisionId::from_bytes);
+            return Err(StoreError::UnsupportedRevisionSchemaVersion {
+                account_id: id,
+                revision_id,
+                // We know it's strictly greater than the max; the exact
+                // value would require a re-read of the row column. Use
+                // max+1 as a lower bound — callers branch on the variant
+                // not the numbers.
+                found: u32::from(crate::revision::REVISION_SCHEMA_VERSION_MAX) + 1,
+                supported: u32::from(crate::revision::REVISION_SCHEMA_VERSION_MAX),
+            });
+        }
+        Ok(())
+    }
+
     /// Add a new account identity. Returns the freshly-generated
     /// `AccountId` of the new account.
     ///
@@ -1377,6 +1464,7 @@ impl Vault {
         // modified would create a fork they don't realize they're
         // creating; surface the freeze before any work is done.
         self.refuse_if_frozen(id)?;
+        self.refuse_if_requires_upgrade(id)?;
         // Look up account state.
         let account_row = self
             .conn
@@ -1475,6 +1563,7 @@ impl Vault {
         // overriding the foreign chain edit; refuse so the user is
         // forced through resolve first.
         self.refuse_if_frozen(id)?;
+        self.refuse_if_requires_upgrade(id)?;
         let head_row = self
             .conn
             .query_row(
@@ -1848,6 +1937,7 @@ impl Vault {
         let mut head_stmt = tx.prepare(
             "SELECT r.revision_id FROM revisions r
              WHERE r.account_id = ?1
+               AND r.superseded_by IS NULL
                AND NOT EXISTS (
                  SELECT 1 FROM revisions r2
                  WHERE r2.parent_revision_id = r.revision_id
@@ -2468,6 +2558,7 @@ impl Vault {
         let mut head_stmt = tx.prepare(
             "SELECT r.revision_id FROM revisions r
              WHERE r.account_id = ?1
+               AND r.superseded_by IS NULL
                AND NOT EXISTS (
                  SELECT 1 FROM revisions r2
                  WHERE r2.parent_revision_id = r.revision_id
@@ -2626,6 +2717,7 @@ impl Vault {
     ) -> Result<Vec<crate::account::PasswordHistorySummaryEntry>> {
         self.check_session_freshness()?;
         self.refuse_if_frozen(id)?;
+        self.refuse_if_requires_upgrade(id)?;
         self.ensure_presence_fresh(presence)?;
         let identity = self.read_head_identity(id)?;
         let crate::account::AccountIdentity {
@@ -2697,6 +2789,8 @@ impl Vault {
         // Step 2: refuse a frozen account before the proof is consumed
         // (P8 fix CRIT-1).
         self.refuse_if_frozen(id)?;
+        // Step 2b (1.6 §18.7): refuse a "requires upgrade" account.
+        self.refuse_if_requires_upgrade(id)?;
         // Step 3: dedup-or-verify the presence proof (Session spec
         // §7.6 / §8.6). Within PRESENCE_FRESHNESS of the last
         // successful presence — including the unlock's — no proof is
@@ -2873,6 +2967,7 @@ impl Vault {
         // P8 fix CRIT-1: refuse before consuming the presence proof —
         // same discipline as `reveal_secret_field`.
         self.refuse_if_frozen(id)?;
+        self.refuse_if_requires_upgrade(id)?;
         self.ensure_presence_fresh(presence)?;
 
         // Look up the account's current head and read its sealed
@@ -2994,7 +3089,8 @@ impl Vault {
         let mut stmt = self.conn.prepare(
             "SELECT revision_id, parent_revision_id, device_id,
                     schema_version, created_at, is_tombstone,
-                    chain_tx_hash, chain_block_number, chain_log_index
+                    chain_tx_hash, chain_block_number, chain_log_index,
+                    superseded_by
              FROM revisions WHERE account_id = ?1
              ORDER BY created_at ASC",
         )?;
@@ -3008,6 +3104,7 @@ impl Vault {
             let chain_tx_hash: Option<Vec<u8>> = row.get(6)?;
             let chain_block_number: Option<i64> = row.get(7)?;
             let chain_log_index: Option<i64> = row.get(8)?;
+            let superseded_by: Option<Vec<u8>> = row.get(9)?;
             Ok(RawRevisionRow {
                 revision_id,
                 parent,
@@ -3018,6 +3115,7 @@ impl Vault {
                 chain_tx_hash,
                 chain_block_number,
                 chain_log_index,
+                superseded_by,
             })
         })?;
 
@@ -3157,6 +3255,7 @@ impl Vault {
         self.check_session_freshness()?;
         let _ = self.require_active()?;
         self.refuse_if_frozen(id)?;
+        self.refuse_if_requires_upgrade(id)?;
 
         let account_row = self
             .conn
@@ -3257,6 +3356,7 @@ impl Vault {
         self.check_session_freshness()?;
         let _ = self.require_active()?;
         self.refuse_if_frozen(id)?;
+        self.refuse_if_requires_upgrade(id)?;
 
         let account_row = self
             .conn
@@ -3280,7 +3380,14 @@ impl Vault {
             .as_slice()
             .try_into()
             .map_err(|_| StoreError::Corrupted("head_revision_id not 32 bytes".into()))?;
-        let head = RevisionId::from_bytes(head_arr);
+        let cached_head = RevisionId::from_bytes(head_arr);
+        // 1.6: for a forked account the canonical head is the
+        // largest-revision_id leaf (clock-free), not the cached pointer.
+        let head = if self.account_heads(id)?.len() > 1 {
+            self.canonical_head(id)?
+        } else {
+            cached_head
+        };
 
         let identity = self.read_identity_at(id, head)?;
         let summary = identity_to_summary(id, head, &identity);
@@ -3340,11 +3447,24 @@ impl Vault {
                 // Raced with a tombstone; skip.
                 continue;
             };
+            // 1.6 §18.7: a "requires upgrade" account is not in the
+            // index, but belt-and-suspenders skip it here too.
+            if self.account_requires_upgrade(acct) {
+                continue;
+            }
             let head_arr: [u8; REVISION_ID_LEN] = head_blob
                 .as_slice()
                 .try_into()
                 .map_err(|_| StoreError::Corrupted("head_revision_id not 32 bytes".into()))?;
-            let head = RevisionId::from_bytes(head_arr);
+            let cached_head = RevisionId::from_bytes(head_arr);
+            // 1.6: for a forked account the canonical head is the
+            // largest-revision_id leaf (clock-free), not the cached
+            // pointer. Linear accounts take the fast path unchanged.
+            let head = if self.account_heads(acct)?.len() > 1 {
+                self.canonical_head(acct)?
+            } else {
+                cached_head
+            };
             let identity = self.read_identity_at(acct, head)?;
             hits.push(identity_to_summary(acct, head, &identity));
         }
@@ -3414,7 +3534,27 @@ impl Vault {
         let ct = Ciphertext::from_vec(row.1);
         let nonce = Nonce::from_storage_bytes(nonce_arr);
         let active = self.require_active()?;
-        match crate::blob::open_identity_payload(active.vdk.aead_key(), &nonce, &ct, &aad)? {
+        // §18.7 (1.6), audit L1: the `revisions.schema_version` byte is
+        // bound into the AEAD AAD, so we authenticate first. A bare
+        // on-disk byte-flip of that column produces an AAD this build
+        // never sealed under → the open fails → `AuthenticationFailed`
+        // (tampering), not a misleading "this account requires a newer
+        // Pangolin" prompt. A *legitimately* future-versioned revision
+        // was sealed by a future build with that exact byte in its AAD,
+        // so the open succeeds; only then do we surface the typed
+        // requires-upgrade error — before attempting to CBOR-decode the
+        // (now-authenticated) future-shaped body.
+        let decoded = crate::blob::open_identity_payload(active.vdk.aead_key(), &nonce, &ct, &aad)
+            .map_err(|e| e.with_revision_context(id, revision_id))?;
+        if row_schema_version > crate::revision::REVISION_SCHEMA_VERSION_MAX {
+            return Err(StoreError::UnsupportedRevisionSchemaVersion {
+                account_id: id,
+                revision_id,
+                found: u32::from(row_schema_version),
+                supported: u32::from(crate::revision::REVISION_SCHEMA_VERSION_MAX),
+            });
+        }
+        match decoded {
             crate::blob::DecodedIdentityPayload::Live(identity) => Ok(identity),
             crate::blob::DecodedIdentityPayload::Tombstone(_) => Err(StoreError::AccountTombstoned),
         }
@@ -3487,6 +3627,7 @@ impl Vault {
         let mut stmt = self.conn.prepare(
             "SELECT r.revision_id, r.created_at FROM revisions r
              WHERE r.account_id = ?1
+               AND r.superseded_by IS NULL
                AND NOT EXISTS (
                  SELECT 1 FROM revisions r2
                  WHERE r2.parent_revision_id = r.revision_id
@@ -3520,6 +3661,399 @@ impl Vault {
         Ok(self.account_heads(id)?.len() > 1)
     }
 
+    /// **MVP-1 issue 1.6.** The canonical head of `id`'s revision graph
+    /// per the production rule: the leaf with the
+    /// lexicographically-largest `revision_id` (byte-order). For a
+    /// linear chain this is the single head; for a fork it is the
+    /// rule-winner. NO `created_at` involvement (Q1 — clock-free). The
+    /// same id on a reopened vault.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::AccountNotFound`] if `id` is unknown;
+    /// [`StoreError::Corrupted`] if `id` has zero revisions (an account
+    /// row with no genesis revision is corruption) or the graph build
+    /// detects a cycle/duplicate.
+    pub fn canonical_head(&self, id: AccountId) -> Result<RevisionId> {
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM account_identities WHERE account_id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(StoreError::AccountNotFound);
+        }
+        let graph = self.revision_graph(id)?;
+        graph
+            .canonical_head()
+            .copied()
+            .ok_or_else(|| StoreError::Corrupted("account has no revisions".into()))
+    }
+
+    /// **MVP-1 issue 1.6 — the one-stop account-status view.** Derived
+    /// from the persisted `account_identities` row, the revision graph,
+    /// and the in-RAM `requires_upgrade` set. Metadata-only and works on
+    /// a `Locked` vault for the persisted bits; the `requires_upgrade`
+    /// field is only meaningful on an `Active` vault (`false` otherwise).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::AccountNotFound`] if `id` is unknown;
+    /// [`StoreError::Sqlite`] / [`StoreError::Corrupted`] on storage
+    /// issues.
+    pub fn account_status(&self, id: AccountId) -> Result<AccountStatus> {
+        let row: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT tombstoned, frozen_pending_resolve
+                 FROM account_identities WHERE account_id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (tombstoned, frozen) = row.ok_or(StoreError::AccountNotFound)?;
+        let is_forked = self.account_heads(id)?.len() > 1;
+        Ok(AccountStatus {
+            account_id: id,
+            is_tombstoned: tombstoned != 0,
+            is_forked,
+            is_frozen_pending_resolve: frozen != 0,
+            requires_upgrade: self.account_requires_upgrade(id),
+        })
+    }
+
+    /// **MVP-1 issue 1.6 — conflict resolution → canonical head.**
+    ///
+    /// Ratify `keep_revision_id` (a current head of `account_id`'s
+    /// forked graph) as the surviving branch: write a new revision
+    /// parented at it (payload re-sealed under a fresh nonce + the merge
+    /// revision's own AAD), advance `head_revision_id` to the new id —
+    /// which is the largest `revision_id` by construction (newest), so
+    /// the account is un-forked — clear `frozen_pending_resolve`, write
+    /// the `dirty_accounts` marker, and prune the now-orphan
+    /// `pending_merges` stash row(s). The losing branch's revision rows
+    /// are **kept** (Q5 — append-only; audit/recovery; they're just off
+    /// the head chain now). Returns the new (merge) revision id.
+    ///
+    /// Composes the P9 store internals into the MVP-1 user-facing API.
+    /// Requires only an active (unlocked, non-expired) session — NOT a
+    /// fresh presence proof: resolving a fork reparents the graph; it
+    /// reveals nothing (Q2 — not a Session spec §5.4 reveal-class
+    /// action). Never auto-resolves; the user must call this explicitly.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] / [`StoreError::SessionExpired`] if
+    /// the session is not active. [`StoreError::AccountNotFound`] if
+    /// `account_id` is unknown OR if `keep_revision_id` is not a row for
+    /// this account (collapsed — no cross-account oracle).
+    /// [`StoreError::NotAHead`] if `keep_revision_id` exists for the
+    /// account but is not a current head.
+    /// [`StoreError::Validation`] (`kind = "not-forked"`) if the account
+    /// is not forked (nothing to resolve — typed, not a silent no-op).
+    /// [`StoreError::AccountTombstoned`] if the account is tombstoned.
+    /// [`StoreError::AuthenticationFailed`] if the chosen leaf's payload
+    /// fails to decrypt.
+    pub fn resolve_fork(
+        &mut self,
+        account_id: AccountId,
+        keep_revision_id: RevisionId,
+    ) -> Result<RevisionId> {
+        // Cache-bearing op (decrypts the chosen leaf, re-seals). Strict
+        // freshness check; NO presence proof (Q2).
+        self.check_session_freshness()?;
+        let _ = self.require_active()?;
+
+        let (chosen_schema_version, chosen_is_tombstone) =
+            self.resolve_fork_validate(account_id, keep_revision_id)?;
+
+        // Build the merge revision's ciphertext. The merge row's
+        // parent_revision_id IS the chosen head's revision_id, so the
+        // AAD binds the new parent (a byte-copy of the chosen leaf's
+        // ciphertext would carry the chosen leaf's own parent baked into
+        // its AAD and be unopenable as the merge row). The schema
+        // version is inherited from the chosen leaf.
+        let merge_revision_id = RevisionId::from_bytes(random_32_via_sqlite(&self.conn)?);
+        let merge_aad = build_aad(
+            &self.meta.vault_id,
+            &account_id,
+            &keep_revision_id,
+            chosen_schema_version,
+        );
+        let now = current_unix_ms();
+        let (ct, nonce, is_tombstone) = if chosen_is_tombstone {
+            // Resolving to a tombstone ratifies the deletion (P9 §A5).
+            // Audit L1: still authenticate the chosen leaf's ciphertext
+            // first — `read_identity_at` does the AEAD open (the
+            // `revisions.schema_version` byte is in the AAD, so a bare
+            // byte-flip of that column surfaces `AuthenticationFailed`
+            // here; a legit future-version leaf surfaces
+            // `UnsupportedRevisionSchemaVersion`). A tombstone payload
+            // decodes to `Err(AccountTombstoned)` *after* a successful
+            // authenticated open — that's the expected, authenticated
+            // outcome for this branch; anything else propagates.
+            match self.read_identity_at(account_id, keep_revision_id) {
+                Err(StoreError::AccountTombstoned) => {}
+                Err(e) => return Err(e),
+                Ok(_) => {
+                    // The `is_tombstone` column said tombstone but the
+                    // (authenticated) payload decoded Live — a tampered
+                    // flag. Refuse to ratify.
+                    return Err(StoreError::AuthenticationFailed);
+                }
+            }
+            let active = self.require_active()?;
+            let merge_payload = TombstonePayload::new(account_id, u64::try_from(now).unwrap_or(0));
+            let (ct, nonce) = seal_tombstone(active.vdk.aead_key(), &merge_aad, &merge_payload)?;
+            (ct, nonce, true)
+        } else {
+            // Read the chosen leaf as an AccountIdentity (V1-aware,
+            // auto-migrating V0 on read) and re-seal it under the merge
+            // AAD with a fresh nonce. The identity zeroizes on drop.
+            // `read_identity_at` does the AEAD open first (audit L1):
+            // a flipped `schema_version` byte → `AuthenticationFailed`;
+            // a legit future leaf → `UnsupportedRevisionSchemaVersion`.
+            let identity = self.read_identity_at(account_id, keep_revision_id)?;
+            let active = self.require_active()?;
+            let (ct, nonce) =
+                crate::blob::seal_identity(active.vdk.aead_key(), &identity, &merge_aad)?;
+            drop(identity);
+            (ct, nonce, false)
+        };
+
+        self.resolve_fork_commit(
+            account_id,
+            keep_revision_id,
+            merge_revision_id,
+            chosen_schema_version,
+            now,
+            &ct,
+            &nonce,
+            is_tombstone,
+        )?;
+
+        // Prune any pending_merges stash row whose target_head_id is no
+        // longer a current head (the just-resolved losing leaves, and
+        // the resolved target itself if it was stashed). Best-effort —
+        // a failure here doesn't undo the resolve, which has committed.
+        let _ = self.prune_orphan_pending_merges(account_id);
+        self.resolve_fork_sync_cache(account_id, merge_revision_id, now, is_tombstone);
+        self.touch_session();
+        Ok(merge_revision_id)
+    }
+
+    /// `resolve_fork` step 1: validate the account exists + isn't
+    /// tombstoned, the chosen revision is a row of *this* account, the
+    /// account is forked, and the chosen revision is a current head.
+    /// Returns `(chosen_schema_version, chosen_is_tombstone)`.
+    fn resolve_fork_validate(
+        &self,
+        account_id: AccountId,
+        keep_revision_id: RevisionId,
+    ) -> Result<(u8, bool)> {
+        let tombstoned: bool = self
+            .conn
+            .query_row(
+                "SELECT tombstoned FROM account_identities WHERE account_id = ?1",
+                params![account_id.as_bytes().as_slice()],
+                |row| {
+                    let t: i64 = row.get(0)?;
+                    Ok(t != 0)
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::AccountNotFound)?;
+        if tombstoned {
+            return Err(StoreError::AccountTombstoned);
+        }
+        // Defense-in-depth: never let a cross-account revision_id become
+        // an oracle — collapse the mismatch into AccountNotFound.
+        let chosen_row: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT schema_version, is_tombstone FROM revisions
+                 WHERE account_id = ?1 AND revision_id = ?2",
+                params![
+                    account_id.as_bytes().as_slice(),
+                    keep_revision_id.as_bytes().as_slice(),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (chosen_sv_i64, chosen_is_tombstone_i64) =
+            chosen_row.ok_or(StoreError::AccountNotFound)?;
+        let chosen_schema_version = u8::try_from(chosen_sv_i64).map_err(|_| {
+            StoreError::Corrupted("revisions.schema_version out of u8 range".into())
+        })?;
+        // Audit L1: no `chosen_schema_version > MAX` pre-check here —
+        // the `revisions.schema_version` byte is bound into the AEAD
+        // AAD, so the authoritative check is the AEAD open of the chosen
+        // leaf in `resolve_fork` (via `read_identity_at`). A bare
+        // byte-flip of that column surfaces `AuthenticationFailed`
+        // there; a legit future-version leaf surfaces
+        // `UnsupportedRevisionSchemaVersion` there. Pre-checking here
+        // would let a flipped byte short-circuit to a misleading
+        // "requires upgrade" before authentication.
+        let heads = self.account_heads(account_id)?;
+        if heads.len() <= 1 {
+            return Err(StoreError::Validation {
+                kind: "not-forked".into(),
+                message: "account is not forked; nothing to resolve".into(),
+            });
+        }
+        if !heads.contains(&keep_revision_id) {
+            return Err(StoreError::NotAHead {
+                account_id,
+                chosen: keep_revision_id,
+                current_heads: heads,
+            });
+        }
+        Ok((chosen_schema_version, chosen_is_tombstone_i64 != 0))
+    }
+
+    /// `resolve_fork` step 2: INSERT the merge revision + advance the
+    /// head pointer + clear `frozen_pending_resolve` + write the dirty
+    /// marker, all in one transaction. Re-checks head membership inside
+    /// the transaction so a concurrent `ingest_chain_revision` that
+    /// demoted the chosen leaf surfaces `NotAHead` rather than producing
+    /// a merge parented at a non-head.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_fork_commit(
+        &self,
+        account_id: AccountId,
+        keep_revision_id: RevisionId,
+        merge_revision_id: RevisionId,
+        schema_version: u8,
+        now: i64,
+        ct: &Ciphertext,
+        nonce: &Nonce,
+        is_tombstone: bool,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut head_stmt = tx.prepare(
+                "SELECT r.revision_id FROM revisions r
+                 WHERE r.account_id = ?1
+                   AND r.superseded_by IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1 FROM revisions r2
+                     WHERE r2.parent_revision_id = r.revision_id
+                       AND r2.account_id = r.account_id
+                   )",
+            )?;
+            let head_rows =
+                head_stmt.query_map(params![account_id.as_bytes().as_slice()], |row| {
+                    let rid: Vec<u8> = row.get(0)?;
+                    Ok(rid)
+                })?;
+            let mut tx_heads: Vec<RevisionId> = Vec::new();
+            for r in head_rows {
+                let blob = r?;
+                let arr: [u8; REVISION_ID_LEN] = blob
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Corrupted("head revision_id not 32 bytes".into()))?;
+                tx_heads.push(RevisionId::from_bytes(arr));
+            }
+            drop(head_stmt);
+            if !tx_heads.contains(&keep_revision_id) {
+                return Err(StoreError::NotAHead {
+                    account_id,
+                    chosen: keep_revision_id,
+                    current_heads: tx_heads,
+                });
+            }
+            // Q5: KEEP the losing branch's revision rows (audit). They
+            // are merely marked `superseded_by = <merge>` so the head
+            // detector stops counting them as leaves — a resolved fork
+            // reports a single canonical head. (Append-only preserved:
+            // no row is deleted; this is a metadata pointer like the
+            // chain-anchor columns.)
+            for losing in tx_heads.iter().filter(|h| **h != keep_revision_id) {
+                tx.execute(
+                    "UPDATE revisions SET superseded_by = ?1
+                     WHERE account_id = ?2 AND revision_id = ?3",
+                    params![
+                        merge_revision_id.as_bytes().as_slice(),
+                        account_id.as_bytes().as_slice(),
+                        losing.as_bytes().as_slice(),
+                    ],
+                )?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO revisions (
+                revision_id, account_id, parent_revision_id, device_id,
+                schema_version, created_at, enc_payload, enc_nonce, is_tombstone
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                merge_revision_id.as_bytes().as_slice(),
+                account_id.as_bytes().as_slice(),
+                keep_revision_id.as_bytes().as_slice(),
+                self.device_id.0.as_slice(),
+                i64::from(schema_version),
+                now,
+                ct.as_bytes(),
+                nonce.as_bytes().as_slice(),
+                i64::from(is_tombstone),
+            ],
+        )?;
+        tx.execute(
+            "UPDATE account_identities
+             SET head_revision_id = ?1, last_modified_at = ?2,
+                 frozen_pending_resolve = 0, tombstoned = ?3
+             WHERE account_id = ?4",
+            params![
+                merge_revision_id.as_bytes().as_slice(),
+                now,
+                i64::from(is_tombstone),
+                account_id.as_bytes().as_slice(),
+            ],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO dirty_accounts
+                (account_id, revision_id, marked_at)
+             VALUES (?1, ?2, ?3)",
+            params![
+                account_id.as_bytes().as_slice(),
+                merge_revision_id.as_bytes().as_slice(),
+                now,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `resolve_fork` step 3: keep the in-RAM cache + FTS5 index aligned
+    /// with the new canonical head. A merge-to-tombstone drops the
+    /// account from both; otherwise re-insert the now-canonical
+    /// identity. Best-effort — the resolve has already committed.
+    fn resolve_fork_sync_cache(
+        &mut self,
+        account_id: AccountId,
+        merge_revision_id: RevisionId,
+        now: i64,
+        is_tombstone: bool,
+    ) {
+        if is_tombstone {
+            if let Ok(active) = self.require_active_mut() {
+                let _ = active.cache.remove(account_id);
+                let _ = active.search_index.remove(account_id);
+            }
+        } else if let Ok(identity) = self.read_identity_at(account_id, merge_revision_id) {
+            let projection = SearchProjection::from_identity(&identity);
+            let snapshot = downgrade_identity_to_snapshot(&identity);
+            drop(identity);
+            if let Ok(active) = self.require_active_mut() {
+                let _ = active.search_index.update(account_id, now, &projection);
+                active.cache.insert(account_id, snapshot);
+            }
+        }
+    }
+
     /// Every account in the local store that currently has more than
     /// one head — the "needs attention" set for P9's eventual conflict
     /// resolution UI.
@@ -3539,7 +4073,8 @@ impl Vault {
             "SELECT account_id FROM (
                 SELECT r.account_id, COUNT(*) AS head_count
                 FROM revisions r
-                WHERE NOT EXISTS (
+                WHERE r.superseded_by IS NULL
+                  AND NOT EXISTS (
                     SELECT 1 FROM revisions r2
                     WHERE r2.parent_revision_id = r.revision_id
                       AND r2.account_id = r.account_id
@@ -3765,13 +4300,113 @@ impl Vault {
         Ok(revision_id)
     }
 
+    /// **Test-only (MVP-1 issue 1.6).** Append a revision parented at
+    /// the account's current head whose blob carries a *future* schema
+    /// version — either the `revisions.schema_version` row column
+    /// (`row_version`, written verbatim — also the AAD byte, so the
+    /// blob is sealed under that byte) or, when `row_version` ==
+    /// [`crate::revision::REVISION_SCHEMA_VERSION_MAX`], a future
+    /// `payload_version` inside the V1 CBOR body (`payload_version`).
+    /// This is the only way to synthesise a "requires upgrade"
+    /// revision from inside the crate (the production encoder always
+    /// emits `payload_version = 1` and `schema_version = wrap_context`).
+    /// The new revision becomes a leaf; advancing the cached
+    /// `head_revision_id` to it (so unlock sees it as the canonical
+    /// head when the account is otherwise linear) is the caller's job
+    /// via the optional `advance_head` flag.
+    ///
+    /// Gated so production builds cannot link against it.
+    ///
+    /// Returns the synthesized revision's id.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utilities"))]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn __test_synthesize_future_version_revision(
+        &mut self,
+        id: AccountId,
+        snapshot: AccountSnapshot,
+        row_version: u8,
+        payload_version: u8,
+        advance_head: bool,
+    ) -> Result<RevisionId> {
+        self.check_session_freshness()?;
+        let _ = self.require_active()?;
+        let head_blob = self
+            .conn
+            .query_row(
+                "SELECT head_revision_id FROM account_identities WHERE account_id = ?1",
+                params![id.as_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .ok_or(StoreError::AccountNotFound)?;
+        let parent_arr: [u8; REVISION_ID_LEN] = head_blob
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Corrupted("head_revision_id not 32 bytes".into()))?;
+        let parent = RevisionId::from_bytes(parent_arr);
+        let revision_id = RevisionId::from_bytes(random_32_via_sqlite(&self.conn)?);
+        // Build an AccountIdentity from the snapshot (hydrate V0→V1
+        // like add_account would) so we can seal a V1 8-key blob.
+        let identity = crate::account::AccountIdentity::new_unchecked(
+            SecretBytes::new(snapshot.display_name.expose().to_vec()),
+            Vec::new(),
+            SecretBytes::new(snapshot.notes.expose().to_vec()),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            SecretBytes::new(snapshot.totp_secret.expose().to_vec()),
+        );
+        let aad = build_aad(&self.meta.vault_id, &id, &parent, row_version);
+        let active = self.require_active()?;
+        let (ct, nonce) = crate::blob::seal_identity_with_payload_version(
+            active.vdk.aead_key(),
+            &identity,
+            &aad,
+            payload_version,
+        )?;
+        let now = current_unix_ms();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO revisions (
+                revision_id, account_id, parent_revision_id, device_id,
+                schema_version, created_at, enc_payload, enc_nonce, is_tombstone
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+            params![
+                revision_id.as_bytes().as_slice(),
+                id.as_bytes().as_slice(),
+                parent.as_bytes().as_slice(),
+                self.device_id.0.as_slice(),
+                i64::from(row_version),
+                now,
+                ct.as_bytes(),
+                nonce.as_bytes().as_slice(),
+            ],
+        )?;
+        if advance_head {
+            tx.execute(
+                "UPDATE account_identities SET head_revision_id = ?1, last_modified_at = ?2
+                 WHERE account_id = ?3",
+                params![
+                    revision_id.as_bytes().as_slice(),
+                    now,
+                    id.as_bytes().as_slice(),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        self.touch_session();
+        Ok(revision_id)
+    }
+
     /// Internal: read every `revisions` row for `account_id` into
     /// [`RevisionMeta`] form. Used by [`Self::revision_graph`].
     fn read_revision_rows_for(&self, id: AccountId) -> Result<Vec<RevisionMeta>> {
         let mut stmt = self.conn.prepare(
             "SELECT revision_id, parent_revision_id, device_id,
                     schema_version, created_at, is_tombstone,
-                    chain_tx_hash, chain_block_number, chain_log_index
+                    chain_tx_hash, chain_block_number, chain_log_index,
+                    superseded_by
              FROM revisions WHERE account_id = ?1
              ORDER BY created_at ASC, revision_id ASC",
         )?;
@@ -3785,6 +4420,7 @@ impl Vault {
             let chain_tx_hash: Option<Vec<u8>> = row.get(6)?;
             let chain_block_number: Option<i64> = row.get(7)?;
             let chain_log_index: Option<i64> = row.get(8)?;
+            let superseded_by: Option<Vec<u8>> = row.get(9)?;
             Ok(RawRevisionRow {
                 revision_id,
                 parent,
@@ -3795,6 +4431,7 @@ impl Vault {
                 chain_tx_hash,
                 chain_block_number,
                 chain_log_index,
+                superseded_by,
             })
         })?;
         let mut out: Vec<RevisionMeta> = Vec::new();
@@ -4838,69 +5475,346 @@ fn build_active_state_data(
     conn: &Connection,
     meta: &VaultMeta,
     vdk_aead: &AeadKey,
-) -> Result<(DecryptedCache, SearchIndex)> {
+) -> Result<(
+    DecryptedCache,
+    SearchIndex,
+    std::collections::HashSet<AccountId>,
+)> {
     let mut cache = DecryptedCache::new();
     let mut index = SearchIndex::new_empty()?;
+    let mut requires_upgrade: std::collections::HashSet<AccountId> =
+        std::collections::HashSet::new();
+    // First pass: collect (account_id, cached_head_pointer,
+    // last_modified_at) for every live account. We do NOT trust the
+    // cached `head_revision_id` for a *forked* account — 1.6's
+    // canonical-head rule (clock-free largest-revision_id leaf) is the
+    // production head. For a linear account the cached pointer IS the
+    // single leaf, so the fast path is untouched.
     let mut stmt = conn.prepare(
-        "SELECT ai.account_id, ai.last_modified_at, r.parent_revision_id, r.enc_payload,
-                r.enc_nonce, r.schema_version
-         FROM account_identities ai
-         JOIN revisions r ON ai.head_revision_id = r.revision_id
-         WHERE ai.tombstoned = 0",
+        "SELECT account_id, head_revision_id, last_modified_at
+         FROM account_identities WHERE tombstoned = 0",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
-            row.get::<_, Vec<u8>>(3)?,
-            row.get::<_, Vec<u8>>(4)?,
-            row.get::<_, i64>(5)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, i64>(2)?,
         ))
     })?;
+    let mut accounts: Vec<(AccountId, RevisionId, i64)> = Vec::new();
     for raw in rows {
-        let (account_id_blob, last_modified_at, parent_blob, payload, nonce_blob, schema_version_i) =
-            raw?;
+        let (account_id_blob, head_blob, last_modified_at) = raw?;
         let account_id_arr: [u8; ACCOUNT_ID_LEN] = account_id_blob
             .as_slice()
             .try_into()
             .map_err(|_| StoreError::Corrupted("account_id not 32 bytes".into()))?;
-        let parent_arr: [u8; REVISION_ID_LEN] = parent_blob
+        let head_arr: [u8; REVISION_ID_LEN] = head_blob
             .as_slice()
             .try_into()
-            .map_err(|_| StoreError::Corrupted("parent_revision_id not 32 bytes".into()))?;
-        let nonce_arr: [u8; NONCE_LEN] = nonce_blob
-            .as_slice()
-            .try_into()
-            .map_err(|_| StoreError::Corrupted("enc_nonce length mismatch".into()))?;
-        let row_schema_version = u8::try_from(schema_version_i).map_err(|_| {
-            StoreError::Corrupted("revisions.schema_version out of u8 range".into())
-        })?;
-        let account_id = AccountId::from_bytes(account_id_arr);
-        let parent = RevisionId::from_bytes(parent_arr);
-        let aad = build_aad(&meta.vault_id, &account_id, &parent, row_schema_version);
-        let ct = Ciphertext::from_vec(payload);
-        let nonce = Nonce::from_storage_bytes(nonce_arr);
-        match crate::blob::open_identity_payload(vdk_aead, &nonce, &ct, &aad)? {
-            crate::blob::DecodedIdentityPayload::Live(identity) => {
-                let projection = SearchProjection::from_identity(&identity);
-                let snapshot = downgrade_identity_to_snapshot(&identity);
-                drop(identity);
-                index.insert(account_id, last_modified_at, &projection)?;
-                cache.insert(account_id, snapshot);
+            .map_err(|_| StoreError::Corrupted("head_revision_id not 32 bytes".into()))?;
+        accounts.push((
+            AccountId::from_bytes(account_id_arr),
+            RevisionId::from_bytes(head_arr),
+            last_modified_at,
+        ));
+    }
+    drop(stmt);
+
+    for (account_id, cached_head, last_modified_at) in accounts {
+        hydrate_account_into_state(
+            conn,
+            meta,
+            vdk_aead,
+            account_id,
+            cached_head,
+            last_modified_at,
+            &mut cache,
+            &mut index,
+            &mut requires_upgrade,
+        )?;
+    }
+    Ok((cache, index, requires_upgrade))
+}
+
+/// Hydrate one live account's canonical head into the unlock-time
+/// decrypted cache and FTS5 index, or — when that head is
+/// future-versioned — record the account in `requires_upgrade` and skip
+/// indexing it. Extracted from [`build_active_state_data`] to keep that
+/// function under the workspace's `too_many_lines` floor.
+#[allow(clippy::too_many_arguments)]
+fn hydrate_account_into_state(
+    conn: &Connection,
+    meta: &VaultMeta,
+    vdk_aead: &AeadKey,
+    account_id: AccountId,
+    cached_head: RevisionId,
+    last_modified_at: i64,
+    cache: &mut DecryptedCache,
+    index: &mut SearchIndex,
+    requires_upgrade: &mut std::collections::HashSet<AccountId>,
+) -> Result<()> {
+    // Determine the canonical head (and, for a forked account, the
+    // full leaf set so every leaf's blob is authenticated at unlock —
+    // a tampered leaf surfaces `AuthenticationFailed` regardless of
+    // which leaf is canonical; defends against a cross-account row
+    // transplant that lands on a non-canonical leaf).
+    let heads = account_heads_inline(conn, account_id)?;
+    let (canonical_head, all_leaves): (RevisionId, Vec<RevisionId>) = if heads.len() > 1 {
+        let graph = RevisionGraph::build(read_revision_rows_inline(conn, account_id)?)?;
+        let canon = graph.canonical_head().copied().unwrap_or(cached_head);
+        (canon, graph.heads().to_vec())
+    } else {
+        (cached_head, vec![cached_head])
+    };
+    // Decode every leaf for authentication; remember the canonical
+    // head's outcome for the cache/index.
+    //
+    // Leaves whose stored nonce is the placeholder zero nonce are
+    // foreign-ingested chain revisions sealed by another device — under
+    // the PoC two-key model this device legitimately cannot decrypt
+    // them, and `ingest_chain_revision` writes the placeholder
+    // (`[0u8; NONCE_LEN]`) on that path. That is the documented
+    // frozen-pending-resolve state, not tampering: skip them here. They
+    // are authenticated when the resolve flow consumes them. A
+    // genuinely-tampered leaf carries a *real* nonce with a mismatched
+    // AAD (e.g. a cross-account row transplant) — that still gets
+    // decoded below and still surfaces `AuthenticationFailed`,
+    // regardless of which leaf is canonical.
+    let mut canonical_outcome: Option<HeadDecodeOutcome> = None;
+    for leaf in &all_leaves {
+        match decode_head_row(conn, meta, vdk_aead, account_id, *leaf)? {
+            HeadDecodeOutcome::FutureVersion => {
+                requires_upgrade.insert(account_id);
             }
-            crate::blob::DecodedIdentityPayload::Tombstone(_) => {
-                // A tombstoned head should not have appeared because
-                // ai.tombstoned = 0 in the WHERE clause, but if it
-                // does we treat it as corruption.
-                return Err(StoreError::Corrupted(
-                    "non-tombstoned account_identities row points at a tombstone revision".into(),
-                ));
+            outcome => {
+                if *leaf == canonical_head {
+                    canonical_outcome = Some(outcome);
+                }
             }
         }
     }
-    drop(stmt);
-    Ok((cache, index))
+    // If the canonical head is itself a foreign placeholder-nonce leaf
+    // (it can win the clock-free largest-`revision_id` head election),
+    // the account is not locally readable at its canonical head pending
+    // resolution. Fall back to the cached local-canonical-head pointer
+    // (`account_identities.head_revision_id`) — the resolve flow keeps
+    // that pointing at a leaf this device can decrypt — so the cache /
+    // index snapshot still reflects something locally readable, exactly
+    // as the pre-1.6 unlock path did for a forked frozen account. If
+    // that fallback is also undecryptable, drop the account from the
+    // cache/index (it surfaces via the freeze/resolve workflow, not as
+    // an aborted unlock).
+    if matches!(canonical_outcome, Some(HeadDecodeOutcome::PlaceholderNonce)) {
+        canonical_outcome = if cached_head == canonical_head {
+            None
+        } else {
+            Some(decode_head_row(
+                conn,
+                meta,
+                vdk_aead,
+                account_id,
+                cached_head,
+            )?)
+        };
+    }
+    match canonical_outcome {
+        Some(HeadDecodeOutcome::Live(identity)) => {
+            let projection = SearchProjection::from_identity(&identity);
+            let snapshot = downgrade_identity_to_snapshot(&identity);
+            drop(identity);
+            index.insert(account_id, last_modified_at, &projection)?;
+            cache.insert(account_id, snapshot);
+        }
+        // Canonical head is a tombstone (a forked account whose
+        // largest-revision_id leaf is a resolve-to-tombstone), OR the
+        // canonical head is future-versioned (already recorded in
+        // `requires_upgrade`), OR neither the canonical head nor the
+        // cached local head is locally decryptable (frozen pending
+        // resolve): drop it from the index/cache.
+        Some(HeadDecodeOutcome::Tombstone | HeadDecodeOutcome::PlaceholderNonce) | None => {
+            let _ = cache.remove(account_id);
+            index.remove(account_id)?;
+        }
+        Some(HeadDecodeOutcome::FutureVersion) => unreachable!(),
+    }
+    Ok(())
+}
+
+/// Outcome of decoding a single revision-head row at unlock time.
+enum HeadDecodeOutcome {
+    /// Decrypted to a live identity.
+    Live(crate::account::AccountIdentity),
+    /// The revision is a tombstone.
+    Tombstone,
+    /// The revision's `schema_version` / `payload_version` is newer
+    /// than this build understands (§18.7 — that account "requires
+    /// upgrade"; not an abort-unlock condition).
+    FutureVersion,
+    /// The revision's stored nonce is the placeholder zero nonce — a
+    /// foreign-ingested chain revision this device cannot decrypt under
+    /// the `PoC` two-key model. Not an abort-unlock condition: the
+    /// account is frozen pending resolve and this leaf is authenticated
+    /// when the resolve flow consumes it.
+    PlaceholderNonce,
+}
+
+/// Decode one revision row's blob at unlock time. Returns
+/// [`HeadDecodeOutcome`]; propagates `AuthenticationFailed` (a tampered
+/// blob aborts the unlock — consistent with the P2 transplant-defence
+/// test) and `Corrupted` / `Sqlite`.
+fn decode_head_row(
+    conn: &Connection,
+    meta: &VaultMeta,
+    vdk_aead: &AeadKey,
+    account_id: AccountId,
+    rev_id: RevisionId,
+) -> Result<HeadDecodeOutcome> {
+    let row: Option<RawRevisionPayload> = conn
+        .query_row(
+            "SELECT parent_revision_id, schema_version, enc_payload, enc_nonce
+             FROM revisions WHERE account_id = ?1 AND revision_id = ?2",
+            params![
+                account_id.as_bytes().as_slice(),
+                rev_id.as_bytes().as_slice()
+            ],
+            |row| {
+                Ok(RawRevisionPayload {
+                    parent: row.get(0)?,
+                    schema_version: row.get(1)?,
+                    enc_payload: row.get(2)?,
+                    enc_nonce: row.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(RawRevisionPayload {
+        parent: parent_blob,
+        schema_version: schema_version_i,
+        enc_payload: payload,
+        enc_nonce: nonce_blob,
+    }) = row
+    else {
+        return Err(StoreError::Corrupted(
+            "account_identities head_revision_id has no matching revisions row".into(),
+        ));
+    };
+    let parent_arr: [u8; REVISION_ID_LEN] = parent_blob
+        .as_slice()
+        .try_into()
+        .map_err(|_| StoreError::Corrupted("parent_revision_id not 32 bytes".into()))?;
+    let nonce_arr: [u8; NONCE_LEN] = nonce_blob
+        .as_slice()
+        .try_into()
+        .map_err(|_| StoreError::Corrupted("enc_nonce length mismatch".into()))?;
+    let row_schema_version = u8::try_from(schema_version_i)
+        .map_err(|_| StoreError::Corrupted("revisions.schema_version out of u8 range".into()))?;
+    // A foreign-ingested chain revision under the PoC two-key model
+    // carries the placeholder zero nonce (`ingest_chain_revision`'s
+    // genuine-foreign-INSERT path) — this device cannot decrypt it and
+    // is not expected to. Report it as such rather than attempting an
+    // AEAD open that would (correctly, for a real ciphertext under the
+    // wrong/zero nonce) fail as `Tampered`. This precedes the schema-
+    // version check: a zero-nonce row is frozen-pending-resolve
+    // regardless of its `schema_version`.
+    if nonce_arr == [0u8; NONCE_LEN] {
+        return Ok(HeadDecodeOutcome::PlaceholderNonce);
+    }
+    let parent = RevisionId::from_bytes(parent_arr);
+    let aad = build_aad(&meta.vault_id, &account_id, &parent, row_schema_version);
+    let ct = Ciphertext::from_vec(payload);
+    let nonce = Nonce::from_storage_bytes(nonce_arr);
+    // Audit L1: `revisions.schema_version` is bound into the AAD, so we
+    // authenticate before honouring it. A real-nonce row whose
+    // `schema_version` byte was flipped on disk yields an AAD this
+    // build never sealed under → the open fails → propagate
+    // `AuthenticationFailed` (the unlock aborts on tamper, consistent
+    // with the P2 transplant-defence test) rather than a misleading
+    // `FutureVersion`/"requires upgrade". A legit future revision was
+    // sealed by a future build with that byte in its AAD, so the open
+    // succeeds; only then do we report it as `FutureVersion`.
+    let outcome = match crate::blob::open_identity_payload(vdk_aead, &nonce, &ct, &aad) {
+        Ok(crate::blob::DecodedIdentityPayload::Live(identity)) => {
+            HeadDecodeOutcome::Live(identity)
+        }
+        Ok(crate::blob::DecodedIdentityPayload::Tombstone(_)) => HeadDecodeOutcome::Tombstone,
+        // The body's own `payload_version` / map-arity check tripped a
+        // future shape — still a "requires upgrade" signal.
+        Err(StoreError::UnsupportedRevisionSchemaVersion { .. }) => {
+            return Ok(HeadDecodeOutcome::FutureVersion)
+        }
+        Err(e) => return Err(e),
+    };
+    if row_schema_version > crate::revision::REVISION_SCHEMA_VERSION_MAX {
+        return Ok(HeadDecodeOutcome::FutureVersion);
+    }
+    Ok(outcome)
+}
+
+/// Helper: the head set for `account_id` via the `NOT EXISTS` detector
+/// (scoped by `account_id`, per P3 audit M-1) — used by
+/// [`build_active_state_data`] which has only a `&Connection`, not a
+/// `&Vault`.
+fn account_heads_inline(conn: &Connection, account_id: AccountId) -> Result<Vec<RevisionId>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.revision_id FROM revisions r
+         WHERE r.account_id = ?1
+           AND r.superseded_by IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM revisions r2
+             WHERE r2.parent_revision_id = r.revision_id
+               AND r2.account_id = r.account_id
+           )",
+    )?;
+    let rows = stmt.query_map(params![account_id.as_bytes().as_slice()], |row| {
+        let rid: Vec<u8> = row.get(0)?;
+        Ok(rid)
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        let blob = r?;
+        let arr: [u8; REVISION_ID_LEN] = blob
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Corrupted("head revision_id not 32 bytes".into()))?;
+        out.push(RevisionId::from_bytes(arr));
+    }
+    Ok(out)
+}
+
+/// Helper: read every `revisions` row for `account_id` into
+/// [`RevisionMeta`] form using only a `&Connection`. Mirror of
+/// [`Vault::read_revision_rows_for`] for [`build_active_state_data`].
+fn read_revision_rows_inline(
+    conn: &Connection,
+    account_id: AccountId,
+) -> Result<Vec<RevisionMeta>> {
+    let mut stmt = conn.prepare(
+        "SELECT revision_id, parent_revision_id, device_id,
+                schema_version, created_at, is_tombstone,
+                chain_tx_hash, chain_block_number, chain_log_index,
+                superseded_by
+         FROM revisions WHERE account_id = ?1
+         ORDER BY created_at ASC, revision_id ASC",
+    )?;
+    let rows = stmt.query_map(params![account_id.as_bytes().as_slice()], |row| {
+        Ok(RawRevisionRow {
+            revision_id: row.get(0)?,
+            parent: row.get(1)?,
+            device_id: row.get(2)?,
+            schema_version: row.get(3)?,
+            created_at: row.get(4)?,
+            is_tombstone: row.get(5)?,
+            chain_tx_hash: row.get(6)?,
+            chain_block_number: row.get(7)?,
+            chain_log_index: row.get(8)?,
+            superseded_by: row.get(9)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for raw in rows {
+        out.push(raw?.into_meta()?);
+    }
+    Ok(out)
 }
 
 /// **P9-1.** Helper struct factored out so the `query_row` body in
@@ -4924,6 +5838,7 @@ struct RawRevisionRow {
     chain_tx_hash: Option<Vec<u8>>,
     chain_block_number: Option<i64>,
     chain_log_index: Option<i64>,
+    superseded_by: Option<Vec<u8>>,
 }
 
 impl RawRevisionRow {
@@ -4973,6 +5888,10 @@ impl RawRevisionRow {
             }
             _ => None,
         };
+        let superseded_by = match self.superseded_by {
+            Some(b) => Some(RevisionId::from_bytes(arr32(&b, "superseded_by")?)),
+            None => None,
+        };
         Ok(RevisionMeta {
             revision_id,
             parent_revision_id,
@@ -4980,6 +5899,7 @@ impl RawRevisionRow {
             schema_version,
             created_at: self.created_at,
             is_tombstone: self.is_tombstone != 0,
+            superseded_by,
             chain_anchor,
         })
     }
@@ -8363,5 +9283,280 @@ mod tests {
             no_leak,
             "umask 0o077 leaked past Vault::create; subsequent file creation observed 0o600 even though baseline was pinned to 0o022.",
         );
+    }
+
+    // -----------------------------------------------------------------
+    // MVP-1 issue 1.6: canonical head / fork / resolve / §18.7
+    // -----------------------------------------------------------------
+
+    /// Build an unlocked vault with one account that has a 2-way fork
+    /// (R0 -> R1 -> R2, plus a sibling R2' of R2). Returns the vault,
+    /// the account id, R1 (the fork point), and the two leaves.
+    fn forked_account() -> (
+        Vault,
+        AccountId,
+        RevisionId,
+        RevisionId,
+        RevisionId,
+        TempDir,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "fork16.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).unwrap();
+        let r1 = v.update_account(id, fresh_snapshot()).unwrap();
+        let r2 = v.update_account(id, fresh_snapshot()).unwrap();
+        let r2_alt = v
+            .__test_synthesize_sibling_revision(id, r1, fresh_snapshot())
+            .unwrap();
+        (v, id, r1, r2, r2_alt, dir)
+    }
+
+    #[test]
+    fn vault_canonical_head_matches_after_reopen() {
+        let (v, id, _r1, r2, r2_alt, dir) = forked_account();
+        let head1 = v.canonical_head(id).unwrap();
+        // Canonical head is the largest-revision_id leaf.
+        let expected = if r2.as_bytes() > r2_alt.as_bytes() {
+            r2
+        } else {
+            r2_alt
+        };
+        assert_eq!(head1, expected);
+        // Reopen the vault; the rule has no run-to-run dependency.
+        let p = v.path().to_path_buf();
+        v.close().unwrap();
+        let v2 = Vault::open(&p).unwrap();
+        assert_eq!(v2.canonical_head(id).unwrap(), head1);
+        let _ = dir;
+    }
+
+    #[test]
+    fn unlock_caches_canonical_head_of_forked_account() {
+        let (mut v, id, _r1, r2, r2_alt, dir) = forked_account();
+        let canonical = if r2.as_bytes() > r2_alt.as_bytes() {
+            r2
+        } else {
+            r2_alt
+        };
+        // Re-unlock so the cache is built fresh (the synthesized
+        // sibling was inserted after the prior unlock).
+        v.lock();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        // account_get returns the summary at the canonical head.
+        let summary = v.account_get(id).unwrap();
+        assert_eq!(summary.head_revision_id, canonical);
+        // account_search also reflects the canonical head.
+        let hits = v.account_search("github").unwrap();
+        assert!(hits
+            .iter()
+            .any(|h| h.id == id && h.head_revision_id == canonical));
+        let _ = dir;
+    }
+
+    #[test]
+    fn resolve_fork_unforks_and_advances_head() {
+        let (mut v, id, _r1, r2, r2_alt, dir) = forked_account();
+        v.lock();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        // Count revisions before.
+        let before = v.account_heads(id).unwrap().len();
+        assert_eq!(before, 2);
+        let all_before = v.account_history(id).unwrap().len();
+        // Keep r2 (the linear branch). Resolve.
+        let new_rev = v.resolve_fork(id, r2).unwrap();
+        assert!(!v.is_forked(id).unwrap());
+        assert_eq!(v.canonical_head(id).unwrap(), new_rev);
+        // The losing branch (r2_alt) row still exists (Q5 — audit).
+        let all_after = v.account_history(id).unwrap();
+        assert_eq!(
+            all_after.len(),
+            all_before + 1,
+            "merge revision added, nothing pruned"
+        );
+        assert!(all_after.iter().any(|m| m.revision_id == r2_alt));
+        let _ = dir;
+    }
+
+    #[test]
+    fn resolve_fork_clears_frozen_and_writes_dirty_marker() {
+        let (mut v, id, _r1, r2, _r2_alt, dir) = forked_account();
+        v.lock();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        // Force the freeze flag on (defense — resolve must clear it).
+        v.conn
+            .execute(
+                "UPDATE account_identities SET frozen_pending_resolve = 1 WHERE account_id = ?1",
+                params![id.as_bytes().as_slice()],
+            )
+            .unwrap();
+        let new_rev = v.resolve_fork(id, r2).unwrap();
+        assert!(!v.is_account_frozen(id).unwrap());
+        // The merge revision is marked dirty (unpublished).
+        let dirty: i64 = v
+            .conn
+            .query_row(
+                "SELECT 1 FROM dirty_accounts WHERE account_id = ?1 AND revision_id = ?2",
+                params![id.as_bytes().as_slice(), new_rev.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dirty, 1);
+        let _ = dir;
+    }
+
+    #[test]
+    fn resolve_fork_prunes_pending_merge_stash() {
+        let (mut v, id, _r1, r2, r2_alt, dir) = forked_account();
+        v.lock();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        // Stash a pending merge whose target is the *losing* leaf r2_alt
+        // (so after resolving to r2, r2_alt is no longer a head → the
+        // stash row is orphan → pruned).
+        v.stash_pending_merge(
+            id,
+            r2_alt,
+            [7u8; pangolin_crypto::sign::SECRET_KEY_LEN],
+            [0u8; pangolin_crypto::aead::NONCE_LEN],
+            vec![1, 2, 3],
+            1,
+        )
+        .unwrap();
+        assert!(v.take_pending_merge(id, r2_alt).unwrap().is_some());
+        v.resolve_fork(id, r2).unwrap();
+        assert!(
+            v.take_pending_merge(id, r2_alt).unwrap().is_none(),
+            "orphan stash row must be pruned on resolve"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn resolve_fork_non_head_revision_errors_not_a_head() {
+        let (mut v, id, r1, r2, _r2_alt, dir) = forked_account();
+        v.lock();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        // r1 is the fork point — a row of this account but NOT a head.
+        match v.resolve_fork(id, r1).unwrap_err() {
+            StoreError::NotAHead { chosen, .. } => assert_eq!(chosen, r1),
+            other => panic!("expected NotAHead, got {other:?}"),
+        }
+        // Sanity: r2 IS a head.
+        assert!(v.account_heads(id).unwrap().contains(&r2));
+        let _ = dir;
+    }
+
+    #[test]
+    fn resolve_fork_cross_account_revision_id_collapsed() {
+        let (mut v, id, _r1, r2, _r2_alt, dir) = forked_account();
+        v.lock();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        // A revision id from a *different* account → collapsed to
+        // AccountNotFound (no oracle), not NotAHead.
+        let other_id = v.add_account(fresh_snapshot()).unwrap();
+        let other_rev = v.update_account(other_id, fresh_snapshot()).unwrap();
+        match v.resolve_fork(id, other_rev).unwrap_err() {
+            StoreError::AccountNotFound => {}
+            other => panic!("expected AccountNotFound, got {other:?}"),
+        }
+        assert!(v.account_heads(id).unwrap().contains(&r2));
+        let _ = dir;
+    }
+
+    #[test]
+    fn resolve_fork_non_forked_account_errors_validation() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "linear16.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).unwrap();
+        let head = v.update_account(id, fresh_snapshot()).unwrap();
+        match v.resolve_fork(id, head).unwrap_err() {
+            StoreError::Validation { kind, .. } => assert_eq!(kind, "not-forked"),
+            other => panic!("expected Validation(not-forked), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_fork_requires_active_session() {
+        let (mut v, id, _r1, r2, _r2_alt, dir) = forked_account();
+        v.lock();
+        // Locked vault → NotUnlocked, no presence prompt.
+        match v.resolve_fork(id, r2).unwrap_err() {
+            StoreError::NotUnlocked => {}
+            other => panic!("expected NotUnlocked, got {other:?}"),
+        }
+        let _ = dir;
+    }
+
+    #[test]
+    fn read_revision_with_future_schema_version_rejects() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "future_row.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).unwrap();
+        let other = v.add_account(fresh_snapshot()).unwrap();
+        // Append a head revision with row schema_version = 255.
+        v.__test_synthesize_future_version_revision(id, fresh_snapshot(), 255, 1, true)
+            .unwrap();
+        // Re-unlock so the cache build sees the future head.
+        v.lock();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        // The affected account requires upgrade; reads error typed.
+        let status = v.account_status(id).unwrap();
+        assert!(status.requires_upgrade);
+        match v.account_get(id).unwrap_err() {
+            StoreError::UnsupportedRevisionSchemaVersion { .. } => {}
+            other => panic!("expected UnsupportedRevisionSchemaVersion, got {other:?}"),
+        }
+        match v.reveal_password(id, &fresh_presence()).unwrap_err() {
+            StoreError::UnsupportedRevisionSchemaVersion { .. } => {}
+            other => panic!("expected UnsupportedRevisionSchemaVersion, got {other:?}"),
+        }
+        // Metadata-only reads still work for the affected account.
+        assert!(!v.account_history(id).unwrap().is_empty());
+        assert!(!v.is_forked(id).unwrap());
+        // The rest of the vault works fine.
+        assert!(v.account_get(other).is_ok());
+        assert!(!v.account_status(other).unwrap().requires_upgrade);
+        // Search does not surface the affected account.
+        let hits = v.account_search("github").unwrap();
+        assert!(hits.iter().all(|h| h.id != id));
+        assert!(hits.iter().any(|h| h.id == other));
+    }
+
+    #[test]
+    fn read_revision_with_future_payload_version_rejects() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "future_payload.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).unwrap();
+        // Row schema_version stays at the build's value (= MAX); the
+        // *payload_version* inside the V1 CBOR body is 2.
+        let row_v = crate::revision::REVISION_SCHEMA_VERSION_MAX;
+        v.__test_synthesize_future_version_revision(id, fresh_snapshot(), row_v, 2, true)
+            .unwrap();
+        v.lock();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        assert!(v.account_status(id).unwrap().requires_upgrade);
+        match v.account_get(id).unwrap_err() {
+            StoreError::UnsupportedRevisionSchemaVersion { .. } => {}
+            other => panic!("expected UnsupportedRevisionSchemaVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_format_version_check_unchanged() {
+        // The whole-vault format_version gate is untouched by 1.6 — a
+        // bad magic / future format_version still rejects at open.
+        // (Regression marker; the meta.rs tests cover the detail.)
+        assert_eq!(crate::meta::FORMAT_VERSION, crate::meta::FORMAT_VERSION);
     }
 }

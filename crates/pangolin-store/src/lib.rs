@@ -60,14 +60,16 @@ pub use device::{DeviceCapabilities, DeviceIdentity, DEVICE_IDENTITY_SCHEMA_VERS
 pub use dirty::{DirtyEntry, IngestOutcome, RevisionPublishPayload};
 pub use error::{Result, StoreError};
 pub use pending::{PendingMerge, PENDING_MERGE_NONCE_LEN, PENDING_MERGE_SECRET_LEN};
-pub use revision::{ChainAnchor, DeviceId, RevisionGraph, RevisionId, RevisionMeta};
+pub use revision::{
+    ChainAnchor, DeviceId, RevisionGraph, RevisionId, RevisionMeta, REVISION_SCHEMA_VERSION_MAX,
+};
 pub use search::{ACCOUNT_SEARCH_RESULT_CAP, FTS_SCHEMA_VERSION};
 pub use session::{
     AuthError, Clock, IdentityProof, PinIdentityProof, PresenceProof, PressYPresenceProof,
     SessionDuration, SessionState, SystemClock, ABSOLUTE_MAX_DEFAULT, IDLE_TIMEOUT_DEFAULT,
     PRESENCE_FRESHNESS, PROMPT_TIMEOUT, SESSION_IDLE_UNTIL_DEVICE_LOCK,
 };
-pub use vault::{Vault, VaultState};
+pub use vault::{AccountStatus, Vault, VaultState};
 
 /// Returns the crate name. Useful for diagnostics and version reporting.
 #[must_use]

@@ -156,6 +156,54 @@ and 1.4's `reveal_*` entries). The C-ABI mirror in `cabi.rs` is not yet
 extended for these (the cbindgen surface remains intentionally tiny —
 `device_*` are `UniFFI`-only for now, same as `account_*` / `reveal_*`).
 
+### Revision lineage + fork resolution (MVP-1 issue 1.6 amendment)
+
+| Function | Lands in |
+|---|---|
+| `account_is_forked(h: &VaultHandle, id: AccountId) -> Result<bool, FfiError>` | 1.6 (**new** entry point) |
+| `account_fork_branches(h: &VaultHandle, id: AccountId) -> Result<Vec<ForkBranch>, FfiError>` | 1.6 (**new** entry point) |
+| `account_resolve_fork(h: &VaultHandle, id: AccountId, keep_revision_id: RevisionId) -> Result<RevisionId, FfiError>` | 1.6 (**new** entry point) |
+| `account_status(h: &VaultHandle, id: AccountId) -> Result<AccountStatus, FfiError>` | 1.6 (**new** entry point) |
+| `account_history(h: &VaultHandle, id: AccountId) -> Result<Vec<RevisionMeta>, FfiError>` | 1.6 finalises `RevisionMeta` (was scaffolded in 1.1) — see below |
+
+**Revision-lineage behaviour (MVP-1 issue 1.6 — Whitepaper §7 / §G3,
+master plan §17 / §18.7).** `RevisionMeta` is finalised: it now carries
+`is_tombstone`, `is_head` (a current leaf of the graph), `is_canonical_head`
+(THE canonical head per the clock-free rule: the leaf with the
+lexicographically-largest `revision_id` — no `created_at` involvement),
+and `on_canonical_chain` (an ancestor of the canonical head). `ForkBranch`
+= `{ schema_version, leaf_revision_id, leaf_device_id, leaf_created_at,
+depth, is_canonical_head }` — enough metadata for the user to choose
+which branch to keep. `AccountStatus` = `{ schema_version, is_tombstoned,
+is_forked, is_frozen_pending_resolve, requires_upgrade }` — the one-stop
+banner-decision query (`requires_upgrade` is true when the account's
+canonical head carries a revision schema version newer than this build
+understands — §18.7; reveals/edits on it return `FfiError::Store`
+carrying `UnsupportedRevisionSchemaVersion`). `account_resolve_fork`
+ratifies the chosen branch (writes a merge revision parented at it,
+un-forks the account, clears any `frozen_pending_resolve` flag, keeps
+the losing branch's revisions for audit, prunes only the
+`pending_merges` stash); it requires an **active (unlocked, non-expired)
+session only — NOT a fresh presence proof** (reparenting the graph
+reveals nothing; not a §5.4 reveal-class action) and **never
+auto-resolves**. A locked / expired session → `FfiError::Session`; a
+non-forked account → `FfiError::Validation { kind: "not-forked" }`; a
+non-head `keep_revision_id` → `FfiError::Store` (carrying `NotAHead`).
+`account_is_forked` / `account_fork_branches` / `account_status` work on
+a *locked* vault (graph queries are metadata-only); `requires_upgrade`
+is only meaningful on an `Active` vault. In MVP-1 a fork can only arise
+from the test helper or the dormant `ingest_chain_revision` path — real
+multi-device forks land with MVP-2's chain sync (honest scope, same
+posture as 1.5's dormant `last_sync_at`). No new CLI subcommand (the
+`pangolin-cli resolve` subcommand rides CLI-V1). These are an **additive
+1.1-surface amendment** — the 1.1 freeze declared `RevisionId` /
+`RevisionMeta` (bodies "finalize in 1.6") but no `fork_*` / `resolve_*`
+entries; nothing external binds the 1.1 surface yet. The C-ABI mirror is
+not yet extended (UniFFI-only, same as `account_*` / `device_*`). The
+§18.7 schema-versioning policy this finalises is documented in
+`docs/architecture/schema-versioning.md`; the lineage model in
+`docs/architecture/revision-lineage.md`.
+
 ### TOTP
 
 | Function | Backed by | Lands in |

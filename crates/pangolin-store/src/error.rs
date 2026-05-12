@@ -126,6 +126,48 @@ pub enum StoreError {
         current_heads: Vec<crate::revision::RevisionId>,
     },
 
+    /// **MVP-1 issue 1.6 — §18.7 schema-versioning policy.** A revision
+    /// blob carries a `schema_version` (the `revisions.schema_version`
+    /// row column, or the `payload_version` discriminator inside the V1
+    /// CBOR body) newer than this build understands
+    /// ([`crate::revision::REVISION_SCHEMA_VERSION_MAX`]).
+    ///
+    /// Distinct from [`Self::UnsupportedFormatVersion`] (which gates the
+    /// *whole vault*): this is per-account / per-revision granularity —
+    /// the affected account surfaces a "requires upgrade" status,
+    /// metadata-only reads keep working where possible, but
+    /// reveals/edits/head-decryption on that account are blocked; the
+    /// rest of the vault is fully usable. Surfacing this rather than
+    /// silently skipping the future-versioned revision is deliberate: a
+    /// head with a future version *is* the account's current state, so
+    /// "skip" would show stale data with no signal (a correctness bug).
+    ///
+    /// A bare on-disk byte-flip of the `revisions.schema_version` column
+    /// collapses to [`Self::AuthenticationFailed`] first: that byte is
+    /// bound into the AEAD AAD, and the `> MAX` reject runs *after* the
+    /// AEAD open (audit L1, fix-pass 2) — a flipped byte yields an AAD
+    /// this build never sealed under, so the open fails before the
+    /// reject can fire. Only a *legitimately* future-versioned revision
+    /// — one a newer Pangolin sealed with that byte in its AAD — opens
+    /// successfully and reaches this check. (Same shape as the
+    /// `payload_version`-inside-the-body case: a tampered body fails the
+    /// open; a genuine future body authenticates and then trips the
+    /// `payload_version` / map-arity check in `blob.rs`.)
+    #[error(
+        "revision schema version {found} is newer than this build supports ({supported}); \
+         this account requires a newer Pangolin"
+    )]
+    UnsupportedRevisionSchemaVersion {
+        /// The account whose revision is from the future.
+        account_id: crate::account::AccountId,
+        /// The future-versioned revision id.
+        revision_id: crate::revision::RevisionId,
+        /// The schema version found on disk.
+        found: u32,
+        /// The maximum this build supports.
+        supported: u32,
+    },
+
     /// Catch-all for storage-level integrity violations (e.g.,
     /// `PRAGMA integrity_check` returning anything other than "ok").
     #[error("storage corruption detected: {0}")]
@@ -227,6 +269,32 @@ pub enum StoreError {
     AccountFrozenPendingResolve {
         account_id: crate::account::AccountId,
     },
+}
+
+impl StoreError {
+    /// **MVP-1 issue 1.6.** If `self` is an
+    /// [`Self::UnsupportedRevisionSchemaVersion`] whose ids are the
+    /// blob-layer placeholder zeros, re-decorate it with the real
+    /// `account_id` / `revision_id` known at the storage-row layer.
+    /// Any other variant passes through unchanged.
+    #[must_use]
+    pub fn with_revision_context(
+        self,
+        account_id: crate::account::AccountId,
+        revision_id: crate::revision::RevisionId,
+    ) -> Self {
+        match self {
+            Self::UnsupportedRevisionSchemaVersion {
+                found, supported, ..
+            } => Self::UnsupportedRevisionSchemaVersion {
+                account_id,
+                revision_id,
+                found,
+                supported,
+            },
+            other => other,
+        }
+    }
 }
 
 impl From<AeadError> for StoreError {
