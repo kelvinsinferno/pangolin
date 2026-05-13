@@ -8181,9 +8181,60 @@ mod tests {
             platform_hint: None,
         };
         assert!(matches!(
-            v.capture_authority_query(future_ctx).unwrap_err(),
+            v.capture_authority_query(future_ctx.clone()).unwrap_err(),
             StoreError::CaptureAuthorityValidation { .. }
         ));
+        // Re-audit L1: `register` against the future-row's key must
+        // also reject — both the would-be-NoOp shape (a byte-matching
+        // payload that would otherwise short-circuit to NoOp) AND the
+        // would-be-Replace shape (`replace_existing=true` that would
+        // otherwise silently downgrade the future row to the current
+        // MAX). Both arms drive the new §18.7 ladder check on the
+        // register path (vault.rs:`capture_authority_register_in_tx`)
+        // that the read paths already enforced via `decode_row`.
+        let byte_matching_authority = crate::capture_authority::CaptureAuthority {
+            schema_version: 1,
+            kind: crate::capture_authority::CaptureAuthorityKind::Desktop,
+            component_id: "future-ext".into(),
+            component_version: "9.9".into(),
+        };
+        // Would-be-NoOp (replace_existing=false, payload matches the
+        // hand-injected future row byte-for-byte): rejects on ladder.
+        assert!(matches!(
+            v.capture_authority_register(
+                &fresh_presence(),
+                byte_matching_authority.clone(),
+                future_ctx.clone(),
+                false,
+            )
+            .unwrap_err(),
+            StoreError::CaptureAuthorityValidation { .. }
+        ));
+        // Would-be-Replace (replace_existing=true, payload differs):
+        // rejects on ladder before the presence check fires.
+        let mut different_authority = byte_matching_authority;
+        different_authority.component_id = "different-ext".into();
+        assert!(matches!(
+            v.capture_authority_register(&fresh_presence(), different_authority, future_ctx, true,)
+                .unwrap_err(),
+            StoreError::CaptureAuthorityValidation { .. }
+        ));
+        // The hand-injected row's columns are unchanged — neither
+        // register attempt mutated it (the outer wrapper rolled back).
+        let still_future_sv: i64 = v
+            .conn
+            .query_row(
+                "SELECT schema_version FROM capture_authorities \
+                 WHERE context_kind = 0 AND platform_hint = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_future_sv,
+            i64::from(crate::capture_authority::CAPTURE_AUTHORITY_SCHEMA_VERSION_MAX + 1),
+            "register's ladder check must not have downgraded the future row"
+        );
         // The valid (Browser/chrome) row remains queryable.
         let ok = v
             .capture_authority_query(sample_context())
