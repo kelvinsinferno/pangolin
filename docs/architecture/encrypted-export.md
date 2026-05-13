@@ -200,9 +200,11 @@ fallback home.
 
 - **Header parser** — strict bounds (truncation, lying `ct_len`, magic
   mismatch, unknown `format_version` / `kdf_algo_id`); Argon2 memory
-  clamped ≤ 1 GiB, time-cost ≤ 64, parallelism ≤ 64 (and ≥ the
-  crypto-crate floor) *before* any derivation — a hostile archive can't
-  OOM us or make Argon2 run for minutes; `ct_len` ceiling ≤ 256 MiB.
+  clamped ≤ 1 GiB, time-cost ≤ 8, parallelism ≤ 8, and
+  memory_kib × time_cost ≤ 3 Mi (≈ a couple seconds of Argon2id) — all
+  ≥ the crypto-crate floor — *before* any derivation, so a hostile
+  archive can't OOM us or make Argon2 run for minutes; `ct_len` ceiling
+  ≤ 256 MiB.
   No panics on any malformed input — all typed `StoreError::Validation`
   variants. `forbid(unsafe_code)` on every crate but `pangolin-ffi`, so
   no UB even on a hostile file.
