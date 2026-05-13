@@ -6,12 +6,13 @@
 //! job.
 //!
 //! The function bodies in `pangolin-ffi` panic with `todo!()` until
-//! 1.2 / 1.3 / 1.4 / 1.7 / 1.8 / 1.9 / 1.10 / 1.11 land. This test
-//! deliberately does NOT call any of them — the build-time `UniFFI`
-//! scaffolding is what we're verifying.
+//! 1.2 / 1.3 / 1.4 / 1.7 / 1.8 / 1.9 / 1.10 land (1.11 has now landed
+//! too). This test deliberately does NOT call any of them — the
+//! build-time `UniFFI` scaffolding is what we're verifying.
 
 use pangolin_ffi::{
-    AccountDraft, AccountId, AccountPatch, AccountSnapshot, CaptureAuthority, CaptureContext,
+    AccountDraft, AccountId, AccountPatch, AccountSnapshot, CaptureAuthority,
+    CaptureAuthorityEntry, CaptureAuthorityKind, CaptureContext, CaptureContextKind,
     DeviceCapabilities, DeviceId, DeviceInfo, KdbxImportReport, PasswordHistoryEntry,
     PasswordPolicy, PlaintextExportConfirmation, PresenceProof, RevealedSecret, RevisionId,
     RevisionMeta, SecretPassword, SessionInfo, TotpCode, TotpSecret, UnixTimestamp, VaultHandle,
@@ -384,24 +385,83 @@ fn kdbx_import_report_record_round_trip() {
 
 #[test]
 fn capture_authority_record_round_trip() {
+    // MVP-1 issue 1.11 finalised shape (L5). The 1.1 placeholder
+    // `{ schema_version, origin }` shape is replaced by the closed-enum
+    // kind + identifier strings. Nothing external binds the 1.1
+    // surface — additive amendment.
     let original = CaptureAuthority {
-        schema_version: 0,
-        origin: "https://example.com".into(),
+        schema_version: 1,
+        kind: CaptureAuthorityKind::BrowserExtension,
+        component_id: "com.example.ext".into(),
+        component_version: "1.0".into(),
     };
     let cloned = original.clone();
-    assert_eq!(original.origin, cloned.origin);
+    assert_eq!(original.kind, cloned.kind);
+    assert_eq!(original.component_id, cloned.component_id);
+    assert_eq!(original.component_version, cloned.component_version);
     assert_eq!(original.schema_version, cloned.schema_version);
 }
 
 #[test]
 fn capture_context_record_round_trip() {
     let original = CaptureContext {
-        schema_version: 0,
-        label: "login-form".into(),
+        schema_version: 1,
+        kind: CaptureContextKind::Browser,
+        platform_hint: Some("chrome".into()),
     };
     let cloned = original.clone();
-    assert_eq!(original.label, cloned.label);
+    assert_eq!(original.kind, cloned.kind);
+    assert_eq!(original.platform_hint, cloned.platform_hint);
     assert_eq!(original.schema_version, cloned.schema_version);
+
+    let no_hint = CaptureContext {
+        schema_version: 1,
+        kind: CaptureContextKind::Desktop,
+        platform_hint: None,
+    };
+    assert_eq!(no_hint.platform_hint, None);
+}
+
+#[test]
+fn capture_authority_entry_record_round_trip() {
+    // MVP-1 issue 1.11 new Record (L9).
+    let original = CaptureAuthorityEntry {
+        schema_version: 1,
+        context: CaptureContext {
+            schema_version: 1,
+            kind: CaptureContextKind::MobileOs,
+            platform_hint: Some("ios".into()),
+        },
+        authority: CaptureAuthority {
+            schema_version: 1,
+            kind: CaptureAuthorityKind::MobileOsAutofill,
+            component_id: "pangolin-ios".into(),
+            component_version: "1.0".into(),
+        },
+        registered_at: 1_700_000_000,
+    };
+    let cloned = original.clone();
+    assert_eq!(original.context.kind, cloned.context.kind);
+    assert_eq!(original.authority.kind, cloned.authority.kind);
+    assert_eq!(original.registered_at, 1_700_000_000);
+}
+
+#[test]
+fn capture_authority_kind_enum_round_trip() {
+    for k in [
+        CaptureAuthorityKind::Desktop,
+        CaptureAuthorityKind::BrowserExtension,
+        CaptureAuthorityKind::MobileOsAutofill,
+    ] {
+        assert_eq!(k, k);
+    }
+    for c in [
+        CaptureContextKind::Desktop,
+        CaptureContextKind::Browser,
+        CaptureContextKind::MobileOs,
+    ] {
+        assert_eq!(c, c);
+    }
 }
 
 #[test]

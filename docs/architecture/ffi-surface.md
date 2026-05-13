@@ -285,9 +285,54 @@ unbiased-draw / CSPRNG guarantees.
 
 ### Capture authority
 
+Browser-Ext spec §2.3 / API contract §16 / Threat Model invariant #8.
+The registry records which component (desktop / browser-ext / mobile-OS
+autofill) owns credential capture per context, with the
+`(context_kind, platform_hint)` key making exclusivity structural.
+
 | Function | Lands in |
 |---|---|
-| `capture_authority_register(h: &VaultHandle, authority: CaptureAuthority, context: CaptureContext) -> Result<(), FfiError>` | 1.11 |
+| `capture_authority_register(h: &VaultHandle, presence: PresenceProof, authority: CaptureAuthority, context: CaptureContext, replace_existing: bool) -> Result<(), FfiError>` | 1.11 |
+| `capture_authority_query(h: &VaultHandle, context: CaptureContext) -> Result<Option<CaptureAuthorityEntry>, FfiError>` | 1.11 |
+| `capture_authority_list(h: &VaultHandle) -> Result<Vec<CaptureAuthorityEntry>, FfiError>` | 1.11 |
+
+**Auth tier (L6, R-c — HYBRID).** `capture_authority_register` takes a
+`PresenceProof` argument always but consumes it only on the `Replaced`
+branch:
+
+- **Created** (first registration for a `(kind, platform_hint)` key) —
+  session-class. The presence proof argument is held but not verified.
+- **NoOp** (re-register with byte-identical payload) — session-class.
+- **Replaced** (existing row overwritten via `replace_existing=true`) —
+  reveal-class. Routes through `ensure_presence_fresh` BEFORE the
+  REPLACE commits; a stale proof → `FfiError::Session` with the
+  `PromptTimedOut` reason.
+
+`capture_authority_query` and `capture_authority_list` are session-class
+(no presence).
+
+**Exclusivity (L8).** A second register with a *different* payload AND
+`replace_existing=false` surfaces
+`FfiError::Validation { kind: "capture_authority_exclusivity" }`; the
+message names the context kind only — no info-leak on the existing
+`component_id`.
+
+**Validation (L7).** `component_id` (≤ 256 chars, NFC, no control
+chars, no leading/trailing whitespace, non-empty), `component_version`
+(≤ 64 chars, same character classes), and `platform_hint`
+(lowercased-ASCII allowlist: `chrome` / `firefox` / `edge` / `safari` /
+`chromium` / `webview` / `ios` / `android` / `windows` / `macos` /
+`linux`). Violations →
+`FfiError::Validation { kind: "capture_authority" }`. The kind /
+context_kind discriminators are closed `uniffi::Enum`s (adding a
+variant is a §18.7 minor bump).
+
+The Rust API on `Vault` additionally exposes a `capture_authority_clear`
+test/MVP-2 helper (not on the FFI surface in 1.11) and the
+`RegistrationOutcome::{Created, Replaced { prior }, NoOp { existing }}`
+discriminator (the FFI body collapses every success to `Ok(())` — the
+discriminator stays on the store side for tests + a future MVP-2
+amendment that may surface the `prior` payload).
 
 ## Records and enums that cross the boundary
 
@@ -317,8 +362,11 @@ unbiased-draw / CSPRNG guarantees.
 | `PlaintextExportConfirmation` | Record | Yes (1.10 — the single-use plaintext-export confirmation token; the FFI requires it to be structurally non-empty) | `schema_version: u16` |
 | `ExportReport` | Record | No (1.10 — `account_count`, `bytes_written`, `encrypted` flag) | `schema_version: u16` |
 | `RestoreReport` | Record | No (1.10 — `account_count`, `device_count`) | `schema_version: u16` |
-| `CaptureAuthority` | Record | No | `schema_version: u16` |
-| `CaptureContext` | Record | No | `schema_version: u16` |
+| `CaptureAuthority` | Record | No (1.11 — `kind: CaptureAuthorityKind` + `component_id: String` + `component_version: String`; the 1.1 placeholder `origin: String` shape is replaced) | `schema_version: u16` |
+| `CaptureContext` | Record | No (1.11 — `kind: CaptureContextKind` + `platform_hint: Option<String>`; the 1.1 placeholder `label: String` shape is replaced) | `schema_version: u16` |
+| `CaptureAuthorityEntry` | Record | No (1.11 — `context: CaptureContext`, `authority: CaptureAuthority`, `registered_at: UnixTimestamp`) | `schema_version: u16` |
+| `CaptureAuthorityKind` | Enum (`uniffi::Enum`) | No (1.11 — `Desktop` / `BrowserExtension` / `MobileOsAutofill`; closed enum, Browser-Ext spec §2.3 / Threat Model #8) | n/a (closed enum) |
+| `CaptureContextKind` | Enum (`uniffi::Enum`) | No (1.11 — `Desktop` / `Browser` / `MobileOs`; closed enum) | n/a (closed enum) |
 
 ### Issue 1.2 amendment: production AccountIdentity shape
 

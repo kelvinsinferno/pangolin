@@ -324,6 +324,15 @@ pub struct ArchiveSnapshot {
     pub accounts: Vec<ArchivedAccount>,
     /// The archived device trust list.
     pub devices: Vec<ArchivedDevice>,
+    /// **MVP-1 issue 1.11 / L10 (additive).** The source vault's
+    /// capture-authority registry rows. Carried for archive fidelity
+    /// (a future MVP-3+ "advanced restore" flow could honour them) but
+    /// [`crate::Vault::restore_to_new_vault`] does NOT re-register
+    /// them on restore — Q-f / R-f: the new vault is its own
+    /// environment and starts with an empty registry. Empty for
+    /// archives produced by 1.10 builds (decoder treats a missing
+    /// trailing field as empty per the additive discipline).
+    pub capture_authorities: Vec<crate::capture_authority::CapturedCaptureAuthority>,
 }
 
 impl zeroize::ZeroizeOnDrop for ArchiveSnapshot {}
@@ -341,6 +350,10 @@ impl core::fmt::Debug for ArchiveSnapshot {
                 &format_args!("<{} accounts>", self.accounts.len()),
             )
             .field("devices", &self.devices)
+            .field(
+                "capture_authorities",
+                &format_args!("<{} capture authorities>", self.capture_authorities.len()),
+            )
             .finish()
     }
 }
@@ -380,13 +393,18 @@ fn put_int(enc: &mut Enc<'_>, v: i64) {
 
 /// Encode the snapshot to a `Zeroizing<Vec<u8>>` CBOR document (it
 /// carries every secret).
+///
+/// **MVP-1 issue 1.11 (L10) additive amendment.** The top-level array
+/// is 8 items (was 7 in 1.10): the trailing item is the
+/// `capture_authorities` list. A decoder that sees only 7 items
+/// (legacy 1.10 archive) treats the missing trailing array as empty.
 #[must_use]
 pub fn encode_snapshot(snap: &ArchiveSnapshot) -> Zeroizing<Vec<u8>> {
     let mut out: Vec<u8> = Vec::with_capacity(1024);
     {
         let mut enc = Encoder::from(&mut out);
-        // Top-level array of 7 items.
-        push(&mut enc, Header::Array(Some(7)));
+        // Top-level array of 8 items (1.11 grew this by 1; see L10).
+        push(&mut enc, Header::Array(Some(8)));
         push(&mut enc, Header::Positive(u64::from(snap.schema_version)));
         put_int(&mut enc, snap.exported_at);
         put_bytes(&mut enc, &snap.source_device_id);
@@ -451,6 +469,27 @@ pub fn encode_snapshot(snap: &ArchiveSnapshot) -> Zeroizing<Vec<u8>> {
             put_bytes(&mut enc, &d.device_id);
             put_text(&mut enc, &d.label);
             put_int(&mut enc, d.added_at_ms);
+        }
+        // MVP-1 issue 1.11 (L10): trailing capture_authorities array.
+        // Always emit (even when empty) to keep the format stable;
+        // decoders that don't expect this trailing item (the legacy
+        // 1.10 7-item shape) silently coalesce it to empty.
+        push(
+            &mut enc,
+            Header::Array(Some(snap.capture_authorities.len())),
+        );
+        for ca in &snap.capture_authorities {
+            // 7-element record matching the SQL row 1:1 — keep in
+            // lockstep with `decode_capture_authorities` and the
+            // capture_authority::decode_row signature.
+            push(&mut enc, Header::Array(Some(7)));
+            put_int(&mut enc, ca.context_kind);
+            put_text(&mut enc, &ca.platform_hint);
+            put_int(&mut enc, ca.authority_kind);
+            put_text(&mut enc, &ca.component_id);
+            put_text(&mut enc, &ca.component_version);
+            put_int(&mut enc, ca.registered_at);
+            push(&mut enc, Header::Positive(u64::from(ca.schema_version)));
         }
     }
     Zeroizing::new(out)
@@ -635,7 +674,15 @@ fn decode_account(dec: &mut Dec<'_>) -> Result<ArchivedAccount> {
 /// malformed input.
 pub fn decode_snapshot(buf: &[u8]) -> Result<ArchiveSnapshot> {
     let mut dec = Decoder::from(buf);
-    expect_array(&mut dec, 7)?;
+    // MVP-1 issue 1.11 (L10): accept either 7 (legacy 1.10) or 8 (the
+    // additive 1.11 shape that adds the trailing `capture_authorities`
+    // array). The format/schema_version stays at 1 — this is an
+    // additive trailing-element growth, not a layout change.
+    let top_len = pull_array_len(&mut dec)?;
+    if top_len != 7 && top_len != 8 {
+        return Err(cbor_err("archive CBOR: unexpected top-level array shape"));
+    }
+    let has_capture_authorities = top_len == 8;
     let schema_version_u = pull_uint(&mut dec)?;
     let schema_version = u16::try_from(schema_version_u)
         .map_err(|_| cbor_err("archive payload schema version out of range"))?;
@@ -678,6 +725,40 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ArchiveSnapshot> {
             added_at_ms,
         });
     }
+    // MVP-1 issue 1.11 (L10): optional trailing capture_authorities
+    // array. A legacy 1.10 archive (top_len == 7) decodes with empty.
+    let capture_authorities = if has_capture_authorities {
+        let ca_n = pull_array_len(&mut dec)?;
+        if ca_n > MAX_ITEMS {
+            return Err(cbor_err("archive CBOR: too many capture authorities"));
+        }
+        let mut out = Vec::with_capacity(ca_n.min(16));
+        for _ in 0..ca_n {
+            expect_array(&mut dec, 7)?;
+            let context_kind = pull_int(&mut dec)?;
+            let platform_hint = pull_text(&mut dec)?;
+            let authority_kind = pull_int(&mut dec)?;
+            let component_id = pull_text(&mut dec)?;
+            let component_version = pull_text(&mut dec)?;
+            let registered_at = pull_int(&mut dec)?;
+            let sv_u = pull_uint(&mut dec)?;
+            let sv = u16::try_from(sv_u).map_err(|_| {
+                cbor_err("archive CBOR: capture-authority schema_version out of u16")
+            })?;
+            out.push(crate::capture_authority::CapturedCaptureAuthority {
+                context_kind,
+                platform_hint,
+                authority_kind,
+                component_id,
+                component_version,
+                registered_at,
+                schema_version: sv,
+            });
+        }
+        out
+    } else {
+        Vec::new()
+    };
     Ok(ArchiveSnapshot {
         schema_version,
         exported_at,
@@ -686,6 +767,7 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ArchiveSnapshot> {
         session_idle_secs,
         accounts,
         devices,
+        capture_authorities,
     })
 }
 
@@ -1021,6 +1103,7 @@ mod tests {
                 label: "laptop".into(),
                 added_at_ms: 1_600_000_000_000,
             }],
+            capture_authorities: Vec::new(),
         }
     }
 

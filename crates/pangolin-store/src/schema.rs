@@ -211,6 +211,29 @@ CREATE TABLE IF NOT EXISTS pending_merges (
     created_at_ms         INTEGER NOT NULL,
     PRIMARY KEY (account_id, target_head_id)
 );
+
+-- MVP-1 issue 1.11 / Browser-Ext spec §2.3 / Threat Model invariant #8.
+-- Vault-level registry of which component (desktop / browser-ext /
+-- mobile-OS autofill) owns credential capture per context. At most one
+-- row per (context_kind, platform_hint) — the PRIMARY KEY makes the
+-- exclusivity invariant structural. All fields non-secret: closed-enum
+-- discriminator + identifier strings + version string + timestamp +
+-- per-row §18.7 schema_version. Additive CREATE TABLE IF NOT EXISTS
+-- (no format_version bump); legacy 1.10 vaults pick it up on next
+-- open via the existing apply_pragmas_and_schema mechanism. NULL
+-- platform_hint is coalesced to empty string so the PRIMARY KEY treats
+-- it as a distinct value -- a (kind, None) registration is different
+-- from a (kind, Some(chrome)) registration.
+CREATE TABLE IF NOT EXISTS capture_authorities (
+    context_kind        INTEGER NOT NULL,
+    platform_hint       TEXT    NOT NULL DEFAULT '',
+    authority_kind      INTEGER NOT NULL,
+    component_id        TEXT    NOT NULL,
+    component_version   TEXT    NOT NULL,
+    registered_at       INTEGER NOT NULL,
+    schema_version      INTEGER NOT NULL,
+    PRIMARY KEY (context_kind, platform_hint)
+);
 ";
 
 /// Apply all pragmas and the schema DDL on the supplied connection.

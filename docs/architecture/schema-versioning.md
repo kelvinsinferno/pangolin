@@ -54,6 +54,15 @@ issue follows when it adds or evolves a persisted record.
      a future value rejects at `take_pending_merge` (`Corrupted`-class
      if it's structurally wrong; otherwise the resolve flow fails
      cleanly).
+   - **`capture_authorities.schema_version`** (1.11) → the
+     capture-authority registry row; a future value rejects at decode
+     for *that row* only (`StoreError::CaptureAuthorityValidation`).
+     The rest of the registry — and the rest of the vault — remains
+     fully usable. A `capture_authority_list` call that touches the
+     future row surfaces the rejection; a `capture_authority_query`
+     for a different `(context_kind, platform_hint)` key still works.
+     Same per-row ladder as `devices.schema_version` /
+     `device_key.schema_version`.
    - **`meta.session_idle_secs` validator** (1.4) → the session-idle
      choice; an unknown value is rejected by
      `SessionDuration::try_from_meta_secs` (the cap engine refuses to
@@ -70,7 +79,9 @@ issue follows when it adds or evolves a persisted record.
    table, a new nullable column, a new optional field). MVP-1's
    additive store changes (`sync_state`, `dirty_accounts`,
    `pending_merges`, `session_idle_secs`, the 1.5 `devices` columns,
-   the 1.6 `superseded_by` column) are *minor* — no `format_version`
+   the 1.6 `superseded_by` column, the 1.11 `capture_authorities`
+   table, the 1.11 trailing `capture_authorities` field in 1.10's
+   `ArchiveSnapshot` CBOR shape) are *minor* — no `format_version`
    bump. A major bump requires the migration path below.
 5. **Migration path for a major bump.** Local store: ship the new
    `MAX_KNOWN`, keep a `decode_vN_…` function that hydrates the old

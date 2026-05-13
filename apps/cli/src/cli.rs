@@ -118,6 +118,50 @@ pub enum Command {
     /// to the composite key. Prints the import counts (imported /
     /// skipped / per-category failures) on stdout. No chain calls.
     Import(ImportArgs),
+
+    /// Inspect the capture-authority registry (MVP-1 issue 1.11 /
+    /// Browser-Ext spec §2.3). The registry records which component
+    /// (desktop / browser-ext / mobile-OS autofill) owns credential
+    /// capture per context — Threat Model invariant #8 in queryable
+    /// form. Read-only in MVP-1; `register` / `clear` arrive with
+    /// MVP-2 when the browser extension is the actual consumer.
+    Authority(AuthorityArgs),
+}
+
+/// `authority` subcommand — wraps the per-verb sub-subcommands. MVP-1
+/// ships exactly one verb (`list`) per R-d / Q-d; `register` / `clear`
+/// defer to MVP-2.
+#[derive(Debug, Args)]
+pub struct AuthorityArgs {
+    #[command(subcommand)]
+    pub command: AuthorityCommand,
+}
+
+/// The `authority` sub-subcommands.
+#[derive(Debug, Subcommand)]
+pub enum AuthorityCommand {
+    /// List every registered capture authority, sorted by
+    /// `(context_kind, platform_hint)`. Prints one line per entry on
+    /// stdout. With `--json` emits JSON-Lines. Read-only.
+    List(AuthorityListArgs),
+}
+
+/// `authority list` — inspect the registry.
+#[derive(Debug, Args)]
+pub struct AuthorityListArgs {
+    /// Path to the `.pvf` vault file.
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Vault password (echoes in `ps`; CI use only). If omitted,
+    /// prompted at the terminal without echo.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+
+    /// Emit JSON-Lines on stdout (one object per registered authority)
+    /// instead of the human-readable single-line form.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `import` subcommand args.

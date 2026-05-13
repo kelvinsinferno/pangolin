@@ -31,7 +31,7 @@ These are non-negotiable. Every issue that touches a relevant surface must verif
 5. **Session authority never stored on-chain.** Local-only, time-bounded, non-transferable.
 6. **Guardians never see VDK.** Recovery rotates *authority* and re-wraps VDK; never re-derives.
 7. **Hardware is never required.** Identity proof always satisfies as fallback.
-8. **Capture authority is exclusive per context.** One component owns capture per browser/desktop/mobile.
+8. **Capture authority is exclusive per context.** One component owns capture per browser/desktop/mobile. *Enforcement landed in MVP-1 issue 1.11:* the `capture_authorities` SQL table's `PRIMARY KEY (context_kind, platform_hint)` makes exclusivity structural; closed `uniffi::Enum` discriminators make the rule a type-system property; a register that would clobber an existing different registration is rejected by default (`StoreError::CaptureAuthorityExclusivity`) and the caller must opt into replacement with a fresh presence proof (the hybrid auth tier — session-class for first register, reveal-class for replace). See `docs/architecture/capture-authority.md` for the full picture.
 
 ## Threat enumeration (to be expanded)
 

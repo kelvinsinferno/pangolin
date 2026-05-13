@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! KDBX-import + capture-authority FFI shapes (MVP-1 issues 1.9 +
-//! 1.11), backed by `pangolin-kdbx`.
+//! KDBX-import FFI shape (MVP-1 issue 1.9), backed by `pangolin-kdbx`.
 //!
 //! 1.9 implements the 1.1-frozen `kdbx_import` body — the one additive
 //! amendment (per `docs/issue-plans/1.9.md` L11/L13) is the optional
@@ -9,6 +8,15 @@
 //! plain owned drafts; the store-side ingestion loop lives **here**
 //! (`pangolin-store` gains no `pangolin-kdbx` dep — HIGH-1 /
 //! uniffi-isolation invariants).
+//!
+//! **MVP-1 issue 1.11 cleanup.** The 1.1 scaffold parked the
+//! `CaptureAuthority` / `CaptureContext` placeholders + the
+//! `capture_authority_register` entry-point declaration in this file
+//! because the 1.1 freeze hadn't yet decided where they belonged. 1.11
+//! finalises the shapes and moves them to a dedicated
+//! [`crate::capture_authority`] module — these types don't belong
+//! with the KDBX import surface. `lib.rs` re-exports are updated to
+//! match.
 
 use std::sync::Arc;
 
@@ -37,25 +45,6 @@ pub struct KdbxImportReport {
     /// Per-failure category labels (non-secret; never entry data). Safe
     /// to render.
     pub failure_kinds: Vec<String>,
-}
-
-/// Capture-authority registration metadata (MVP-1 issue 1.11). The
-/// `CaptureAuthority` and `CaptureContext` records are scaffolded
-/// here and finalised in 1.11 — additive only after lock.
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct CaptureAuthority {
-    /// Issue 1.1 schema-version slot.
-    pub schema_version: u16,
-    /// Origin URL or platform identifier (non-secret).
-    pub origin: String,
-}
-
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct CaptureContext {
-    /// Issue 1.1 schema-version slot.
-    pub schema_version: u16,
-    /// Free-form context label. 1.11 finalises the encoding.
-    pub label: String,
 }
 
 // -- Locked-in-1.1 entry points ---------------------------------------
@@ -368,18 +357,4 @@ mod tests {
         let b = map_kdbx_err(K::WrongCredentials);
         assert_eq!(format!("{a:?}"), format!("{b:?}"));
     }
-}
-
-/// Register a new capture authority. Body lands in 1.11.
-///
-/// # Panics
-/// Panics with `todo!()` until 1.11 lands.
-#[uniffi::export]
-pub fn capture_authority_register(
-    handle: Arc<VaultHandle>,
-    authority: CaptureAuthority,
-    context: CaptureContext,
-) -> Result<(), FfiError> {
-    let _ = (handle, authority, context);
-    todo!("capture_authority_register body lands in MVP-1 issue 1.11")
 }

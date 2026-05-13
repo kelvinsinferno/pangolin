@@ -66,6 +66,7 @@ fn main() -> Result<()> {
             cli::Command::Account(sub) => commands::account::run(&args.global, sub).await,
             cli::Command::Vault(sub) => commands::vault::run(&args.global, sub).await,
             cli::Command::Import(sub) => commands::import::run(&args.global, sub).await,
+            cli::Command::Authority(sub) => commands::authority::run(&args.global, sub).await,
         }
     })
 }

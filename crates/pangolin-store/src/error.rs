@@ -269,6 +269,36 @@ pub enum StoreError {
     AccountFrozenPendingResolve {
         account_id: crate::account::AccountId,
     },
+
+    /// **MVP-1 issue 1.11 / Browser-Ext spec §2.3 / Threat Model
+    /// invariant #8.** A [`crate::Vault::capture_authority_register`]
+    /// call was made for a `(context_kind, platform_hint)` key that
+    /// already has a different registration AND `replace_existing` was
+    /// `false`. Defence-in-depth against silent double-registration.
+    ///
+    /// The message names the *context kind only* — no info-leak on the
+    /// existing `component_id` (a curious caller cannot probe the
+    /// registry by exclusivity errors; the legitimate read path is
+    /// [`crate::Vault::capture_authority_query`]).
+    #[error(
+        "capture authority for context {context} already registered; \
+         pass replace_existing=true with a fresh presence proof to overwrite"
+    )]
+    CaptureAuthorityExclusivity {
+        /// Stable lowercase context-kind label (`"desktop"`, `"browser"`,
+        /// `"mobile_os"`) — no info-leak on the existing payload.
+        context: String,
+    },
+
+    /// **MVP-1 issue 1.11.** A capture-authority payload failed
+    /// validation (empty / overlong / non-NFC / control-char /
+    /// not-on-the-allowlist for `platform_hint`; future
+    /// `schema_version`). UI-safe message.
+    #[error("capture authority validation failed: {reason}")]
+    CaptureAuthorityValidation {
+        /// UI-safe rejection reason.
+        reason: String,
+    },
 }
 
 impl StoreError {
