@@ -635,29 +635,279 @@ pub fn password_policy_default() -> PasswordPolicy {
     PasswordPolicy::from_core(pangolin_core::pwgen::PwgenPolicy::default())
 }
 
-/// Export the vault encrypted with a fresh key (e.g., for backup).
-/// Body lands in 1.10.
-///
-/// # Panics
-/// Panics with `todo!()` until 1.10 lands.
-#[uniffi::export]
-pub fn vault_export_encrypted(handle: Arc<VaultHandle>, dest: String) -> Result<(), FfiError> {
-    let _ = (handle, dest);
-    todo!("vault_export_encrypted body lands in MVP-1 issue 1.10")
+// -- MVP-1 issue 1.10: encrypted export / restore-to-fresh-vault -------
+//
+// Additive 1.1-surface amendment (same posture as 1.2/1.4/1.7/1.9):
+// - `vault_export_encrypted` grows `presence`, an export `passphrase`,
+//   and an optional `accounts` subset selector (D1/D5/D9).
+// - `vault_export_plaintext` grows `presence` + the `accounts` selector;
+//   keeps its frozen `PlaintextExportConfirmation` Record (the FFI
+//   requires a structurally-valid single-use token; the CLI/UI owns the
+//   30 s delay + double-y/N + warning copy per master plan §4 row 1.10).
+// - new `vault_restore_from_archive` entry (D2/D4) — operates on a file
+//   path + archive passphrase, not an unlocked vault; creates a brand-new
+//   `.pvf` from a decoded archive (no merge into an existing vault).
+//
+// `ffi-surface.md` records the amendments.
+
+/// Build the CLI-tier presence proof from the 1.1-frozen FFI envelope.
+/// (`bytes` is unused for the CLI tier; the engine owns dedup.)
+fn presence_from_ffi(_proof: PresenceProof) -> pangolin_core::PressYPresenceProof {
+    pangolin_core::PressYPresenceProof::confirmed()
 }
 
-/// Export the vault as plaintext. Requires an explicit second
-/// confirmation; Design Spec §11 mandates this branch be visually
-/// distinct from the encrypted-export path. Body lands in 1.10.
+/// Parse the FFI `accounts: Option<Vec<String>>` (hex-encoded 32-byte
+/// account ids) into an [`pangolin_core::AccountSelection`].
+fn parse_account_selection(
+    accounts: Option<Vec<String>>,
+) -> Result<pangolin_core::AccountSelection, FfiError> {
+    match accounts {
+        None => Ok(pangolin_core::AccountSelection::All),
+        Some(list) => {
+            let mut out = Vec::with_capacity(list.len());
+            for s in list {
+                let bytes = decode_hex32(&s).ok_or_else(|| FfiError::Validation {
+                    kind: "export_account_id".into(),
+                    message: "account id must be 64 hex characters".into(),
+                })?;
+                out.push(bytes);
+            }
+            Ok(pangolin_core::AccountSelection::Subset(out))
+        }
+    }
+}
+
+fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        let hi = (s.as_bytes()[2 * i] as char).to_digit(16)?;
+        let lo = (s.as_bytes()[2 * i + 1] as char).to_digit(16)?;
+        *b = u8::try_from(hi * 16 + lo).ok()?;
+    }
+    Some(out)
+}
+
+/// Write `bytes` to `dest`, never clobbering an existing file. On Unix,
+/// the umask-respecting create plus an explicit `0o600` chmod restricts
+/// the file to the owner (env-quirk #1: on CI Linux umask 0o077 the file
+/// already lands ~0o600). A partial file is removed if the write fails.
+fn write_export_file(dest: &str, bytes: &[u8]) -> Result<(), FfiError> {
+    use std::io::Write as _;
+    let path = std::path::Path::new(dest);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| FfiError::Validation {
+            kind: "export_io".into(),
+            message: format!("cannot create export file: {e}"),
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = f
+            .metadata()
+            .map_err(|e| FfiError::Validation {
+                kind: "export_io".into(),
+                message: format!("cannot stat export file: {e}"),
+            })?
+            .permissions();
+        perms.set_mode(0o600);
+        let _ = f.set_permissions(perms);
+    }
+    if let Err(e) = f.write_all(bytes).and_then(|()| f.flush()) {
+        drop(f);
+        let _ = std::fs::remove_file(path);
+        return Err(FfiError::Validation {
+            kind: "export_io".into(),
+            message: format!("cannot write export file: {e}"),
+        });
+    }
+    Ok(())
+}
+
+/// Non-secret report returned by the export FFI ops.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ExportReport {
+    /// Schema-version slot.
+    pub schema_version: u16,
+    /// Number of accounts written into the archive.
+    pub account_count: u32,
+    /// Number of bytes written to the destination file.
+    pub bytes_written: u64,
+    /// Whether the file is the *encrypted* archive (`true`) or the
+    /// guarded *plaintext* dump (`false`).
+    pub encrypted: bool,
+}
+
+/// Non-secret report returned by [`vault_restore_from_archive`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RestoreReport {
+    /// Schema-version slot.
+    pub schema_version: u16,
+    /// Number of accounts restored into the new vault.
+    pub account_count: u32,
+    /// Number of devices present in the decoded archive. (The restore
+    /// path does **not** carry the device trust list over into the new
+    /// vault — see [`pangolin_store::Vault::restore_to_new_vault`] — this
+    /// is purely the count from the decoded archive payload.)
+    pub device_count: u32,
+}
+
+/// Export a self-contained **encrypted** Pangolin vault archive to
+/// `dest`. **High-risk operation** (Session spec §5.4) — presence-gated.
 ///
-/// # Panics
-/// Panics with `todo!()` until 1.10 lands.
+/// The archive is AEAD-sealed under a 256-bit key derived (Argon2id,
+/// `RECOMMENDED`) from `passphrase` — a *fresh* export passphrase,
+/// independent of the vault master password — over a random salt stored
+/// in the archive's plaintext header (the AEAD AAD). `passphrase` is
+/// consumed into Rust-owned memory and zeroized before returning.
+/// `accounts` (hex-encoded 32-byte ids) narrows the export to a subset;
+/// `None` = the whole vault. The archive is written to `dest` with
+/// restrictive permissions; `dest` is never clobbered.
+///
+/// # Errors
+///
+/// `FfiError::Session` for a locked/expired session or a timed-out
+/// presence prompt; `FfiError::Validation` with an `export_*` `kind`
+/// for an IO / serialization / crypto failure.
+#[allow(clippy::significant_drop_tightening)]
+#[uniffi::export]
+pub fn vault_export_encrypted(
+    handle: Arc<VaultHandle>,
+    dest: String,
+    passphrase: Arc<SecretPassword>,
+    accounts: Option<Vec<String>>,
+    presence: PresenceProof,
+) -> Result<ExportReport, FfiError> {
+    let selection = parse_account_selection(accounts)?;
+    let mut pw = zeroize::Zeroizing::new(passphrase.bytes_for_bridge().to_vec());
+    let secret = pangolin_crypto::secret::SecretBytes::new(std::mem::take(&mut *pw));
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    let proof = presence_from_ffi(presence);
+    let archive = vault
+        .export_encrypted(&secret, &selection, &proof)
+        .map_err(store_into_ffi)?;
+    let count = match &selection {
+        pangolin_core::AccountSelection::All => vault.list_accounts().len(),
+        pangolin_core::AccountSelection::Subset(ids) => ids.len(),
+    };
+    drop(secret);
+    write_export_file(&dest, &archive)?;
+    let bytes_written = u64::try_from(archive.len()).unwrap_or(u64::MAX);
+    Ok(ExportReport {
+        schema_version: PASSWORD_POLICY_SCHEMA_VERSION,
+        account_count: u32::try_from(count).unwrap_or(u32::MAX),
+        bytes_written,
+        encrypted: true,
+    })
+}
+
+/// Export the vault as an **unencrypted cleartext** dump to `dest`.
+///
+/// The spec-guarded `--plaintext` branch (Design Spec §11). **This
+/// writes every secret in cleartext.** Presence-gated *and* requires a
+/// structurally-valid single-use `confirmation` token (the CLI/UI owns
+/// the double-confirmation + 30 s delay + warning copy). `accounts`
+/// narrows the export; `None` = the whole vault. The file is written
+/// with restrictive permissions; `dest` is never clobbered.
+///
+/// # Errors
+///
+/// As [`vault_export_encrypted`], plus `FfiError::Validation` with
+/// `kind = "export_not_confirmed"` for a missing/invalid token.
+#[allow(clippy::significant_drop_tightening)]
 #[uniffi::export]
 pub fn vault_export_plaintext(
     handle: Arc<VaultHandle>,
     dest: String,
     confirmation: PlaintextExportConfirmation,
-) -> Result<(), FfiError> {
-    let _ = (handle, dest, confirmation);
-    todo!("vault_export_plaintext body lands in MVP-1 issue 1.10")
+    accounts: Option<Vec<String>>,
+    presence: PresenceProof,
+) -> Result<ExportReport, FfiError> {
+    let selection = parse_account_selection(accounts)?;
+    let conf = pangolin_core::PlaintextExportConfirmationData {
+        schema_version: confirmation.schema_version,
+        token: confirmation.token,
+    };
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    let proof = presence_from_ffi(presence);
+    let bytes = vault
+        .export_plaintext(&conf, &selection, &proof)
+        .map_err(store_into_ffi)?;
+    let count = match &selection {
+        pangolin_core::AccountSelection::All => vault.list_accounts().len(),
+        pangolin_core::AccountSelection::Subset(ids) => ids.len(),
+    };
+    write_export_file(&dest, &bytes)?;
+    let bytes_written = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    Ok(ExportReport {
+        schema_version: PASSWORD_POLICY_SCHEMA_VERSION,
+        account_count: u32::try_from(count).unwrap_or(u32::MAX),
+        bytes_written,
+        encrypted: false,
+    })
+}
+
+/// Restore a **brand-new** `.pvf` vault at `dest` from the encrypted
+/// archive at `archive_path`.
+///
+/// Uses `new_vault_password` as the new vault's master password. Does
+/// **not** touch any existing vault and does **not** merge an archive
+/// into an existing vault (deferred to MVP-2). `archive_passphrase` +
+/// `new_vault_password` are consumed into Rust-owned memory and zeroized
+/// before returning. `dest` is never clobbered.
+///
+/// # Errors
+///
+/// `FfiError::Validation` with `kind = "export_format"` for a malformed
+/// archive, `kind = "export_credentials"` for a wrong archive passphrase
+/// or a tampered archive (one error — no oracle), `kind = "export_io"`
+/// for an IO failure, `kind = "export_too_large"` for an oversized
+/// archive file; storage-level errors otherwise.
+#[uniffi::export]
+pub fn vault_restore_from_archive(
+    archive_path: String,
+    dest: String,
+    archive_passphrase: Arc<SecretPassword>,
+    new_vault_password: Arc<SecretPassword>,
+) -> Result<RestoreReport, FfiError> {
+    // Bounded read of the archive file (256 MiB ceiling — env-quirk: a
+    // hostile "archive" must not OOM us).
+    const MAX_ARCHIVE_FILE: u64 = 256 * 1024 * 1024;
+    let meta = std::fs::metadata(&archive_path).map_err(|e| FfiError::Validation {
+        kind: "export_io".into(),
+        message: format!("cannot open archive: {e}"),
+    })?;
+    if meta.len() > MAX_ARCHIVE_FILE {
+        return Err(FfiError::Validation {
+            kind: "export_too_large".into(),
+            message: "archive file exceeds the maximum size".into(),
+        });
+    }
+    let bytes = std::fs::read(&archive_path).map_err(|e| FfiError::Validation {
+        kind: "export_io".into(),
+        message: format!("cannot read archive: {e}"),
+    })?;
+    let mut ap = zeroize::Zeroizing::new(archive_passphrase.bytes_for_bridge().to_vec());
+    let archive_pw = pangolin_crypto::secret::SecretBytes::new(std::mem::take(&mut *ap));
+    let snapshot = pangolin_core::decode_archive(&bytes, &archive_pw).map_err(store_into_ffi)?;
+    drop(archive_pw);
+    let account_count = u32::try_from(snapshot.accounts.len()).unwrap_or(u32::MAX);
+    let device_count = u32::try_from(snapshot.devices.len()).unwrap_or(u32::MAX);
+    let mut np = zeroize::Zeroizing::new(new_vault_password.bytes_for_bridge().to_vec());
+    let new_pw = pangolin_crypto::secret::SecretBytes::new(std::mem::take(&mut *np));
+    pangolin_core::Vault::restore_to_new_vault(std::path::Path::new(&dest), snapshot, &new_pw)
+        .map_err(store_into_ffi)?;
+    drop(new_pw);
+    Ok(RestoreReport {
+        schema_version: PASSWORD_POLICY_SCHEMA_VERSION,
+        account_count,
+        device_count,
+    })
 }

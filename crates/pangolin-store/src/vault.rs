@@ -3056,6 +3056,342 @@ impl Vault {
     }
 
     // -----------------------------------------------------------------
+    // MVP-1 issue 1.10: encrypted export / restore-to-fresh-vault.
+    //
+    // Both export entries are reveal-class (Session spec §5.4 — "export
+    // vault" is a high-risk action requiring presence even mid-session):
+    // same `check_session_freshness` → `ensure_presence_fresh` →
+    // `touch_session` pre-amble as `export_payload` / `reveal_*`. The
+    // archive format + codec + decoder live in `crate::export`; these
+    // methods gather the snapshot from the open vault. `restore_to_new_vault`
+    // operates on a file path + archive passphrase, not an unlocked vault.
+    // -----------------------------------------------------------------
+
+    /// Gather the [`crate::export::ArchiveSnapshot`] for `selection` from
+    /// this open vault. Shared by [`Self::export_encrypted`] and
+    /// [`Self::export_plaintext`]. Reads every (non-tombstoned) account
+    /// matching the selection — the full V1 identity (incl. the password
+    /// history bytes/timestamps/devices) — plus the device trust list and
+    /// the session-idle `meta` setting plus the provenance fingerprint.
+    fn gather_archive_snapshot(
+        &self,
+        selection: &crate::export::AccountSelection,
+    ) -> Result<crate::export::ArchiveSnapshot> {
+        let exported_at = current_unix_ms() / 1000;
+        let source_device_id = self.device_id.0;
+        let vault_id = self.meta.vault_id;
+        let session_idle_secs = meta::read_session_idle_secs(&self.conn)?;
+
+        // Every live (non-tombstoned, non-frozen-by-upgrade) account id.
+        let mut acct_rows: Vec<([u8; ACCOUNT_ID_LEN], i64)> = Vec::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT account_id, created_at FROM account_identities
+                 WHERE tombstoned = 0 ORDER BY account_id ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let id: Vec<u8> = row.get(0)?;
+                let created: i64 = row.get(1)?;
+                Ok((id, created))
+            })?;
+            for r in rows {
+                let (blob, created) = r?;
+                let arr: [u8; ACCOUNT_ID_LEN] = blob.as_slice().try_into().map_err(|_| {
+                    StoreError::Corrupted("account_identities.account_id not 32 bytes".into())
+                })?;
+                if selection.includes(&arr) {
+                    acct_rows.push((arr, created));
+                }
+            }
+        }
+
+        let mut accounts = Vec::with_capacity(acct_rows.len());
+        for (id_bytes, created_at_ms) in acct_rows {
+            let id = AccountId::from_bytes(id_bytes);
+            // Skip a "requires upgrade" account rather than fail the
+            // whole export (it can't be hydrated by this build).
+            if self.account_requires_upgrade(id) {
+                continue;
+            }
+            let identity = match self.read_head_identity(id) {
+                Ok(i) => i,
+                Err(StoreError::AccountTombstoned) => continue,
+                Err(e) => return Err(e),
+            };
+            let crate::account::AccountIdentity {
+                display_name,
+                tags,
+                notes,
+                urls,
+                usernames,
+                password_history,
+                totp_secret,
+                totp_params,
+            } = identity;
+            let archived_history = password_history
+                .into_iter()
+                .map(|e| {
+                    let crate::account::PasswordEntry {
+                        password,
+                        set_at_ms,
+                        originating_device,
+                    } = e;
+                    crate::export::ArchivedPasswordEntry {
+                        password,
+                        set_at_ms,
+                        originating_device,
+                    }
+                })
+                .collect();
+            accounts.push(crate::export::ArchivedAccount {
+                account_id: id_bytes,
+                created_at_ms,
+                display_name,
+                tags,
+                urls,
+                usernames,
+                notes,
+                password_history: archived_history,
+                totp_secret,
+                totp_params,
+            });
+        }
+
+        let devices = device::list_devices(&self.conn, &self.device_id)?
+            .into_iter()
+            .map(|d| crate::export::ArchivedDevice {
+                device_id: d.device_id.0,
+                label: d.label,
+                added_at_ms: d.registered_at,
+            })
+            .collect();
+
+        Ok(crate::export::ArchiveSnapshot {
+            schema_version: crate::export::ARCHIVE_SNAPSHOT_SCHEMA_VERSION,
+            exported_at,
+            source_device_id,
+            vault_id,
+            session_idle_secs,
+            accounts,
+            devices,
+        })
+    }
+
+    /// Export an encrypted, self-contained Pangolin vault archive.
+    ///
+    /// **High-risk operation** (Session spec §5.4). Routes through the
+    /// same presence gate as [`Self::export_payload`] / `reveal_*`: an
+    /// active session plus a fresh presence proof. The archive is
+    /// AEAD-sealed (XChaCha20-Poly1305) under a 256-bit key derived
+    /// (Argon2id, `KdfParams::RECOMMENDED`) from `passphrase` — a fresh
+    /// user-supplied export passphrase, independent of the vault master
+    /// password — over a random 16-byte salt stored in the archive's
+    /// plaintext header (which is the AEAD AAD). The returned bytes are
+    /// `header || ciphertext`; the plaintext snapshot is never written
+    /// un-sealed and never escapes this call's `Zeroizing` buffers.
+    ///
+    /// # Errors
+    ///
+    /// Same session/presence set as [`Self::export_payload`]
+    /// ([`StoreError::NotUnlocked`], [`StoreError::SessionExpired`],
+    /// [`StoreError::PromptTimedOut`], …); [`StoreError::Validation`]
+    /// with an `export_*` `kind` on a crypto/serialization failure.
+    pub fn export_encrypted(
+        &mut self,
+        passphrase: &SecretBytes,
+        selection: &crate::export::AccountSelection,
+        presence: &dyn PresenceProof,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        self.check_session_freshness()?;
+        self.ensure_presence_fresh(presence)?;
+        let snapshot = self.gather_archive_snapshot(selection)?;
+        let plain = crate::export::encode_snapshot(&snapshot);
+        drop(snapshot);
+        let archive = crate::export::seal_archive(passphrase, &plain)?;
+        self.touch_session();
+        Ok(archive)
+    }
+
+    /// Export an **unencrypted, cleartext** Pangolin vault dump (the
+    /// spec-guarded `--plaintext` branch — Design Spec §11 / master plan
+    /// §4 row 1.10). **This writes every secret in cleartext.**
+    ///
+    /// **High-risk operation** (Session spec §5.4) — same presence gate
+    /// as [`Self::export_encrypted`] — and additionally requires a
+    /// structurally-valid single-use confirmation token. The
+    /// double-confirmation + 30 s delay + warning copy are owned by the
+    /// CLI/UI; the engine just refuses an empty/invalid token. The
+    /// returned bytes carry a loud in-file cleartext banner.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::export_encrypted`], plus [`StoreError::Validation`]
+    /// with `kind = "export_not_confirmed"` for an invalid token.
+    pub fn export_plaintext(
+        &mut self,
+        confirmation: &crate::export::PlaintextExportConfirmationData,
+        selection: &crate::export::AccountSelection,
+        presence: &dyn PresenceProof,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        self.check_session_freshness()?;
+        self.ensure_presence_fresh(presence)?;
+        if !confirmation.is_valid() {
+            return Err(StoreError::Validation {
+                kind: "export_not_confirmed".into(),
+                message: "plaintext export was not confirmed".into(),
+            });
+        }
+        let snapshot = self.gather_archive_snapshot(selection)?;
+        let bytes = crate::export::render_plaintext(&snapshot);
+        drop(snapshot);
+        self.touch_session();
+        Ok(bytes)
+    }
+
+    /// Restore a **brand-new** `.pvf` vault at `dest` from a decoded
+    /// archive `snapshot`, using `new_master_password` for the new
+    /// vault's master key. Does **not** touch any existing vault and does
+    /// **not** merge — that's deferred to MVP-2 (signed Revision Log v1).
+    ///
+    /// Each archived account is reconstructed through the normal
+    /// validated `account_add` / `account_update` history-replay path
+    /// (see [`Self::restore_write_account`]) — so the new vault preserves
+    /// the credential **content** (the head password, the full sequence
+    /// of historical password *values*, the identity fields, the TOTP
+    /// slot) but **not** the lineage metadata: each restored account gets
+    /// a *fresh random* `account_id` (not the source's), `now` timestamps
+    /// on the replayed history entries (not the originals), and this (the
+    /// new vault's) device as the originating device. The archived
+    /// **device trust list is NOT written** into the new vault — the
+    /// restored `.pvf` is its own fresh device (registered on its first
+    /// unlock); grafting the source's device rows would mis-elect the
+    /// device-key-load row and graft foreign device identities with no
+    /// key material (the archive payload still carries the source device
+    /// list / ids / timestamps / originating-devices — D1/D6 — for any
+    /// future lineage-preserving restore). The session-idle `meta`
+    /// setting is carried over. `snapshot` is moved in and dropped
+    /// (zeroized) before returning. Matches the description in
+    /// `docs/architecture/encrypted-export.md` and `THREAT_MODEL.md`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::AlreadyOpen`] / [`StoreError::Io`] if `dest` exists
+    /// or cannot be created; [`StoreError::Validation`] for an internal
+    /// failure; storage-level errors otherwise.
+    pub fn restore_to_new_vault(
+        dest: &Path,
+        snapshot: crate::export::ArchiveSnapshot,
+        new_master_password: &SecretBytes,
+    ) -> Result<()> {
+        // `snapshot` is `ZeroizeOnDrop` — it wipes when this fn returns.
+        // Provision the fresh `.pvf`, then close it and re-open before
+        // populating it — mirrors the proven create→close→open→unlock
+        // pattern used elsewhere (e2e), so the `meta` write that `create`
+        // committed is fully checkpointed into the on-disk DB before this
+        // session writes a single revision.
+        Self::create(dest, new_master_password)?.close()?;
+        let mut vault = Self::open(dest)?;
+        let presence = crate::session::PressYPresenceProof::confirmed();
+        let identity = crate::session::PinIdentityProof::new(SecretBytes::new(
+            new_master_password.expose().to_vec(),
+        ));
+        vault.unlock(&presence, &identity)?;
+
+        // Carry over the session-idle meta setting.
+        if let Some(secs) = snapshot.session_idle_secs {
+            meta::write_session_idle_secs(&vault.conn, Some(secs))?;
+        }
+
+        // Reconstruct each archived account (head + replayed history).
+        for a in &snapshot.accounts {
+            vault.restore_write_account(a)?;
+        }
+
+        // 1.10 fidelity note: the archived device *trust list* is NOT
+        // re-written into the new vault. The restored `.pvf` is its own
+        // fresh device (registered on its first unlock); injecting the
+        // source's device rows would (a) make this build's
+        // device-key-load path pick the wrong device row (it elects the
+        // oldest `added_at`) and fail, and (b) graft foreign device
+        // identities with no key material — the trust-list reconciliation
+        // belongs with MVP-2's signed authority registry. The archive
+        // payload still carries the source device list (D1) for any
+        // future merge.
+        let _ = &snapshot.devices;
+
+        vault.close()?;
+        drop(snapshot);
+        Ok(())
+    }
+
+    /// **1.10 restore helper.** Reconstruct one archived account into
+    /// this (freshly-created, unlocked) vault.
+    ///
+    /// The non-secret identity fields + the head TOTP slot are written
+    /// via the normal validated `account_add` path; the password history
+    /// is replayed oldest-first via `account_update` so the restored
+    /// vault has the same head password *and* the same number of
+    /// historical password values (with their plaintext bytes).
+    ///
+    /// **1.10 fidelity note:** the restored account gets a *fresh*
+    /// `account_id` (a new random id, not the source vault's), `now`
+    /// timestamps on the history entries, and this device as the
+    /// originating device — the encrypted archive payload still carries
+    /// the original ids/timestamps/originating-devices (D1/D6); the
+    /// *restore-to-a-fresh-vault* path in 1.10 reconstructs the
+    /// credential content, not the lineage metadata. (Lineage-preserving
+    /// restore is a follow-up alongside MVP-2's signed Revision Log.)
+    fn restore_write_account(&mut self, a: &crate::export::ArchivedAccount) -> Result<AccountId> {
+        // The archive stores the history head-first; replay oldest →
+        // newest so the final head matches the source's current
+        // password.
+        let mut entries: Vec<&crate::export::ArchivedPasswordEntry> =
+            a.password_history.iter().collect();
+        entries.reverse();
+        let first_pw = entries
+            .first()
+            .map_or_else(Vec::new, |e| e.password.expose().to_vec());
+        let to_str = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        // The validated `account_add` path requires ≥ 1 username; every
+        // account written through the normal API has one, but synthesize
+        // a placeholder if a hand-built archive somehow has none.
+        let usernames: Vec<String> = if a.usernames.is_empty() {
+            vec!["(no username)".to_string()]
+        } else {
+            a.usernames.iter().map(|u| to_str(u.expose())).collect()
+        };
+        let draft = crate::account::AccountIdentityDraft {
+            schema_version: crate::account::ACCOUNT_IDENTITY_SCHEMA_VERSION,
+            display_name: to_str(a.display_name.expose()),
+            tags: a.tags.iter().map(|t| to_str(t.expose())).collect(),
+            usernames,
+            urls: a.urls.iter().map(|u| to_str(u.expose())).collect(),
+            notes: to_str(a.notes.expose()),
+            password: SecretBytes::new(first_pw),
+            totp_secret: SecretBytes::new(a.totp_secret.expose().to_vec()),
+            totp_params: a.totp_params,
+        };
+        let id = self.account_add(draft)?;
+        // Replay the remaining history entries (oldest already written
+        // as genesis).
+        for e in entries.iter().skip(1) {
+            let patch = crate::account::AccountIdentityPatch {
+                schema_version: crate::account::ACCOUNT_IDENTITY_SCHEMA_VERSION,
+                display_name: None,
+                tags: None,
+                usernames: None,
+                urls: None,
+                notes: None,
+                password: Some(SecretBytes::new(e.password.expose().to_vec())),
+                totp_secret: None,
+                totp_params: None,
+            };
+            self.account_update(id, patch)?;
+        }
+        Ok(id)
+    }
+
+    // -----------------------------------------------------------------
     // MVP-1 issue 1.5: device identity + local trust list.
     //
     // The trust list is the `devices` table; it is add-only (no

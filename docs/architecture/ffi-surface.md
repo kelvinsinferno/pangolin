@@ -254,8 +254,34 @@ unbiased-draw / CSPRNG guarantees.
 
 | Function | Lands in |
 |---|---|
-| `vault_export_encrypted(h: &VaultHandle, dest: &str) -> Result<(), FfiError>` | 1.10 |
-| `vault_export_plaintext(h: &VaultHandle, dest: &str, second_confirmation: PlaintextExportConfirmation) -> Result<(), FfiError>` | 1.10 |
+| `vault_export_encrypted(handle: Arc<VaultHandle>, dest: String, passphrase: Arc<SecretPassword>, accounts: Option<Vec<String>>, presence: PresenceProof) -> Result<ExportReport, FfiError>` | **1.10 — implemented** |
+| `vault_export_plaintext(handle: Arc<VaultHandle>, dest: String, confirmation: PlaintextExportConfirmation, accounts: Option<Vec<String>>, presence: PresenceProof) -> Result<ExportReport, FfiError>` | **1.10 — implemented** |
+| `vault_restore_from_archive(archive_path: String, dest: String, archive_passphrase: Arc<SecretPassword>, new_vault_password: Arc<SecretPassword>) -> Result<RestoreReport, FfiError>` | **1.10 — added (additive)** |
+
+> **1.10 amendments (additive, per `docs/issue-plans/1.10.md` L2/L9 +
+> D1/D2/D4/D5):** both 1.1-frozen `vault_export_*` signatures grew a
+> `presence: PresenceProof` (forced by Session spec §5.4 — "export
+> vault" is reveal-class; the frozen signature predates 1.4's presence
+> model) and an `accounts: Option<Vec<String>>` subset selector (hex
+> account ids; `None` = the whole vault — D1); the encrypted entry also
+> grew an export-passphrase arg (`Arc<SecretPassword>`, consumed +
+> zeroized — a *fresh* passphrase, independent of the vault master
+> password). Both now return a non-secret `ExportReport { schema_version,
+> account_count, bytes_written, encrypted }` instead of `()`. A new
+> `vault_restore_from_archive` entry (D2/D4) decodes an archive and
+> writes a brand-new `.pvf` (`O_CREAT|O_EXCL` — never clobbers; does NOT
+> merge into an existing vault), returning `RestoreReport { schema_version,
+> account_count, device_count }`. The frozen `PlaintextExportConfirmation
+> { schema_version, token }` Record is finally given semantics: the FFI
+> requires a structurally-valid single-use `token` (a missing/empty token
+> → `FfiError::Validation { kind: "export_not_confirmed" }`); the
+> CLI/UI owns the double-confirmation + 30 s delay + warning copy (master
+> plan §4 row 1.10). `UnixTimestamp` is reused for the D6 `exported_at`
+> inside the encrypted payload. Error mapping: a wrong export passphrase
+> *or* a tampered archive → one `FfiError::Validation { kind:
+> "export_credentials" }` (no oracle); bad header/CBOR/unknown version →
+> `export_format`; oversized archive → `export_too_large`; IO →
+> `export_io`. See `docs/architecture/encrypted-export.md`.
 
 ### Capture authority
 
@@ -288,7 +314,9 @@ unbiased-draw / CSPRNG guarantees.
 | `PasswordPolicy` | Record | No (policy flags — `length`, `uppercase`, `lowercase`, `digits`, `symbols`, `exclude_ambiguous` (1.8)) | `schema_version: u16` |
 | `PasswordStrength` | Record | No (1.8 — zxcvbn score, guesses-log10, conservative crack-time-seconds, optional feedback warning + suggestions) | `schema_version: u16` |
 | `KdbxImportReport` | Record | No (counts + category labels) | `schema_version: u16` |
-| `PlaintextExportConfirmation` | Record | Yes (confirmation token) | `schema_version: u16` |
+| `PlaintextExportConfirmation` | Record | Yes (1.10 — the single-use plaintext-export confirmation token; the FFI requires it to be structurally non-empty) | `schema_version: u16` |
+| `ExportReport` | Record | No (1.10 — `account_count`, `bytes_written`, `encrypted` flag) | `schema_version: u16` |
+| `RestoreReport` | Record | No (1.10 — `account_count`, `device_count`) | `schema_version: u16` |
 | `CaptureAuthority` | Record | No | `schema_version: u16` |
 | `CaptureContext` | Record | No | `schema_version: u16` |
 

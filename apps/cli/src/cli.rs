@@ -161,7 +161,7 @@ pub struct VaultArgs {
     pub command: VaultCommand,
 }
 
-/// The `vault` sub-subcommands (P11B ships exactly one — `create`).
+/// The `vault` sub-subcommands.
 #[derive(Debug, Subcommand)]
 pub enum VaultCommand {
     /// Create a brand-new vault file at the given path. Prompts
@@ -171,6 +171,87 @@ pub enum VaultCommand {
     /// password-recovery mechanism; loss of this password is
     /// permanent data loss.
     Create(VaultCreateArgs),
+
+    /// Export the vault as a self-contained, portable encrypted
+    /// archive (`.pvea`) — the move-to-a-new-device / off-site backup
+    /// artifact (MVP-1 issue 1.10). Prompts on stderr for a fresh
+    /// export passphrase (independent of the vault master password) and
+    /// writes the AEAD-sealed archive to the given output path; warns
+    /// (does not block) if zxcvbn rates the passphrase weak. With
+    /// `--accounts` only the listed accounts are included (same archive
+    /// format). With `--plaintext` the spec-guarded cleartext branch is
+    /// selected instead — a double-confirmed, 30-second-delayed,
+    /// loudly-warned `.pvtxt` dump that writes every secret in
+    /// cleartext.
+    Export(VaultExportArgs),
+
+    /// Restore a **brand-new** vault file from an encrypted archive
+    /// (`.pvea`) produced by `vault export` (MVP-1 issue 1.10). Prompts
+    /// on stderr for the archive passphrase and a fresh master password
+    /// for the new vault, decodes the archive, and writes the new `.pvf`
+    /// at `--out` (never clobbers an existing file). Does NOT merge into
+    /// an existing vault.
+    Restore(VaultRestoreArgs),
+}
+
+/// `vault export` — write a portable archive of the vault.
+#[derive(Debug, Args)]
+pub struct VaultExportArgs {
+    /// Path to the `.pvf` vault file to export.
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Output path for the archive. `.pvea` is suggested for the
+    /// encrypted form, `.pvtxt` for `--plaintext`. The path must not
+    /// already exist.
+    #[arg(value_name = "OUT_PATH")]
+    pub out_path: PathBuf,
+
+    /// Vault password (echoes in `ps`; CI use only). If omitted,
+    /// prompted at the terminal without echo.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+
+    /// Comma-separated list of account ids (64-hex each) to include.
+    /// Omit to export the whole vault.
+    #[arg(long, value_delimiter = ',')]
+    pub accounts: Vec<String>,
+
+    /// Read the export passphrase from the first line of stdin (CI use).
+    /// Mutually exclusive with the interactive prompt.
+    #[arg(long)]
+    pub export_passphrase_stdin: bool,
+
+    /// Select the **dangerous** cleartext-export branch instead of the
+    /// default encrypted archive. Guarded behind a typed confirmation +
+    /// a 30-second delay + a second y/N prompt + an in-file warning
+    /// banner.
+    #[arg(long)]
+    pub plaintext: bool,
+
+    /// **Test/CI only.** Skip the 30-second `--plaintext` cooling-off
+    /// delay. Hidden — never document this in user-facing material.
+    #[arg(long, hide = true)]
+    pub no_delay: bool,
+}
+
+/// `vault restore` — create a fresh `.pvf` from an encrypted archive.
+#[derive(Debug, Args)]
+pub struct VaultRestoreArgs {
+    /// Path to the `.pvea` archive to restore from.
+    #[arg(value_name = "ARCHIVE")]
+    pub archive_path: PathBuf,
+
+    /// Path where the brand-new vault file will be created. Must not
+    /// already exist.
+    #[arg(long)]
+    pub out: PathBuf,
+
+    /// Read the archive passphrase from the first line of stdin (CI
+    /// use). The new vault's master password is then read from the
+    /// second stdin line.
+    #[arg(long)]
+    pub archive_passphrase_stdin: bool,
 }
 
 /// `vault create` — provision a fresh `.pvf` at `--path`.
@@ -1370,6 +1451,7 @@ mod tests {
                     assert!(!c.password_stdin);
                     assert!(!c.print_id);
                 }
+                other => panic!("expected Create, got {other:?}"),
             },
             other => panic!("expected Vault, got {other:?}"),
         }
@@ -1402,6 +1484,7 @@ mod tests {
         match cli.command {
             super::Command::Vault(args) => match args.command {
                 super::VaultCommand::Create(c) => assert!(c.print_id),
+                other => panic!("expected Create, got {other:?}"),
             },
             _ => panic!("expected Vault"),
         }
@@ -1423,6 +1506,7 @@ mod tests {
         match cli.command {
             super::Command::Vault(args) => match args.command {
                 super::VaultCommand::Create(c) => assert!(c.password_stdin),
+                other => panic!("expected Create, got {other:?}"),
             },
             _ => panic!("expected Vault"),
         }

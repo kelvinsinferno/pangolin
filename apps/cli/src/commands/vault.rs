@@ -47,7 +47,9 @@ use anyhow::{bail, Context, Result};
 use pangolin_crypto::secret::SecretBytes;
 use pangolin_store::Vault;
 
-use crate::cli::{GlobalArgs, VaultArgs, VaultCommand, VaultCreateArgs};
+use crate::cli::{
+    GlobalArgs, VaultArgs, VaultCommand, VaultCreateArgs, VaultExportArgs, VaultRestoreArgs,
+};
 use crate::commands::account::{
     prompt_password_with_confirmation, read_secret_first_line_from_stdin, reject_empty_password,
 };
@@ -57,6 +59,8 @@ use crate::commands::account::{
 pub async fn run(global: &GlobalArgs, args: VaultArgs) -> Result<()> {
     match args.command {
         VaultCommand::Create(sub) => run_create(global, sub).await,
+        VaultCommand::Export(sub) => run_export(global, sub).await,
+        VaultCommand::Restore(sub) => run_restore(global, sub).await,
     }
 }
 
@@ -253,6 +257,292 @@ fn test_or_prompt_password() -> Result<SecretBytes> {
         }
     }
     prompt_password_with_confirmation()
+}
+
+// ---------------------------------------------------------------------
+// MVP-1 issue 1.10: `pangolin-cli vault export` / `vault restore`.
+// ---------------------------------------------------------------------
+
+/// Pre-flight: refuse to write where a regular file or a symlink
+/// already sits; return the canonicalized path otherwise.
+fn preflight_new_file(path: &Path) -> Result<PathBuf> {
+    let canonical = canonicalize_target_path(path)?;
+    match std::fs::symlink_metadata(&canonical) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!(
+                "refusing to write to {}: path is a symlink; resolve to the real target",
+                canonical.display()
+            );
+        }
+        Ok(_) => bail!(
+            "file already exists at {}; refusing to overwrite",
+            canonical.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(canonical),
+        Err(e) => bail!("could not stat path {}: {e}", canonical.display()),
+    }
+}
+
+/// Write `bytes` to `path` (already pre-flighted), never clobbering, and
+/// on Unix tighten the mode to 0o600.
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("could not create {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Ok(meta) = f.metadata() {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            let _ = f.set_permissions(perms);
+        }
+    }
+    if let Err(e) = f.write_all(bytes).and_then(|()| f.flush()) {
+        drop(f);
+        let _ = std::fs::remove_file(path);
+        return Err(anyhow::Error::from(e))
+            .with_context(|| format!("could not write {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Run `pangolin-cli vault export`.
+#[allow(clippy::unused_async)]
+async fn run_export(_global: &GlobalArgs, args: VaultExportArgs) -> Result<()> {
+    use pangolin_store::session::PressYPresenceProof;
+    use pangolin_store::AccountSelection;
+
+    let out_path = preflight_new_file(&args.out_path)?;
+
+    // 1. Open + unlock the source vault (two-proof flow via the shared
+    //    helper).
+    let mut vault =
+        crate::vault_open::open_and_unlock(&args.vault_path, args.vault_password.as_deref())
+            .context("vault open + unlock failed")?;
+
+    // 2. Build the account selection.
+    let selection = if args.accounts.is_empty() {
+        AccountSelection::All
+    } else {
+        let mut ids = Vec::with_capacity(args.accounts.len());
+        for s in &args.accounts {
+            ids.push(parse_hex32(s).with_context(|| format!("invalid account id {s:?}"))?);
+        }
+        AccountSelection::Subset(ids)
+    };
+    let presence = PressYPresenceProof::confirmed();
+
+    if args.plaintext {
+        run_plaintext_export(&mut vault, &out_path, &selection, &presence, args.no_delay)?;
+        return Ok(());
+    }
+
+    // Encrypted branch: prompt for a fresh export passphrase (twice,
+    // confirm-match), warn (don't block) if zxcvbn rates it weak.
+    let export_pw = prompt_export_passphrase(args.export_passphrase_stdin)?;
+    warn_if_weak_export_passphrase(&export_pw);
+
+    let archive = vault
+        .export_encrypted(&export_pw, &selection, &presence)
+        .context("encrypted export failed")?;
+    drop(export_pw);
+    let n = archive.len();
+    let account_count = match &selection {
+        AccountSelection::All => vault.list_accounts().len(),
+        AccountSelection::Subset(ids) => ids.len(),
+    };
+    write_new_file(&out_path, &archive)?;
+    println!(
+        "wrote encrypted archive to {} ({account_count} accounts, {n} bytes)",
+        out_path.display()
+    );
+    Ok(())
+}
+
+/// Prompt (twice, confirm-match) for a fresh export passphrase, or read
+/// it from the first stdin line when `from_stdin`.
+fn prompt_export_passphrase(from_stdin: bool) -> Result<SecretBytes> {
+    if from_stdin {
+        return reject_empty_password(read_secret_first_line_from_stdin()?);
+    }
+    let first = rpassword::prompt_password(
+        "Enter a NEW export passphrase (independent of your vault password): ",
+    )
+    .context("failed to read export passphrase")?;
+    let second = rpassword::prompt_password("Confirm export passphrase: ")
+        .context("failed to read export passphrase confirmation")?;
+    if first != second {
+        bail!("export passphrases did not match");
+    }
+    reject_empty_password(SecretBytes::new(first.into_bytes()))
+}
+
+/// Advisory zxcvbn weak-passphrase warning on stderr (never blocks).
+fn warn_if_weak_export_passphrase(pw: &SecretBytes) {
+    let as_str = String::from_utf8_lossy(pw.expose());
+    let strength = pangolin_core::pwgen::strength(&as_str);
+    if strength.score <= 2 {
+        eprintln!(
+            "warning: this export passphrase is weak (zxcvbn score {}/4). It is the only thing",
+            strength.score
+        );
+        eprintln!(
+            "protecting a portable copy of every secret in your vault. Consider a stronger one."
+        );
+        if let Some(w) = &strength.feedback_warning {
+            eprintln!("  zxcvbn: {w}");
+        }
+    }
+}
+
+/// The spec-guarded cleartext-export gate (Design Spec §11 / master plan
+/// §4 row 1.10): warning copy → typed confirmation → 30 s delay →
+/// second y/N → mint a single-use token → write the `.pvtxt` file.
+fn run_plaintext_export(
+    vault: &mut Vault,
+    out_path: &Path,
+    selection: &pangolin_store::AccountSelection,
+    presence: &pangolin_store::session::PressYPresenceProof,
+    no_delay: bool,
+) -> Result<()> {
+    eprintln!();
+    eprintln!("============================ DANGER ============================");
+    eprintln!("You asked for a PLAINTEXT export.");
+    eprintln!(
+        "The file at {} will contain EVERY password, note, and TOTP",
+        out_path.display()
+    );
+    eprintln!("seed in your vault — in CLEARTEXT. Anyone who can read that file");
+    eprintln!("can read your entire vault. There is no undo.");
+    eprintln!("===============================================================");
+    eprintln!();
+    eprint!("Type EXACTLY  i understand  to continue: ");
+    std::io::Write::flush(&mut std::io::stderr()).ok();
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
+        .context("failed to read confirmation")?;
+    if line.trim() != "i understand" {
+        bail!("plaintext export aborted (confirmation phrase did not match)");
+    }
+    if no_delay {
+        eprintln!("(--no-delay set: skipping the 30-second cooling-off period)");
+    } else {
+        eprintln!("Waiting 30 seconds — press Ctrl-C now to abort.");
+        for remaining in (1..=30).rev() {
+            eprint!("\r  {remaining:>2}s remaining ...   ");
+            std::io::Write::flush(&mut std::io::stderr()).ok();
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        eprintln!("\r  done.                 ");
+    }
+    eprint!("Final confirmation — write the cleartext file? [y/N]: ");
+    std::io::Write::flush(&mut std::io::stderr()).ok();
+    let mut yn = String::new();
+    std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut yn)
+        .context("failed to read confirmation")?;
+    if !matches!(yn.trim(), "y" | "Y" | "yes" | "YES") {
+        bail!("plaintext export aborted");
+    }
+    // Mint a single-use confirmation token. (Its only role at the engine
+    // layer is structural validity; the gesture above is the real gate.)
+    let mut token = vec![0u8; 32];
+    pangolin_crypto::rng::fill_random(&mut token);
+    let confirmation = pangolin_store::PlaintextExportConfirmationData {
+        schema_version: 1,
+        token,
+    };
+    let bytes = vault
+        .export_plaintext(&confirmation, selection, presence)
+        .context("plaintext export failed")?;
+    let n = bytes.len();
+    write_new_file(out_path, &bytes)?;
+    println!(
+        "wrote PLAINTEXT vault dump to {} ({n} bytes) — this file contains cleartext secrets",
+        out_path.display()
+    );
+    Ok(())
+}
+
+/// Run `pangolin-cli vault restore`.
+#[allow(clippy::unused_async)]
+async fn run_restore(_global: &GlobalArgs, args: VaultRestoreArgs) -> Result<()> {
+    const MAX_ARCHIVE_FILE: u64 = 256 * 1024 * 1024;
+
+    let out_path = preflight_new_file(&args.out)?;
+    let archive_path = args.archive_path.clone();
+    if let Ok(meta) = std::fs::metadata(&archive_path) {
+        anyhow::ensure!(
+            meta.len() <= MAX_ARCHIVE_FILE,
+            "archive {} is too large (max {} bytes)",
+            archive_path.display(),
+            MAX_ARCHIVE_FILE
+        );
+    }
+    let bytes = std::fs::read(&archive_path)
+        .with_context(|| format!("could not read archive {}", archive_path.display()))?;
+
+    // Prompt for the archive passphrase + a fresh master password for
+    // the new vault.
+    let (archive_pw, new_master): (SecretBytes, SecretBytes) = if args.archive_passphrase_stdin {
+        let a = read_secret_first_line_from_stdin()?;
+        let m = reject_empty_password(read_secret_first_line_from_stdin()?)?;
+        (a, m)
+    } else {
+        let a = rpassword::prompt_password("Enter the archive passphrase: ")
+            .context("failed to read archive passphrase")?;
+        let m1 = rpassword::prompt_password("Enter a NEW master password for the restored vault: ")
+            .context("failed to read new master password")?;
+        let m2 = rpassword::prompt_password("Confirm new master password: ")
+            .context("failed to read new master password confirmation")?;
+        if m1 != m2 {
+            bail!("new master passwords did not match");
+        }
+        (
+            SecretBytes::new(a.into_bytes()),
+            reject_empty_password(SecretBytes::new(m1.into_bytes()))?,
+        )
+    };
+
+    let snapshot = pangolin_store::decode_archive(&bytes, &archive_pw)
+        .context("could not decode the archive (wrong passphrase, or the archive is corrupt)")?;
+    drop(archive_pw);
+    let account_count = snapshot.accounts.len();
+    let device_count = snapshot.devices.len();
+    Vault::restore_to_new_vault(&out_path, snapshot, &new_master)
+        .context("could not write the restored vault")?;
+    drop(new_master);
+    println!(
+        "restored {account_count} accounts ({device_count} devices) to {}",
+        out_path.display()
+    );
+    Ok(())
+}
+
+/// Decode a 64-hex string into 32 bytes.
+///
+/// Byte-indexes (like the FFI's `decode_hex32`) so a 64-byte value that
+/// happens to contain a multi-byte UTF-8 char yields a clean error
+/// rather than a mid-char `&str` slice panic.
+fn parse_hex32(s: &str) -> Result<[u8; 32]> {
+    let bytes = s.trim().as_bytes();
+    anyhow::ensure!(
+        bytes.len() == 64,
+        "expected 64 hex characters, got {}",
+        bytes.len()
+    );
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        let pair = std::str::from_utf8(&bytes[2 * i..2 * i + 2])
+            .ok()
+            .and_then(|p| u8::from_str_radix(p, 16).ok())
+            .with_context(|| format!("invalid hex at position {}", 2 * i))?;
+        *b = pair;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -619,5 +909,27 @@ mod tests {
             "symlink at {} must remain after refusal",
             link_path.display()
         );
+    }
+
+    #[test]
+    fn parse_hex32_rejects_non_ascii_without_panic() {
+        // 16 four-byte emoji = 64 bytes — passes the byte-length check
+        // but is not ASCII; the old `&str`-slice impl panicked mid-char.
+        let non_ascii: String = "\u{1F600}".repeat(16);
+        assert_eq!(non_ascii.len(), 64);
+        assert!(super::parse_hex32(&non_ascii).is_err());
+
+        // A 64-byte string that is ASCII but not hex → clean error too.
+        let not_hex = "z".repeat(64);
+        assert!(super::parse_hex32(&not_hex).is_err());
+
+        // Wrong length → clean error.
+        assert!(super::parse_hex32("abc").is_err());
+
+        // A real 64-hex id round-trips.
+        let ok = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let bytes = super::parse_hex32(ok).expect("valid 64-hex parses");
+        assert_eq!(bytes[0], 0x00);
+        assert_eq!(bytes[31], 0xff);
     }
 }
