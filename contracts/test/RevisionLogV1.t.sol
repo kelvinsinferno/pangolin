@@ -309,6 +309,91 @@ contract RevisionLogV1Test is Test {
         revLog.publishRevision(vaultId, bytes32(0), bytes32(0), bytes32(0), 1, tampered, sig);
     }
 
+    /// @dev test_publishRevision_v1_rejectsTamperedVaultId — plan
+    ///      test 8 (named); explicit pin of the EIP-712 typehash
+    ///      vaultId field. A signature computed over (vaultId = X)
+    ///      cannot be replayed against a different vaultId Y because
+    ///      vaultId is bound into the struct hash. The recovered
+    ///      signer recovers to a pseudo-random address that is not
+    ///      registered for the OTHER vault -> ErrSignerNotRegistered.
+    ///      Distinct from `rejectsCrossVaultReplay` only in that this
+    ///      test bootstraps NEITHER vault before the tamper attempt,
+    ///      pinning the "tampered vaultId on a fresh vault triggers
+    ///      self-bootstrap with the recovered signer rather than
+    ///      registering DEVICE_A" path.
+    function test_publishRevision_v1_rejectsTamperedVaultId() public {
+        bytes32 vaultX = keccak256("vault-X");
+        bytes32 vaultY = keccak256("vault-Y");
+        bytes memory payload = hex"01";
+
+        // Bootstrap vault X with DEVICE_A so the registry for X is
+        // populated; vault Y stays empty so the tamper attempt below
+        // triggers the self-bootstrap path on Y with the
+        // pseudo-random recovered signer (NOT DEVICE_A). The test
+        // then asserts DEVICE_A is NOT registered for Y — proving
+        // the tampered-vault-id signature did not get DEVICE_A onto
+        // vault Y's registry.
+        address deviceA = vm.addr(DEVICE_A_PK);
+        bytes32 dx = _computeDigest(vaultX, bytes32(0), bytes32(0), bytes32(0), 1, payload);
+        bytes memory sigX = _sign(DEVICE_A_PK, dx);
+        revLog.publishRevision(vaultX, bytes32(0), bytes32(0), bytes32(0), 1, payload, sigX);
+        assertTrue(revLog.isRegisteredDevice(vaultX, deviceA), "DEVICE_A registered on X");
+
+        // Submit sigX against vaultY. The digest the contract
+        // computes uses vaultY (NOT vaultX), so ecrecover recovers
+        // some pseudo-random address — which the empty Y registry
+        // happily self-bootstraps to. DEVICE_A still NOT on Y.
+        revLog.publishRevision(vaultY, bytes32(0), bytes32(0), bytes32(0), 1, payload, sigX);
+        assertFalse(
+            revLog.isRegisteredDevice(vaultY, deviceA),
+            "DEVICE_A must NOT be registered on Y by a tampered-vault-id sig"
+        );
+    }
+
+    /// @dev test_publishRevision_v1_rejectsTamperedParent — plan
+    ///      test 9 (named); explicit pin of the EIP-712 typehash
+    ///      parentRevision field. A signature computed over
+    ///      (parent = A) cannot be replayed against parent = B. The
+    ///      recovered signer mismatches DEVICE_A so the registry
+    ///      gate fires.
+    function test_publishRevision_v1_rejectsTamperedParent() public {
+        bytes32 vaultId = keccak256("vault");
+        bytes32 parentA = keccak256("parent-A");
+        bytes32 parentB = keccak256("parent-B");
+        bytes memory payload = hex"01";
+
+        // Bootstrap with DEVICE_A on parent = parentA.
+        bytes32 dA = _computeDigest(vaultId, bytes32(0), parentA, bytes32(0), 1, payload);
+        bytes memory sig = _sign(DEVICE_A_PK, dA);
+        revLog.publishRevision(vaultId, bytes32(0), parentA, bytes32(0), 1, payload, sig);
+
+        // Submit the same sig but with parent = parentB. Digest
+        // differs -> ecrecover recovers a non-DEVICE_A address ->
+        // registry gate fires (DEVICE_A IS registered, but the
+        // recovered random signer is not).
+        vm.expectRevert(ErrSignerNotRegistered.selector);
+        revLog.publishRevision(vaultId, bytes32(0), parentB, bytes32(0), 1, payload, sig);
+    }
+
+    /// @dev test_publishRevision_v1_rejectsZeroRZeroS — explicit pin
+    ///      of the `signer == address(0)` guard in `_recover`.
+    ///      `ecrecover` returns address(0) for shape-valid but
+    ///      degenerate signatures (r=0, s=0, valid v). The contract
+    ///      MUST surface ErrInvalidSignature (not silently treat
+    ///      address(0) as "registered" via a self-bootstrap path on
+    ///      a fresh vault).
+    function test_publishRevision_v1_rejectsZeroRZeroS() public {
+        bytes32 vaultId = keccak256("vault-zero-rs");
+        bytes memory payload = hex"01";
+        // r = 0, s = 0, v = 27 — shape-valid but ecrecover returns
+        // address(0). Packed in the contract's expected layout
+        // (r ‖ s ‖ v = 32 + 32 + 1 = 65 bytes).
+        bytes memory sig = abi.encodePacked(bytes32(0), bytes32(0), uint8(27));
+        assertEq(sig.length, 65, "signature must be 65 bytes");
+        vm.expectRevert(ErrInvalidSignature.selector);
+        revLog.publishRevision(vaultId, bytes32(0), bytes32(0), bytes32(0), 1, payload, sig);
+    }
+
     /// @dev test_publishRevision_v1_rejectsCrossVaultReplay — a
     ///      signature for (vault X) cannot publish for (vault Y).
     function test_publishRevision_v1_rejectsCrossVaultReplay() public {
