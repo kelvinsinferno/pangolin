@@ -51,14 +51,25 @@ pub const KDF_ALGO_ARGON2ID: u8 = 1;
 pub const MAX_CIPHERTEXT_LEN: u64 = 256 * 1024 * 1024;
 
 /// Upper clamp on Argon2 memory cost (KiB) we will accept on decode:
-/// 1 GiB. A hostile archive can't make us allocate gigabytes.
+/// 1 GiB. A hostile archive can't make us allocate more than ~1 GiB.
 pub const MAX_KDF_MEMORY_KIB: u32 = 1024 * 1024;
 
-/// Upper clamp on Argon2 time cost we will accept on decode.
-pub const MAX_KDF_TIME_COST: u32 = 64;
+/// Upper clamp on Argon2 time cost we will accept on decode. Combined
+/// with [`MAX_KDF_MEMORY_KIB_TIME_COST_PRODUCT`] this bounds a hostile
+/// header to ~a couple seconds of Argon2 work.
+pub const MAX_KDF_TIME_COST: u32 = 8;
 
 /// Upper clamp on Argon2 parallelism we will accept on decode.
-pub const MAX_KDF_PARALLELISM: u32 = 64;
+pub const MAX_KDF_PARALLELISM: u32 = 8;
+
+/// Combined ceiling on `memory_kib * time_cost` we accept on decode
+/// (≈3 GiB-KiB-passes ≈ a couple seconds of Argon2id).
+///
+/// Even at the 1-GiB memory ceiling a hostile header can't crank
+/// `time_cost` to make the derive run for minutes. `KdfParams::
+/// RECOMMENDED` is 256 MiB × t=3 = 768 K, comfortably under; a paranoid
+/// 512 MiB × t=3 = 1.5 M is also under.
+pub const MAX_KDF_MEMORY_KIB_TIME_COST_PRODUCT: u64 = 3 * 1024 * 1024;
 
 /// Length of the fixed-size plaintext archive header (everything before
 /// the ciphertext).
@@ -164,11 +175,16 @@ impl ArchiveHeader {
             parallelism,
         };
         // Clamp BEFORE any Argon2 call: reject anything below the
-        // crypto-crate floor or above our DoS ceiling.
+        // crypto-crate floor or above our DoS ceiling (each axis plus a
+        // combined memory×time-cost cap, so a hostile header can't make
+        // `derive_key` run for more than ~a couple seconds or allocate
+        // more than ~1 GiB).
         if kdf_params.validate().is_err()
             || memory_kib > MAX_KDF_MEMORY_KIB
             || time_cost > MAX_KDF_TIME_COST
             || parallelism > MAX_KDF_PARALLELISM
+            || u64::from(memory_kib).saturating_mul(u64::from(time_cost))
+                > MAX_KDF_MEMORY_KIB_TIME_COST_PRODUCT
         {
             return Err(fmt_err("archive KDF parameters out of supported range"));
         }
@@ -1092,15 +1108,43 @@ mod tests {
         let plain = encode_snapshot(&s);
         let pw = SecretBytes::new(b"pw".to_vec());
         let archive = seal_archive(&pw, &plain).expect("seal");
-        // Set memory_kib to 64 GiB.
-        let mut t = archive.to_vec();
-        // memory_kib at offset 12+1+1 = 14
-        t[14..18].copy_from_slice(&(64u32 * 1024 * 1024).to_be_bytes());
-        let err = decode_archive(&t, &pw).unwrap_err();
-        match err {
-            StoreError::Validation { kind, .. } => assert_eq!(kind, "export_format"),
+        // Header offsets: magic(12) + format_version(1) + kdf_algo(1) =>
+        // memory_kib at 14..18, time_cost at 18..22, parallelism at 22..26.
+        let expect_export_format = |bytes: &[u8]| match decode_archive(bytes, &pw) {
+            Err(StoreError::Validation { kind, .. }) => assert_eq!(kind, "export_format"),
             other => panic!("unexpected: {other:?}"),
-        }
+        };
+
+        // (a) memory_kib = 64 GiB → over MAX_KDF_MEMORY_KIB.
+        let mut t = archive.to_vec();
+        t[14..18].copy_from_slice(&(64u32 * 1024 * 1024).to_be_bytes());
+        expect_export_format(&t);
+
+        // (b) time_cost = 9 → over MAX_KDF_TIME_COST (8).
+        let mut t = archive.to_vec();
+        t[18..22].copy_from_slice(&9u32.to_be_bytes());
+        expect_export_format(&t);
+
+        // (c) parallelism = 9 → over MAX_KDF_PARALLELISM (8).
+        let mut t = archive.to_vec();
+        t[22..26].copy_from_slice(&9u32.to_be_bytes());
+        expect_export_format(&t);
+
+        // (d) memory_kib = 1 GiB, time_cost = 8 — each axis is at its
+        //     individual ceiling, but the product (8 Gi) blows the
+        //     combined memory×time-cost cap.
+        let mut t = archive.to_vec();
+        t[14..18].copy_from_slice(&(1024u32 * 1024).to_be_bytes());
+        t[18..22].copy_from_slice(&8u32.to_be_bytes());
+        expect_export_format(&t);
+
+        // The unmodified archive uses KdfParams::RECOMMENDED — its params
+        // pass the clamp (a Pangolin-produced archive must always decode).
+        // We only assert the clamp accepts them, without running the real
+        // (expensive) Argon2 derive here; the full round-trip through
+        // decode_archive is covered by `export_decode_restore_round_trip`.
+        let (parsed, _ct) = ArchiveHeader::parse(&archive).expect("RECOMMENDED params accepted");
+        assert_eq!(parsed.kdf_params, KdfParams::RECOMMENDED);
     }
 
     #[test]

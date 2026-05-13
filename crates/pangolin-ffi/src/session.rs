@@ -750,7 +750,10 @@ pub struct RestoreReport {
     pub schema_version: u16,
     /// Number of accounts restored into the new vault.
     pub account_count: u32,
-    /// Number of devices carried over into the new vault's trust list.
+    /// Number of devices present in the decoded archive. (The restore
+    /// path does **not** carry the device trust list over into the new
+    /// vault — see [`pangolin_store::Vault::restore_to_new_vault`] — this
+    /// is purely the count from the decoded archive payload.)
     pub device_count: u32,
 }
 

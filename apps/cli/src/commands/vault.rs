@@ -523,14 +523,24 @@ async fn run_restore(_global: &GlobalArgs, args: VaultRestoreArgs) -> Result<()>
 }
 
 /// Decode a 64-hex string into 32 bytes.
+///
+/// Byte-indexes (like the FFI's `decode_hex32`) so a 64-byte value that
+/// happens to contain a multi-byte UTF-8 char yields a clean error
+/// rather than a mid-char `&str` slice panic.
 fn parse_hex32(s: &str) -> Result<[u8; 32]> {
-    let s = s.trim();
-    anyhow::ensure!(s.len() == 64, "expected 64 hex characters, got {}", s.len());
+    let bytes = s.trim().as_bytes();
+    anyhow::ensure!(
+        bytes.len() == 64,
+        "expected 64 hex characters, got {}",
+        bytes.len()
+    );
     let mut out = [0u8; 32];
     for (i, b) in out.iter_mut().enumerate() {
-        let byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16)
+        let pair = std::str::from_utf8(&bytes[2 * i..2 * i + 2])
+            .ok()
+            .and_then(|p| u8::from_str_radix(p, 16).ok())
             .with_context(|| format!("invalid hex at position {}", 2 * i))?;
-        *b = byte;
+        *b = pair;
     }
     Ok(out)
 }
@@ -899,5 +909,27 @@ mod tests {
             "symlink at {} must remain after refusal",
             link_path.display()
         );
+    }
+
+    #[test]
+    fn parse_hex32_rejects_non_ascii_without_panic() {
+        // 16 four-byte emoji = 64 bytes — passes the byte-length check
+        // but is not ASCII; the old `&str`-slice impl panicked mid-char.
+        let non_ascii: String = "\u{1F600}".repeat(16);
+        assert_eq!(non_ascii.len(), 64);
+        assert!(super::parse_hex32(&non_ascii).is_err());
+
+        // A 64-byte string that is ASCII but not hex → clean error too.
+        let not_hex = "z".repeat(64);
+        assert!(super::parse_hex32(&not_hex).is_err());
+
+        // Wrong length → clean error.
+        assert!(super::parse_hex32("abc").is_err());
+
+        // A real 64-hex id round-trips.
+        let ok = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let bytes = super::parse_hex32(ok).expect("valid 64-hex parses");
+        assert_eq!(bytes[0], 0x00);
+        assert_eq!(bytes[31], 0xff);
     }
 }

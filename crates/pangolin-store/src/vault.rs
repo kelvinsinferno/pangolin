@@ -3253,14 +3253,25 @@ impl Vault {
     /// vault's master key. Does **not** touch any existing vault and does
     /// **not** merge — that's deferred to MVP-2 (signed Revision Log v1).
     ///
-    /// The new vault gets one genesis revision per archived account whose
-    /// V1 identity body carries the full password history (bytes +
-    /// timestamps + originating-device ids — exactly how the source vault
-    /// stores it). The archived device trust list is written into the new
-    /// vault's `devices` table (the new vault's own freshly-registered
-    /// device is added on the first unlock). The session-idle `meta`
+    /// Each archived account is reconstructed through the normal
+    /// validated `account_add` / `account_update` history-replay path
+    /// (see [`Self::restore_write_account`]) — so the new vault preserves
+    /// the credential **content** (the head password, the full sequence
+    /// of historical password *values*, the identity fields, the TOTP
+    /// slot) but **not** the lineage metadata: each restored account gets
+    /// a *fresh random* `account_id` (not the source's), `now` timestamps
+    /// on the replayed history entries (not the originals), and this (the
+    /// new vault's) device as the originating device. The archived
+    /// **device trust list is NOT written** into the new vault — the
+    /// restored `.pvf` is its own fresh device (registered on its first
+    /// unlock); grafting the source's device rows would mis-elect the
+    /// device-key-load row and graft foreign device identities with no
+    /// key material (the archive payload still carries the source device
+    /// list / ids / timestamps / originating-devices — D1/D6 — for any
+    /// future lineage-preserving restore). The session-idle `meta`
     /// setting is carried over. `snapshot` is moved in and dropped
-    /// (zeroized) before returning.
+    /// (zeroized) before returning. Matches the description in
+    /// `docs/architecture/encrypted-export.md` and `THREAT_MODEL.md`.
     ///
     /// # Errors
     ///
