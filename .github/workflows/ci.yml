@@ -6,6 +6,10 @@
 #   - contracts-test: forge test (unit + invariant; >=10k invariant runs)
 #   - contracts-abi-drift: re-build and diff out/ABI vs committed contracts/abi/RevisionLogV0.json
 #   - contracts-slither: static analysis; zero high-severity findings required
+#
+# MVP-2 issue 2.1 — extends the jobs above to cover RevisionLogV1 alongside
+# v0. Per docs/issue-plans/2.1.md §6: same deploy-script dry-run, same
+# ABI-drift diff, same slither scan; v0 jobs are unchanged.
 
 name: CI
 
@@ -105,6 +109,11 @@ jobs:
       # `vm.startBroadcast()` with no broadcaster signed-up is a no-op.
       - name: forge script (deploy dry-run)
         run: forge script script/DeployRevisionLogV0.s.sol --sig "run()" --tc DeployRevisionLogV0
+      # MVP-2 issue 2.1: same dry-run for v1. Same audit-gap-7 rationale
+      # as v0 — catches a regression in the script (bad import, missing
+      # constructor arg, vm.startBroadcast misuse) at build time.
+      - name: forge script (deploy v1 dry-run)
+        run: forge script script/DeployRevisionLogV1.s.sol --sig "run()" --tc DeployRevisionLogV1
 
   contracts-test:
     name: contracts / forge test (incl. invariants)
@@ -164,16 +173,27 @@ jobs:
       # failure or stale ABI commit.
       - name: forge build
         run: forge build
-      - name: Extract freshly built ABI
+      - name: Extract freshly built ABI (v0)
         # Match the committed file's POSIX trailing-newline convention so
         # diff does not flag a spurious end-of-file mismatch.
         run: |
           python3 -c "import json; d=json.load(open('out/RevisionLogV0.sol/RevisionLogV0.json')); f=open('/tmp/RevisionLogV0.fresh.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()"
-      - name: Diff committed ABI against fresh ABI
+      - name: Diff committed v0 ABI against fresh ABI
         run: |
           if ! diff -u abi/RevisionLogV0.json /tmp/RevisionLogV0.fresh.json; then
             echo "::error::ABI drift detected between contracts/abi/RevisionLogV0.json and forge build output."
             echo "::error::Re-run: cd contracts && forge build && python3 -c \"import json; d=json.load(open('out/RevisionLogV0.sol/RevisionLogV0.json')); f=open('abi/RevisionLogV0.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()\""
+            exit 1
+          fi
+      # MVP-2 issue 2.1: same ABI-drift discipline for v1.
+      - name: Extract freshly built ABI (v1)
+        run: |
+          python3 -c "import json; d=json.load(open('out/RevisionLogV1.sol/RevisionLogV1.json')); f=open('/tmp/RevisionLogV1.fresh.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()"
+      - name: Diff committed v1 ABI against fresh ABI
+        run: |
+          if ! diff -u abi/RevisionLogV1.json /tmp/RevisionLogV1.fresh.json; then
+            echo "::error::ABI drift detected between contracts/abi/RevisionLogV1.json and forge build output."
+            echo "::error::Re-run: cd contracts && forge build && python3 -c \"import json; d=json.load(open('out/RevisionLogV1.sol/RevisionLogV1.json')); f=open('abi/RevisionLogV1.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()\""
             exit 1
           fi
 
@@ -212,8 +232,12 @@ jobs:
       # We do NOT exclude lower severities by default; informational and
       # low-severity findings are tolerated but visible in CI logs so a
       # reviewer can decide whether to address them.
-      - name: slither
+      - name: slither (v0)
         run: slither src/RevisionLogV0.sol --fail-high
+      # MVP-2 issue 2.1: same slither posture for v1. Zero high-severity
+      # findings required per docs/issue-plans/2.1.md success criterion.
+      - name: slither (v1)
+        run: slither src/RevisionLogV1.sol --fail-high
 
   # -----------------------------------------------------------------
   # P1-6: Rust supply-chain hardening
