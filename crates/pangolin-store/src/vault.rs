@@ -3588,7 +3588,7 @@ impl Vault {
     ///   verification failure on the Replace branch.
     /// - [`StoreError::Sqlite`] / [`StoreError::Corrupted`] — storage
     ///   failure.
-    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+    #[allow(clippy::needless_pass_by_value)]
     pub fn capture_authority_register(
         &mut self,
         presence: &dyn PresenceProof,
@@ -3606,12 +3606,71 @@ impl Vault {
         let platform_hint_stored =
             crate::capture_authority::coalesce_platform_hint(&canonical_context.platform_hint);
 
-        // Step 3: lookup + decide outcome. IMMEDIATE transaction so a
-        // concurrent register from another handle on the same file
-        // (impossible in MVP-1 — `Vault::open` holds the sidecar
-        // lock — but defence in depth) cannot race the read/write.
-        let tx = self.conn.unchecked_transaction()?;
-        let existing: Option<(i64, String, String, i64, i64)> = tx
+        // Step 3: lookup + decide outcome under a single IMMEDIATE
+        // transaction. We drive the transaction via raw SQL
+        // (`BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK`) rather than
+        // rusqlite's `Transaction` wrapper so the SQLite write lock
+        // can be held continuously across `ensure_presence_fresh` on
+        // the Replace branch — the wrapper borrows `&self.conn`
+        // immutably which would prevent calling
+        // `self.ensure_presence_fresh(&mut self, ...)`.
+        // `ensure_presence_fresh` is in-memory only (no DB I/O), so
+        // holding the SQLite lock across it is safe and closes the
+        // prior TOCTOU window between the lookup and the REPLACE.
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(StoreError::from)?;
+        let outcome = self.capture_authority_register_in_tx(
+            presence,
+            &canonical_authority,
+            &canonical_context,
+            context_kind_i,
+            platform_hint_stored,
+            replace_existing,
+        );
+        match outcome {
+            Ok(o) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(StoreError::from)?;
+                // touch_session runs on every successful outcome
+                // (Created / NoOp / Replaced) — matches the original
+                // semantics where the session is extended on a
+                // successful no-op re-register too.
+                self.touch_session();
+                Ok(o)
+            }
+            Err(e) => {
+                // Best-effort rollback on any error path
+                // (validation, exclusivity, presence-stale, sqlite).
+                // The original error wins — a rollback failure here
+                // would only happen if the connection itself is
+                // broken, in which case the caller already has more
+                // serious problems to surface.
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Inner body of [`Self::capture_authority_register`]. Runs under
+    /// an already-opened `BEGIN IMMEDIATE` transaction; the outer
+    /// wrapper commits on `Ok` and rolls back on `Err`. Split out so
+    /// the borrow checker permits calling `&mut self` methods
+    /// (specifically `ensure_presence_fresh`) on the Replace branch
+    /// without releasing the `SQLite` write lock.
+    #[allow(clippy::too_many_arguments)]
+    fn capture_authority_register_in_tx(
+        &mut self,
+        presence: &dyn PresenceProof,
+        canonical_authority: &crate::capture_authority::CaptureAuthority,
+        canonical_context: &crate::capture_authority::CaptureContext,
+        context_kind_i: i64,
+        platform_hint_stored: &str,
+        replace_existing: bool,
+    ) -> Result<crate::capture_authority::RegistrationOutcome> {
+        let existing: Option<(i64, String, String, i64, i64)> = self
+            .conn
             .query_row(
                 "SELECT authority_kind, component_id, component_version, registered_at, \
                  schema_version FROM capture_authorities \
@@ -3636,9 +3695,7 @@ impl Vault {
 
         match existing {
             None => {
-                // Created: session-class. INSERT under the IMMEDIATE
-                // transaction; commit; touch_session.
-                tx.execute(
+                self.conn.execute(
                     "INSERT INTO capture_authorities \
                        (context_kind, platform_hint, authority_kind, component_id, \
                         component_version, registered_at, schema_version) \
@@ -3647,24 +3704,39 @@ impl Vault {
                         context_kind_i,
                         platform_hint_stored,
                         canonical_authority.kind.to_repr(),
-                        canonical_authority.component_id,
-                        canonical_authority.component_version,
+                        &canonical_authority.component_id,
+                        &canonical_authority.component_version,
                         now_ms,
                         schema_version_i,
                     ],
                 )?;
-                tx.commit()?;
-                self.touch_session();
                 Ok(crate::capture_authority::RegistrationOutcome::Created)
             }
             Some((existing_kind_i, existing_id, existing_version, _existing_at, existing_sv_i)) => {
-                let existing_kind =
-                    crate::capture_authority::CaptureAuthorityKind::from_repr(existing_kind_i)?;
                 let existing_sv = u16::try_from(existing_sv_i).map_err(|_| {
                     StoreError::CaptureAuthorityValidation {
                         reason: "stored schema_version out of u16 range".into(),
                     }
                 })?;
+                // §18.7 per-row ladder parity with `decode_row` (the
+                // path query/list use): a row whose `schema_version`
+                // is from the future is rejected on the register
+                // path too. Without this check, a future-version row
+                // could be silently NoOp'd by a byte-matching
+                // payload — or silently downgraded to the current
+                // MAX via `replace_existing=true` — defeating the
+                // ladder for the only write path that touches it.
+                if existing_sv > crate::capture_authority::CAPTURE_AUTHORITY_SCHEMA_VERSION_MAX {
+                    return Err(StoreError::CaptureAuthorityValidation {
+                        reason: format!(
+                            "stored row schema_version {existing_sv} > {} \
+                             (requires newer Pangolin)",
+                            crate::capture_authority::CAPTURE_AUTHORITY_SCHEMA_VERSION_MAX
+                        ),
+                    });
+                }
+                let existing_kind =
+                    crate::capture_authority::CaptureAuthorityKind::from_repr(existing_kind_i)?;
                 let existing_authority = crate::capture_authority::CaptureAuthority {
                     schema_version: existing_sv,
                     kind: existing_kind,
@@ -3676,36 +3748,24 @@ impl Vault {
                     && existing_authority.component_version
                         == canonical_authority.component_version;
                 if payload_matches {
-                    // NoOp: session-class. Drop the transaction (no
-                    // writes performed); touch_session.
-                    drop(tx);
-                    self.touch_session();
                     return Ok(crate::capture_authority::RegistrationOutcome::NoOp {
                         existing: existing_authority,
                     });
                 }
                 if !replace_existing {
-                    // Exclusivity violation: drop the transaction (no
-                    // writes performed); surface a typed error that
-                    // names the context kind only.
-                    drop(tx);
                     return Err(StoreError::CaptureAuthorityExclusivity {
                         context: canonical_context.kind.label().to_owned(),
                     });
                 }
-                // Replace: reveal-class. ensure_presence_fresh must
-                // succeed BEFORE the REPLACE commits — a stale proof
-                // surfaces PromptTimedOut without any row change.
-                // Drop the transaction borrow so we can call
-                // self.ensure_presence_fresh (which takes &mut self);
-                // re-acquire after.
-                drop(tx);
+                // Replace: reveal-class. `ensure_presence_fresh` runs
+                // INSIDE the BEGIN IMMEDIATE held by the outer
+                // wrapper — a stale proof surfaces `PromptTimedOut`,
+                // the outer wrapper rolls back, no row is changed.
+                // The continuous lock holds across the in-memory
+                // presence check, closing the prior TOCTOU window
+                // between lookup and REPLACE.
                 self.ensure_presence_fresh(presence)?;
-                let tx = self.conn.unchecked_transaction()?;
-                // INSERT OR REPLACE keyed on the primary key. The
-                // registered_at advances on every replace (tiny audit
-                // trail per R-e).
-                tx.execute(
+                self.conn.execute(
                     "INSERT OR REPLACE INTO capture_authorities \
                        (context_kind, platform_hint, authority_kind, component_id, \
                         component_version, registered_at, schema_version) \
@@ -3714,14 +3774,12 @@ impl Vault {
                         context_kind_i,
                         platform_hint_stored,
                         canonical_authority.kind.to_repr(),
-                        canonical_authority.component_id,
-                        canonical_authority.component_version,
+                        &canonical_authority.component_id,
+                        &canonical_authority.component_version,
                         now_ms,
                         schema_version_i,
                     ],
                 )?;
-                tx.commit()?;
-                self.touch_session();
                 Ok(crate::capture_authority::RegistrationOutcome::Replaced {
                     prior: existing_authority,
                 })
@@ -8132,6 +8190,74 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(ok.authority.component_id, "com.example.ext");
+    }
+
+    /// Plan §6 Test 5 / audit F2 fix: a session expired by idle
+    /// timeout blocks `capture_authority_register` for both
+    /// `replace_existing=false` (would-be Created or Exclusivity) and
+    /// `replace_existing=true` (would-be Replaced). The
+    /// `check_session_freshness` preamble fires *before* any DB I/O,
+    /// presence check, or row mutation — same shape as
+    /// `device_set_label`'s active-session contract.
+    #[test]
+    fn capture_authority_register_session_expired_blocked() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "ca-session-expired.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let (mut v, clock) = open_vault_with_test_clock(&p);
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+
+        // Seed a row so the second register (after expiry) would land
+        // on either NoOp / Exclusivity / Replaced — exercising the
+        // existence branches as well as the no-existing-row branch.
+        v.capture_authority_register(
+            &fresh_presence(),
+            sample_authority(),
+            sample_context(),
+            false,
+        )
+        .unwrap();
+
+        // Advance clock past the idle deadline.
+        clock.advance(IDLE_TIMEOUT_DEFAULT + Duration::from_secs(1));
+
+        // replace_existing = false → would-be Exclusivity if the
+        // session were live; with the expired session we hit
+        // SessionExpired first, before validation / DB / presence.
+        let mut other = sample_authority();
+        other.component_id = "com.different.ext".into();
+        let err = v
+            .capture_authority_register(&fresh_presence(), other.clone(), sample_context(), false)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::SessionExpired),
+            "expected SessionExpired (replace_existing=false), got {err:?}"
+        );
+
+        // After SessionExpired surfaces, the session is torn down;
+        // re-unlock to get back into a usable state for the second arm.
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        clock.advance(IDLE_TIMEOUT_DEFAULT + Duration::from_secs(1));
+
+        // replace_existing = true → would-be Replaced if the session
+        // were live; with the expired session we hit SessionExpired
+        // before the presence check is invoked (the proof is dead
+        // weight on the failure path — never consumed).
+        let err = v
+            .capture_authority_register(&fresh_presence(), other, sample_context(), true)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::SessionExpired),
+            "expected SessionExpired (replace_existing=true), got {err:?}"
+        );
+
+        // The originally-seeded row is unchanged.
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let found = v
+            .capture_authority_query(sample_context())
+            .unwrap()
+            .expect("seeded row survives the failed register attempts");
+        assert_eq!(found.authority.component_id, "com.example.ext");
     }
 
     /// Criterion 5: the in-memory `DeviceKey` is dropped on `lock()` —

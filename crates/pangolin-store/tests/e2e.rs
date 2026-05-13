@@ -1763,3 +1763,125 @@ fn search_index_and_session_machine_untouched_by_device_ops() {
     v.lock();
     v.close().unwrap();
 }
+
+// ---------------------------------------------------------------------
+// MVP-1 issue 1.11 plan §6 Test 8 / audit F2 fix:
+// `no_plaintext_on_disk_extended` — extend the plaintext-at-rest scan to
+// cover the capture-authority registry's identifier strings.
+// ---------------------------------------------------------------------
+//
+// `component_id` / `component_version` are NON-secret metadata by design
+// (per `docs/architecture/capture-authority.md` — same on-disk posture
+// as `devices.label`), so they DO appear in the `.pvf` as plaintext
+// inside the `capture_authorities` table row. The interesting property
+// to verify is that they appear in a *bounded* number of locations —
+// catching a regression that would, say, copy them into per-account
+// records (`O(N)` accounts × per-iteration) or duplicate them into the
+// AEAD-sealed revision payload (where they should be indistinguishable
+// from random ciphertext bytes).
+//
+// 5 iterations is plenty: each register overwrites the prior row (via
+// `replace_existing=true`), so the steady-state on-disk shape is a
+// single row + WAL/journal artefacts (typical ≤ 2-3 hits).
+#[test]
+fn no_plaintext_on_disk_extended() {
+    use pangolin_store::{
+        CaptureAuthority, CaptureAuthorityKind, CaptureContext, CaptureContextKind,
+    };
+
+    // Per-row hard ceiling. Catches a duplication-leak regression
+    // (e.g. component_id accidentally copied into N account records)
+    // while tolerating WAL replay + SQLite page boundaries. The
+    // table row + at most 2 SQLite copies (page header + WAL backup)
+    // gives 3; a margin of 1 yields the bound.
+    const MAX_HITS_PER_MARKER: usize = 4;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("vault.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+
+    // First unlock seeds the device row. Lock + close so the next
+    // iteration starts from a clean disk state.
+    {
+        let mut v = Vault::open(&path).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        v.lock();
+        v.close().unwrap();
+    }
+
+    let n_iterations: usize = 5;
+    for i in 0..n_iterations {
+        let id_marker = format!("ca-comp-{i:04}-{}", random_suffix(i));
+        let ver_marker = format!("ca-vers-{i:04}-{}", random_suffix(i + 7919));
+
+        // Each iteration overwrites the prior row via
+        // `replace_existing=true`, so the steady-state is a single
+        // row carrying the iteration's markers.
+        {
+            let mut v = Vault::open(&path).unwrap();
+            v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+            let authority = CaptureAuthority {
+                schema_version: 1,
+                kind: CaptureAuthorityKind::BrowserExtension,
+                component_id: id_marker.clone(),
+                component_version: ver_marker.clone(),
+            };
+            let context = CaptureContext {
+                schema_version: 1,
+                kind: CaptureContextKind::Browser,
+                platform_hint: Some("chrome".into()),
+            };
+            v.capture_authority_register(&fresh_presence(), authority, context, true)
+                .unwrap();
+            v.lock();
+            v.close().unwrap();
+        }
+
+        let scan_one = |bytes: &[u8], where_: &str, marker: &str| {
+            let needle = marker.as_bytes();
+            let hits = bytes.windows(needle.len()).filter(|w| *w == needle).count();
+            assert!(
+                hits >= 1,
+                "marker {marker:?} not found in {where_} (iteration {i}) — \
+                 capture-authority row must persist as plaintext metadata"
+            );
+            assert!(
+                hits <= MAX_HITS_PER_MARKER,
+                "marker {marker:?} appeared {hits}× in {where_} (iteration {i}) — \
+                 leak / duplication regression (cap {MAX_HITS_PER_MARKER})"
+            );
+        };
+
+        let pvf_bytes = std::fs::read(&path).unwrap();
+        scan_one(&pvf_bytes, ".pvf", &id_marker);
+        scan_one(&pvf_bytes, ".pvf", &ver_marker);
+
+        let wal = path.with_extension("pvf-wal");
+        if wal.exists() {
+            let wal_bytes = std::fs::read(&wal).unwrap();
+            let id_needle = id_marker.as_bytes();
+            let ver_needle = ver_marker.as_bytes();
+            // WAL is allowed to contain the markers (it is the same
+            // plaintext data en route to the .pvf); but the cap still
+            // applies — no unbounded duplication.
+            let id_hits = wal_bytes
+                .windows(id_needle.len())
+                .filter(|w| *w == id_needle)
+                .count();
+            let ver_hits = wal_bytes
+                .windows(ver_needle.len())
+                .filter(|w| *w == ver_needle)
+                .count();
+            assert!(
+                id_hits <= MAX_HITS_PER_MARKER,
+                "id marker {id_marker:?} appeared {id_hits}× in WAL (iteration {i}) — \
+                 leak / duplication regression (cap {MAX_HITS_PER_MARKER})"
+            );
+            assert!(
+                ver_hits <= MAX_HITS_PER_MARKER,
+                "version marker {ver_marker:?} appeared {ver_hits}× in WAL (iteration {i}) — \
+                 leak / duplication regression (cap {MAX_HITS_PER_MARKER})"
+            );
+        }
+    }
+}

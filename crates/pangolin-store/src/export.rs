@@ -40,7 +40,22 @@ pub const ARCHIVE_FORMAT_VERSION: u8 = 1;
 
 /// Payload schema version (the CBOR snapshot shape). Independent of
 /// [`ARCHIVE_FORMAT_VERSION`].
-pub const ARCHIVE_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+///
+/// **History:**
+/// - `1` (MVP-1 issues 1.10): the 7-element top-level CBOR array
+///   (`schema_version`, `exported_at`, `source_device_id`, `vault_id`,
+///   `session_idle_secs`, `accounts`, `devices`).
+/// - `2` (MVP-1 issue 1.11): adds the trailing `capture_authorities`
+///   array → 8-element top-level shape.
+///
+/// The bump is what an older Pangolin (1.10 or earlier) needs to
+/// surface the typed "requires newer Pangolin" error on a 1.11
+/// archive — without the bump it would error on the CBOR array
+/// shape first (UX regression). The current decoder accepts both
+/// `(top_len=7, schema_version=1)` (legacy 1.10) and
+/// `(top_len=8, schema_version=2)` (1.11+) shapes; all other
+/// combinations are rejected as malformed.
+pub const ARCHIVE_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 
 /// KDF algorithm id slot. `1` = Argon2id. Future-proofing for a v2.
 pub const KDF_ALGO_ARGON2ID: u8 = 1;
@@ -674,10 +689,17 @@ fn decode_account(dec: &mut Dec<'_>) -> Result<ArchivedAccount> {
 /// malformed input.
 pub fn decode_snapshot(buf: &[u8]) -> Result<ArchiveSnapshot> {
     let mut dec = Decoder::from(buf);
-    // MVP-1 issue 1.11 (L10): accept either 7 (legacy 1.10) or 8 (the
-    // additive 1.11 shape that adds the trailing `capture_authorities`
-    // array). The format/schema_version stays at 1 — this is an
-    // additive trailing-element growth, not a layout change.
+    // MVP-1 issue 1.11 (L10) + audit Low-3 fix:
+    // - top_len = 7, schema_version = 1: legacy 1.10 archive (no
+    //   `capture_authorities` field); `capture_authorities` decodes
+    //   as empty.
+    // - top_len = 8, schema_version = 2: current 1.11+ archive,
+    //   trailing `capture_authorities` array carries the registry.
+    // Any other combination is malformed (e.g. an 8-element shape
+    // with sv=1 is rejected: that shape was never released — only
+    // the in-flight 1.11 builder commit used it before the
+    // schema-version bump). A future Pangolin emitting sv=3 lands
+    // on the typed "requires newer Pangolin" rejection here.
     let top_len = pull_array_len(&mut dec)?;
     if top_len != 7 && top_len != 8 {
         return Err(cbor_err("archive CBOR: unexpected top-level array shape"));
@@ -686,7 +708,11 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<ArchiveSnapshot> {
     let schema_version_u = pull_uint(&mut dec)?;
     let schema_version = u16::try_from(schema_version_u)
         .map_err(|_| cbor_err("archive payload schema version out of range"))?;
-    if schema_version != ARCHIVE_SNAPSHOT_SCHEMA_VERSION {
+    // Allowed (top_len, schema_version) tuples: (7, 1) and (8, 2).
+    // Anything else surfaces the typed "unsupported … schema
+    // version" message so an older Pangolin presented a newer
+    // archive gets the right error.
+    if !matches!((top_len, schema_version), (7, 1) | (8, 2)) {
         return Err(cbor_err(
             "unsupported archive payload schema version (need a newer Pangolin)",
         ));

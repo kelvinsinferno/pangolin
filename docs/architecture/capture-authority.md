@@ -211,14 +211,18 @@ the `prior` payload on `Replaced` (out of scope for 1.11).
 
 ## Archive round-trip (L10, R-f)
 
-1.10's `ArchiveSnapshot` grows an additive optional `capture_authorities:
+1.10's `ArchiveSnapshot` grows an additive `capture_authorities:
 Vec<CapturedCaptureAuthority>` field at the end of the top-level CBOR
 array. The encoder always emits it (even when empty) to keep the
-format stable; the decoder accepts either the legacy 7-item shape (1.10
-archives — the missing trailing field decodes as empty) or the 1.11
-8-item shape. No schema-version bump on the archive payload —
-`ARCHIVE_SNAPSHOT_SCHEMA_VERSION` stays at 1 because the change is
-structurally additive (a trailing optional element).
+format stable; the decoder accepts either the legacy
+`(top_len=7, schema_version=1)` shape (1.10 archives — the missing
+trailing field decodes as empty) or the current
+`(top_len=8, schema_version=2)` shape. The bump from 1 to 2 is what
+an older Pangolin (1.10 or earlier) needs to surface the typed
+"requires newer Pangolin" rejection on a 1.11+ archive; without the
+bump the older decoder would fail on the CBOR array-shape mismatch
+first and emit a generic decode error (audit Low-3 fix). All other
+`(top_len, schema_version)` combinations are rejected as malformed.
 
 `Vault::restore_to_new_vault` does **not** re-register the archive's
 registry — the destination vault starts with an empty registry. The

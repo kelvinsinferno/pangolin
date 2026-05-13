@@ -55,10 +55,27 @@ generous ceiling (> 256 MiB → typed `export_too_large`).
 
 - **`format_version: u8`** (container) — bumped on any header-layout
   change. An unknown value → typed `export_format` error (the §18.7
-  pattern; never a silent partial read).
+  pattern; never a silent partial read). Currently `1`.
 - **`schema_version: u16`** (the CBOR payload shape, inside the
   ciphertext) — independent of the container version. An unknown value
-  → typed `export_format` error.
+  → typed `export_format` error. Currently `2`.
+
+### Snapshot `schema_version` history
+
+- **`1`** — MVP-1 issue 1.10 (initial encrypted-export landing). 7-item
+  top-level CBOR array: `(schema_version, exported_at, source_device_id,
+  vault_id, session_idle_secs, accounts, devices)`.
+- **`2`** — MVP-1 issue 1.11. Adds a trailing `capture_authorities`
+  array (8-item top-level shape).
+
+The decoder accepts both legacy archives (`top_len=7, schema_version=1`)
+and current archives (`top_len=8, schema_version=2`); all other
+combinations are rejected as the typed "requires newer Pangolin"
+error. The bump in 1.11 is what an older Pangolin (1.10 or earlier)
+needs to surface that typed error on a 1.11 archive — without the bump
+it would fail on the CBOR array shape first and surface a less-useful
+generic decode error. A future Pangolin emitting `schema_version=3`
+similarly lands on the typed rejection here.
 
 (Same two-axis approach as the vault's `format_version` vs the CBOR-body
 `schema_version`. See `docs/architecture/schema-versioning.md`.)
