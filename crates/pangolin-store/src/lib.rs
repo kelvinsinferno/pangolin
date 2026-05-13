@@ -39,6 +39,7 @@ pub mod conflict;
 pub mod device;
 pub mod dirty;
 pub mod error;
+pub mod export;
 pub mod pending;
 pub mod revision;
 pub mod session;
@@ -59,6 +60,12 @@ pub use conflict::ConflictReport;
 pub use device::{DeviceCapabilities, DeviceIdentity, DEVICE_IDENTITY_SCHEMA_VERSION};
 pub use dirty::{DirtyEntry, IngestOutcome, RevisionPublishPayload};
 pub use error::{Result, StoreError};
+pub use export::{
+    decode_archive, decode_snapshot, encode_snapshot, render_plaintext, AccountSelection,
+    ArchiveHeader, ArchiveSnapshot, ArchivedAccount, ArchivedDevice, ArchivedPasswordEntry,
+    PlaintextExportConfirmationData, ARCHIVE_FORMAT_VERSION, ARCHIVE_MAGIC,
+    ARCHIVE_SNAPSHOT_SCHEMA_VERSION, PLAINTEXT_EXPORT_BANNER,
+};
 pub use pending::{PendingMerge, PENDING_MERGE_NONCE_LEN, PENDING_MERGE_SECRET_LEN};
 pub use revision::{
     ChainAnchor, DeviceId, RevisionGraph, RevisionId, RevisionMeta, REVISION_SCHEMA_VERSION_MAX,
