@@ -58,6 +58,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod cabi;
+pub mod capture_authority;
 pub mod device;
 pub mod error;
 pub mod identity;
@@ -80,10 +81,18 @@ pub use identity::{
     AccountDraft, AccountId, AccountPatch, AccountSnapshot, DeviceId, PasswordHistoryEntry,
     TotpSecret,
 };
+// MVP-1 issue 1.11: capture-authority FFI shapes + entry points
+// (additive 1.1-surface amendment — see capture_authority.rs /
+// ffi-surface.md). The 1.1-frozen placeholders previously lived in
+// kdbx.rs and are now finalised + relocated.
+pub use capture_authority::{
+    CaptureAuthority, CaptureAuthorityEntry, CaptureAuthorityKind, CaptureContext,
+    CaptureContextKind,
+};
 // MVP-1 issue 1.5: device-identity FFI shapes + entry points (additive
 // 1.1-surface amendment — see device.rs / ffi-surface.md).
 pub use device::{DeviceCapabilities, DeviceInfo};
-pub use kdbx::{CaptureAuthority, CaptureContext, KdbxImportReport};
+pub use kdbx::KdbxImportReport;
 // MVP-1 issue 1.4: presence-gated reveal-class entry points + the
 // zeroizing `RevealedSecret` wrapper they return (Q4 amendment).
 pub use reveal::RevealedSecret;

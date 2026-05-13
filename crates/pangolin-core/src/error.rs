@@ -91,6 +91,19 @@ impl From<StoreError> for Error {
             | StoreError::PromptTimedOut
             | StoreError::NotUnlocked => Self::Session(err.to_string()),
             StoreError::Validation { kind, message } => Self::Validation { kind, message },
+            // MVP-1 issue 1.11: the capture-authority variants surface
+            // as Validation with stable `kind` labels (no info-leak on
+            // the existing payload — the exclusivity message names the
+            // context kind only, the validation message echoes a
+            // structural reason).
+            StoreError::CaptureAuthorityExclusivity { ref context } => Self::Validation {
+                kind: "capture_authority_exclusivity".into(),
+                message: format!("capture authority for context {context} already registered"),
+            },
+            StoreError::CaptureAuthorityValidation { ref reason } => Self::Validation {
+                kind: "capture_authority".into(),
+                message: reason.clone(),
+            },
             other => Self::Store(other.to_string()),
         }
     }

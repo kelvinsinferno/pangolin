@@ -35,6 +35,7 @@
 #![cfg_attr(test, deny(unsafe_code))]
 
 pub mod account;
+pub mod capture_authority;
 pub mod conflict;
 pub mod device;
 pub mod dirty;
@@ -56,6 +57,11 @@ pub use account::{
     ACCOUNT_IDENTITY_SCHEMA_VERSION, PAYLOAD_VERSION_V0, PAYLOAD_VERSION_V1, PAYLOAD_VERSION_V2,
 };
 pub use blob::TombstonePayload;
+pub use capture_authority::{
+    CaptureAuthority, CaptureAuthorityEntry, CaptureAuthorityKind, CaptureContext,
+    CaptureContextKind, CapturedCaptureAuthority, RegistrationOutcome,
+    CAPTURE_AUTHORITY_SCHEMA_VERSION_MAX,
+};
 pub use conflict::ConflictReport;
 pub use device::{DeviceCapabilities, DeviceIdentity, DEVICE_IDENTITY_SCHEMA_VERSION};
 pub use dirty::{DirtyEntry, IngestOutcome, RevisionPublishPayload};

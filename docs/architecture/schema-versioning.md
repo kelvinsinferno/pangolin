@@ -54,6 +54,33 @@ issue follows when it adds or evolves a persisted record.
      a future value rejects at `take_pending_merge` (`Corrupted`-class
      if it's structurally wrong; otherwise the resolve flow fails
      cleanly).
+   - **`capture_authorities.schema_version`** (1.11) → the
+     capture-authority registry row; a future value rejects at decode
+     for *that row* only (`StoreError::CaptureAuthorityValidation`).
+     The rest of the registry — and the rest of the vault — remains
+     fully usable. A `capture_authority_list` call that touches the
+     future row surfaces the rejection; a `capture_authority_query`
+     for a different `(context_kind, platform_hint)` key still works.
+     Same per-row ladder as `devices.schema_version` /
+     `device_key.schema_version`. The §18.7 ladder is enforced on
+     **every** code path that loads a row — both the read side
+     (`query` / `list` via `decode_row`) and the write side
+     (`register`'s inline lookup) — so a future-version row cannot be
+     silently NoOp'd by a matching payload or silently downgraded via
+     `replace_existing=true`.
+   - **`ArchiveSnapshot.schema_version`** (1.10 / 1.11) → the encrypted
+     archive's CBOR payload shape; a future value rejects at
+     `decode_snapshot` with the typed `unsupported archive payload
+     schema version (need a newer Pangolin)` error (whole-archive
+     blast radius — an archive is one self-contained unit, no
+     partial-archive parse is meaningful). 1.10 shipped `1`; 1.11
+     bumped to `2` to add a trailing `capture_authorities` array
+     (top-level shape grew 7→8). The bump is what lets an older
+     Pangolin presented with a 1.11 archive surface the typed
+     "requires upgrade" error — without the bump the older decoder
+     would fail on the CBOR array-shape mismatch first and emit a
+     generic decode error. See `docs/architecture/encrypted-export.md`
+     for the accepted `(top_len, schema_version)` matrix.
    - **`meta.session_idle_secs` validator** (1.4) → the session-idle
      choice; an unknown value is rejected by
      `SessionDuration::try_from_meta_secs` (the cap engine refuses to
@@ -70,7 +97,9 @@ issue follows when it adds or evolves a persisted record.
    table, a new nullable column, a new optional field). MVP-1's
    additive store changes (`sync_state`, `dirty_accounts`,
    `pending_merges`, `session_idle_secs`, the 1.5 `devices` columns,
-   the 1.6 `superseded_by` column) are *minor* — no `format_version`
+   the 1.6 `superseded_by` column, the 1.11 `capture_authorities`
+   table, the 1.11 trailing `capture_authorities` field in 1.10's
+   `ArchiveSnapshot` CBOR shape) are *minor* — no `format_version`
    bump. A major bump requires the migration path below.
 5. **Migration path for a major bump.** Local store: ship the new
    `MAX_KNOWN`, keep a `decode_vN_…` function that hydrates the old
@@ -116,6 +145,8 @@ synthesised V3 body is the new "future" that trips the reject.
 | Resolve-stash record | `pending_merges.schema_version` (P9) | `u8` (stored as INTEGER) | inherited from the revision being resolved | `Corrupted` / clean resolve-flow failure | that stash row |
 | Session-idle choice | `meta.session_idle_secs` (1.4) | a sentinel integer (`{300,900,1800,3600,14400}` s, or `-1` for until-device-lock, or `NULL` = 15-min default) | the recognised set | `SessionDuration::try_from_meta_secs` rejects | session-config refuses to run |
 | FFI user-data records | `schema_version: u16` slot on every FFI `Record` carrying user data (1.1) | `u16` | `ACCOUNT_IDENTITY_SCHEMA_VERSION` (= 1) etc. | bindings mismatch; signature change ⇒ version bump + regen | FFI consumer |
+| Capture-authority row | `capture_authorities.schema_version` (1.11) | `u16` (stored as INTEGER) | `CAPTURE_AUTHORITY_SCHEMA_VERSION_MAX` (= 1) | `StoreError::CaptureAuthorityValidation` (per-row reject; enforced on both `decode_row` and `register`'s inline lookup) | that row only — rest of registry + vault unaffected |
+| Encrypted-archive snapshot | CBOR `schema_version` inside the sealed archive payload (1.10 / 1.11) | `u16` | `ARCHIVE_SNAPSHOT_SCHEMA_VERSION` (= **2** as of MVP-1 issue 1.11) | typed `unsupported archive payload schema version (need a newer Pangolin)` | whole-archive reject (no partial parse) |
 
 ## The §18.7-vs-implementation note (Q3)
 

@@ -3166,6 +3166,12 @@ impl Vault {
             })
             .collect();
 
+        // MVP-1 issue 1.11 (L10): also gather the capture_authorities
+        // registry. The destination of a restore does NOT re-register
+        // them (Q-f / R-f) — but the archive carries them for archive
+        // fidelity / a future MVP-3+ advanced-restore flow.
+        let capture_authorities = self.gather_archive_capture_authorities()?;
+
         Ok(crate::export::ArchiveSnapshot {
             schema_version: crate::export::ARCHIVE_SNAPSHOT_SCHEMA_VERSION,
             exported_at,
@@ -3174,7 +3180,53 @@ impl Vault {
             session_idle_secs,
             accounts,
             devices,
+            capture_authorities,
         })
+    }
+
+    /// Snapshot the `capture_authorities` table for archive export.
+    /// Sorted by `(context_kind, platform_hint)` (stable output).
+    /// Distinct from [`Self::capture_authority_list`] in that it does
+    /// NOT touch the session machinery (no `check_session_freshness` /
+    /// `touch_session`) — the caller has already done that as part of
+    /// `export_encrypted` / `export_plaintext`.
+    fn gather_archive_capture_authorities(
+        &self,
+    ) -> Result<Vec<crate::capture_authority::CapturedCaptureAuthority>> {
+        let sql = format!(
+            "SELECT {} FROM capture_authorities ORDER BY context_kind ASC, platform_hint ASC",
+            crate::capture_authority::CAPTURE_AUTHORITIES_SELECT_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mapped = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in mapped {
+            let (ck, ph, ak, cid, cv, at, sv_i) = r?;
+            let schema_version =
+                u16::try_from(sv_i).map_err(|_| StoreError::CaptureAuthorityValidation {
+                    reason: "stored schema_version out of u16 range".into(),
+                })?;
+            out.push(crate::capture_authority::CapturedCaptureAuthority {
+                context_kind: ck,
+                platform_hint: ph,
+                authority_kind: ak,
+                component_id: cid,
+                component_version: cv,
+                registered_at: at,
+                schema_version,
+            });
+        }
+        Ok(out)
     }
 
     /// Export an encrypted, self-contained Pangolin vault archive.
@@ -3319,6 +3371,17 @@ impl Vault {
         // future merge.
         let _ = &snapshot.devices;
 
+        // MVP-1 issue 1.11 (L10) / Q-f / R-f: the archived
+        // capture-authority registry is NOT re-registered on the new
+        // vault either — the destination is a new environment (new
+        // device, possibly new OS); the source's registration is
+        // stale; the user re-registers helpers on the new device
+        // (when they're also re-installing extensions anyway). Mirrors
+        // the `snapshot.devices` posture. The archive payload still
+        // carries the source registry for a future MVP-3+ advanced-
+        // restore flow.
+        let _ = &snapshot.capture_authorities;
+
         vault.close()?;
         drop(snapshot);
         Ok(())
@@ -3461,6 +3524,397 @@ impl Vault {
         device::set_device_label(&self.conn, &id, &canonical)?;
         self.touch_session();
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // MVP-1 issue 1.11: capture-authority registry.
+    //
+    // Browser-Ext spec §2.3 / API contract §16 / Threat Model invariant
+    // #8: at most one component owns capture per context. The registry
+    // lives in the `capture_authorities` table (PRIMARY KEY
+    // (context_kind, platform_hint) — structural exclusivity). Reads
+    // are session-class (no presence). Writes are *hybrid* (L6, R-c):
+    // a `Created` or `NoOp` registration is session-class; a
+    // `Replaced` registration (existing row overwritten via
+    // `replace_existing=true`) is reveal-class — presence proof is
+    // verified via `ensure_presence_fresh` before the REPLACE is
+    // committed, same machinery as `reveal_*` / `export_*`.
+    // -----------------------------------------------------------------
+
+    /// Register a capture authority for a context.
+    ///
+    /// On entry:
+    /// - `check_session_freshness()` runs first (locked / expired
+    ///   session is rejected before any work).
+    /// - `authority` and `context` are validated per L7 (NFC, length,
+    ///   character classes, `platform_hint` allowlist, future-schema
+    ///   reject).
+    /// - The IMMEDIATE transaction looks up the existing row for the
+    ///   `(context_kind, platform_hint)` key:
+    ///   - **No existing row** → INSERT new row, return
+    ///     [`crate::capture_authority::RegistrationOutcome::Created`].
+    ///     Session-class.
+    ///   - **Existing row, byte-identical payload** → no-op, return
+    ///     [`crate::capture_authority::RegistrationOutcome::NoOp`].
+    ///     Session-class.
+    ///   - **Existing row, different payload**, `replace_existing=false`
+    ///     → [`StoreError::CaptureAuthorityExclusivity`]. The error
+    ///     names the context kind only (no info-leak on the existing
+    ///     `component_id`).
+    ///   - **Existing row, different payload**, `replace_existing=true`
+    ///     → reveal-class branch: `ensure_presence_fresh(presence)`
+    ///     consumes the proof, then REPLACE the row, then
+    ///     `touch_session()`. Returns
+    ///     [`crate::capture_authority::RegistrationOutcome::Replaced`]
+    ///     carrying the prior payload (caller-side audit; the FFI
+    ///     surface collapses Created/Replaced/NoOp to `Ok(())`).
+    ///
+    /// **L6 hybrid:** presence is *required* as an argument even on
+    /// the session-class branches so the call site is uniform; it is
+    /// only *consumed* (verified) on the Replace branch. A stale
+    /// presence proof on a `Created` / `NoOp` registration never fires
+    /// the `PromptTimedOut` path — the proof is dead weight there. On
+    /// the Replace branch a stale proof maps to
+    /// [`StoreError::PromptTimedOut`] (same as the `reveal_*` shape).
+    ///
+    /// # Errors
+    /// - [`StoreError::NotUnlocked`] / [`StoreError::SessionExpired`] /
+    ///   [`StoreError::SessionPending`] — locked / expired session.
+    /// - [`StoreError::CaptureAuthorityValidation`] — payload rejected.
+    /// - [`StoreError::CaptureAuthorityExclusivity`] — existing
+    ///   different registration; caller must opt into replacement.
+    /// - [`StoreError::PromptTimedOut`] /
+    ///   [`StoreError::AuthenticationFailed`] — presence-proof
+    ///   verification failure on the Replace branch.
+    /// - [`StoreError::Sqlite`] / [`StoreError::Corrupted`] — storage
+    ///   failure.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn capture_authority_register(
+        &mut self,
+        presence: &dyn PresenceProof,
+        authority: crate::capture_authority::CaptureAuthority,
+        context: crate::capture_authority::CaptureContext,
+        replace_existing: bool,
+    ) -> Result<crate::capture_authority::RegistrationOutcome> {
+        // Step 1: session-freshness check (proof never consumed if
+        // this fails; rejection happens before any work).
+        self.check_session_freshness()?;
+        // Step 2: validate inputs. Rejection happens before any DB I/O.
+        let canonical_authority = crate::capture_authority::validate_authority(&authority)?;
+        let canonical_context = crate::capture_authority::validate_context(&context)?;
+        let context_kind_i = canonical_context.kind.to_repr();
+        let platform_hint_stored =
+            crate::capture_authority::coalesce_platform_hint(&canonical_context.platform_hint);
+
+        // Step 3: lookup + decide outcome under a single IMMEDIATE
+        // transaction. We drive the transaction via raw SQL
+        // (`BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK`) rather than
+        // rusqlite's `Transaction` wrapper so the SQLite write lock
+        // can be held continuously across `ensure_presence_fresh` on
+        // the Replace branch — the wrapper borrows `&self.conn`
+        // immutably which would prevent calling
+        // `self.ensure_presence_fresh(&mut self, ...)`.
+        // `ensure_presence_fresh` is in-memory only (no DB I/O), so
+        // holding the SQLite lock across it is safe and closes the
+        // prior TOCTOU window between the lookup and the REPLACE.
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(StoreError::from)?;
+        let outcome = self.capture_authority_register_in_tx(
+            presence,
+            &canonical_authority,
+            &canonical_context,
+            context_kind_i,
+            platform_hint_stored,
+            replace_existing,
+        );
+        match outcome {
+            Ok(o) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(StoreError::from)?;
+                // touch_session runs on every successful outcome
+                // (Created / NoOp / Replaced) — matches the original
+                // semantics where the session is extended on a
+                // successful no-op re-register too.
+                self.touch_session();
+                Ok(o)
+            }
+            Err(e) => {
+                // Best-effort rollback on any error path
+                // (validation, exclusivity, presence-stale, sqlite).
+                // The original error wins — a rollback failure here
+                // would only happen if the connection itself is
+                // broken, in which case the caller already has more
+                // serious problems to surface.
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Inner body of [`Self::capture_authority_register`]. Runs under
+    /// an already-opened `BEGIN IMMEDIATE` transaction; the outer
+    /// wrapper commits on `Ok` and rolls back on `Err`. Split out so
+    /// the borrow checker permits calling `&mut self` methods
+    /// (specifically `ensure_presence_fresh`) on the Replace branch
+    /// without releasing the `SQLite` write lock.
+    #[allow(clippy::too_many_arguments)]
+    fn capture_authority_register_in_tx(
+        &mut self,
+        presence: &dyn PresenceProof,
+        canonical_authority: &crate::capture_authority::CaptureAuthority,
+        canonical_context: &crate::capture_authority::CaptureContext,
+        context_kind_i: i64,
+        platform_hint_stored: &str,
+        replace_existing: bool,
+    ) -> Result<crate::capture_authority::RegistrationOutcome> {
+        let existing: Option<(i64, String, String, i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT authority_kind, component_id, component_version, registered_at, \
+                 schema_version FROM capture_authorities \
+                 WHERE context_kind = ?1 AND platform_hint = ?2",
+                rusqlite::params![context_kind_i, platform_hint_stored],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)?;
+
+        let now_ms = current_unix_ms();
+        let schema_version_i =
+            i64::from(crate::capture_authority::CAPTURE_AUTHORITY_SCHEMA_VERSION_MAX);
+
+        match existing {
+            None => {
+                self.conn.execute(
+                    "INSERT INTO capture_authorities \
+                       (context_kind, platform_hint, authority_kind, component_id, \
+                        component_version, registered_at, schema_version) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        context_kind_i,
+                        platform_hint_stored,
+                        canonical_authority.kind.to_repr(),
+                        &canonical_authority.component_id,
+                        &canonical_authority.component_version,
+                        now_ms,
+                        schema_version_i,
+                    ],
+                )?;
+                Ok(crate::capture_authority::RegistrationOutcome::Created)
+            }
+            Some((existing_kind_i, existing_id, existing_version, _existing_at, existing_sv_i)) => {
+                let existing_sv = u16::try_from(existing_sv_i).map_err(|_| {
+                    StoreError::CaptureAuthorityValidation {
+                        reason: "stored schema_version out of u16 range".into(),
+                    }
+                })?;
+                // §18.7 per-row ladder parity with `decode_row` (the
+                // path query/list use): a row whose `schema_version`
+                // is from the future is rejected on the register
+                // path too. Without this check, a future-version row
+                // could be silently NoOp'd by a byte-matching
+                // payload — or silently downgraded to the current
+                // MAX via `replace_existing=true` — defeating the
+                // ladder for the only write path that touches it.
+                if existing_sv > crate::capture_authority::CAPTURE_AUTHORITY_SCHEMA_VERSION_MAX {
+                    return Err(StoreError::CaptureAuthorityValidation {
+                        reason: format!(
+                            "stored row schema_version {existing_sv} > {} \
+                             (requires newer Pangolin)",
+                            crate::capture_authority::CAPTURE_AUTHORITY_SCHEMA_VERSION_MAX
+                        ),
+                    });
+                }
+                let existing_kind =
+                    crate::capture_authority::CaptureAuthorityKind::from_repr(existing_kind_i)?;
+                let existing_authority = crate::capture_authority::CaptureAuthority {
+                    schema_version: existing_sv,
+                    kind: existing_kind,
+                    component_id: existing_id,
+                    component_version: existing_version,
+                };
+                let payload_matches = existing_authority.kind == canonical_authority.kind
+                    && existing_authority.component_id == canonical_authority.component_id
+                    && existing_authority.component_version
+                        == canonical_authority.component_version;
+                if payload_matches {
+                    return Ok(crate::capture_authority::RegistrationOutcome::NoOp {
+                        existing: existing_authority,
+                    });
+                }
+                if !replace_existing {
+                    return Err(StoreError::CaptureAuthorityExclusivity {
+                        context: canonical_context.kind.label().to_owned(),
+                    });
+                }
+                // Replace: reveal-class. `ensure_presence_fresh` runs
+                // INSIDE the BEGIN IMMEDIATE held by the outer
+                // wrapper — a stale proof surfaces `PromptTimedOut`,
+                // the outer wrapper rolls back, no row is changed.
+                // The continuous lock holds across the in-memory
+                // presence check, closing the prior TOCTOU window
+                // between lookup and REPLACE.
+                self.ensure_presence_fresh(presence)?;
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO capture_authorities \
+                       (context_kind, platform_hint, authority_kind, component_id, \
+                        component_version, registered_at, schema_version) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        context_kind_i,
+                        platform_hint_stored,
+                        canonical_authority.kind.to_repr(),
+                        &canonical_authority.component_id,
+                        &canonical_authority.component_version,
+                        now_ms,
+                        schema_version_i,
+                    ],
+                )?;
+                Ok(crate::capture_authority::RegistrationOutcome::Replaced {
+                    prior: existing_authority,
+                })
+            }
+        }
+    }
+
+    /// Look up the registered capture authority for `context`.
+    ///
+    /// Session-class — requires an unlocked, non-expired session, no
+    /// presence proof. `Ok(None)` when no row matches the
+    /// `(context_kind, platform_hint)` key.
+    ///
+    /// # Errors
+    /// - [`StoreError::NotUnlocked`] / [`StoreError::SessionExpired`] /
+    ///   [`StoreError::SessionPending`].
+    /// - [`StoreError::CaptureAuthorityValidation`] — context payload
+    ///   rejected.
+    /// - [`StoreError::Sqlite`] — storage failure.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn capture_authority_query(
+        &mut self,
+        context: crate::capture_authority::CaptureContext,
+    ) -> Result<Option<crate::capture_authority::CaptureAuthorityEntry>> {
+        self.check_session_freshness()?;
+        let canonical_context = crate::capture_authority::validate_context(&context)?;
+        let context_kind_i = canonical_context.kind.to_repr();
+        let platform_hint_stored =
+            crate::capture_authority::coalesce_platform_hint(&canonical_context.platform_hint);
+        let sql = format!(
+            "SELECT {} FROM capture_authorities WHERE context_kind = ?1 AND platform_hint = ?2",
+            crate::capture_authority::CAPTURE_AUTHORITIES_SELECT_COLS
+        );
+        let row: Option<(i64, String, i64, String, String, i64, i64)> = self
+            .conn
+            .query_row(
+                &sql,
+                rusqlite::params![context_kind_i, platform_hint_stored],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)?;
+        match row {
+            None => {
+                self.touch_session();
+                Ok(None)
+            }
+            Some((ck, ph, ak, cid, cv, at, sv)) => {
+                let entry = crate::capture_authority::decode_row(ck, ph, ak, cid, cv, at, sv)?;
+                self.touch_session();
+                Ok(Some(entry))
+            }
+        }
+    }
+
+    /// List every registered capture authority, sorted by
+    /// `(context_kind, platform_hint)` (stable). Session-class.
+    ///
+    /// # Errors
+    /// - [`StoreError::NotUnlocked`] / [`StoreError::SessionExpired`] /
+    ///   [`StoreError::SessionPending`].
+    /// - [`StoreError::CaptureAuthorityValidation`] — a row from the
+    ///   future (per-row §18.7 ladder reject; rest of vault fine).
+    /// - [`StoreError::Sqlite`] — storage failure.
+    pub fn capture_authority_list(
+        &mut self,
+    ) -> Result<Vec<crate::capture_authority::CaptureAuthorityEntry>> {
+        self.check_session_freshness()?;
+        let sql = format!(
+            "SELECT {} FROM capture_authorities ORDER BY context_kind ASC, platform_hint ASC",
+            crate::capture_authority::CAPTURE_AUTHORITIES_SELECT_COLS
+        );
+        let rows = {
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for r in mapped {
+                let (ck, ph, ak, cid, cv, at, sv) = r?;
+                out.push(crate::capture_authority::decode_row(
+                    ck, ph, ak, cid, cv, at, sv,
+                )?);
+            }
+            out
+        };
+        self.touch_session();
+        Ok(rows)
+    }
+
+    /// Delete the registered authority for `context`. Returns `true`
+    /// when a row was deleted, `false` when none was present.
+    ///
+    /// Session-class; not on the FFI surface in 1.11 (test helper +
+    /// future MVP-2 "extension uninstalled" hook).
+    ///
+    /// # Errors
+    /// - [`StoreError::NotUnlocked`] / [`StoreError::SessionExpired`] /
+    ///   [`StoreError::SessionPending`].
+    /// - [`StoreError::CaptureAuthorityValidation`].
+    /// - [`StoreError::Sqlite`].
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn capture_authority_clear(
+        &mut self,
+        context: crate::capture_authority::CaptureContext,
+    ) -> Result<bool> {
+        self.check_session_freshness()?;
+        let canonical_context = crate::capture_authority::validate_context(&context)?;
+        let context_kind_i = canonical_context.kind.to_repr();
+        let platform_hint_stored =
+            crate::capture_authority::coalesce_platform_hint(&canonical_context.platform_hint);
+        let n = self.conn.execute(
+            "DELETE FROM capture_authorities WHERE context_kind = ?1 AND platform_hint = ?2",
+            rusqlite::params![context_kind_i, platform_hint_stored],
+        )?;
+        self.touch_session();
+        Ok(n > 0)
     }
 
     /// Walk the revision history for `id` from genesis to head. Returns
@@ -7410,6 +7864,451 @@ mod tests {
         let v = Vault::open(&p).unwrap();
         assert_eq!(v.device_current().unwrap().device_id, id);
         assert_eq!(v.device_current().unwrap().label, "Kelvin's Café");
+    }
+
+    // -----------------------------------------------------------------
+    // MVP-1 issue 1.11: capture-authority registry tests.
+    // -----------------------------------------------------------------
+
+    fn sample_authority() -> crate::capture_authority::CaptureAuthority {
+        crate::capture_authority::CaptureAuthority {
+            schema_version: 1,
+            kind: crate::capture_authority::CaptureAuthorityKind::BrowserExtension,
+            component_id: "com.example.ext".into(),
+            component_version: "1.0".into(),
+        }
+    }
+
+    fn sample_context() -> crate::capture_authority::CaptureContext {
+        crate::capture_authority::CaptureContext {
+            schema_version: 1,
+            kind: crate::capture_authority::CaptureContextKind::Browser,
+            platform_hint: Some("chrome".into()),
+        }
+    }
+
+    /// L6 (Created branch): a first register on an empty key is
+    /// session-class — succeeds without consuming the presence proof.
+    /// Subsequent identical register is a `NoOp` (no row duplication).
+    #[test]
+    fn capture_authority_register_then_query_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "ca-roundtrip.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+
+        // Empty initially.
+        assert!(v.capture_authority_list().unwrap().is_empty());
+
+        // Created.
+        let outcome = v
+            .capture_authority_register(
+                &fresh_presence(),
+                sample_authority(),
+                sample_context(),
+                false,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::capture_authority::RegistrationOutcome::Created
+        ));
+
+        // Query finds it.
+        let found = v
+            .capture_authority_query(sample_context())
+            .unwrap()
+            .expect("registered");
+        assert_eq!(found.authority.component_id, "com.example.ext");
+        assert_eq!(found.context.platform_hint.as_deref(), Some("chrome"));
+
+        // NoOp on identical re-register.
+        let outcome = v
+            .capture_authority_register(
+                &fresh_presence(),
+                sample_authority(),
+                sample_context(),
+                false,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::capture_authority::RegistrationOutcome::NoOp { .. }
+        ));
+        assert_eq!(v.capture_authority_list().unwrap().len(), 1);
+    }
+
+    /// L8: a second register with a different payload AND
+    /// `replace_existing=false` surfaces `CaptureAuthorityExclusivity`
+    /// (the message names the context kind only — no info-leak on the
+    /// existing `component_id`). With `replace_existing=true`, the
+    /// REPLACE succeeds and returns `Replaced { prior }`.
+    #[test]
+    fn capture_authority_rejects_exclusivity_then_replaces() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "ca-exclusivity.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        v.capture_authority_register(
+            &fresh_presence(),
+            sample_authority(),
+            sample_context(),
+            false,
+        )
+        .unwrap();
+
+        let mut other = sample_authority();
+        other.component_id = "com.different.ext".into();
+
+        let err = v
+            .capture_authority_register(&fresh_presence(), other.clone(), sample_context(), false)
+            .unwrap_err();
+        match err {
+            StoreError::CaptureAuthorityExclusivity { context } => {
+                // No-info-leak: the context kind is named, the existing
+                // component_id is NOT in the variant.
+                assert_eq!(context, "browser");
+            }
+            other => panic!("expected CaptureAuthorityExclusivity, got {other:?}"),
+        }
+
+        // Replace with fresh presence — succeeds.
+        let outcome = v
+            .capture_authority_register(&fresh_presence(), other, sample_context(), true)
+            .unwrap();
+        match outcome {
+            crate::capture_authority::RegistrationOutcome::Replaced { prior } => {
+                assert_eq!(prior.component_id, "com.example.ext");
+            }
+            o => panic!("expected Replaced, got {o:?}"),
+        }
+        // The new payload is now live.
+        let found = v
+            .capture_authority_query(sample_context())
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.authority.component_id, "com.different.ext");
+    }
+
+    /// L7: malformed inputs surface `CaptureAuthorityValidation` and
+    /// do NOT write a row.
+    #[test]
+    fn capture_authority_rejects_malformed_inputs() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "ca-validation.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+
+        // Empty component_id.
+        let mut bad = sample_authority();
+        bad.component_id = String::new();
+        assert!(matches!(
+            v.capture_authority_register(&fresh_presence(), bad, sample_context(), false)
+                .unwrap_err(),
+            StoreError::CaptureAuthorityValidation { .. }
+        ));
+
+        // Non-allowlist platform_hint.
+        let mut bad_ctx = sample_context();
+        bad_ctx.platform_hint = Some("opera".into());
+        assert!(matches!(
+            v.capture_authority_register(&fresh_presence(), sample_authority(), bad_ctx, false)
+                .unwrap_err(),
+            StoreError::CaptureAuthorityValidation { .. }
+        ));
+
+        // Uppercase rejected (must be lowercased ASCII).
+        let mut bad_ctx = sample_context();
+        bad_ctx.platform_hint = Some("Chrome".into());
+        assert!(matches!(
+            v.capture_authority_register(&fresh_presence(), sample_authority(), bad_ctx, false)
+                .unwrap_err(),
+            StoreError::CaptureAuthorityValidation { .. }
+        ));
+
+        // No row was written.
+        assert!(v.capture_authority_list().unwrap().is_empty());
+    }
+
+    /// Reads on a locked vault error with `NotUnlocked`.
+    #[test]
+    fn capture_authority_reads_require_active_session() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "ca-locked.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        v.lock();
+        assert!(matches!(
+            v.capture_authority_list().unwrap_err(),
+            StoreError::NotUnlocked
+        ));
+        assert!(matches!(
+            v.capture_authority_query(sample_context()).unwrap_err(),
+            StoreError::NotUnlocked
+        ));
+    }
+
+    /// `clear` deletes a registered row and returns whether anything
+    /// was removed. Test-only helper; not on the FFI surface in 1.11.
+    #[test]
+    fn capture_authority_clear_removes_row() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "ca-clear.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        v.capture_authority_register(
+            &fresh_presence(),
+            sample_authority(),
+            sample_context(),
+            false,
+        )
+        .unwrap();
+        assert!(v.capture_authority_clear(sample_context()).unwrap());
+        assert!(v
+            .capture_authority_query(sample_context())
+            .unwrap()
+            .is_none());
+        // Second clear: nothing to remove.
+        assert!(!v.capture_authority_clear(sample_context()).unwrap());
+    }
+
+    /// L10 / Q-f: an archive round-trip preserves the registry in the
+    /// snapshot (encode + decode), and `restore_to_new_vault` starts
+    /// the destination with an empty registry (does NOT re-register
+    /// the source's rows; mirrors the `devices` posture).
+    #[test]
+    fn capture_authority_archive_round_trip_destination_starts_empty() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "ca-archive.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        v.capture_authority_register(
+            &fresh_presence(),
+            sample_authority(),
+            sample_context(),
+            false,
+        )
+        .unwrap();
+        let pw = SecretBytes::new(b"export-pp-123".to_vec());
+        let archive = v
+            .export_encrypted(
+                &pw,
+                &crate::export::AccountSelection::All,
+                &fresh_presence(),
+            )
+            .unwrap();
+        let snapshot = crate::export::decode_archive(&archive, &pw).unwrap();
+        // The snapshot carries the registered row.
+        assert_eq!(snapshot.capture_authorities.len(), 1);
+        assert_eq!(
+            snapshot.capture_authorities[0].component_id,
+            "com.example.ext"
+        );
+        // Restore into a fresh vault. Q-f: destination starts with an
+        // empty registry — the snapshot field is carried for fidelity
+        // but `restore_to_new_vault` ignores it.
+        v.close().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+        let dest = vault_path(&dest_dir, "ca-archive-restored.pvf");
+        let new_master = SecretBytes::new(b"new-master".to_vec());
+        Vault::restore_to_new_vault(&dest, snapshot, &new_master).unwrap();
+        let mut dv = Vault::open(&dest).unwrap();
+        dv.unlock(
+            &fresh_presence(),
+            &crate::session::PinIdentityProof::new(SecretBytes::new(b"new-master".to_vec())),
+        )
+        .unwrap();
+        assert!(
+            dv.capture_authority_list().unwrap().is_empty(),
+            "Q-f: restored vault starts with an empty capture-authority registry"
+        );
+    }
+
+    /// §18.7 per-row ladder: a row hand-injected with a
+    /// `schema_version` above the supported max is rejected at decode
+    /// for that row only; the rest of the vault is fine. We poke a
+    /// row in directly via SQL so the test does not depend on a
+    /// future build.
+    #[test]
+    fn capture_authority_future_row_schema_version_rejected_per_row() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "ca-future-row.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        // A clean valid row first.
+        v.capture_authority_register(
+            &fresh_presence(),
+            sample_authority(),
+            sample_context(),
+            false,
+        )
+        .unwrap();
+        // Hand-inject a row with a future schema_version on a
+        // different key.
+        v.conn
+            .execute(
+                "INSERT INTO capture_authorities \
+                   (context_kind, platform_hint, authority_kind, component_id, \
+                    component_version, registered_at, schema_version) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    0i64, // Desktop context
+                    "",
+                    0i64, // Desktop authority kind
+                    "future-ext".to_string(),
+                    "9.9".to_string(),
+                    1_700_000_000_000i64,
+                    i64::from(crate::capture_authority::CAPTURE_AUTHORITY_SCHEMA_VERSION_MAX + 1,),
+                ],
+            )
+            .unwrap();
+        // `list` rejects when it hits the future row.
+        assert!(matches!(
+            v.capture_authority_list().unwrap_err(),
+            StoreError::CaptureAuthorityValidation { .. }
+        ));
+        // `query` for the future-row's key rejects too.
+        let future_ctx = crate::capture_authority::CaptureContext {
+            schema_version: 1,
+            kind: crate::capture_authority::CaptureContextKind::Desktop,
+            platform_hint: None,
+        };
+        assert!(matches!(
+            v.capture_authority_query(future_ctx.clone()).unwrap_err(),
+            StoreError::CaptureAuthorityValidation { .. }
+        ));
+        // Re-audit L1: `register` against the future-row's key must
+        // also reject — both the would-be-NoOp shape (a byte-matching
+        // payload that would otherwise short-circuit to NoOp) AND the
+        // would-be-Replace shape (`replace_existing=true` that would
+        // otherwise silently downgrade the future row to the current
+        // MAX). Both arms drive the new §18.7 ladder check on the
+        // register path (vault.rs:`capture_authority_register_in_tx`)
+        // that the read paths already enforced via `decode_row`.
+        let byte_matching_authority = crate::capture_authority::CaptureAuthority {
+            schema_version: 1,
+            kind: crate::capture_authority::CaptureAuthorityKind::Desktop,
+            component_id: "future-ext".into(),
+            component_version: "9.9".into(),
+        };
+        // Would-be-NoOp (replace_existing=false, payload matches the
+        // hand-injected future row byte-for-byte): rejects on ladder.
+        assert!(matches!(
+            v.capture_authority_register(
+                &fresh_presence(),
+                byte_matching_authority.clone(),
+                future_ctx.clone(),
+                false,
+            )
+            .unwrap_err(),
+            StoreError::CaptureAuthorityValidation { .. }
+        ));
+        // Would-be-Replace (replace_existing=true, payload differs):
+        // rejects on ladder before the presence check fires.
+        let mut different_authority = byte_matching_authority;
+        different_authority.component_id = "different-ext".into();
+        assert!(matches!(
+            v.capture_authority_register(&fresh_presence(), different_authority, future_ctx, true,)
+                .unwrap_err(),
+            StoreError::CaptureAuthorityValidation { .. }
+        ));
+        // The hand-injected row's columns are unchanged — neither
+        // register attempt mutated it (the outer wrapper rolled back).
+        let still_future_sv: i64 = v
+            .conn
+            .query_row(
+                "SELECT schema_version FROM capture_authorities \
+                 WHERE context_kind = 0 AND platform_hint = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_future_sv,
+            i64::from(crate::capture_authority::CAPTURE_AUTHORITY_SCHEMA_VERSION_MAX + 1),
+            "register's ladder check must not have downgraded the future row"
+        );
+        // The valid (Browser/chrome) row remains queryable.
+        let ok = v
+            .capture_authority_query(sample_context())
+            .unwrap()
+            .unwrap();
+        assert_eq!(ok.authority.component_id, "com.example.ext");
+    }
+
+    /// Plan §6 Test 5 / audit F2 fix: a session expired by idle
+    /// timeout blocks `capture_authority_register` for both
+    /// `replace_existing=false` (would-be Created or Exclusivity) and
+    /// `replace_existing=true` (would-be Replaced). The
+    /// `check_session_freshness` preamble fires *before* any DB I/O,
+    /// presence check, or row mutation — same shape as
+    /// `device_set_label`'s active-session contract.
+    #[test]
+    fn capture_authority_register_session_expired_blocked() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "ca-session-expired.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let (mut v, clock) = open_vault_with_test_clock(&p);
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+
+        // Seed a row so the second register (after expiry) would land
+        // on either NoOp / Exclusivity / Replaced — exercising the
+        // existence branches as well as the no-existing-row branch.
+        v.capture_authority_register(
+            &fresh_presence(),
+            sample_authority(),
+            sample_context(),
+            false,
+        )
+        .unwrap();
+
+        // Advance clock past the idle deadline.
+        clock.advance(IDLE_TIMEOUT_DEFAULT + Duration::from_secs(1));
+
+        // replace_existing = false → would-be Exclusivity if the
+        // session were live; with the expired session we hit
+        // SessionExpired first, before validation / DB / presence.
+        let mut other = sample_authority();
+        other.component_id = "com.different.ext".into();
+        let err = v
+            .capture_authority_register(&fresh_presence(), other.clone(), sample_context(), false)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::SessionExpired),
+            "expected SessionExpired (replace_existing=false), got {err:?}"
+        );
+
+        // After SessionExpired surfaces, the session is torn down;
+        // re-unlock to get back into a usable state for the second arm.
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        clock.advance(IDLE_TIMEOUT_DEFAULT + Duration::from_secs(1));
+
+        // replace_existing = true → would-be Replaced if the session
+        // were live; with the expired session we hit SessionExpired
+        // before the presence check is invoked (the proof is dead
+        // weight on the failure path — never consumed).
+        let err = v
+            .capture_authority_register(&fresh_presence(), other, sample_context(), true)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::SessionExpired),
+            "expected SessionExpired (replace_existing=true), got {err:?}"
+        );
+
+        // The originally-seeded row is unchanged.
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let found = v
+            .capture_authority_query(sample_context())
+            .unwrap()
+            .expect("seeded row survives the failed register attempts");
+        assert_eq!(found.authority.component_id, "com.example.ext");
     }
 
     /// Criterion 5: the in-memory `DeviceKey` is dropped on `lock()` —
