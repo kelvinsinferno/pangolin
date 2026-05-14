@@ -10,6 +10,11 @@
 # MVP-2 issue 2.1 — extends the jobs above to cover RevisionLogV1 alongside
 # v0. Per docs/issue-plans/2.1.md §6: same deploy-script dry-run, same
 # ABI-drift diff, same slither scan; v0 jobs are unchanged.
+#
+# MVP-2 issue 2.2 — extends the jobs above to cover EntitlementRegistry
+# alongside v0 + v1. Per docs/issue-plans/2.2.md §6: same deploy-script
+# dry-run (with dummy authority env vars), same ABI-drift diff, same
+# slither scan; v0 + v1 jobs are unchanged.
 
 name: CI
 
@@ -114,6 +119,17 @@ jobs:
       # constructor arg, vm.startBroadcast misuse) at build time.
       - name: forge script (deploy v1 dry-run)
         run: forge script script/DeployRevisionLogV1.s.sol --sig "run()" --tc DeployRevisionLogV1
+      # MVP-2 issue 2.2: same dry-run for the EntitlementRegistry.
+      # Dummy authority addresses passed via env so the constructor's
+      # `address(0)` zero-authority guard does not trip; the deploy
+      # script reads both via vm.envAddress. Per docs/issue-plans/2.2.md
+      # L11, the actual testnet deploy is issue 2.3 — this step only
+      # gates that the script + constructor compile and dry-run cleanly.
+      - name: forge script (deploy entitlement-registry dry-run)
+        env:
+          PAYMENT_AUTHORITY: "0x0000000000000000000000000000000000000001"
+          REDEMPTION_AUTHORITY: "0x0000000000000000000000000000000000000002"
+        run: forge script script/DeployEntitlementRegistry.s.sol --sig "run()" --tc DeployEntitlementRegistry
 
   contracts-test:
     name: contracts / forge test (incl. invariants)
@@ -196,6 +212,18 @@ jobs:
             echo "::error::Re-run: cd contracts && forge build && python3 -c \"import json; d=json.load(open('out/RevisionLogV1.sol/RevisionLogV1.json')); f=open('abi/RevisionLogV1.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()\""
             exit 1
           fi
+      # MVP-2 issue 2.2: same ABI-drift discipline for the entitlement
+      # registry.
+      - name: Extract freshly built ABI (entitlement-registry)
+        run: |
+          python3 -c "import json; d=json.load(open('out/EntitlementRegistry.sol/EntitlementRegistry.json')); f=open('/tmp/EntitlementRegistry.fresh.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()"
+      - name: Diff committed entitlement-registry ABI against fresh ABI
+        run: |
+          if ! diff -u abi/EntitlementRegistry.json /tmp/EntitlementRegistry.fresh.json; then
+            echo "::error::ABI drift detected between contracts/abi/EntitlementRegistry.json and forge build output."
+            echo "::error::Re-run: cd contracts && forge build && python3 -c \"import json; d=json.load(open('out/EntitlementRegistry.sol/EntitlementRegistry.json')); f=open('abi/EntitlementRegistry.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()\""
+            exit 1
+          fi
 
   contracts-slither:
     name: contracts / slither
@@ -238,6 +266,11 @@ jobs:
       # findings required per docs/issue-plans/2.1.md success criterion.
       - name: slither (v1)
         run: slither src/RevisionLogV1.sol --fail-high
+      # MVP-2 issue 2.2: same slither posture for the entitlement
+      # registry. Zero high-severity findings required per
+      # docs/issue-plans/2.2.md success criterion.
+      - name: slither (entitlement-registry)
+        run: slither src/EntitlementRegistry.sol --fail-high
 
   # -----------------------------------------------------------------
   # P1-6: Rust supply-chain hardening
