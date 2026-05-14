@@ -111,6 +111,124 @@
         "Identical gas profile (149135 gas at 0.006 gwei) to the original deploy at 0x8566... — same bytecode, same compiler artifact.",
         "MVP-2 issue 2.1's RevisionLog v1 (with signature verification) will land at a third address; this redeploy is just for the PoC gate."
       ]
+    },
+    "RevisionLogV1": {
+      "address": "0x179362Ad7fb7dA664312aEFDdaa53431eb748E42",
+      "deployer": "0x89e720238A3913688CB0E025ef03a64539575c54",
+      "deploy_tx": "0x22e464123c7fc1c71a161350d521ed7946975b0a9a3b9fd232d8846327cacd19",
+      "deploy_block": 41639216,
+      "deploy_timestamp_unix": 1779235648,
+      "deploy_timestamp_iso": "2026-05-14T18:07:28Z",
+      "gas_used": 451478,
+      "gas_price_gwei": 0.006,
+      "deploy_cost_eth": 0.000002708868,
+      "compiler": {
+        "name": "solc",
+        "version": "0.8.24",
+        "evm_version": "shanghai",
+        "optimizer": true,
+        "optimizer_runs": 200,
+        "bytecode_hash": "none"
+      },
+      "bytecode": {
+        "runtime_size_bytes": 1825,
+        "deployed_runtime_keccak256": "0x5220ac27b023082183b62e9739ae40692551aa4495e94bfe1f4c8da4cf727f43",
+        "matches_audited_artifact": true,
+        "audited_at": "2.1 SIGNOFF (commit 3d3bf87)",
+        "comment": "1,825-byte runtime size matches the 2.1 plan-gate's audited artifact verbatim (well under EIP-170's 24,576 ceiling). Keccak hash is Ethereum Keccak-256 — independently verified via `cast keccak $(cast code 0x179362... --rpc-url https://sepolia.base.org)`."
+      },
+      "abi": "../abi/RevisionLogV1.json",
+      "source": "../src/RevisionLogV1.sol",
+      "verified_on_explorer": true,
+      "verification": {
+        "status": "verified",
+        "method": "Basescan Standard-JSON-Input upload (manual, via web UI) on 2026-05-14",
+        "comment": "The deploy pipeline's auto-verify failed because foundry 1.0.0-stable (Feb 2025) pre-dates Etherscan's V2 multichain endpoint migration; the wrapper's --verifier-url config was switched to V2 in commit b421f95 but forge 1.0.0's URL builder strips the chainid query param. Workaround: generated Standard JSON Input via `forge verify-contract --show-standard-json-input ...` and uploaded via Basescan's UI. Future foundry-version bump will let the wrapper auto-verify directly."
+      },
+      "smoke_tests": {
+        "test_1_max_known_schema_version": {
+          "command": "cast call 0x179362Ad7fb7dA664312aEFDdaa53431eb748E42 \"MAX_KNOWN_SCHEMA_VERSION()(uint16)\" --rpc-url https://sepolia.base.org",
+          "expected": 1,
+          "passed": true,
+          "passed_at": "2026-05-14T18:07:30Z"
+        }
+      },
+      "explorer_links": {
+        "contract": "https://sepolia.basescan.org/address/0x179362Ad7fb7dA664312aEFDdaa53431eb748E42",
+        "deploy_tx": "https://sepolia.basescan.org/tx/0x22e464123c7fc1c71a161350d521ed7946975b0a9a3b9fd232d8846327cacd19"
+      },
+      "notes": [
+        "Recorded under D-017 in DECISIONS.md.",
+        "First MVP-2 contract — adds on-chain signature verification (ecrecover + EIP-712 typed-data) and a write-additive device-key registry over v0's append-only-immutable substrate. Per 2.1 R-a (Path B), the same keypair signs revisions AND pays gas (D-006).",
+        "No constructor arguments — V1 takes none. Deploy initcode is exactly the contract creation code.",
+        "v0 (D-014) stays append-only-immutable wherever it currently sits on chain; this v1 is the substrate every MVP-2 sync issue (3.1, 3.3, 4.1) points at.",
+        "Pangolin-chain adapter integration (-v1 domain prefix bump in `crates/pangolin-chain/src/signing.rs` + new secp256k1_signing.rs module) is a separate MVP-2 issue (3.1)."
+      ]
+    },
+    "EntitlementRegistry": {
+      "address": "0x08F8c394EB0c04ba0A4FBA1e64507b88F4b59D8d",
+      "deployer": "0x89e720238A3913688CB0E025ef03a64539575c54",
+      "deploy_tx": "0x914f5d97dc4b7c78e85ef3ab0d33d0e5c0fa741e3aaa407fc83461e028e94cd0",
+      "deploy_block": 41640322,
+      "deploy_timestamp_unix": 1779237860,
+      "deploy_timestamp_iso": "2026-05-14T18:44:20Z",
+      "gas_used": 593592,
+      "gas_price_gwei": 0.006,
+      "deploy_cost_eth": 0.000003561552,
+      "compiler": {
+        "name": "solc",
+        "version": "0.8.24",
+        "evm_version": "shanghai",
+        "optimizer": true,
+        "optimizer_runs": 200,
+        "bytecode_hash": "none"
+      },
+      "bytecode": {
+        "runtime_size_bytes": 2464,
+        "deployed_runtime_keccak256": "0xca252c6eaa70553a3fb040b9493c2b9db2a34fb7abc782a3ddeb74b1b35dd1f7",
+        "matches_audited_artifact": true,
+        "audited_at": "2.2 SIGNOFF (commit 26b7af1)",
+        "comment": "2,464-byte runtime size matches the 2.2 plan-gate's audited artifact verbatim (22,112-byte margin under EIP-170). Keccak hash is Ethereum Keccak-256."
+      },
+      "constructor_args": {
+        "payment_authority": "0x89e720238A3913688CB0E025ef03a64539575c54",
+        "redemption_authority": "0x89e720238A3913688CB0E025ef03a64539575c54",
+        "initial_schema_version": 1,
+        "abi_encoded": "00000000000000000000000089e720238a3913688cb0e025ef03a64539575c540000000000000000000000089e720238a3913688cb0e025ef03a64539575c540000000000000000000000000000000000000000000000000000000000000001",
+        "comment": "Per 2.3 R-b + 2.2 L8: both authority addresses collapsed to the pangolin-dev wallet for the testnet deploy. This collapses 2.2's split-trust property (R-a of 2.2); the testnet contract is for smoke-testing the integration only — no real money flows. Production-grade split keys ship with MVP-2 issue 3.4 (funder service) at a fresh redeployment."
+      },
+      "abi": "../abi/EntitlementRegistry.json",
+      "source": "../src/EntitlementRegistry.sol",
+      "verified_on_explorer": true,
+      "verification": {
+        "status": "verified",
+        "method": "Basescan Standard-JSON-Input upload (manual, via web UI) on 2026-05-14",
+        "comment": "Same Etherscan-V2 migration constraint as D-017 — manual standard-json-input verification via Basescan's UI. Constructor args encoded inline (three 32-byte words). Future foundry-version bump will let the wrapper auto-verify directly."
+      },
+      "smoke_tests": {
+        "test_1_payment_authority": {
+          "command": "cast call 0x08F8c394EB0c04ba0A4FBA1e64507b88F4b59D8d \"PAYMENT_AUTHORITY()(address)\" --rpc-url https://sepolia.base.org",
+          "expected": "0x89e720238A3913688CB0E025ef03a64539575c54",
+          "passed": true,
+          "passed_at": "2026-05-14T18:44:22Z"
+        },
+        "test_2_max_known_schema_version": {
+          "command": "cast call 0x08F8c394EB0c04ba0A4FBA1e64507b88F4b59D8d \"MAX_KNOWN_SCHEMA_VERSION()(uint16)\" --rpc-url https://sepolia.base.org",
+          "expected": 1,
+          "passed": true,
+          "passed_at": "2026-05-14T18:44:22Z"
+        }
+      },
+      "explorer_links": {
+        "contract": "https://sepolia.basescan.org/address/0x08F8c394EB0c04ba0A4FBA1e64507b88F4b59D8d",
+        "deploy_tx": "https://sepolia.basescan.org/tx/0x914f5d97dc4b7c78e85ef3ab0d33d0e5c0fa741e3aaa407fc83461e028e94cd0"
+      },
+      "notes": [
+        "Recorded under D-018 in DECISIONS.md.",
+        "Per-user paid-balance ledger contract — funder-push split-signer (payment + redemption authorities) with strict-equality nonce + per-credit expiresAt. Same chain as RevisionLogV1 per D-008.",
+        "Constructor immutables locked at deploy: PAYMENT_AUTHORITY, REDEMPTION_AUTHORITY (both pangolin-dev on testnet per R-b), initial schemaVersion=1. No setSigner / setAuthority / rotateKeys — a compromised key would require a v2 redeploy per 2.2 R-d.",
+        "THIS IS THE SMOKE-TEST INSTANCE. Production deployment with real payment-processor + funder-service split keys ships with MVP-2 issue 3.4 at a fresh address; this testnet contract is NOT wired to production."
+      ]
     }
   }
 }
