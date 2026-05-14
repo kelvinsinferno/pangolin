@@ -97,8 +97,10 @@
 
 pub mod adapter;
 pub mod base_sepolia;
+pub mod deployments;
 pub mod error;
 pub mod evm;
+pub mod secp256k1_signing;
 pub mod signing;
 pub mod types;
 
@@ -107,8 +109,13 @@ pub mod mock;
 
 pub use adapter::ChainAdapter;
 pub use base_sepolia::{BaseSepoliaAdapter, BASE_SEPOLIA_CHAIN_ID};
+pub use deployments::{load_deployed_address, ChainEnv};
 pub use error::ChainError;
 pub use evm::{derive_evm_address, derive_evm_wallet, EvmWallet};
+pub use secp256k1_signing::{
+    build_signed_revision_v1, RevisionFieldsV1, SignedRevisionV1, DOMAIN_SEPARATOR_BASE_SEPOLIA_V1,
+    EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA, REVISION_TYPEHASH_V1, SIGNED_REVISION_DOMAIN_V1,
+};
 pub use signing::{
     build_signed_revision, canonical_hash, verify_signed_revision, SignatureInvalid,
 };

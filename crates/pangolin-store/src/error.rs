@@ -8,6 +8,7 @@
 //! [`pangolin_crypto::aead::AeadError::Tampered`] discipline in the
 //! cryptographic layer.
 
+use pangolin_chain::ChainError;
 use pangolin_crypto::aead::AeadError;
 use pangolin_crypto::kdf::KdfError;
 
@@ -299,6 +300,17 @@ pub enum StoreError {
         /// UI-safe rejection reason.
         reason: String,
     },
+
+    /// **MVP-2 issue 3.1.** A chain-side signing operation
+    /// ([`crate::vault::Vault::sign_revision_v1`]) failed. The wrapped
+    /// [`ChainError`] carries the underlying cause (deployment file
+    /// missing / malformed, pinned-address mismatch, wallet error).
+    /// Distinct from authentication-class failures because chain
+    /// signing happens AFTER the session gate succeeds — so a failure
+    /// here is structural (config / build / chain-state), not
+    /// proof-class.
+    #[error("chain signing error: {0}")]
+    ChainSignError(ChainError),
 }
 
 impl StoreError {

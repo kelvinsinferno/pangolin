@@ -41,7 +41,10 @@ use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pangolin_chain::{derive_evm_wallet, EvmWallet};
+use pangolin_chain::{
+    build_signed_revision_v1, derive_evm_wallet, ChainEnv, EvmWallet, RevisionFieldsV1,
+    SignedRevisionV1,
+};
 use pangolin_crypto::aead::{AeadKey, Ciphertext, Nonce, NONCE_LEN};
 use pangolin_crypto::kdf::{self, KdfParams, KdfSalt};
 use pangolin_crypto::keys::{AuthorityKey, DeviceKey, VdkKey, WrapContext, VAULT_ID_LEN};
@@ -987,6 +990,40 @@ impl Vault {
     /// `device_key_verifying_key` / `device_current` posture).
     pub fn evm_wallet(&self) -> Result<&EvmWallet> {
         Ok(&self.require_active()?.evm_wallet)
+    }
+
+    /// **MVP-2 issue 3.1 (R-a..R-e).** Build a v1 signed revision over
+    /// `fields` using the active session's [`EvmWallet`] and the
+    /// deployed `RevisionLogV1` contract address for `chain_env`.
+    ///
+    /// Per L5 (signing reachable only via active session): this method
+    /// calls [`Self::require_active`] before threading the wallet into
+    /// [`pangolin_chain::build_signed_revision_v1`]; a Locked vault
+    /// returns [`StoreError::NotUnlocked`]; an expired session
+    /// surfaces via the require-active gate as
+    /// [`StoreError::SessionExpired`] (the existing eager-drop
+    /// mechanism).
+    ///
+    /// Returns a 65-byte `r ‖ s ‖ v` signature over the EIP-712
+    /// typed-data digest the deployed contract `_recover`s against.
+    /// The broadcast layer (issue 3.3) consumes this output verbatim
+    /// when wiring `publishRevision(...)`.
+    ///
+    /// # Errors
+    ///
+    /// - [`StoreError::NotUnlocked`] / [`StoreError::SessionExpired`]
+    ///   per the L5 session gate.
+    /// - [`StoreError::ChainSignError`] for any chain-side failure:
+    ///   missing / malformed deployment file, pinned-address mismatch
+    ///   (L-domain-binding defense), or signer-internal error.
+    pub fn sign_revision_v1(
+        &self,
+        fields: RevisionFieldsV1,
+        chain_env: ChainEnv,
+    ) -> Result<SignedRevisionV1> {
+        let active = self.require_active()?;
+        build_signed_revision_v1(&active.evm_wallet, fields, chain_env)
+            .map_err(StoreError::ChainSignError)
     }
 
     /// **MVP-1 issue 1.5 (test/test-utilities only).** The 32-byte
@@ -8524,6 +8561,92 @@ mod tests {
                 StoreError::NotUnlocked
             ));
         }
+    }
+
+    /// MVP-2 issue 3.1 (L5 + R-a..R-e): `Vault::sign_revision_v1` is
+    /// reachable ONLY via an active session. Three legs (mirroring
+    /// `evm_wallet_accessor_works_on_active_only`):
+    ///
+    /// 1. Locked vault → `StoreError::NotUnlocked`.
+    /// 2. Active session → `Ok(SignedRevisionV1)` with a 65-byte sig.
+    /// 3. Idle-expired session → `StoreError::SessionExpired` via the
+    ///    require-active gate (an intervening cache-bearing &mut op
+    ///    observes expiry and drops `ActiveState`).
+    ///
+    /// The sig itself is also recovery-checked: signing then
+    /// recovering via the wallet's address must round-trip — but
+    /// that's covered hermetically in `pangolin-chain` already; this
+    /// test focuses on the session gate, the production-critical
+    /// piece.
+    #[test]
+    fn sign_revision_v1_requires_active_session() {
+        use pangolin_chain::{ChainEnv, RevisionFieldsV1};
+
+        // Leg 1: Locked → NotUnlocked.
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "sign-v1-locked.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        let fields = RevisionFieldsV1 {
+            vault_id: [0x11; 32],
+            account_id: [0x22; 32],
+            parent_revision: [0x33; 32],
+            device_id: [0x44; 32],
+            schema_version: 1,
+            enc_payload_hash: [0xCC; 32],
+        };
+        let err = v
+            .sign_revision_v1(fields, ChainEnv::BaseSepolia)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::NotUnlocked),
+            "Locked vault must error NotUnlocked, got {err:?}"
+        );
+
+        // Leg 2: Active → Ok + 65-byte sig + device_id-derived sig
+        // matches the wallet's address.
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let wallet_addr = v.evm_wallet().unwrap().address();
+        let fields = RevisionFieldsV1::with_signer_device_id(
+            v.evm_wallet().unwrap(),
+            [0x11; 32],
+            [0x22; 32],
+            [0x33; 32],
+            1,
+            [0xCC; 32],
+        );
+        let signed = v
+            .sign_revision_v1(fields, ChainEnv::BaseSepolia)
+            .expect("active session must sign");
+        assert_eq!(signed.signature.len(), 65, "EIP-712 sig is 65 bytes");
+        // device_id field carries the left-padded wallet address.
+        assert_eq!(
+            &signed.fields.device_id[12..],
+            wallet_addr.as_slice(),
+            "device_id must be the left-padded wallet address"
+        );
+
+        // Leg 3: idle-expired session → SessionExpired via the
+        // require-active gate (an intervening &mut op observes
+        // expiry; then the &self signing call sees no active state).
+        let dir2 = TempDir::new().unwrap();
+        let p2 = vault_path(&dir2, "sign-v1-expired.pvf");
+        Vault::create(&p2, &fresh_password()).unwrap();
+        let (mut v2, clock) = open_vault_with_test_clock(&p2);
+        v2.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        assert!(v2.sign_revision_v1(fields, ChainEnv::BaseSepolia).is_ok());
+        clock.advance(IDLE_TIMEOUT_DEFAULT + Duration::from_secs(1));
+        // Trigger expiry via an &mut op — the documented mechanism.
+        let err = v2.add_account(fresh_snapshot()).unwrap_err();
+        assert!(matches!(err, StoreError::SessionExpired));
+        // Now the &self signing call sees no active state.
+        let err = v2
+            .sign_revision_v1(fields, ChainEnv::BaseSepolia)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::NotUnlocked),
+            "expired session must error NotUnlocked, got {err:?}"
+        );
     }
 
     /// Criterion 5 (expiry leg): the in-memory `DeviceKey` is also
