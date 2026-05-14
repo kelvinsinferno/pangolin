@@ -130,6 +130,21 @@ jobs:
           PAYMENT_AUTHORITY: "0x0000000000000000000000000000000000000001"
           REDEMPTION_AUTHORITY: "0x0000000000000000000000000000000000000002"
         run: forge script script/DeployEntitlementRegistry.s.sol --sig "run()" --tc DeployEntitlementRegistry
+      # MVP-2 issue 2.3: smoke-test the deploy-wrapper script
+      # (scripts/deploy-contracts.sh) in dry-run mode against the dev
+      # environment. Catches regressions in the wrapper itself — flag
+      # parsing, env-file sourcing, forge invocation — without touching
+      # chain state. --dry-run skips the chain-id + balance checks
+      # because the dev env's RPC URL (127.0.0.1:8545) has no anvil
+      # listening in CI, and --unattended is safe because dry-run never
+      # prompts for a keystore passphrase. The wrapper lives at the repo
+      # root so we override this job's `working-directory: contracts`
+      # default for this step only.
+      - name: deploy-wrapper dry-run (scripts/deploy-contracts.sh smoke test)
+        working-directory: ${{ github.workspace }}
+        env:
+          BASESCAN_API_KEY: ""
+        run: bash scripts/deploy-contracts.sh --env dev --contract all --dry-run --unattended
 
   contracts-test:
     name: contracts / forge test (incl. invariants)

@@ -42,6 +42,13 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+# MVP-2 issue 2.3: per-environment contract deploy configs are committed
+# (dev + sepolia have no secrets; mainnet ships only as a template). The
+# real .env.mainnet (filled in just-in-time by Kelvin) stays ignored.
+!contracts/deploy/.env.dev
+!contracts/deploy/.env.sepolia
+!contracts/deploy/.env.mainnet.template
+contracts/deploy/.env.mainnet
 *.pem
 *.key
 secrets/
