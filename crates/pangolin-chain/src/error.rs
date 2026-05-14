@@ -24,7 +24,10 @@
 //! propagate that as-is. The `Wallet` family carries only a fixed
 //! string description.
 
+use alloy::primitives::Address;
 use thiserror::Error;
+
+use crate::deployments::ChainEnv;
 
 /// Errors returned by [`crate::ChainAdapter`] methods and constructor
 /// helpers.
@@ -149,4 +152,61 @@ pub enum ChainError {
     /// from wrong-message from non-canonical-encoding.
     #[error("signed revision did not verify")]
     SignatureInvalid,
+
+    /// **MVP-2 issue 3.1 (R-c).** A deployment file expected to exist
+    /// at `contracts/deployments/<env>.json` is missing, OR the file
+    /// is present but does not list the requested `<contract_name>`
+    /// under `.contracts.<contract_name>.address`.
+    ///
+    /// Fail-closed posture: the v1 EIP-712 signing path refuses to
+    /// produce a signature against an unknown `verifyingContract`.
+    /// Distinct from [`Self::DeploymentParseError`] so callers can
+    /// distinguish "deployment never recorded" from "deployment file
+    /// present but malformed".
+    #[error("deployment file or contract entry not found: env={env:?}, contract={contract_name}")]
+    DeploymentNotFound {
+        /// Which env was looked up.
+        env: ChainEnv,
+        /// Which contract name was requested.
+        contract_name: String,
+    },
+
+    /// **MVP-2 issue 3.1 (R-c).** The deployment file at
+    /// `contracts/deployments/<env>.json` is present but its JSON
+    /// content is malformed, OR the recorded address string does not
+    /// parse as a hex `Address`. The wrapped `source` is the upstream
+    /// error message; never carries secret material (deployment files
+    /// are public artifacts).
+    #[error("deployment file parse error: env={env:?}, source={detail}")]
+    DeploymentParseError {
+        /// Which env was looked up.
+        env: ChainEnv,
+        /// Upstream error description.
+        detail: String,
+    },
+
+    /// **MVP-2 issue 3.1 (L-domain-binding defense).** The runtime
+    /// address loaded via [`crate::deployments::load_deployed_address`]
+    /// disagrees with the pinned-at-source `EXPECTED_DEPLOYED_ADDRESS_*`
+    /// constant inside the signing primitive. Either the JSON file was
+    /// tampered (deployment redirected to an attacker's contract) or
+    /// the binary was built against a stale pinned constant after a
+    /// legitimate redeploy. Either way the signer refuses to produce a
+    /// signature that would bind to the wrong `verifyingContract` —
+    /// see L-domain-binding in `docs/issue-plans/3.1.md` for the
+    /// worst-case adversary leverage this defends against (permanent
+    /// self-bootstrap-capture of the wrong device).
+    #[error(
+        "deployment address mismatch: env={env:?}, expected={expected}, actual={actual}; \
+         pinned constant and on-disk deployment must agree"
+    )]
+    DeploymentAddressMismatch {
+        /// Which env was looked up.
+        env: ChainEnv,
+        /// The address pinned in source (the
+        /// `EXPECTED_DEPLOYED_ADDRESS_*` constant).
+        expected: Address,
+        /// The address loaded from the on-disk deployment file.
+        actual: Address,
+    },
 }

@@ -74,6 +74,12 @@ pub use export::{
     PlaintextExportConfirmationData, ARCHIVE_FORMAT_VERSION, ARCHIVE_MAGIC,
     ARCHIVE_SNAPSHOT_SCHEMA_VERSION, PLAINTEXT_EXPORT_BANNER,
 };
+// MVP-2 issue 3.1 (R-b convenience re-export): downstream callers
+// (apps/cli, the eventual sync transport in 3.3) get the v1 signing
+// types from `pangolin-store` directly so they don't have to dep on
+// `pangolin-chain` just to name the input/output types. The
+// `pangolin-store -> pangolin-chain` dep direction (L8) is preserved.
+pub use pangolin_chain::{ChainEnv, RevisionFieldsV1, SignedRevisionV1};
 pub use pending::{PendingMerge, PENDING_MERGE_NONCE_LEN, PENDING_MERGE_SECRET_LEN};
 pub use revision::{
     ChainAnchor, DeviceId, RevisionGraph, RevisionId, RevisionMeta, REVISION_SCHEMA_VERSION_MAX,

@@ -174,6 +174,17 @@ the first unlock, the row is back-filled and the field is always 20
 bytes. Appended at end-of-record per the additive-FFI-surface
 discipline.
 
+**MVP-2 issue 3.1 (no-op for FFI).** Issue 3.1 ships the
+secp256k1 EIP-712 v1 signing path (`Vault::sign_revision_v1` +
+`pangolin_chain::build_signed_revision_v1`) entirely inside Rust
+core; nothing new crosses FFI. The new `SignedRevisionV1` struct +
+`RevisionFieldsV1` input type are pure-Rust types that the broadcast
+layer (MVP-2 issue 3.3) will consume internally — they never appear
+in `UniFFI` / `cabi.rs` boundaries. Same posture as 3.2's wallet
+lifecycle: the secp256k1 scalar is gated behind `require_active()`
+and never escapes the Rust core. See
+`docs/architecture/signing.md` for the architectural walkthrough.
+
 ### Revision lineage + fork resolution (MVP-1 issue 1.6 amendment)
 
 | Function | Lands in |
