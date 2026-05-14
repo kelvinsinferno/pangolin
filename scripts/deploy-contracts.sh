@@ -82,6 +82,49 @@ case "$CONTRACT" in
   *) echo "ERROR: --contract must be one of {v0, v1, entitlement, all}; got '$CONTRACT'" >&2; exit 1 ;;
 esac
 
+# --- combo-guard: refuse policy-forbidden (--env, --contract) pairs -
+# These guards fire BEFORE the env file is sourced and BEFORE any RPC
+# is contacted (chain-id check, balance check). Audit fix-pass: putting
+# them later would mean a policy-forbidden invocation hangs on a slow
+# public RPC before reaching the guard.
+
+# F3 (audit Med): --contract v0 --env sepolia would destructively
+# overwrite the canonical D-014 RevisionLogV0 entry in
+# contracts/deployments/base-sepolia.json under the same JSON key.
+# The D-015 redeploy-proof pattern used a separate key precisely
+# to avoid this. Refuse non-dry-run; dry-run never writes JSON so
+# is allowed for syntax-check use.
+if [[ "$CONTRACT" == "v0" && "$ENV" == "sepolia" && "$DRY_RUN" == "0" ]]; then
+  echo "ERROR: --contract v0 --env sepolia would destructively overwrite the canonical" >&2
+  echo "       D-014 RevisionLogV0 entry in contracts/deployments/base-sepolia.json." >&2
+  echo "" >&2
+  echo "       v0 is the PoC append-only-immutable contract; it stays at D-014" >&2
+  echo "       (0x8566D3...3896) and D-015 (0x74f287...A9c4). It does NOT need redeploying" >&2
+  echo "       as part of MVP-2." >&2
+  echo "" >&2
+  echo "       If you genuinely need a fresh v0 redeploy proof (D-015-style), invoke" >&2
+  echo "       forge script directly, then hand-edit a unique key (e.g." >&2
+  echo "       'RevisionLogV0_redeploy_<date>') into base-sepolia.json. The wrapper" >&2
+  echo "       intentionally refuses to touch the D-014 key." >&2
+  exit 1
+fi
+
+# F5 (audit Low): mainnet --contract all is policy-forbidden by the
+# runbook (one contract at a time on mainnet so each on-chain step
+# gets explicit human inspection). Doc-only would be bypassable by
+# a tired operator; script-level guard makes the policy load-bearing.
+if [[ "$CONTRACT" == "all" && "$ENV" == "mainnet" ]]; then
+  echo "ERROR: mainnet --contract all is policy-forbidden per docs/RELEASE-CONTRACTS.md." >&2
+  echo "       Deploy one contract at a time on mainnet so each irreversible on-chain" >&2
+  echo "       step gets explicit human inspection between." >&2
+  echo "" >&2
+  echo "       Re-run as:" >&2
+  echo "         $0 --env mainnet --contract v1" >&2
+  echo "         # ... verify D-NNN record + inspect Basescan ..." >&2
+  echo "         $0 --env mainnet --contract entitlement" >&2
+  exit 1
+fi
+
 # --- env file source ------------------------------------------------
 ENV_FILE="$REPO_ROOT/contracts/deploy/.env.$ENV"
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -245,7 +288,39 @@ deploy_one() {
   addr="$(grep -oE 'Contract Address: 0x[0-9a-fA-F]{40}' "$log_file" | head -n1 | awk '{print $3}' || true)"
   tx_hash="$(grep -oE 'Hash: 0x[0-9a-fA-F]{64}' "$log_file" | head -n1 | awk '{print $2}' || true)"
   block="$(grep -oE 'Block: [0-9]+' "$log_file" | head -n1 | awk '{print $2}' || true)"
+  # gas_used parsing handles BOTH forge output formats:
+  #   - dry-run / simulation: "Gas used: 422850"
+  #   - broadcast: "Paid: 0.0000... ETH (149135 gas * 0.006 gwei)"
+  # We try the dry-run pattern first, then fall back to the broadcast
+  # pattern, then to the canonical broadcast artefact at
+  # contracts/broadcast/<script>.s.sol/<chain-id>/run-latest.json
+  # (only exists after a real --broadcast invocation). Empty value
+  # at the end means the JSON entry will record gas_used: 0 — the
+  # deploy still succeeded; only the metadata field is unknown.
   gas_used="$(grep -oE 'Gas used: [0-9]+' "$log_file" | head -n1 | awk '{print $3}' || true)"
+  if [[ -z "$gas_used" ]]; then
+    # Broadcast format: "(149135 gas * 0.006 gwei)" — pull the integer
+    # immediately before " gas *".
+    gas_used="$(grep -oE '\([0-9]+ gas \*' "$log_file" | head -n1 | grep -oE '[0-9]+' || true)"
+  fi
+  if [[ -z "$gas_used" && "$DRY_RUN" == "0" ]]; then
+    # Canonical fallback: the structured broadcast artefact JSON.
+    # Path: contracts/broadcast/<script_name>.s.sol/<chain-id>/run-latest.json
+    # (script_name is the function parameter, e.g. "DeployRevisionLogV1")
+    local broadcast_artefact
+    broadcast_artefact="$REPO_ROOT/contracts/broadcast/${script_name}.s.sol/${EXPECTED_CHAIN_ID}/run-latest.json"
+    if [[ -f "$broadcast_artefact" ]]; then
+      gas_used="$(jq -r --arg addr "$addr" '
+        [.transactions[]?
+          | select(.contractAddress != null and (.contractAddress | ascii_downcase) == ($addr | ascii_downcase))
+          | .transaction.gas // empty
+        ] | first // empty' "$broadcast_artefact" 2>/dev/null || true)"
+      # gas in the artefact is hex (0x...); decode to decimal if so.
+      if [[ "$gas_used" =~ ^0x[0-9a-fA-F]+$ ]]; then
+        gas_used="$((gas_used))"
+      fi
+    fi
+  fi
 
   if [[ -z "$addr" || -z "$tx_hash" ]]; then
     echo "ERROR: failed to parse deploy address/tx from $log_file" >&2
@@ -262,7 +337,7 @@ deploy_one() {
     RevisionLogV1)
       local max_ver dom_sep
       max_ver="$(cast call "$addr" "MAX_KNOWN_SCHEMA_VERSION()(uint16)" --rpc-url "$RPC_URL")"
-      dom_sep="$(cast call "$addr" "DOMAIN_SEPARATOR()(bytes32)" --rpc-url "$RPC_URL")"
+      dom_sep="$(cast call "$addr" "domainSeparator()(bytes32)" --rpc-url "$RPC_URL")"
       echo "    MAX_KNOWN_SCHEMA_VERSION = $max_ver (expected: 1)"
       echo "    DOMAIN_SEPARATOR = $dom_sep"
       if [[ "$max_ver" != "1" ]]; then
@@ -497,6 +572,8 @@ EOF
 }
 
 # --- dispatch on --contract ----------------------------------------
+# (Combo-guards for v0+sepolia and all+mainnet fire early, before
+# env-file source — see the "combo-guard" block near the top.)
 case "$CONTRACT" in
   v0) deploy_one "DeployRevisionLogV0" "RevisionLogV0" ;;
   v1) deploy_one "DeployRevisionLogV1" "RevisionLogV1" ;;
@@ -504,6 +581,7 @@ case "$CONTRACT" in
   all)
     # Per L1: 'all' deploys V1 then EntitlementRegistry in that order;
     # v0 is already deployed at D-014 and stays there.
+    # F5: mainnet+all is refused above; only dev + sepolia reach this branch.
     deploy_one "DeployRevisionLogV1" "RevisionLogV1"
     deploy_one "DeployEntitlementRegistry" "EntitlementRegistry"
     ;;

@@ -91,16 +91,36 @@ terminal first:
 anvil
 ```
 
-Then in another terminal:
+### One-time anvil keystore setup
+
+`.env.dev` references `DEPLOYER_ACCOUNT="anvil-default"` and the wrapper
+passes `--account anvil-default` to forge (per L3 — never `--private-key`
+on the command line). This requires a Foundry keystore alias named
+`anvil-default`. Anvil's account 0 has a well-known private key; import
+it once:
+
+```bash
+cast wallet import anvil-default --interactive
+# When prompted for the private key, paste:
+#   0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+# (the deterministic anvil-account-0 key; SAFE to commit/share —
+#  it's the same one in every anvil instance worldwide)
+# Set any passphrase you like; the `--unattended` flag below skips
+# the passphrase prompt at deploy time.
+```
+
+This is a one-time setup; the alias survives across machine reboots.
+Verify with `cast wallet list` — you should see `anvil-default (Local)`.
+
+### Run the dev deploy
 
 ```bash
 scripts/deploy-contracts.sh --env dev --contract all --unattended
 ```
 
-The `--unattended` flag is safe on dev because anvil's default-account
-deploy needs no keystore passphrase. The wrapper does NOT write
-`contracts/deployments/dev.json` because anvil restarts re-issue the
-same nonce-0 address — recording would be misleading.
+The wrapper does NOT write `contracts/deployments/dev.json` because anvil
+restarts re-issue the same nonce-0 address — recording would be
+misleading.
 
 To smoke-test the wrapper without an anvil running (e.g., as part of
 a script-syntax check), use `--dry-run`:
