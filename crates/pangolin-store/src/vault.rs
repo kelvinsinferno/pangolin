@@ -41,6 +41,7 @@ use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use pangolin_chain::{derive_evm_wallet, EvmWallet};
 use pangolin_crypto::aead::{AeadKey, Ciphertext, Nonce, NONCE_LEN};
 use pangolin_crypto::kdf::{self, KdfParams, KdfSalt};
 use pangolin_crypto::keys::{AuthorityKey, DeviceKey, VdkKey, WrapContext, VAULT_ID_LEN};
@@ -333,6 +334,28 @@ struct ActiveState {
     /// `dead_code` allow on the non-test cfg.
     #[cfg_attr(not(any(test, feature = "test-utilities")), allow(dead_code))]
     device_key: DeviceKey,
+    /// **MVP-2 issue 3.2 (R-b: eager materialisation).** The
+    /// per-device EVM wallet derived deterministically from `device_key`
+    /// via [`pangolin_chain::derive_evm_wallet`]. Materialised once on
+    /// every successful `Vault::unlock` (one HKDF-SHA256 expand + one
+    /// `k256::SecretKey::from_slice`; ~hundreds of microseconds —
+    /// negligible against the ~ms Argon2id already pays). Held by
+    /// value, never cloned (`EvmWallet` is deliberately not `Clone` —
+    /// L-zeroize); every session-teardown path (`lock()` / idle
+    /// expiry / absolute expiry / `Drop`) drops the wallet alongside
+    /// `device_key`. The secp256k1 *scalar* lives only inside the
+    /// wallet's `k256::SecretKey` whose `Drop` zeroizes; the on-disk
+    /// shape carries only the wallet's public 20-byte *address* (R-a:
+    /// vault-sealed-only).
+    ///
+    /// Reachable from production code via [`Vault::evm_wallet`] —
+    /// which calls `require_active()` so a locked or expired session
+    /// returns `StoreError::NotUnlocked` / `SessionExpired` rather
+    /// than handing out the wallet. Production callers (MVP-2 issues
+    /// 3.1 / 3.3 / 3.4 / 4.2) thread the borrowed wallet into chain
+    /// primitives; the wallet is never re-derived per-call (consumer
+    /// L6 doctrine).
+    evm_wallet: EvmWallet,
     /// **MVP-1 issue 1.4 — presence freshness + dedup (Session spec
     /// §7.6 / §8.6).** Wall-clock instant of the most recent successful
     /// presence proof for this session — set by `unlock` (the 2-proof
@@ -818,22 +841,40 @@ impl Vault {
             key
         };
 
+        // Step 6c (MVP-2 issue 3.2 / R-b — eager materialisation):
+        // derive the per-device EVM wallet from the just-materialised
+        // `DeviceKey`. The wallet lives in `ActiveState` alongside the
+        // `DeviceKey` and is dropped on every session-teardown path
+        // (`lock()`, idle/absolute expiry, `Drop`); no static, no
+        // `OnceCell`, no cross-session memoisation (L2). The
+        // derivation is total in practice (HKDF rejection-sampling
+        // budget exhaustion is ~ 2^-128); a failure surfaces as a
+        // typed `StoreError::Corrupted` so the unlock collapses to a
+        // clean failure path rather than panicking. The wallet's
+        // secp256k1 scalar lives only inside the wallet's
+        // `k256::SecretKey` whose `Drop` zeroizes.
+        let evm_wallet = derive_evm_wallet(&device_key).map_err(|e| {
+            StoreError::Corrupted(format!("evm wallet derivation failed during unlock: {e}"))
+        })?;
+
         // Step 7: install the new ActiveState and session timer. If a
         // prior ActiveState exists (case 1 above), `Option::replace`
         // drops the old one, which zeroizes its cache + VDK + device key
-        // and frees the prior `:memory:` index. The first `expires_at`
-        // derives from the configured idle duration (1.4) — capped at
-        // the absolute-max ceiling via `next_idle_deadline`, which for
-        // `SessionDuration::UntilDeviceLock` collapses to "the absolute
-        // ceiling, no idle leg". The unlock's presence proof is fresh
-        // *now*, so `last_presence_at = now` — a reveal-class op within
-        // `PRESENCE_FRESHNESS` of unlock won't re-prompt (Session spec
-        // §5.2's "access remains seamless"; §8.6 dedup).
+        // + the prior EVM wallet (3.2) and frees the prior `:memory:`
+        // index. The first `expires_at` derives from the configured
+        // idle duration (1.4) — capped at the absolute-max ceiling via
+        // `next_idle_deadline`, which for `SessionDuration::UntilDeviceLock`
+        // collapses to "the absolute ceiling, no idle leg". The
+        // unlock's presence proof is fresh *now*, so `last_presence_at
+        // = now` — a reveal-class op within `PRESENCE_FRESHNESS` of
+        // unlock won't re-prompt (Session spec §5.2's "access remains
+        // seamless"; §8.6 dedup).
         self.active = Some(ActiveState {
             vdk,
             cache,
             search_index,
             device_key,
+            evm_wallet,
             last_presence_at: Some(now),
             requires_upgrade,
         });
@@ -896,6 +937,39 @@ impl Vault {
         self.active
             .as_ref()
             .map(|a| a.device_key.verifying_key().to_bytes())
+    }
+
+    /// **MVP-2 issue 3.2 (R-b).** Borrow the per-device EVM wallet
+    /// for the active session. The wallet is derived deterministically
+    /// from this device's Ed25519 [`DeviceKey`] via
+    /// [`pangolin_chain::derive_evm_wallet`] inside `unlock`; it lives
+    /// only in `ActiveState` (L2) and dies with the session — every
+    /// `lock()`, idle / absolute-max expiry, and `Drop` path takes
+    /// `ActiveState` whole, dropping the wallet alongside the
+    /// `DeviceKey`. The wallet exposes the 20-byte public address via
+    /// `.address()` (for diagnostics / display) and the inner alloy
+    /// `PrivateKeySigner` via `.signer()` (the secp256k1 signing
+    /// surface — consumed by MVP-2 issues 3.1 / 3.3 / 3.4 / 4.2). The
+    /// secp256k1 *scalar* is held only inside the wallet's
+    /// `k256::SecretKey`, whose `Drop` zeroizes; this accessor returns
+    /// a borrow only (`EvmWallet` is deliberately not `Clone`).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] when the vault is not active (the
+    /// session has never been unlocked, or has been locked /
+    /// `Drop`-ped). The
+    /// idle / absolute-max-expiry transition is observed via the
+    /// caller's own freshness check (e.g.
+    /// `check_session_freshness` inside the wrapping op); this
+    /// accessor does *not* run a freshness check on its own, because
+    /// it is the read-only "give me the wallet for a downstream
+    /// signing call" primitive and the session-class gating happens
+    /// at the wrapping op. Once expiry drops `ActiveState`, the
+    /// accessor returns `NotUnlocked` (matching the existing
+    /// `device_key_verifying_key` / `device_current` posture).
+    pub fn evm_wallet(&self) -> Result<&EvmWallet> {
+        Ok(&self.require_active()?.evm_wallet)
     }
 
     /// **MVP-1 issue 1.5 (test/test-utilities only).** The 32-byte
@@ -8332,6 +8406,107 @@ mod tests {
         v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         let vk2 = v.device_key_verifying_key().expect("device key reloaded");
         assert_eq!(vk1, vk2, "reloaded DeviceKey re-derives the same device_id");
+    }
+
+    /// MVP-2 issue 3.2 (R-b): `Vault::evm_wallet()` returns Ok on an
+    /// active session and surfaces the address that
+    /// `pangolin_chain::derive_evm_wallet` would produce; the access
+    /// fails on a locked vault, a never-unlocked vault, and an
+    /// expired session.
+    #[test]
+    fn evm_wallet_accessor_works_on_active_only() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "evm-wallet-active.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        // Not unlocked yet → NotUnlocked.
+        assert!(matches!(
+            v.evm_wallet().unwrap_err(),
+            StoreError::NotUnlocked
+        ));
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        // Active → Ok, address matches the cached `devices.evm_address`.
+        let cached = v
+            .device_current()
+            .unwrap()
+            .evm_address
+            .expect("3.2-era unlock populates the cache");
+        let wallet_addr = v.evm_wallet().unwrap().address();
+        assert_eq!(
+            wallet_addr.as_slice(),
+            cached.as_slice(),
+            "wallet address must match the cached column"
+        );
+        v.lock();
+        // Locked → NotUnlocked again (the wallet dropped with the
+        // session — see `evm_wallet_dropped_on_lock_idle_expiry_absolute_expiry`).
+        assert!(matches!(
+            v.evm_wallet().unwrap_err(),
+            StoreError::NotUnlocked
+        ));
+    }
+
+    /// MVP-2 issue 3.2 (L2): the in-memory `EvmWallet` is dropped on
+    /// every session-teardown path — `lock()`, idle expiry, and
+    /// absolute expiry — alongside the existing `DeviceKey`. We
+    /// observe the drop indirectly: `evm_wallet()` errors after each
+    /// teardown.
+    ///
+    /// Three subtests in one (the plan-gate's "three subtests if
+    /// convenient" wording): all three legs share the same setup
+    /// helpers + the assertion shape, so they live in one body to
+    /// keep the noise down.
+    #[test]
+    fn evm_wallet_dropped_on_lock_idle_expiry_absolute_expiry() {
+        // Leg 1: lock().
+        {
+            let dir = TempDir::new().unwrap();
+            let p = vault_path(&dir, "evm-wallet-lock.pvf");
+            Vault::create(&p, &fresh_password()).unwrap();
+            let mut v = Vault::open(&p).unwrap();
+            v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+            assert!(v.evm_wallet().is_ok());
+            v.lock();
+            assert!(matches!(
+                v.evm_wallet().unwrap_err(),
+                StoreError::NotUnlocked
+            ));
+        }
+        // Leg 2: idle-timer expiry.
+        {
+            let dir = TempDir::new().unwrap();
+            let p = vault_path(&dir, "evm-wallet-idle.pvf");
+            Vault::create(&p, &fresh_password()).unwrap();
+            let (mut v, clock) = open_vault_with_test_clock(&p);
+            v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+            assert!(v.evm_wallet().is_ok());
+            clock.advance(IDLE_TIMEOUT_DEFAULT + Duration::from_secs(1));
+            // A cache-bearing &mut op observes expiry and drops
+            // ActiveState (the documented mechanism — same as
+            // `device_key_dropped_on_session_expiry`).
+            let err = v.add_account(fresh_snapshot()).unwrap_err();
+            assert!(matches!(err, StoreError::SessionExpired));
+            assert!(matches!(
+                v.evm_wallet().unwrap_err(),
+                StoreError::NotUnlocked
+            ));
+        }
+        // Leg 3: absolute-max expiry.
+        {
+            let dir = TempDir::new().unwrap();
+            let p = vault_path(&dir, "evm-wallet-abs.pvf");
+            Vault::create(&p, &fresh_password()).unwrap();
+            let (mut v, clock) = open_vault_with_test_clock(&p);
+            v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+            assert!(v.evm_wallet().is_ok());
+            clock.advance(crate::session::ABSOLUTE_MAX_DEFAULT + Duration::from_secs(1));
+            let err = v.add_account(fresh_snapshot()).unwrap_err();
+            assert!(matches!(err, StoreError::SessionExpired));
+            assert!(matches!(
+                v.evm_wallet().unwrap_err(),
+                StoreError::NotUnlocked
+            ));
+        }
     }
 
     /// Criterion 5 (expiry leg): the in-memory `DeviceKey` is also

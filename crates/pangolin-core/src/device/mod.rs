@@ -17,5 +17,5 @@
 //! the local record + the MVP-2 on-chain-authority-registry hook.
 
 pub use pangolin_store::{
-    DeviceCapabilities, DeviceId, DeviceIdentity, DEVICE_IDENTITY_SCHEMA_VERSION,
+    DeviceCapabilities, DeviceId, DeviceIdentity, DEVICE_IDENTITY_SCHEMA_VERSION, EVM_ADDRESS_LEN,
 };

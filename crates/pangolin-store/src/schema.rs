@@ -137,7 +137,20 @@ CREATE TABLE IF NOT EXISTS devices (
     capabilities   INTEGER NOT NULL DEFAULT 0,
     last_sync_at   INTEGER,
     public_key     BLOB,
-    schema_version INTEGER NOT NULL DEFAULT 1
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    -- MVP-2 issue 3.2 additive column. The device's per-device EVM
+    -- wallet *address* — 20 bytes (the public Ethereum address derived
+    -- deterministically from this device's Ed25519 `DeviceKey` via
+    -- `pangolin_chain::derive_evm_address`). NON-secret per D-006's
+    -- known mitigation (the address is on-chain-observable). The
+    -- secp256k1 *scalar* is NEVER persisted — it is re-derived on every
+    -- `Vault::unlock` from the AEAD-sealed Ed25519 seed (R-a:
+    -- vault-sealed-only; the single source of secrecy is the 1.5 seed).
+    -- Nullable for legacy 1.5-era rows pre-dating 3.2; back-filled on
+    -- the first 3.2-era unlock (idempotent thereafter). §18.7 slot is
+    -- the existing `devices.schema_version = 1` — additive-column
+    -- doctrine (no format_version bump).
+    evm_address    BLOB
 );
 
 -- MVP-1 issue 1.5: single-row device-key table. Holds the device's
@@ -300,6 +313,14 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     // bump — same additive doctrine as the four migrations above.
     migrate_devices_columns(conn)?;
     migrate_device_key_table(conn)?;
+
+    // MVP-2 issue 3.2 migration: the `devices` table gains a nullable
+    // `evm_address` BLOB column (20 bytes when present; NULL for
+    // legacy 1.5-era rows pre-dating 3.2). Idempotent — `PRAGMA
+    // table_info` check first. Back-fill (NULL → derived address) is
+    // a runtime concern handled inside `Vault::unlock`, not here.
+    // Additive column; no `format_version` bump.
+    migrate_devices_evm_address_column(conn)?;
 
     // MVP-1 issue 1.6 migration: add the nullable `superseded_by` column
     // to `revisions` on vaults that predate 1.6. Idempotent —
@@ -470,6 +491,42 @@ fn migrate_device_key_table(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// **MVP-2 issue 3.2 migration.** Add the nullable `evm_address` BLOB
+/// column to `devices` on vaults that predate 3.2 (1.5-era rows that
+/// were registered before this column existed). Idempotent — checks
+/// `PRAGMA table_info(devices)` first and only runs the `ALTER TABLE`
+/// when the column is absent. Existing legacy rows pick up `NULL`,
+/// which `Vault::unlock` back-fills on the first 3.2-era unlock by
+/// deriving the address via `pangolin_chain::derive_evm_address` from
+/// the sealed `DeviceKey` seed. Additive column; no `format_version`
+/// bump (same doctrine as the migrations above).
+///
+/// **Why a separate helper.** The 1.5-era `migrate_devices_columns`
+/// helper is the historical migration that landed the four 1.5
+/// columns; the 3.2 column is a *later* additive amendment with its
+/// own audit trail, so it gets its own helper (mirroring the
+/// 1.4 `migrate_session_idle_secs_column` / 1.6
+/// `migrate_revision_superseded_by_column` pattern — one migration
+/// helper per additive amendment). Splitting also lets the
+/// `devices_migration_evm_address_idempotent` test target this
+/// migration in isolation.
+fn migrate_devices_evm_address_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(devices)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_column = false;
+    for r in rows {
+        if r? == "evm_address" {
+            has_column = true;
+            break;
+        }
+    }
+    drop(stmt);
+    if !has_column {
+        conn.execute("ALTER TABLE devices ADD COLUMN evm_address BLOB", [])?;
+    }
+    Ok(())
+}
+
 /// Confirms the connection is in WAL journal mode. Used by
 /// `vault_test::wal_mode_set` (success criterion 10).
 ///
@@ -532,7 +589,8 @@ mod tests {
 
     /// MVP-1 issue 1.5 success criterion 9b: `apply_pragmas_and_schema`
     /// is idempotent — running it twice does not error and the new
-    /// `devices` columns appear exactly once.
+    /// `devices` columns appear exactly once. Extended in 3.2 to
+    /// include `evm_address`.
     #[test]
     fn devices_migration_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
@@ -549,6 +607,7 @@ mod tests {
             "last_sync_at",
             "public_key",
             "schema_version",
+            "evm_address",
         ] {
             assert_eq!(
                 cols.iter().filter(|c| c.as_str() == needed).count(),
@@ -559,10 +618,43 @@ mod tests {
         assert!(table_exists(&conn, "device_key"));
     }
 
+    /// MVP-2 issue 3.2: the `evm_address` column migration is
+    /// idempotent on its own — repeated calls do not duplicate the
+    /// column, and a fresh DB still ends up with exactly one
+    /// `evm_address` column after the full schema run.
+    #[test]
+    fn devices_migration_evm_address_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        // First full run lands the column via the SCHEMA_DDL path.
+        apply_pragmas_and_schema(&conn).unwrap();
+        let cols_after_first = column_names(&conn, "devices");
+        assert_eq!(
+            cols_after_first
+                .iter()
+                .filter(|c| c.as_str() == "evm_address")
+                .count(),
+            1,
+            "evm_address should appear exactly once after first apply_pragmas_and_schema"
+        );
+        // Second full run is a no-op (the column-exists check in the
+        // migration helper short-circuits the ALTER TABLE).
+        apply_pragmas_and_schema(&conn).unwrap();
+        let cols_after_second = column_names(&conn, "devices");
+        assert_eq!(
+            cols_after_second
+                .iter()
+                .filter(|c| c.as_str() == "evm_address")
+                .count(),
+            1,
+            "evm_address column must remain singular after idempotent re-run"
+        );
+    }
+
     /// A legacy-shaped `devices` table (the P2 stub: `device_id, label,
     /// added_at, revoked_at` only, and no `device_key` table) gets the
     /// four new columns + the new table on the next
-    /// `apply_pragmas_and_schema` run.
+    /// `apply_pragmas_and_schema` run. Extended in 3.2: the
+    /// `evm_address` column also lands on legacy tables.
     #[test]
     fn legacy_devices_table_is_migrated() {
         let conn = Connection::open_in_memory().unwrap();
@@ -584,6 +676,7 @@ mod tests {
             "last_sync_at",
             "public_key",
             "schema_version",
+            "evm_address",
         ] {
             assert!(
                 cols.iter().any(|c| c.as_str() == needed),
@@ -591,5 +684,54 @@ mod tests {
             );
         }
         assert!(table_exists(&conn, "device_key"));
+    }
+
+    /// MVP-2 issue 3.2: a 1.5-era `devices` table that already carries
+    /// the four 1.5 columns but lacks the new `evm_address` column
+    /// (i.e. a vault written by a pre-3.2 build) gets the column added
+    /// on the next `apply_pragmas_and_schema` run with no data loss.
+    #[test]
+    fn legacy_1_5_devices_table_gets_evm_address() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Hand-build the 1.5-era schema (every 1.5 column present
+        // except `evm_address`).
+        conn.execute_batch(
+            "CREATE TABLE devices (
+                device_id      BLOB PRIMARY KEY,
+                label          TEXT    NOT NULL DEFAULT '',
+                added_at       INTEGER NOT NULL,
+                revoked_at     INTEGER,
+                capabilities   INTEGER NOT NULL DEFAULT 0,
+                last_sync_at   INTEGER,
+                public_key     BLOB,
+                schema_version INTEGER NOT NULL DEFAULT 1
+            );",
+        )
+        .unwrap();
+        // Seed a row so we can verify the existing data survives.
+        conn.execute(
+            "INSERT INTO devices (device_id, label, added_at) VALUES (?1, 'legacy', 100)",
+            [&[0xAAu8; 32] as &[u8]],
+        )
+        .unwrap();
+        apply_pragmas_and_schema(&conn).unwrap();
+        let cols = column_names(&conn, "devices");
+        assert!(
+            cols.iter().any(|c| c.as_str() == "evm_address"),
+            "evm_address column must be added to a legacy 1.5-era devices table"
+        );
+        // The pre-migration row is preserved with a NULL evm_address.
+        let (label, evm): (String, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT label, evm_address FROM devices WHERE device_id = ?1",
+                [&[0xAAu8; 32] as &[u8]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(label, "legacy");
+        assert!(
+            evm.is_none(),
+            "legacy row's evm_address must be NULL pre-backfill"
+        );
     }
 }

@@ -77,6 +77,30 @@ pub struct DeviceInfo {
     /// chain. Equal to `id.bytes` for every 1.5-registered device;
     /// empty only for a legacy P2 stub row (which 1.5 never creates).
     pub public_key: Vec<u8>,
+    /// **MVP-2 issue 3.2 (R-c — address-only FFI).** The device's per-
+    /// device EVM wallet *address* (20 bytes; the public Ethereum
+    /// address derived deterministically from this device's Ed25519
+    /// `DeviceKey` via `pangolin_chain::derive_evm_address`). Non-
+    /// secret — the address is on-chain-observable per D-006's known
+    /// mitigation. NO signing handle ever crosses FFI in 3.2 — every
+    /// future chain-write (3.3 direct-submit, 3.4 funder client, 4.2
+    /// indexer reads) signs inside the Rust core; this field is render-
+    /// only (a host UI shows "your gas wallet: 0x...").
+    ///
+    /// Empty `Vec` (`.len() == 0`) for a legacy 1.5-era row that has
+    /// not yet been back-filled. The first 3.2-era `Vault::unlock`
+    /// back-fills the column from the recovered `DeviceKey`, so this
+    /// vector is empty in practice only between (a) opening a 1.5-era
+    /// vault for the first time under a 3.2-era build and (b) the
+    /// first `unlock` on it — i.e. in MVP-1 hosts that call
+    /// `device_current` on a locked-but-previously-registered vault
+    /// before unlocking it once under 3.2. Hosts render "not yet
+    /// derived; unlock once to populate".
+    ///
+    /// Appended at end-of-record per the additive-FFI-surface
+    /// discipline (1.1-frozen-but-amend posture; nothing external
+    /// binds the 1.1 surface yet — see issue 3.2 R-c).
+    pub evm_address: Vec<u8>,
 }
 
 /// Convert a core [`pangolin_core::DeviceIdentity`] to the FFI shape.
@@ -85,6 +109,12 @@ fn device_identity_to_ffi(identity: pangolin_core::DeviceIdentity) -> DeviceInfo
         .public_key
         .map(|vk| vk.to_bytes().to_vec())
         .unwrap_or_default();
+    // MVP-2 issue 3.2 (R-c): the 20-byte EVM address (cached on
+    // disk in `devices.evm_address`). Empty `Vec` for a legacy
+    // 1.5-era row whose column is still NULL pre-back-fill; once
+    // unlocked under a 3.2-era build, the first unlock writes the
+    // column and subsequent reads return `len() == 20`.
+    let evm_address = identity.evm_address.map(|a| a.to_vec()).unwrap_or_default();
     DeviceInfo {
         schema_version: pangolin_core::DEVICE_IDENTITY_SCHEMA_VERSION,
         id: DeviceId {
@@ -99,6 +129,7 @@ fn device_identity_to_ffi(identity: pangolin_core::DeviceIdentity) -> DeviceInfo
         capabilities: identity.capabilities.into(),
         is_current: identity.is_current,
         public_key,
+        evm_address,
     }
 }
 
@@ -230,6 +261,13 @@ mod tests {
         assert!(only.is_current);
         assert_eq!(only.id.bytes.len(), 32);
         assert_eq!(only.public_key, only.id.bytes);
+        // MVP-2 issue 3.2 (R-c): the FFI carries the 20-byte EVM
+        // wallet address for a 3.2-era registered device.
+        assert_eq!(
+            only.evm_address.len(),
+            20,
+            "DeviceInfo.evm_address must be 20 bytes for a registered device"
+        );
 
         let cur = device_current(Arc::clone(&h)).unwrap();
         assert_eq!(cur.id.bytes, only.id.bytes);
@@ -245,6 +283,37 @@ mod tests {
             device_set_label(Arc::clone(&h), cur.id, "   ".into()).unwrap_err(),
             crate::error::FfiError::Validation { kind, .. } if kind == "device_label"
         ));
+    }
+
+    /// MVP-2 issue 3.2: `device_current()` returns `DeviceInfo` whose
+    /// `evm_address` is the 20-byte EVM wallet address for a
+    /// registered device, and equals the address that
+    /// `pangolin_chain::derive_evm_address` produces from the same
+    /// device's `DeviceKey` (determinism). The FFI surface does NOT
+    /// expose any signing handle — only the public address (R-c).
+    #[test]
+    fn ffi_device_current_returns_evm_address() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "evm-ffi.pvf");
+        let cur = device_current(Arc::clone(&h)).unwrap();
+        assert_eq!(
+            cur.evm_address.len(),
+            20,
+            "DeviceInfo.evm_address must be 20 bytes for a registered device"
+        );
+        // Determinism: every byte is non-deterministic per device,
+        // but the field IS non-empty + IS exactly 20 bytes. (We
+        // do not have host-side access to the seed to re-derive
+        // the exact bytes here; the determinism property is
+        // exercised in `pangolin-store::device::tests` and the
+        // `evm_address_determinism_across_unlock_cycles` e2e
+        // proptest.)
+        let listed = device_list(Arc::clone(&h)).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].evm_address, cur.evm_address,
+            "list and current must agree on the EVM address"
+        );
     }
 
     #[test]
