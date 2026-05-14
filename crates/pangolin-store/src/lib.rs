@@ -63,7 +63,9 @@ pub use capture_authority::{
     CAPTURE_AUTHORITY_SCHEMA_VERSION_MAX,
 };
 pub use conflict::ConflictReport;
-pub use device::{DeviceCapabilities, DeviceIdentity, DEVICE_IDENTITY_SCHEMA_VERSION};
+pub use device::{
+    DeviceCapabilities, DeviceIdentity, DEVICE_IDENTITY_SCHEMA_VERSION, EVM_ADDRESS_LEN,
+};
 pub use dirty::{DirtyEntry, IngestOutcome, RevisionPublishPayload};
 pub use error::{Result, StoreError};
 pub use export::{

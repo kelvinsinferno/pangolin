@@ -148,13 +148,171 @@ the 1.3 `:memory:` FTS5 search-index lifecycle and the 1.4 session state
 machine are untouched (1.5 only inserts the register/load step into
 `Vault::unlock`, after the VDK unwrap, before the `Active` transition).
 
+## 6. EVM wallet (MVP-2 issue 3.2)
+
+> Implements master plan §4 row `3.2` (Device wallet generation) under
+> the **vault-sealed-only** posture locked in 3.2 R-a (Kelvin sign-off
+> 2026-05-14). The per-device secp256k1 wallet is a *derived*
+> primitive of the 1.5 Ed25519 `DeviceKey`; it has no independent
+> at-rest secret. Frozen plan: `docs/issue-plans/3.2.md`.
+
+### a. Deterministic derivation chain
+
+Every Pangolin device holds **one Ed25519 `DeviceKey`** (seed AEAD-
+sealed under the VDK; this is 1.5's contribution above). 3.2 promotes
+the existing `pangolin_chain::derive_evm_wallet` function from a
+passive utility (previously called only by `BaseSepoliaAdapter::new_with_device_key`)
+into a per-device, unlock-time lifecycle primitive.
+
+The derivation pipeline (documented in detail in
+`crates/pangolin-chain/src/evm.rs`'s module docstring):
+
+1. **Ed25519 sign over a fixed domain-separator message** — the
+   `DeviceKey`'s Ed25519 signing key signs the fixed bytes
+   `b"pangolin-chain-evm-wallet-derive-v0"`. RFC 8032 §5.1.6 guarantees
+   determinism; same seed → same 64-byte signature.
+2. **HKDF-SHA256 expand** with info `b"pangolin-chain-evm-wallet-v0"`
+   + a 1-byte counter (initially 0). Output: 32 bytes.
+3. **secp256k1 scalar interpretation** via `k256::SecretKey::from_slice`
+   (which rejects 0 and ≥ N; on rejection the counter advances and the
+   loop retries — bounded at 255 attempts, probabilistically saturating
+   below 2^-128 failure). The scalar lives inside a `k256::ecdsa::SigningKey`
+   wrapped by `alloy::signers::local::PrivateKeySigner` wrapped by
+   `pangolin_chain::evm::EvmWallet`.
+4. **EVM address** = `Keccak256(uncompressed_secp256k1_pubkey)[12..]`
+   (the standard EIP-55 construction).
+
+One Pangolin device → one secp256k1 wallet → one EVM address. The
+derivation is one-way (HMAC-SHA256 preimage resistance): an attacker
+who recovers the secp256k1 scalar cannot recover the Ed25519 seed in
+polynomial time. See `evm.rs`'s module docstring for the full
+cryptographic-assumption discussion.
+
+### b. At-rest model (what touches disk)
+
+| Field | On disk? | Format |
+|---|---|---|
+| Ed25519 device seed | YES | AEAD-sealed under VDK; `device_key` table (1.5) |
+| secp256k1 scalar (signing key) | **NO** | Never written — derived on every unlock |
+| EVM address (20 bytes; public) | YES | `devices.evm_address` (additive 3.2 column; nullable; cached only) |
+
+**The secp256k1 scalar is the single new in-memory secret 3.2
+introduces and it has zero new at-rest surface** (L4). The cached
+address is a 20-byte public number, on-chain-observable per D-006's
+known mitigation — caching it lets a locked-but-previously-unlocked
+vault answer "what is this device's gas wallet address?" without
+materialising the wallet (L6: no chain crypto in the read path).
+
+### c. In-memory model (what lives during a session)
+
+The `EvmWallet` lives in `ActiveState` alongside the `DeviceKey`
+(under `crates/pangolin-store/src/vault.rs`'s `ActiveState` struct).
+On every `Vault::unlock`, after the 1.5 `DeviceKey` is materialised,
+the unlock path calls `pangolin_chain::derive_evm_wallet(&device_key)`
+and stashes the result in `ActiveState.evm_wallet`. The eager-
+materialisation cost (~hundreds of microseconds) is negligible
+against the ~ms Argon2id derivation `unlock` already pays.
+
+Every existing session-teardown path drops `ActiveState` whole — the
+wallet rides along; there is no new teardown surface. The drops happen
+on:
+
+- `Vault::lock()` (explicit lock).
+- `Vault::with_session` / `check_session_freshness` detecting an
+  idle-timer expiry.
+- `Vault::with_session` / `check_session_freshness` detecting an
+  absolute-max expiry.
+- `Vault::Drop` (e.g. handle drop without `close()`).
+
+`EvmWallet` is **deliberately not `Clone`** — the only handle on the
+scalar is the one inside `ActiveState`. Production code reaches it
+via `Vault::evm_wallet() -> Result<&EvmWallet, StoreError>`, which
+calls `require_active()` and returns a borrow.
+
+The scalar bytes are zeroized on drop by `k256::SecretKey`'s own
+zeroize-on-drop discipline; `EvmWallet`'s `Drop` is the trivial
+field-by-field drop chain. The
+`derive_evm_wallet_is_deterministic_post_drop` regression test pins
+the determinism contract end-to-end across a Drop boundary (a
+behavioural test, not a formal zeroize proof — see
+`crates/pangolin-chain/src/evm.rs::tests::derive_evm_wallet_is_deterministic_post_drop`).
+The session-drop regression (the property that `Vault::evm_wallet`
+errors with `StoreError::NotUnlocked` after lock / idle expiry /
+absolute expiry) is covered separately by the
+`evm_wallet_dropped_on_lock_idle_expiry_absolute_expiry` test in
+`crates/pangolin-store/src/vault.rs`.
+
+### d. FFI surface (R-c — address only)
+
+The FFI carries the public 20-byte EVM address ONLY (no signing
+handle):
+
+- `DeviceInfo` (the FFI Record for a device row) gains
+  `evm_address: Vec<u8>` (20 bytes; empty `Vec` for a legacy
+  un-back-filled row pre-3.2-era unlock).
+- No new entry point. Future chain-write entry points (3.3 direct-
+  submit, 3.4 funder client) sign inside the Rust core via
+  `Vault::evm_wallet()`; the host never holds a signing handle.
+
+Identical posture to 1.5's `public_key` addition. See
+`docs/architecture/ffi-surface.md` for the schema row.
+
+### e. Migration story (additive, idempotent)
+
+`devices.evm_address` is a nullable BLOB column added by
+`schema::migrate_devices_evm_address_column` (mirrors the
+1.5 / 1.4 / 1.6 migration pattern: idempotent `PRAGMA table_info`
+check before each `ALTER TABLE ADD COLUMN`). The schema DDL in
+`SCHEMA_DDL` also carries the column so fresh-create vaults pick it
+up trivially. **No `format_version` bump** — additive-column
+doctrine (the same posture the seven existing migrations follow).
+
+For a legacy 1.5-era vault whose `devices.evm_address` is `NULL`:
+the first 3.2-era `Vault::unlock` reaches
+`device::load_device_key_with_id`, which after recovering the
+`DeviceKey` calls `device::backfill_evm_address_if_missing`. The
+back-fill derives the address from the seed via
+`pangolin_chain::derive_evm_address(&device_key)` and writes it back
+into the row inside the same unlock-time SQL transaction.
+Idempotent thereafter — once the column is non-NULL, the back-fill
+is a structural no-op.
+
+Brand-new vaults (3.2-era register-on-unlock) skip the back-fill
+branch entirely: `register_device` derives the address inline and
+stamps it into the INSERT.
+
+### f. What 3.2 explicitly defers
+
+- **Real on-chain revision signing** — MVP-2 issue 3.1 (signed-
+  revision client format under v1 per 2.1 R-a / R-d). 3.2 ships the
+  wallet lifecycle + address surface; 3.1 is what *calls* the
+  wallet's `signer()` to sign a revision.
+- **Direct-submit chain transport** — MVP-2 issue 3.3 (the wallet
+  pays gas; this issue ships nothing on the broadcast side).
+- **Funder client / payment-driven top-up** — MVP-2 issues 3.4 / 3.5.
+- **`pangolin-cli wallet show`** — Q-d (R-d) defers the CLI verb to
+  the standing CLI-V1-wiring follow-up batch; FFI-complete in 3.2,
+  CLI verbs land alongside the other deferred subcommands when CLI-V1
+  ships.
+- **Multi-device EVM-identity sharing** — intentional, per Q-d / R-a
+  + 2.1 R-b's self-bootstrap model: two devices for the same user
+  have two different EVM addresses; recovery rotates authority (MVP-3
+  territory).
+
 ## References
 
 - `docs/issue-plans/1.5.md` — the frozen plan (decisions Q1–Q7).
+- `docs/issue-plans/3.2.md` — the frozen 3.2 plan (decisions R-a..R-e).
 - `docs/issue-plans/P1.md` — the `DeviceKey` key-hierarchy type.
 - `docs/issue-plans/P2.md` — the original `devices` stub.
 - `docs/issue-plans/1.4.md` — the `meta.session_idle_secs` migration
   pattern this issue's migrations follow.
+- `docs/issue-plans/2.1.md` — the v1 Revision Log contract Path B
+  decision (`ecrecover` + EIP-712 + the secp256k1 wallet IS the
+  revision signer; locks the architecture 3.2 implements).
+- `crates/pangolin-chain/src/evm.rs` — the deterministic Ed25519 →
+  secp256k1 derivation (module docstring covers the PRF assumption +
+  the secrecy-direction proof).
 - Whitepaper §5 / §F + the Key & Authority Model diagram — the
   per-device keypair, the device's role in the authority hierarchy, the
   trust list, capability flags, `last_sync`, the on-chain authority

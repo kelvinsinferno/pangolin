@@ -23,14 +23,28 @@
 //! lives entirely here in `pangolin-store` — `pangolin-crypto` gains no
 //! serde path (HIGH-1).
 
+use pangolin_chain::derive_evm_address;
 use pangolin_crypto::aead::{AeadKey, Ciphertext, Nonce, NONCE_LEN};
 use pangolin_crypto::keys::DeviceKey;
 use pangolin_crypto::secret::SecretBytes;
 use pangolin_crypto::sign::{VerifyingKey, SECRET_KEY_LEN};
 use rusqlite::{params, Connection, OptionalExtension};
+use subtle::ConstantTimeEq;
 
 use crate::error::{Result, StoreError};
 use crate::revision::{DeviceId, DEVICE_ID_LEN};
+
+/// Length in bytes of an EVM address (20 bytes — the standard Ethereum
+/// address derivation: `Keccak256(uncompressed_secp256k1_pubkey)[12..]`).
+///
+/// MVP-2 issue 3.2: cached on disk in `devices.evm_address` (additive
+/// nullable column; 20 bytes when present). The secp256k1 *scalar*
+/// itself is never persisted (R-a: vault-sealed-only — the secret is
+/// re-derived per unlock from the AEAD-sealed Ed25519 seed). The
+/// address is on-chain-observable per D-006's known mitigation; caching
+/// it lets `Vault::device_current` return it on a locked-but-previously-
+/// unlocked vault without materialising a wallet (L6).
+pub const EVM_ADDRESS_LEN: usize = 20;
 
 /// Schema-version slot for the device-identity records / on-disk
 /// `device_key` blob.
@@ -126,9 +140,39 @@ pub struct DeviceIdentity {
     /// re-deriving. `None` only for legacy P2 rows (which 1.5 never
     /// creates) — every 1.5-registered device row writes it.
     pub public_key: Option<VerifyingKey>,
+    /// **MVP-2 issue 3.2.** The device's per-device EVM wallet *address*
+    /// (20 bytes; the public Ethereum address derived deterministically
+    /// from this device's Ed25519 [`DeviceKey`] via
+    /// [`pangolin_chain::derive_evm_address`]). Non-secret — the
+    /// address is on-chain-observable per D-006's known mitigation.
+    /// Cached on disk in `devices.evm_address` so
+    /// [`crate::Vault::device_current`] / [`crate::Vault::device_list`]
+    /// can return it on a locked-but-previously-unlocked vault without
+    /// materialising a wallet (L6).
+    ///
+    /// `None` for legacy 1.5-era rows pre-dating 3.2 that have not yet
+    /// been back-filled. The back-fill happens inside the next 3.2-era
+    /// `Vault::unlock` (R-a): the unlock derives the address from the
+    /// re-materialised `DeviceKey` and writes it back into the row in
+    /// the same transaction, idempotent thereafter. Every device row
+    /// registered by a 3.2-era build carries it from the start (the
+    /// derivation runs inside [`register_device`]).
+    pub evm_address: Option<[u8; EVM_ADDRESS_LEN]>,
     /// `true` iff this row matches the open handle's `device_id` (filled
     /// by the read path).
     pub is_current: bool,
+}
+
+impl DeviceIdentity {
+    /// Borrow the cached EVM wallet address. Returns `None` for legacy
+    /// 1.5-era rows that have not yet been back-filled (the back-fill
+    /// happens inside the next 3.2-era unlock — see the `evm_address`
+    /// field docstring). Mirrors the `public_key` accessor pattern for
+    /// ergonomic FFI bridge code.
+    #[must_use]
+    pub fn wallet_address(&self) -> Option<&[u8; EVM_ADDRESS_LEN]> {
+        self.evm_address.as_ref()
+    }
 }
 
 /// Build the AAD blob bound when sealing / opening the device-key seed.
@@ -238,6 +282,14 @@ pub fn read_registered_device_id(conn: &Connection) -> Result<Option<DeviceId>> 
 /// VDK, transplanted from another vault) collapses to
 /// [`StoreError::AuthenticationFailed`] per the crate's
 /// indistinguishability discipline.
+///
+/// **MVP-2 issue 3.2 back-fill (R-a).** After the key is recovered, if
+/// the matching `devices` row has `evm_address IS NULL` (a legacy
+/// pre-3.2 row), the address is derived from the key and written back
+/// into the row inside the same caller transaction. Idempotent on
+/// subsequent unlocks (the column is non-NULL; no write). The 3.2
+/// register-on-unlock path already writes the column, so brand-new
+/// vaults never reach the back-fill branch.
 pub fn load_device_key_with_id(
     conn: &Connection,
     vault_id: &[u8; 32],
@@ -281,7 +333,123 @@ pub fn load_device_key_with_id(
     if device_id_from_key(&key) != *device_id {
         return Err(StoreError::AuthenticationFailed);
     }
+    // MVP-2 issue 3.2 back-fill (R-a). Legacy 1.5-era rows pre-date the
+    // `evm_address` column; their on-disk value is NULL. The first
+    // 3.2-era unlock derives the address from the recovered key and
+    // writes it back into the row. Idempotent thereafter.
+    backfill_evm_address_if_missing(conn, &key, device_id)?;
     Ok(Some(key))
+}
+
+/// **MVP-2 issue 3.2.** Back-fill `devices.evm_address` for the given
+/// `device_id` if the on-disk value is NULL (a legacy 1.5-era row), OR
+/// surface storage tampering if the cached value disagrees with the
+/// freshly-derived address.
+///
+/// On NULL: derives the 20-byte EVM address from the (already-decrypted)
+/// `DeviceKey` via [`pangolin_chain::derive_evm_address`] and writes it
+/// into the row.
+///
+/// On non-NULL (a row registered under 3.2 or back-filled by a prior
+/// unlock): re-derives the address from the same `DeviceKey` and
+/// constant-time-compares against the cached 20 bytes. The address is
+/// a pure function of the seed, so the bytes MUST match. A mismatch
+/// means the `evm_address` column was tampered with on disk (the
+/// column is non-secret metadata and is NOT bound into the AEAD AAD
+/// that covers the sealed seed, so a clever attacker editing the
+/// .pvf could flip these bytes to a different-but-valid 20-byte
+/// pattern without invalidating the AEAD on the seed) — collapses
+/// to [`StoreError::Corrupted`]. Refuses to silently overwrite the
+/// cached value: a tamper-detection error is strictly better than
+/// an auto-heal that lets the attacker observe whether their
+/// transplant attempt was caught.
+///
+/// **Constant-time discipline.** The cached address is non-secret per
+/// D-006's known-mitigation posture, but we still use
+/// [`subtle::ConstantTimeEq`] here to match the rest of the codebase's
+/// discipline (`account.rs` compares ids the same way; vault.rs does
+/// the same for several non-secret-but-AAD-bound fields). The cost is
+/// negligible (20 bytes); the benefit is one fewer place where a
+/// future refactor could accidentally introduce a timing-side-channel.
+///
+/// **MEDIUM-1 fix-pass on 3.2.** Earlier behaviour was: non-NULL → no-op
+/// (return Ok without comparing). That silently tolerated a tampered
+/// `devices.evm_address` column — every subsequent unlock would walk
+/// past the cached-but-wrong bytes, leaving `Vault::device_current()
+/// .evm_address` diverged from `Vault::evm_wallet().address()` until
+/// somebody happened to call both. Now the divergence surfaces at
+/// `Vault::unlock` time, which is the right place to fail (the user
+/// has just typed their password; we have both bytes side by side).
+fn backfill_evm_address_if_missing(
+    conn: &Connection,
+    key: &DeviceKey,
+    device_id: &DeviceId,
+) -> Result<()> {
+    // Read the current value (NULL or 20 bytes).
+    let existing: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT evm_address FROM devices WHERE device_id = ?1",
+            params![device_id.0.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    // Derive once — used by both branches (verify on non-NULL, write on
+    // NULL). The derivation is microseconds (one HKDF expand + one
+    // k256::SecretKey::from_slice + one Keccak256); doing it
+    // unconditionally simplifies the control flow and the audit story.
+    let address = derive_evm_address(key).map_err(|e| {
+        // The Ed25519 → secp256k1 derivation is total in practice
+        // (probability of HKDF budget exhaustion is ~2^-128). A failure
+        // here would mean a runtime catastrophe in HKDF/k256 itself;
+        // surface as a typed Corrupted error so the caller's
+        // `Vault::unlock` collapses to an authentication-style failure
+        // path rather than panicking.
+        StoreError::Corrupted(format!(
+            "evm address derivation failed during backfill: {e}"
+        ))
+    })?;
+    if let Some(cached) = existing {
+        // Non-NULL row. The cached bytes MUST equal the re-derived
+        // bytes; mismatch is storage tampering. We don't trust the
+        // column's length-validity check (`DeviceRow::into_identity`'s
+        // 20-byte try_into) to catch this — a tampered-to-also-20-bytes
+        // payload would pass that check silently.
+        if cached.len() != EVM_ADDRESS_LEN {
+            return Err(StoreError::Corrupted(format!(
+                "devices.evm_address (cached) length {} != {EVM_ADDRESS_LEN}",
+                cached.len()
+            )));
+        }
+        let derived: &[u8] = address.as_slice();
+        if bool::from(cached.as_slice().ct_eq(derived)) {
+            // Cached value matches — idempotent no-op. No UPDATE.
+            return Ok(());
+        }
+        return Err(StoreError::Corrupted(
+            "devices.evm_address (cached) does not match address derived from \
+             device key — possible storage tampering"
+                .into(),
+        ));
+    }
+    // NULL — back-fill the column. The bytes equal the bytes the next
+    // register would have written, so the back-fill is observationally
+    // indistinguishable from a row that had been registered under 3.2
+    // directly.
+    let n = conn.execute(
+        "UPDATE devices SET evm_address = ?1 WHERE device_id = ?2",
+        params![address.as_slice(), device_id.0.as_slice()],
+    )?;
+    if n == 0 {
+        // The `devices` row went missing between the SELECT and the
+        // UPDATE — structurally impossible in a single-connection
+        // SQLite handle, but surfacing it as a typed error guards a
+        // future refactor that adds concurrent writers.
+        return Err(StoreError::Corrupted(
+            "devices row vanished mid-backfill of evm_address".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Register a brand-new device on the first unlock of a vault file.
@@ -290,6 +458,16 @@ pub fn load_device_key_with_id(
 /// `device_key` row + the `devices` row, all in one transaction.
 /// `now_ms` is the registration timestamp; `label` must already be
 /// validated (see [`validate_label`]).
+///
+/// **MVP-2 issue 3.2 (R-a).** The 20-byte EVM wallet *address* is
+/// derived inside this function from the `DeviceKey` via
+/// [`pangolin_chain::derive_evm_address`] and persisted into the
+/// `devices.evm_address` column as part of the same transaction. The
+/// secp256k1 *scalar* is NEVER persisted (the scalar lives only inside
+/// the transiently-constructed `EvmWallet` returned by the wrapping
+/// `derive_evm_wallet` call, which Drop-zeroizes via k256's secret-key
+/// discipline; here we only keep the public address). Single source of
+/// secrecy: the AEAD-sealed Ed25519 seed already being written above.
 pub fn register_device(
     conn: &Connection,
     vault_id: &[u8; 32],
@@ -304,6 +482,21 @@ pub fn register_device(
     let aad = device_key_aad(vault_id, &device_id);
     let ct = vdk_aead.seal(&nonce, &*seed, &aad)?;
     let public_key = key.verifying_key().to_bytes();
+    // MVP-2 issue 3.2 (R-a): derive the EVM wallet address (20 bytes,
+    // non-secret) from the same DeviceKey. The derivation pulls
+    // through `pangolin_chain` (a non-dev dep already; see
+    // `pangolin-store/Cargo.toml:41`). The transient secret scalar
+    // inside the wallet is zeroized by k256 / alloy on drop the
+    // moment `derive_evm_address` returns.
+    let evm_address = derive_evm_address(key).map_err(|e| {
+        // The derivation is total in practice (probability of HKDF
+        // budget exhaustion ~ 2^-128). Surface a typed Corrupted
+        // error so unlock collapses to a clean failure path rather
+        // than panicking — matches the back-fill helper's discipline.
+        StoreError::Corrupted(format!(
+            "evm address derivation failed during register: {e}"
+        ))
+    })?;
 
     let tx = conn.unchecked_transaction()?;
     tx.execute(
@@ -318,8 +511,8 @@ pub fn register_device(
     tx.execute(
         "INSERT OR REPLACE INTO devices
             (device_id, label, added_at, revoked_at, capabilities, last_sync_at, public_key,
-             schema_version)
-         VALUES (?1, ?2, ?3, NULL, ?4, NULL, ?5, ?6)",
+             schema_version, evm_address)
+         VALUES (?1, ?2, ?3, NULL, ?4, NULL, ?5, ?6, ?7)",
         params![
             device_id.0.as_slice(),
             label,
@@ -327,6 +520,7 @@ pub fn register_device(
             DeviceCapabilities::Full.to_repr(),
             public_key.as_slice(),
             i64::from(DEVICE_IDENTITY_SCHEMA_VERSION),
+            evm_address.as_slice(),
         ],
     )?;
     tx.commit()?;
@@ -342,12 +536,16 @@ struct DeviceRow {
     capabilities_i: i64,
     last_sync_at: Option<i64>,
     public_key_blob: Option<Vec<u8>>,
+    /// **MVP-2 issue 3.2.** The 20-byte EVM wallet address, or `None`
+    /// for a legacy 1.5-era row pre-back-fill. Validated into the
+    /// `DeviceIdentity.evm_address` field by [`Self::into_identity`].
+    evm_address_blob: Option<Vec<u8>>,
 }
 
 /// SELECT column list for the `devices` rows. Order matches
 /// [`DeviceRow::from_sqlite_row`].
 const DEVICES_SELECT_COLS: &str =
-    "device_id, label, added_at, capabilities, last_sync_at, public_key";
+    "device_id, label, added_at, capabilities, last_sync_at, public_key, evm_address";
 
 impl DeviceRow {
     fn from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -358,6 +556,7 @@ impl DeviceRow {
             capabilities_i: row.get(3)?,
             last_sync_at: row.get(4)?,
             public_key_blob: row.get(5)?,
+            evm_address_blob: row.get(6)?,
         })
     }
 
@@ -382,6 +581,15 @@ impl DeviceRow {
                 VerifyingKey::from_bytes(arr).ok()
             }
         };
+        let evm_address = match self.evm_address_blob {
+            None => None,
+            Some(bytes) => {
+                let arr: [u8; EVM_ADDRESS_LEN] = bytes.as_slice().try_into().map_err(|_| {
+                    StoreError::Corrupted("devices.evm_address not 20 bytes".into())
+                })?;
+                Some(arr)
+            }
+        };
         Ok(DeviceIdentity {
             device_id,
             label: self.label,
@@ -389,6 +597,7 @@ impl DeviceRow {
             last_sync_at: self.last_sync_at,
             capabilities: DeviceCapabilities::from_repr(self.capabilities_i),
             public_key,
+            evm_address,
             is_current: device_id == *current,
         })
     }
@@ -583,5 +792,211 @@ mod tests {
         assert!(load_device_key_with_id(&conn, &[0u8; 32], &vdk, &id)
             .unwrap()
             .is_none());
+    }
+
+    /// MVP-2 issue 3.2: `register_device` derives the 20-byte EVM
+    /// address from the supplied `DeviceKey` and persists it. The
+    /// `read_device` / `list_devices` paths return it on the
+    /// [`DeviceIdentity`] view. Determinism is verified by
+    /// re-deriving via `pangolin_chain::derive_evm_address` and
+    /// asserting equality.
+    #[test]
+    fn register_on_first_unlock_writes_evm_address() {
+        let conn = fresh_conn();
+        let vault_id = [0x33u8; 32];
+        let vdk = AeadKey::generate();
+        let key = DeviceKey::generate();
+        let id = register_device(&conn, &vault_id, &vdk, &key, "Dev", 5).unwrap();
+
+        // Direct SQL check: the row carries a 20-byte BLOB.
+        let blob: Vec<u8> = conn
+            .query_row(
+                "SELECT evm_address FROM devices WHERE device_id = ?1",
+                [&id.0 as &[u8]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blob.len(), 20, "evm_address column must be 20 bytes");
+
+        // The bytes match `pangolin_chain::derive_evm_address`.
+        let expected = pangolin_chain::derive_evm_address(&key).unwrap();
+        assert_eq!(blob.as_slice(), expected.as_slice());
+
+        // The view-layer field is populated.
+        let listed = list_devices(&conn, &id).unwrap();
+        assert_eq!(listed.len(), 1);
+        let identity = &listed[0];
+        assert_eq!(
+            identity.evm_address.unwrap().as_slice(),
+            expected.as_slice()
+        );
+        assert_eq!(
+            identity.wallet_address().unwrap().as_slice(),
+            expected.as_slice(),
+            "wallet_address() accessor mirrors the field"
+        );
+    }
+
+    /// MVP-2 issue 3.2: an `unlock` on a 1.5-era row whose
+    /// `evm_address IS NULL` back-fills the column from the recovered
+    /// `DeviceKey`. The post-back-fill row is exactly what a 3.2-era
+    /// register would have written, and a second load is a no-op
+    /// (idempotent).
+    #[test]
+    fn unlock_on_legacy_1_5_row_backfills_evm_address() {
+        let conn = fresh_conn();
+        let vault_id = [0x55u8; 32];
+        let vdk = AeadKey::generate();
+        let key = DeviceKey::generate();
+        // Register through the production path, then deliberately
+        // NULL the column to simulate a vault written under a pre-3.2
+        // build that never wrote the column.
+        let id = register_device(&conn, &vault_id, &vdk, &key, "Pre-3.2", 1).unwrap();
+        conn.execute(
+            "UPDATE devices SET evm_address = NULL WHERE device_id = ?1",
+            [&id.0 as &[u8]],
+        )
+        .unwrap();
+        // Sanity: the column is now NULL.
+        let pre: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT evm_address FROM devices WHERE device_id = ?1",
+                [&id.0 as &[u8]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(pre.is_none());
+
+        // The unlock-path read back-fills.
+        let loaded = load_device_key_with_id(&conn, &vault_id, &vdk, &id)
+            .unwrap()
+            .unwrap();
+        assert!(bool::from(loaded.ct_eq(&key)));
+
+        let post: Vec<u8> = conn
+            .query_row(
+                "SELECT evm_address FROM devices WHERE device_id = ?1",
+                [&id.0 as &[u8]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let expected = pangolin_chain::derive_evm_address(&key).unwrap();
+        assert_eq!(post.as_slice(), expected.as_slice());
+
+        // Second unlock is a no-op (idempotent — the column is now
+        // non-NULL).
+        let _loaded2 = load_device_key_with_id(&conn, &vault_id, &vdk, &id)
+            .unwrap()
+            .unwrap();
+        let post2: Vec<u8> = conn
+            .query_row(
+                "SELECT evm_address FROM devices WHERE device_id = ?1",
+                [&id.0 as &[u8]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(post2, post);
+    }
+
+    /// MVP-2 issue 3.2 (MEDIUM-1 fix-pass regression guard).
+    ///
+    /// An attacker who can edit a `.pvf` file on disk can flip the
+    /// `devices.evm_address` bytes to a different-but-valid 20-byte
+    /// pattern: the column is non-secret metadata and is NOT bound
+    /// into the AEAD AAD that protects the sealed Ed25519 seed in
+    /// the `device_key` table. Earlier behaviour was: on every
+    /// unlock, `load_device_key_with_id` walked past the tampered
+    /// row silently (the `existing.is_some()` branch in
+    /// `backfill_evm_address_if_missing` returned Ok without
+    /// comparing). Result: `Vault::device_current().evm_address`
+    /// (read from disk → tampered bytes) and `Vault::evm_wallet()
+    /// .address()` (derived from the in-memory `DeviceKey` → real
+    /// bytes) would silently diverge until somebody called both.
+    ///
+    /// Fix: the helper now constant-time compares the cached bytes
+    /// against the freshly-derived address and surfaces
+    /// `StoreError::Corrupted` on mismatch. This test exercises
+    /// that path end-to-end by simulating the tamper via a raw
+    /// `UPDATE` against a different-shape 20-byte pattern, then
+    /// asserts the next load fails clean.
+    #[test]
+    fn unlock_on_tampered_evm_address_row_surfaces_corruption() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("dev-evm-tamper.sqlite");
+        let vault_id = [0x88u8; 32];
+        let vdk = AeadKey::generate();
+        let key = DeviceKey::generate();
+
+        // 1. Register through the production path — the row now
+        //    carries a real 20-byte address derived from `key`.
+        let id = {
+            let conn = Connection::open(&path).unwrap();
+            crate::schema::apply_pragmas_and_schema(&conn).unwrap();
+            register_device(&conn, &vault_id, &vdk, &key, "Tamper-target", 1).unwrap()
+        };
+
+        // 2. Tamper the row via raw SQL (simulating an attacker who
+        //    edited the .pvf bytes). Use a different-but-valid 20-byte
+        //    pattern so the length check (`DeviceRow::into_identity`)
+        //    cannot catch it — the constant-time compare in the
+        //    back-fill helper is the only line of defence.
+        let tampered: [u8; 20] = [0xDEu8; 20];
+        {
+            let conn = Connection::open(&path).unwrap();
+            crate::schema::apply_pragmas_and_schema(&conn).unwrap();
+            let n = conn
+                .execute(
+                    "UPDATE devices SET evm_address = ?1 WHERE device_id = ?2",
+                    rusqlite::params![tampered.as_slice(), &id.0 as &[u8]],
+                )
+                .unwrap();
+            assert_eq!(n, 1, "tamper UPDATE must hit the registered row");
+        }
+
+        // 3. Reopen + try to load the device key — the back-fill
+        //    helper detects the divergence and surfaces Corrupted.
+        let conn = Connection::open(&path).unwrap();
+        crate::schema::apply_pragmas_and_schema(&conn).unwrap();
+        let err = load_device_key_with_id(&conn, &vault_id, &vdk, &id).unwrap_err();
+        match err {
+            StoreError::Corrupted(msg) => {
+                assert!(
+                    msg.contains("devices.evm_address")
+                        && msg.contains("does not match")
+                        && msg.contains("device key"),
+                    "expected the tamper-detection message, got: {msg}"
+                );
+            }
+            other => panic!("expected StoreError::Corrupted, got {other:?}"),
+        }
+    }
+
+    /// MVP-2 issue 3.2: the cached `evm_address` survives a
+    /// close/reopen — i.e. it round-trips through `SQLite` verbatim.
+    /// We exercise this at the `pangolin-store::device` layer (which
+    /// is the on-disk truth) rather than through a full `Vault`
+    /// (the e2e proptest covers that path).
+    #[test]
+    fn evm_address_round_trips_through_close_reopen() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("dev-evm-roundtrip.sqlite");
+        let vault_id = [0x77u8; 32];
+        let vdk = AeadKey::generate();
+        let key = DeviceKey::generate();
+        let expected = pangolin_chain::derive_evm_address(&key).unwrap();
+
+        let id = {
+            let conn = Connection::open(&path).unwrap();
+            crate::schema::apply_pragmas_and_schema(&conn).unwrap();
+            register_device(&conn, &vault_id, &vdk, &key, "Round-trip", 10).unwrap()
+        };
+        // Reopen and read the row back.
+        let conn = Connection::open(&path).unwrap();
+        crate::schema::apply_pragmas_and_schema(&conn).unwrap();
+        let identity = read_device(&conn, &id, &id).unwrap().unwrap();
+        assert_eq!(
+            identity.evm_address.unwrap().as_slice(),
+            expected.as_slice()
+        );
     }
 }

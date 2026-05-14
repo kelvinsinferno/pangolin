@@ -215,6 +215,8 @@ fn device_info_record_round_trip() {
         capabilities: DeviceCapabilities::Full,
         is_current: true,
         public_key: vec![0xAB; 32],
+        // MVP-2 issue 3.2 (R-c): additive 20-byte EVM address.
+        evm_address: vec![0xCD; 20],
     };
     let cloned = original.clone();
     assert_eq!(original.id, cloned.id);
@@ -222,6 +224,7 @@ fn device_info_record_round_trip() {
     assert_eq!(cloned.capabilities, DeviceCapabilities::Full);
     assert!(cloned.is_current);
     assert_eq!(cloned.public_key, cloned.id.bytes);
+    assert_eq!(cloned.evm_address.len(), 20);
 }
 
 #[test]

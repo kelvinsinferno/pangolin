@@ -156,6 +156,24 @@ and 1.4's `reveal_*` entries). The C-ABI mirror in `cabi.rs` is not yet
 extended for these (the cbindgen surface remains intentionally tiny —
 `device_*` are `UniFFI`-only for now, same as `account_*` / `reveal_*`).
 
+**MVP-2 issue 3.2 amendment (R-c — address only).** `DeviceInfo` gains
+a trailing `evm_address: Vec<u8>` field carrying the device's per-
+device EVM wallet *address* (20 bytes; the public Ethereum address
+derived deterministically from this device's Ed25519 `DeviceKey` via
+`pangolin_chain::derive_evm_address` — see
+`docs/architecture/device.md` §6). Non-secret per D-006's known
+mitigation (the address is on-chain-observable). NO signing handle
+ever crosses FFI; every future chain-write signs inside the Rust core
+via the new `Vault::evm_wallet()` accessor — identical posture to
+1.5's `public_key` (non-secret bytes crossed for display; signing
+handle stays inside the core). The field is empty (`Vec::new()`) only
+for a legacy 1.5-era row whose `devices.evm_address` is still NULL
+pre-back-fill — which happens between (a) the first time a 3.2-era
+build opens a pre-3.2 vault and (b) the first `unlock` on it. After
+the first unlock, the row is back-filled and the field is always 20
+bytes. Appended at end-of-record per the additive-FFI-surface
+discipline.
+
 ### Revision lineage + fork resolution (MVP-1 issue 1.6 amendment)
 
 | Function | Lands in |
@@ -346,7 +364,7 @@ amendment that may surface the `prior` payload).
 | `VaultHandle` | Object (`Arc<Self>`) | Indirect (holds vault state) | n/a (opaque) |
 | `AccountId` | Record | No | `schema_version: u16` |
 | `DeviceId` | Record | No | `schema_version: u16` |
-| `DeviceInfo` | Record | No (1.5 — device id, label, registered-at, dormant last-sync, capability flags, is-current, public verifying key) | `schema_version: u16` |
+| `DeviceInfo` | Record | No (1.5 — device id, label, registered-at, dormant last-sync, capability flags, is-current, public verifying key; **3.2 additive: `evm_address: Vec<u8>` — 20 bytes for a registered device, empty `Vec` for a legacy un-back-filled row pre-first-3.2-era-unlock**) | `schema_version: u16` |
 | `DeviceCapabilities` | Enum (`uniffi::Enum`) | No (1.5 — `Full` in MVP-1; grows later) | n/a (closed enum) |
 | `AccountDraft` | Record | Yes (full account at create — multi-username, multi-URL, tags, password, optional TOTP) | `schema_version: u16` |
 | `AccountPatch` | Record | Yes (partial update; password change appends to history) | `schema_version: u16` |

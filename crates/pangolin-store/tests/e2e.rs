@@ -84,7 +84,14 @@ fn fresh_password() -> SecretBytes {
 // ≥100 random markers per the plan; MEDIUM-3 (P2 audit) extends the
 // per-iteration coverage from "just password" to all six fields:
 // display_name, username, password, url, notes, totp_secret.
+// 3.2 added the wallet-scalar scan; the per-iteration test body is
+// naturally lengthy because it scans full + 8-byte sub-windows for two
+// distinct marker classes (Ed25519 seed, secp256k1 scalar) + the 6
+// per-snapshot markers across both the .pvf and the WAL sidecar.
+// Splitting would scatter the assertion bookkeeping; the test reads
+// top-to-bottom as one property and stays here.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn no_plaintext_on_disk() {
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join("vault.pvf");
@@ -99,15 +106,34 @@ fn no_plaintext_on_disk() {
     // marker set scanned in every iteration below. Sub-slices of the
     // 32-byte seed are also scanned (an 8-byte window) so even a
     // partial leak would be caught.
-    let device_key_seed: [u8; 32] = {
+    //
+    // MVP-2 issue 3.2 (L4 + L-test-coverage extension): the
+    // secp256k1 scalar derived from the same Ed25519 seed is ALSO
+    // never persisted (R-a: vault-sealed-only; only the public 20-
+    // byte address hits disk). Snapshot the scalar bytes derived
+    // from the same seed via `pangolin_chain::derive_evm_wallet` and
+    // include them in the marker set. The plan-gate's expectation:
+    // "they won't be — the scalar is never written; the test guards
+    // against a future bug that inadvertently writes the scalar."
+    let (device_key_seed, evm_scalar): ([u8; 32], [u8; 32]) = {
         let mut v = Vault::open(&path).unwrap();
         v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         let seed = *v
             .device_key_secret_seed()
             .expect("device key present after unlock");
+        // Re-derive the secp256k1 scalar from the live wallet (held
+        // inside ActiveState per 3.2 R-b). The scalar bytes are
+        // `signer().to_bytes()`; they live transiently here and
+        // drop with the wallet when the vault locks below.
+        let scalar: [u8; 32] = v
+            .evm_wallet()
+            .expect("evm wallet present after unlock")
+            .signer()
+            .to_bytes()
+            .into();
         v.lock();
         v.close().unwrap();
-        seed
+        (seed, scalar)
     };
 
     let mut total_bytes_scanned: u64 = 0;
@@ -131,6 +157,28 @@ fn no_plaintext_on_disk() {
                 hits, 0,
                 "8-byte slice of the device-key seed found in {where_} — plaintext leaked! \
                  (issue 1.5 criterion 5 violation)",
+            );
+        }
+        // MVP-2 issue 3.2: scan for the secp256k1 scalar bytes (full
+        // 32-byte + 8-byte sub-windows). The plan's expectation is
+        // zero hits — the scalar is never persisted. A regression
+        // that adds a new on-disk surface for the scalar (e.g., a
+        // future `device_key_evm` table) would be caught here.
+        let evm_full_hits = bytes
+            .windows(evm_scalar.len())
+            .filter(|w| *w == evm_scalar.as_slice())
+            .count();
+        assert_eq!(
+            evm_full_hits, 0,
+            "secp256k1 scalar bytes found in {where_} — plaintext leaked! \
+             (issue 3.2 L4 violation — the wallet scalar must never hit disk)",
+        );
+        for w8 in evm_scalar.windows(8) {
+            let hits = bytes.windows(8).filter(|w| *w == w8).count();
+            assert_eq!(
+                hits, 0,
+                "8-byte slice of the secp256k1 scalar found in {where_} — plaintext leaked! \
+                 (issue 3.2 L4 violation)",
             );
         }
     };
@@ -183,7 +231,8 @@ fn no_plaintext_on_disk() {
     let total_markers = n_iterations * 6;
     eprintln!(
         "[no_plaintext_on_disk] {total_markers} markers across 6 secret fields + the device-key \
-         seed × {n_iterations} iterations scanned over {total_bytes_scanned} bytes; 0 hits"
+         seed + the secp256k1 wallet scalar (issue 3.2) × {n_iterations} iterations scanned \
+         over {total_bytes_scanned} bytes; 0 hits"
     );
 }
 
@@ -1762,6 +1811,54 @@ fn search_index_and_session_machine_untouched_by_device_ops() {
     assert_eq!(v.account_search("delta renamed").unwrap().len(), 1);
     v.lock();
     v.close().unwrap();
+}
+
+// ---------------------------------------------------------------------
+// MVP-2 issue 3.2 plan §"Test plan":
+// `evm_address_determinism_across_unlock_cycles` — every unlock on a
+// given vault produces the same 20-byte EVM address (the L1
+// determinism contract: same seed → same scalar → same address).
+// ---------------------------------------------------------------------
+#[test]
+fn evm_address_determinism_across_unlock_cycles() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("evm-determinism.pvf");
+    Vault::create(&path, &fresh_password()).unwrap();
+
+    // First unlock — register-on-unlock writes the cached address.
+    let first: [u8; 20] = {
+        let mut v = Vault::open(&path).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let cached = v
+            .device_current()
+            .unwrap()
+            .evm_address
+            .expect("3.2-era register writes the address");
+        // Wallet address (live derivation) must equal the cached
+        // column on disk.
+        let live = v.evm_wallet().unwrap().address();
+        assert_eq!(cached.as_slice(), live.as_slice());
+        v.lock();
+        v.close().unwrap();
+        cached
+    };
+    // Close + reopen + unlock — re-derive from the AEAD-sealed seed.
+    for _ in 0..3 {
+        let mut v = Vault::open(&path).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let cached = v.device_current().unwrap().evm_address.unwrap();
+        let live: [u8; 20] = *v.evm_wallet().unwrap().address().0;
+        assert_eq!(
+            cached, first,
+            "cached evm_address must be stable across unlock cycles"
+        );
+        assert_eq!(
+            live, first,
+            "live wallet address must be stable across unlock cycles"
+        );
+        v.lock();
+        v.close().unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------

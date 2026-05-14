@@ -377,6 +377,82 @@ mod tests {
         assert_eq!(HKDF_INFO, b"pangolin-chain-evm-wallet-v0");
     }
 
+    /// MVP-2 issue 3.2 — derivation is deterministic across Drop
+    /// boundaries (the L1 contract end-to-end at the scalar layer).
+    ///
+    /// **What this test actually verifies:** after the first
+    /// `EvmWallet` goes out of scope and Drops, a fresh derivation
+    /// from the same seed reproduces the same secp256k1 scalar
+    /// bytes (and the same address). This is the L1 "secret is a
+    /// pure function of the seed" determinism contract, observed
+    /// across a Drop boundary so the assertion would catch a future
+    /// regression where the derivation pipeline grows hidden state
+    /// (e.g. an RNG mixed into HKDF info; an init-once that
+    /// remembers the first scalar).
+    ///
+    /// **What this test does NOT verify** (L2 audit fix-pass clarity
+    /// rename — earlier name `no_evm_secret_after_drop` overclaimed):
+    /// it does NOT prove the dropped wallet's heap allocation is
+    /// zeroed, and it would NOT catch a regression where a static
+    /// `OnceCell<EvmWallet>` cache makes the scalar survive the
+    /// owning binding's drop (such a cache would return the same
+    /// scalar bytes — the equality assertion holds either way). The
+    /// session-drop regression (the property that `Vault::evm_wallet`
+    /// errors with `StoreError::NotUnlocked` after lock/expiry,
+    /// which IS the property that would fail if a `OnceCell` cache
+    /// snuck in) is covered separately by
+    /// `evm_wallet_dropped_on_lock_idle_expiry_absolute_expiry` in
+    /// `pangolin-store/src/vault.rs`.
+    ///
+    /// The formal zeroize guarantee on the dropped scalar lives in
+    /// `k256`'s own zeroize-on-drop discipline (not asserted here —
+    /// safe Rust cannot inspect freed allocations).
+    #[test]
+    fn derive_evm_wallet_is_deterministic_post_drop() {
+        use pangolin_crypto::sign::SigningKey;
+        // Pin a fixed seed so the test is deterministic across runs.
+        let seed: [u8; 32] = [
+            0x9c, 0xa5, 0x6a, 0x77, 0xde, 0xb4, 0x02, 0xc7, 0xee, 0x10, 0x35, 0x44, 0x2b, 0x91,
+            0x5f, 0x4e, 0x55, 0xdc, 0x77, 0xb2, 0x09, 0x88, 0xfa, 0x21, 0x10, 0xf6, 0xa6, 0xcf,
+            0x35, 0x88, 0x6c, 0x10,
+        ];
+        let _sk = SigningKey::from_seed(seed);
+        let device1 = DeviceKey::from_seed(seed);
+        let snapshot1: [u8; 32] = {
+            let wallet = derive_evm_wallet(&device1).expect("derive 1");
+            let bytes: [u8; 32] = wallet.signer().to_bytes().into();
+            // wallet drops here at end of scope.
+            bytes
+        };
+        let device2 = DeviceKey::from_seed(seed);
+        let snapshot2: [u8; 32] = {
+            let wallet = derive_evm_wallet(&device2).expect("derive 2");
+            let bytes: [u8; 32] = wallet.signer().to_bytes().into();
+            bytes
+        };
+        assert_eq!(
+            snapshot1, snapshot2,
+            "same seed must produce the same secp256k1 scalar across wallet \
+             instantiations (the determinism contract); a regression here \
+             would mean a future refactor introduced a state hazard"
+        );
+        // Sanity: the scalar is non-zero (k256 enforces this on
+        // construction, but assert explicitly so a future
+        // change that returns a sentinel-zero scalar would be
+        // caught here).
+        assert_ne!(
+            snapshot1, [0u8; 32],
+            "scalar must be non-zero by construction"
+        );
+        // And the derivation reproduces the same public address —
+        // the L1 contract end-to-end.
+        let device3 = DeviceKey::from_seed(seed);
+        let addr1 = derive_evm_address(&device3).unwrap();
+        let device4 = DeviceKey::from_seed(seed);
+        let addr2 = derive_evm_address(&device4).unwrap();
+        assert_eq!(addr1, addr2);
+    }
+
     /// Two devices with different deterministic seeds (constructed
     /// through `pangolin-crypto`'s public `SigningKey::from_seed`
     /// surface, which is one indirection away from `DeviceKey`)
