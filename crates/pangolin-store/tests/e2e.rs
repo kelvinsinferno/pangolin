@@ -84,13 +84,14 @@ fn fresh_password() -> SecretBytes {
 // ≥100 random markers per the plan; MEDIUM-3 (P2 audit) extends the
 // per-iteration coverage from "just password" to all six fields:
 // display_name, username, password, url, notes, totp_secret.
+// 3.2 added the wallet-scalar scan; the per-iteration test body is
+// naturally lengthy because it scans full + 8-byte sub-windows for two
+// distinct marker classes (Ed25519 seed, secp256k1 scalar) + the 6
+// per-snapshot markers across both the .pvf and the WAL sidecar.
+// Splitting would scatter the assertion bookkeeping; the test reads
+// top-to-bottom as one property and stays here.
 #[test]
-#[allow(clippy::too_many_lines)] // 3.2 added the wallet-scalar scan; the
-// per-iteration test body is naturally lengthy because it scans full +
-// 8-byte sub-windows for two distinct marker classes (Ed25519 seed,
-// secp256k1 scalar) + the 6 per-snapshot markers across both the .pvf
-// and the WAL sidecar. Splitting would scatter the assertion bookkeeping;
-// the test reads top-to-bottom as one property and stays here.
+#[allow(clippy::too_many_lines)]
 fn no_plaintext_on_disk() {
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join("vault.pvf");
