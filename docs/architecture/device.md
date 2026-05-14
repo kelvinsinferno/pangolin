@@ -231,10 +231,16 @@ calls `require_active()` and returns a borrow.
 
 The scalar bytes are zeroized on drop by `k256::SecretKey`'s own
 zeroize-on-drop discipline; `EvmWallet`'s `Drop` is the trivial
-field-by-field drop chain. The plan-gate's `no_evm_secret_after_drop`
-regression test pins the determinism contract end-to-end (a
+field-by-field drop chain. The
+`derive_evm_wallet_is_deterministic_post_drop` regression test pins
+the determinism contract end-to-end across a Drop boundary (a
 behavioural test, not a formal zeroize proof — see
-`crates/pangolin-chain/src/evm.rs::tests::no_evm_secret_after_drop`).
+`crates/pangolin-chain/src/evm.rs::tests::derive_evm_wallet_is_deterministic_post_drop`).
+The session-drop regression (the property that `Vault::evm_wallet`
+errors with `StoreError::NotUnlocked` after lock / idle expiry /
+absolute expiry) is covered separately by the
+`evm_wallet_dropped_on_lock_idle_expiry_absolute_expiry` test in
+`crates/pangolin-store/src/vault.rs`.
 
 ### d. FFI surface (R-c — address only)
 

@@ -377,40 +377,38 @@ mod tests {
         assert_eq!(HKDF_INFO, b"pangolin-chain-evm-wallet-v0");
     }
 
-    /// MVP-2 issue 3.2 / L-key-material-location regression guard.
+    /// MVP-2 issue 3.2 — derivation is deterministic across Drop
+    /// boundaries (the L1 contract end-to-end at the scalar layer).
     ///
-    /// The secp256k1 scalar inside an [`EvmWallet`] is held by a
-    /// `k256::ecdsa::SigningKey` whose `Drop` zeroizes (verified by
-    /// the `RustCrypto` stack's own zeroize discipline; see the module
-    /// docstring's L-zeroize subsection). We cannot directly assert
-    /// "the heap allocation is zeroed after drop" in safe Rust —
-    /// Rust's `Drop` semantics do not guarantee an inspectable
-    /// post-Drop heap state, the compiler is free to elide fields
-    /// into registers, and probing the freed allocation is undefined
-    /// behaviour. So this test exercises the *behavioural* property
-    /// that matters: after the `EvmWallet` is dropped, a fresh
-    /// derivation from the same seed reproduces the same scalar
-    /// bytes — i.e. the secret IS recoverable from the seed (the L1
-    /// determinism guarantee) but NOT from any dangling reference to
-    /// the dropped wallet (which would be UB to read anyway).
+    /// **What this test actually verifies:** after the first
+    /// `EvmWallet` goes out of scope and Drops, a fresh derivation
+    /// from the same seed reproduces the same secp256k1 scalar
+    /// bytes (and the same address). This is the L1 "secret is a
+    /// pure function of the seed" determinism contract, observed
+    /// across a Drop boundary so the assertion would catch a future
+    /// regression where the derivation pipeline grows hidden state
+    /// (e.g. an RNG mixed into HKDF info; an init-once that
+    /// remembers the first scalar).
     ///
-    /// Concretely: we materialise a wallet, snapshot its scalar
-    /// bytes, drop the wallet, derive a fresh wallet from the same
-    /// seed, snapshot its scalar bytes, and assert the two snapshots
-    /// are byte-equal. This is the regression guard against a future
-    /// refactor that, e.g., introduces a global signer pool / static
-    /// cache that survives the wallet's drop — at which point the
-    /// drop would no longer zeroize the *only* copy and the
-    /// determinism check could silently mask the leak. Pairing the
-    /// determinism assertion with the wallet's `Drop` discipline
-    /// pins the contract end-to-end.
+    /// **What this test does NOT verify** (L2 audit fix-pass clarity
+    /// rename — earlier name `no_evm_secret_after_drop` overclaimed):
+    /// it does NOT prove the dropped wallet's heap allocation is
+    /// zeroed, and it would NOT catch a regression where a static
+    /// `OnceCell<EvmWallet>` cache makes the scalar survive the
+    /// owning binding's drop (such a cache would return the same
+    /// scalar bytes — the equality assertion holds either way). The
+    /// session-drop regression (the property that `Vault::evm_wallet`
+    /// errors with `StoreError::NotUnlocked` after lock/expiry,
+    /// which IS the property that would fail if a `OnceCell` cache
+    /// snuck in) is covered separately by
+    /// `evm_wallet_dropped_on_lock_idle_expiry_absolute_expiry` in
+    /// `pangolin-store/src/vault.rs`.
     ///
-    /// Pragmatic note (per the plan-gate's L-key-material-location
-    /// fallback wording): this is a defense-in-depth regression
-    /// guard, not a formal zeroize proof. The formal guarantee
-    /// lives in k256's own zeroize-on-drop discipline.
+    /// The formal zeroize guarantee on the dropped scalar lives in
+    /// `k256`'s own zeroize-on-drop discipline (not asserted here —
+    /// safe Rust cannot inspect freed allocations).
     #[test]
-    fn no_evm_secret_after_drop() {
+    fn derive_evm_wallet_is_deterministic_post_drop() {
         use pangolin_crypto::sign::SigningKey;
         // Pin a fixed seed so the test is deterministic across runs.
         let seed: [u8; 32] = [

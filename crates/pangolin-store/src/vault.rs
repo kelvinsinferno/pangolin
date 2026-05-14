@@ -317,23 +317,6 @@ struct ActiveState {
     /// add / update / delete paths; `SQLite` frees the arena when this
     /// `ActiveState` drops on `lock()` / expiry / `Drop`.
     search_index: SearchIndex,
-    /// **MVP-1 issue 1.5.** This device's Ed25519 [`DeviceKey`] — loaded
-    /// (decrypted from the `device_key` table under the VDK) on `unlock`,
-    /// or freshly generated + persisted on the first unlock that
-    /// registers a device. It does NOT sign anything in MVP-1 (Q4 — it
-    /// is the hook for MVP-2's signed-revision format / gas-payer role);
-    /// it is held here so every session-teardown path (`lock()` /
-    /// idle-or-absolute expiry / `Drop`) drops it alongside the cache +
-    /// search index. `DeviceKey` zeroizes on drop and redacts `Debug`
-    /// (P1 invariants); the on-disk form is only the AEAD ciphertext.
-    ///
-    /// Read only by the test/test-utilities accessor
-    /// [`Vault::device_key_verifying_key`] (verifies the in-memory key
-    /// matches the registered device + that teardown drops it); in a
-    /// production build it is a write-only MVP-2 hook, hence the
-    /// `dead_code` allow on the non-test cfg.
-    #[cfg_attr(not(any(test, feature = "test-utilities")), allow(dead_code))]
-    device_key: DeviceKey,
     /// **MVP-2 issue 3.2 (R-b: eager materialisation).** The
     /// per-device EVM wallet derived deterministically from `device_key`
     /// via [`pangolin_chain::derive_evm_wallet`]. Materialised once on
@@ -355,7 +338,34 @@ struct ActiveState {
     /// 3.1 / 3.3 / 3.4 / 4.2) thread the borrowed wallet into chain
     /// primitives; the wallet is never re-derived per-call (consumer
     /// L6 doctrine).
+    ///
+    /// **Drop order (L1 audit fix-pass).** Declared BEFORE `device_key`
+    /// so Rust's declaration-order drop semantics tear the derivative
+    /// wallet down before the source seed — defense-in-depth (derivative
+    /// material is wiped before the material it was derived from is
+    /// itself wiped, so a hypothetical mid-Drop observer sees the
+    /// derivative go first). The two zeroize disciplines are
+    /// independent (`k256::SecretKey` vs `ed25519-dalek` `SecretKey` via
+    /// `pangolin_crypto`'s `Zeroize` plumbing); ordering them here is
+    /// pure belt-and-braces.
     evm_wallet: EvmWallet,
+    /// **MVP-1 issue 1.5.** This device's Ed25519 [`DeviceKey`] — loaded
+    /// (decrypted from the `device_key` table under the VDK) on `unlock`,
+    /// or freshly generated + persisted on the first unlock that
+    /// registers a device. It does NOT sign anything in MVP-1 (Q4 — it
+    /// is the hook for MVP-2's signed-revision format / gas-payer role);
+    /// it is held here so every session-teardown path (`lock()` /
+    /// idle-or-absolute expiry / `Drop`) drops it alongside the cache +
+    /// search index. `DeviceKey` zeroizes on drop and redacts `Debug`
+    /// (P1 invariants); the on-disk form is only the AEAD ciphertext.
+    ///
+    /// Read only by the test/test-utilities accessor
+    /// [`Vault::device_key_verifying_key`] (verifies the in-memory key
+    /// matches the registered device + that teardown drops it); in a
+    /// production build it is a write-only MVP-2 hook, hence the
+    /// `dead_code` allow on the non-test cfg.
+    #[cfg_attr(not(any(test, feature = "test-utilities")), allow(dead_code))]
+    device_key: DeviceKey,
     /// **MVP-1 issue 1.4 — presence freshness + dedup (Session spec
     /// §7.6 / §8.6).** Wall-clock instant of the most recent successful
     /// presence proof for this session — set by `unlock` (the 2-proof
@@ -873,8 +883,15 @@ impl Vault {
             vdk,
             cache,
             search_index,
-            device_key,
+            // L1 audit fix-pass: `evm_wallet` is declared BEFORE
+            // `device_key` in ActiveState so the derivative drops
+            // first; the construction order here mirrors the
+            // declaration for visual clarity (Rust's struct-literal
+            // syntax is by-name, so the literal order does not
+            // affect drop order — that's purely a function of the
+            // struct declaration).
             evm_wallet,
+            device_key,
             last_presence_at: Some(now),
             requires_upgrade,
         });
