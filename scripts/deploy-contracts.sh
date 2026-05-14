@@ -195,7 +195,14 @@ if [[ "$DRY_RUN" == "0" && "$ENV" != "dev" ]]; then
   # passphrase even for an address-only read. That prompt is interactive
   # so we expect a TTY at this step (guaranteed by the --unattended guard
   # above).
-  DEPLOYER_ADDR="$(cast wallet address --account "$DEPLOYER_ACCOUNT")"
+  #
+  # The `tr -d '[:space:]'` strip handles a foundry-version-specific quirk
+  # where a stray newline leaks into the captured stdout on Windows/MSYS
+  # (probably from the interactive passphrase prompt's terminal echo
+  # interacting with command substitution); without the strip, `cast balance`
+  # below receives `\n0x…` and rejects it as "odd number of digits". An EVM
+  # address has no internal whitespace, so unconditional strip is safe.
+  DEPLOYER_ADDR="$(cast wallet address --account "$DEPLOYER_ACCOUNT" | tr -d '[:space:]')"
   BAL_WEI="$(cast balance "$DEPLOYER_ADDR" --rpc-url "$RPC_URL")"
   MIN_WEI="${MIN_DEPLOYER_BALANCE_WEI:-10000000000000000}"
   # Compare as decimal strings of arbitrary length; bash arithmetic
@@ -430,7 +437,7 @@ EOF
   local deployed_at
   deployed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   local deployer_addr
-  deployer_addr="${DEPLOYER_ADDR:-$(cast wallet address --account "$DEPLOYER_ACCOUNT" 2>/dev/null || echo "unknown")}"
+  deployer_addr="${DEPLOYER_ADDR:-$(cast wallet address --account "$DEPLOYER_ACCOUNT" 2>/dev/null | tr -d '[:space:]' || echo "unknown")}"
   local explorer_base
   case "$ENV" in
     sepolia) explorer_base="https://sepolia.basescan.org" ;;
