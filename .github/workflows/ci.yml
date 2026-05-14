@@ -362,20 +362,11 @@ jobs:
         run: bash scripts/check-no-uniffi-in-core.sh
       # MVP-2 issue 3.2 (L7): the locked workspace dep direction is
       # `pangolin-store → pangolin-chain` (one-way). `pangolin-chain` MUST
-      # NOT gain a non-dev `pangolin-store` dep. We use `--edges normal`
-      # so the existing dev-dep on `pangolin-store/test-utilities` (used
-      # by base_sepolia's integration tests) is filtered out and does
-      # not false-positive. The `|| true` after `grep -c` avoids
-      # `grep -c 0` exiting 1; the `[ "$l7" = "0" ]` is the real gate.
-      - name: Cross-cutting invariants (HIGH-1 + Q3 + L7)
-        run: |
-          set -euxo pipefail
-          high1=$(cargo tree -p pangolin-crypto | grep -ci serde)
-          [ "$high1" = "0" ] || { echo "::error::HIGH-1 violated: pangolin-crypto serde count = $high1"; exit 1; }
-          q3=$(cargo tree -p pangolin-core | grep -ci uniffi)
-          [ "$q3" = "0" ] || { echo "::error::Q3 violated: pangolin-core uniffi count = $q3"; exit 1; }
-          l7=$(cargo tree -p pangolin-chain --no-default-features --edges normal | grep -c pangolin-store || true)
-          [ "$l7" = "0" ] || { echo "::error::L7 violated: pangolin-chain production tree reaches pangolin-store ($l7 edges)"; exit 1; }
+      # NOT gain a non-dev `pangolin-store` dep. Mirrors the
+      # check-no-serde-in-crypto.sh / check-no-uniffi-in-core.sh pattern;
+      # the script handles the `grep -c 0` exit-1 trap via `|| true`.
+      - name: Verify pangolin-chain production tree has zero pangolin-store references
+        run: bash scripts/check-chain-no-store.sh
 
   # MVP-1 issue 1.1 §Test plan: `ffi-bindings` job. Builds the FFI
   # crate, asserts `staticlib`/`cdylib` artefacts exist, runs
