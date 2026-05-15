@@ -12,6 +12,7 @@ members = [
     "crates/pangolin-kdbx",
     "apps/cli",
     "tools/chaincli",
+    "services/funder",
 ]
 
 # Workspace-wide dependency pins. Crypto-bearing crates are restricted to the

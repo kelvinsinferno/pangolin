@@ -111,15 +111,19 @@ pub mod mock;
 pub use adapter::ChainAdapter;
 pub use base_sepolia::{BaseSepoliaAdapter, BASE_SEPOLIA_CHAIN_ID};
 pub use chain_submit::{
-    publish_revision_v1, ChainAnchorV1, MAX_FEE_PER_GAS_CAP_WEI, PRIORITY_FEE_DEFAULT_WEI,
-    PUBLISH_REVISION_BACKOFF_MS, PUBLISH_REVISION_MAX_RETRIES, RECEIPT_TIMEOUT_SECS,
+    publish_revision_v1, submit_redemption_v1, ChainAnchorV1, RedemptionAnchorV1,
+    MAX_FEE_PER_GAS_CAP_WEI, PRIORITY_FEE_DEFAULT_WEI, PUBLISH_REVISION_BACKOFF_MS,
+    PUBLISH_REVISION_MAX_RETRIES, RECEIPT_TIMEOUT_SECS,
 };
 pub use deployments::{load_deployed_address, ChainEnv};
 pub use error::ChainError;
 pub use evm::{derive_evm_address, derive_evm_wallet, EvmWallet};
 pub use secp256k1_signing::{
-    build_signed_revision_v1, RevisionFieldsV1, SignedRevisionV1, DOMAIN_SEPARATOR_BASE_SEPOLIA_V1,
-    EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA, REVISION_TYPEHASH_V1, SIGNED_REVISION_DOMAIN_V1,
+    build_signed_redemption_v1, build_signed_revision_v1, RedemptionFieldsV1, RevisionFieldsV1,
+    SignedRedemptionV1, SignedRevisionV1, DOMAIN_SEPARATOR_BASE_SEPOLIA_V1,
+    ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1, EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA,
+    EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA, REDEMPTION_TYPEHASH_V1,
+    REVISION_TYPEHASH_V1, SIGNED_REVISION_DOMAIN_V1,
 };
 pub use signing::{
     build_signed_revision, canonical_hash, verify_signed_revision, SignatureInvalid,

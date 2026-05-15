@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# `pangolin-funder` — one-way ETH dispenser service (MVP-2 issue 3.4).
+#
+# Per docs/issue-plans/3.4.md L1 + L7 + L8: this crate is DELIBERATELY
+# isolated from `pangolin-store` / `pangolin-core` / `pangolin-crypto` /
+# `pangolin-ffi`. The dep set below is reviewed against L1 + L7 at
+# every plan-gate; new deps require justification (L8).
+#
+# CI invariant (run from the workspace root):
+#   cargo tree -p pangolin-funder | grep -E "pangolin-(store|core|crypto|ffi)" | wc -l
+# must return 0.
+
+[package]
+name        = "pangolin-funder"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+description = "Pangolin funder service — verifies signed Credit attestations and dispenses ETH to user device wallets."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "pangolin-funder"
+path = "src/main.rs"
+
+[features]
+# Expose the `MockSigner` test impl to external integration tests
+# (e.g., the eventual 3.5 CLI integration tests that drive a real
+# binary). Disabled by default — release builds NEVER include the
+# mock. Mirror of `pangolin-chain`'s `test-utilities` feature.
+test-utilities = []
+
+[dependencies]
+
+# ---- Internal workspace deps (L1 + L7 audit surface) ----
+
+# 3.1's EIP-712 primitives + 3.3's chain-submit transport, extended in
+# 3.4 with `build_signed_redemption_v1` + `submit_redemption_v1`. The
+# funder also reads the registry address via `load_deployed_address`.
+pangolin-chain = { path = "../../crates/pangolin-chain" }
+
+# Shared wire types for the HTTP protocol + the device-binding
+# verifier. L1 isolation: this client crate has NO transitive
+# pangolin-store/core/crypto/ffi deps.
+pangolin-funder-client = { path = "../../crates/pangolin-funder-client" }
+
+# ---- External deps (each justified below) ----
+
+# alloy 2.0.4 — primitives + signer-local + json-rpc. Same workspace
+# pin the rest of the chain stack uses; no new transitive surface.
+alloy = { workspace = true }
+alloy-signer-local = { workspace = true }
+
+# tokio 1.52.2 — async runtime. Workspace pin. The funder enables
+# `rt-multi-thread` + `macros` (for `#[tokio::main]`) plus `signal`
+# (for graceful SIGTERM shutdown) and `time` (for the rate-limit
+# replenishment + receipt-poll timeouts).
+tokio = { version = "=1.52.2", default-features = false, features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+
+# axum 0.7 — HTTP server (R-a). The 0.7 line is the current
+# tower-aligned major; 0.8+ has churn we don't want to inherit
+# pre-release. `json` feature enables `axum::Json` body extraction.
+axum = { version = "=0.7.9", default-features = false, features = ["http1", "json", "tokio"] }
+
+# tower 0.4 + tower-http 0.5 — middleware (R-a). `tower-http` provides
+# `TraceLayer` (structured request logging) + `RequestBodyLimitLayer`
+# (the 16 KB body cap defending against memory-exhaustion DoS).
+tower = { version = "=0.4.13", default-features = false, features = ["util"] }
+tower-http = { version = "=0.5.2", default-features = false, features = ["trace", "limit"] }
+
+# tracing 0.1 + tracing-subscriber 0.3 — structured logging. L12
+# discipline: only WARN-and-above logs include request metadata at
+# default verbosity; userId / deviceAddress / Credit-attestation bytes
+# log at DEBUG only.
+tracing = { version = "=0.1.41", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "=0.3.19", default-features = false, features = ["fmt", "env-filter", "std"] }
+
+# rusqlite 0.39 — workspace pin (no new dep; pangolin-store also
+# uses this). The funder runs the SQLite ledger on the same vendored
+# build. `bundled` ensures cross-platform consistency.
+rusqlite = { workspace = true }
+
+# serde + serde_json — HTTP request/response shapes. First time
+# `serde` derive lands in any Pangolin crate (per 3.4 L8: the
+# serde-ban in deny.toml is scoped to the `pangolin-crypto` tree;
+# this binary crate is exempt by virtue of being separate). serde_json
+# is already a workspace pin (=1.0.133) for the deployment-file loader.
+serde = { version = "=1.0.228", default-features = false, features = ["std", "derive"] }
+serde_json = { workspace = true }
+
+# thiserror — workspace pin; the funder error taxonomy uses the same
+# derive macro as `pangolin-chain::error::ChainError`.
+thiserror = { workspace = true }
+
+# hex — workspace pin; used in tests + the health response's hex
+# rendering of the registry address.
+hex = { workspace = true }
+
+# async-trait — workspace pin. The `FunderSigner` trait (R-f) needs
+# `async fn` in dyn-compatible position, which stable Rust does not
+# yet support natively; `async-trait` is the canonical workaround.
+async-trait = { workspace = true }
+
+[dev-dependencies]
+# Hermetic test fixtures + the MockSigner test-only impl. The
+# `MockSigner` is gated `#[cfg(test)]` so it never lands in the release
+# binary (L1 + L9 mechanical defense). Test deps pulled from the
+# workspace where possible.
+tempfile = { workspace = true }
+tokio = { version = "=1.52.2", default-features = false, features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }

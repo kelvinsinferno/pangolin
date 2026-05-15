@@ -491,3 +491,91 @@ production payment flow.
 full metadata in `contracts/deployments/base-sepolia.json` under the
 `EntitlementRegistry` key.
 ```
+
+## D-019 split-key EntitlementRegistry redeploy (MVP-2 issue 3.4 follow-up)
+
+> **Status:** Template only — code merged in 3.4; the actual deploy +
+> address is the operational follow-up Kelvin runs after merge.
+
+### Why a redeploy
+
+D-018 deployed with `PAYMENT_AUTHORITY = REDEMPTION_AUTHORITY =
+pangolin-dev` (collapsed authorities). The 2.2 split-trust property is
+load-bearing for the funder threat model (L-funder-wallet-key-leak —
+the redemption authority compromise must not also let the attacker
+inflate balances via `credit`). 3.4 ships the funder code; the
+operational follow-up deploys a fresh `EntitlementRegistry` instance
+with two distinct authority addresses.
+
+### Steps
+
+1. **Create the funder keystore** (one-time):
+
+   ```bash
+   cast wallet new --keystore-dir ~/.foundry/keystores --name pangolin-funder-dev
+   # Note the passphrase + the printed address.
+   ```
+
+2. **Fund the funder wallet** via the Base Sepolia faucet
+   (https://www.coinbase.com/faucets/base-ethereum-goerli-faucet). At
+   minimum ~0.05 ETH for steady-state operation; the cold-wallet refill
+   discipline is the 18.5 runbook's job.
+
+3. **Update `contracts/deploy/.env.sepolia`** with the new authority
+   variables (the file already has the placeholder block from 3.4).
+
+4. **Deploy** via the existing wrapper, overriding the constructor args
+   (`scripts/deploy-contracts.sh --env sepolia --contract entitlement`).
+
+5. **Update `contracts/deployments/base-sepolia.json`** — replace or
+   shadow the D-018 `EntitlementRegistry` entry with the D-019 address +
+   deploy metadata. The funder reads from this file via
+   `load_deployed_address`.
+
+6. **Re-pin the EIP-712 constants** in
+   `crates/pangolin-chain/src/secp256k1_signing.rs`:
+   - `EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA` → new D-019
+     address.
+   - `ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1` → re-captured via
+     `cast call <D-019 addr> "DOMAIN_SEPARATOR()(bytes32)"`.
+   The `redemption_domain_separator_matches_pinned_constant` hermetic
+   test will fail loudly if the constants drift from the on-chain
+   value.
+
+7. **Smoke-test** the new contract via `cast call` for `PAYMENT_AUTHORITY()`
+   and `REDEMPTION_AUTHORITY()` views.
+
+8. **Record D-019** in `DECISIONS.md` (template below) + add to
+   `DEVLOG.md` as the post-deploy follow-up entry.
+
+### D-019 entry template
+
+Copy this into `DECISIONS.md` after deploy:
+
+```
+## D-019 · EntitlementRegistry redeploy on Base Sepolia with split authorities
+
+**Date locked:** 2026-MM-DD
+
+**Decision:** `EntitlementRegistry` redeployed at `0x<addr>` on Base
+Sepolia (chain id `84532`). Deploy tx `0x<tx>` in block `<block>`.
+Deployer: `0x89e720238A3913688CB0E025ef03a64539575c54` (pangolin-dev
+wallet). Runtime keccak256: `0x<keccak>`. Constructor args:
+`PAYMENT_AUTHORITY = 0x89e720238A3913688CB0E025ef03a64539575c54`
+(pangolin-dev, testnet smoke-billing); `REDEMPTION_AUTHORITY =
+0x<funder-addr>` (pangolin-funder-dev wallet, real split-key per 3.4
+R-d). Smoke-tested post-deploy: `PAYMENT_AUTHORITY()` +
+`REDEMPTION_AUTHORITY()` views match constructor args;
+`DOMAIN_SEPARATOR()` matches the freshly-pinned
+`ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1` constant.
+
+**Why:** Per master plan §4 row 3.4 + R-d of `docs/issue-plans/3.4.md`.
+D-018 collapsed authorities for the smoke-test pass; D-019 ships real
+split keys so the funder service's `REDEMPTION_AUTHORITY` cannot also
+mint credits via `credit`. D-018 stays untouched as historical record.
+
+**Spec ref:** Master plan §4 row 3.4; `docs/issue-plans/3.4.md` R-d;
+`docs/architecture/funder-service.md`; full metadata in
+`contracts/deployments/base-sepolia.json` under the `EntitlementRegistry`
+key (replaces / shadows D-018 entry).
+```

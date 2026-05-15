@@ -72,7 +72,7 @@
 //! defensively even though k256's `sign_prehash_recoverable` produces
 //! low-s by default.
 
-use alloy::primitives::{address, hex, keccak256, Address, B256};
+use alloy::primitives::{address, hex, keccak256, Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::SignerSync;
 use alloy::sol_types::{eip712_domain, Eip712Domain};
@@ -860,5 +860,462 @@ mod tests {
         //
         // and confirm output equals
         // `DOMAIN_SEPARATOR_BASE_SEPOLIA_V1` (the hex! constant).
+    }
+}
+
+// =====================================================================
+// MVP-2 issue 3.4 — `Redemption` typehash + signer for `EntitlementRegistry`
+// =====================================================================
+//
+// Per docs/issue-plans/3.4.md (Kelvin sign-off 2026-05-15):
+// the funder service signs `Redemption` attestations against the
+// `EntitlementRegistry`'s `REDEMPTION_AUTHORITY`. This is a separate
+// codepath from the revision-publish signer above (L11 verbatim):
+// `Redemption` binds a distinct typehash, distinct domain separator
+// (the `EntitlementRegistry` contract, NOT RevisionLogV1), and a
+// distinct field set. The discipline (canonical-low s, v ∈ {27,28},
+// 65-byte rsv) is shared.
+//
+// The on-chain typehash literal is taken VERBATIM from
+// `contracts/src/EntitlementRegistry.sol:173-175`:
+//   Redemption(bytes32 userId,uint256 amount,uint64 nonce,uint16 schemaVersion,uint64 expiresAt)
+// Field ORDER is load-bearing (env-quirk #14): the contract's
+// `_hashRedemption` ABI-encodes in the order (userId, amount, nonce,
+// schemaVersion, expiresAt); the builder below ABI-encodes in the
+// SAME order. A mismatch is the 3.3 `encPayload` regression class of
+// bug — invisible to hermetic tests, fatal on every live submit.
+
+/// Pinned EIP-712 typehash for `Redemption`.
+///
+/// Equals `keccak256("Redemption(bytes32 userId,uint256 amount,uint64 nonce,uint16 schemaVersion,uint64 expiresAt)")`.
+/// Computed via `cast keccak "Redemption(...)"` at 3.4 builder time
+/// (2026-05-15) and pinned here so the `redemption_typehash_matches_pinned_constant`
+/// hermetic test re-keccaks the literal + asserts byte-equality.
+///
+/// **DO NOT** edit the field list / order without redeploying the
+/// contract — the bytes on the wire MUST equal what the contract's
+/// `REDEMPTION_TYPEHASH` constant resolves to.
+pub const REDEMPTION_TYPEHASH_V1: [u8; 32] =
+    hex!("2a1614246eddcb4b1915f697272835ba7c8fefd0ff42b3eae7692c9fc2977663");
+
+/// Pinned EIP-712 domain separator for `EntitlementRegistry` on Base
+/// Sepolia. Captured from the LIVE D-018 contract at 3.4 builder time
+/// (2026-05-15) via:
+///
+/// ```text
+/// cast call 0x08F8c394EB0c04ba0A4FBA1e64507b88F4b59D8d \
+///     "DOMAIN_SEPARATOR()(bytes32)" \
+///     --rpc-url https://sepolia.base.org
+/// ```
+///
+/// The `redemption_domain_separator_matches_pinned_constant` hermetic
+/// test constructs the same domain via [`eip712_domain!`] + asserts
+/// byte-equality.
+///
+/// **Note on D-019 redeploy:** when Kelvin runs the operational redeploy
+/// (R-d), the new D-019 contract will have a DIFFERENT
+/// `verifyingContract` field (the new contract address) and therefore
+/// a DIFFERENT `DOMAIN_SEPARATOR`. The pinned constant here is for
+/// D-018 (the smoke-test instance currently at
+/// `0x08F8c394EB0c04ba0A4FBA1e64507b88F4b59D8d`). The follow-up
+/// operational commit that updates `contracts/deployments/base-sepolia.json`
+/// to point at D-019 MUST also update this constant + the
+/// `EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA` constant
+/// below to match the new deployment's `DOMAIN_SEPARATOR()` view
+/// fn output. The `domain_separator_matches_pinned_constant` test
+/// catches drift at CI time.
+pub const ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1: [u8; 32] =
+    hex!("3c8b930fcd97a1d2fc760f841fa1cee652130f42af7eaedd143e37aba3e552b3");
+
+/// Pinned-at-source expected deployment address for the
+/// `EntitlementRegistry` on Base Sepolia (mirror of
+/// [`EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA`] for `RevisionLogV1`).
+///
+/// Today this is D-018 (`0x08F8...8d`); after the D-019 operational
+/// redeploy this constant updates to the new address. The
+/// [`build_signed_redemption_v1`] entry point cross-checks the
+/// deployment-file address against this constant before signing.
+pub const EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA: Address =
+    address!("0x08F8c394EB0c04ba0A4FBA1e64507b88F4b59D8d");
+
+/// EIP-712 domain string for the `EntitlementRegistry` `name` field.
+/// Taken VERBATIM from `EntitlementRegistry.sol:240` — a future
+/// contract revision changing this name would invalidate the pinned
+/// constant + fire `redemption_domain_separator_matches_pinned_constant`.
+const ENTITLEMENT_DOMAIN_NAME: &str = "Pangolin EntitlementRegistry";
+
+/// EIP-712 domain string for the `EntitlementRegistry` `version` field.
+const ENTITLEMENT_DOMAIN_VERSION: &str = "1";
+
+/// Inputs to the v1 signed-redemption builder.
+///
+/// Five fields, byte-for-byte matching `EntitlementRegistry.sol`'s
+/// `Redemption` struct (typehash literal pinned above). Field order
+/// follows the typehash — the ABI-encoded struct hash MUST match the
+/// contract's `_hashRedemption`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedemptionFieldsV1 {
+    /// Opaque user identifier (2.2 R-b; bytes32).
+    pub user_id: [u8; 32],
+    /// Credits to decrement (uint256). Funder's view is "the user
+    /// just received this much value off-chain — decrement their
+    /// on-chain balance by the same amount".
+    pub amount: U256,
+    /// Attestation nonce. MUST equal `nonce[userId]` at submit time
+    /// (strict equality, contract-enforced).
+    pub nonce: u64,
+    /// Event-schema version. Contract rejects values >
+    /// `MAX_KNOWN_SCHEMA_VERSION`.
+    pub schema_version: u16,
+    /// Unix timestamp after which the attestation is rejected by the
+    /// contract.
+    pub expires_at: u64,
+}
+
+/// Output of [`build_signed_redemption_v1`]: the field set + the
+/// 65-byte secp256k1 signature.
+///
+/// Mirror of [`SignedRevisionV1`]'s shape minus the `enc_payload`
+/// preimage (Redemption has no variable-length bytes field; the
+/// contract's `redeem(...)` calldata reproduces every field directly
+/// from the typed inputs, so there is no preimage drift class).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignedRedemptionV1 {
+    /// The same field set the digest was computed over.
+    pub fields: RedemptionFieldsV1,
+    /// 65-byte `r || s || v` signature. v ∈ {27, 28}; s canonical-low.
+    pub signature: [u8; 65],
+}
+
+/// Build the EIP-712 domain for the `EntitlementRegistry` on a given env.
+///
+/// Mirror of `build_domain` for `RevisionLogV1` — same alloy primitive,
+/// different `name` constant. The `chain_id` source is the same
+/// `ChainEnv::chain_id()` helper; the `verifying_contract` is loaded
+/// from the deployment file at the call site.
+fn build_entitlement_domain(env: ChainEnv, verifying_contract: Address) -> Eip712Domain {
+    let chain_id = env.chain_id().unwrap_or(0);
+    eip712_domain! {
+        name: ENTITLEMENT_DOMAIN_NAME,
+        version: ENTITLEMENT_DOMAIN_VERSION,
+        chain_id: chain_id,
+        verifying_contract: verifying_contract,
+    }
+}
+
+/// Compute the EIP-712 struct-hash for a [`RedemptionFieldsV1`].
+///
+/// Mirrors the contract's `_hashRedemption`:
+///
+/// ```text
+/// structHash = keccak256(
+///     abi.encode(
+///         REDEMPTION_TYPEHASH,
+///         userId,         // bytes32
+///         amount,         // uint256 (32-byte word, big-endian)
+///         nonce,          // uint64 (left-padded to 32-byte word)
+///         schemaVersion,  // uint16 (left-padded to 32-byte word)
+///         expiresAt       // uint64 (left-padded to 32-byte word)
+///     )
+/// )
+/// ```
+///
+/// ABI-encoding rules: every elementary type pads UP to a 32-byte
+/// word; `uintN` left-pads with zeros. The buffer layout below is the
+/// audit-friendly explicit form; alloy's `SolValue::abi_encode` would
+/// also work but produces the same bytes.
+fn redemption_struct_hash(fields: &RedemptionFieldsV1) -> B256 {
+    // 6 × 32 bytes = 192 bytes. (typehash + 5 fields, each padded to
+    // a 32-byte word.)
+    let mut buf = [0u8; 6 * 32];
+    let mut o = 0usize;
+    buf[o..o + 32].copy_from_slice(&REDEMPTION_TYPEHASH_V1);
+    o += 32;
+    // userId — already 32 bytes.
+    buf[o..o + 32].copy_from_slice(&fields.user_id);
+    o += 32;
+    // amount — uint256 fits exactly 32 bytes (big-endian).
+    buf[o..o + 32].copy_from_slice(&fields.amount.to_be_bytes::<32>());
+    o += 32;
+    // nonce — uint64 left-padded to 32 bytes (bytes [o..o+24] stay
+    // zero; the 8-byte BE value lands at [o+24..o+32]).
+    buf[o + 24..o + 32].copy_from_slice(&fields.nonce.to_be_bytes());
+    o += 32;
+    // schemaVersion — uint16 left-padded to 32 bytes.
+    buf[o + 30..o + 32].copy_from_slice(&fields.schema_version.to_be_bytes());
+    o += 32;
+    // expiresAt — uint64 left-padded to 32 bytes.
+    buf[o + 24..o + 32].copy_from_slice(&fields.expires_at.to_be_bytes());
+    debug_assert_eq!(o + 32, buf.len(), "redemption_struct_hash buffer drift");
+    keccak256(buf)
+}
+
+/// Build a v1 signed-redemption over `fields` using `signer`'s key,
+/// binding to `chain_env`'s deployed `EntitlementRegistry` contract.
+///
+/// Per R-d: the deployment-file `EntitlementRegistry` address is
+/// loaded via [`load_deployed_address`] + cross-checked against
+/// [`EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA`] for
+/// `BaseSepolia`. Mismatch fails closed with
+/// [`ChainError::DeploymentAddressMismatch`] (mirror of the
+/// `build_signed_revision_v1` guard).
+///
+/// Takes a `&PrivateKeySigner` rather than `&EvmWallet` because the
+/// funder service holds an alloy-native signer (loaded from a Foundry
+/// keystore at startup, NOT derived from a Pangolin device key —
+/// L1 + L7 isolation).
+///
+/// # Errors
+///
+/// - [`ChainError::DeploymentNotFound`] / [`ChainError::DeploymentParseError`]
+///   if the deployment file is missing / malformed.
+/// - [`ChainError::DeploymentAddressMismatch`] for `BaseSepolia` if
+///   the deployment file points at an unexpected address.
+/// - [`ChainError::Wallet`] if alloy's signer surfaces an error
+///   (vanishingly rare).
+pub fn build_signed_redemption_v1(
+    signer: &PrivateKeySigner,
+    fields: RedemptionFieldsV1,
+    chain_env: ChainEnv,
+) -> Result<SignedRedemptionV1, ChainError> {
+    // R-d: deployment-file sourcing of `verifyingContract`.
+    let verifying_contract = load_deployed_address(chain_env, "EntitlementRegistry")?;
+    // L-domain-binding defense: the pinned-at-source constant is the
+    // ground-truth address; mismatch fails closed.
+    if matches!(chain_env, ChainEnv::BaseSepolia)
+        && verifying_contract != EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA
+    {
+        return Err(ChainError::DeploymentAddressMismatch {
+            env: chain_env,
+            expected: EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA,
+            actual: verifying_contract,
+        });
+    }
+
+    let domain = build_entitlement_domain(chain_env, verifying_contract);
+    let domain_sep = domain.separator();
+    let s_hash = redemption_struct_hash(&fields);
+    let digest = eip712_digest(domain_sep, s_hash);
+
+    let signature = sign_digest_to_rsv(signer, digest)?;
+
+    // Defensive structural asserts mirroring the revision-signer.
+    debug_assert!(
+        signature[64] == 27 || signature[64] == 28,
+        "v must be in {{27,28}} for EIP-712"
+    );
+    let mut s_be = [0u8; 32];
+    s_be.copy_from_slice(&signature[32..64]);
+    debug_assert!(is_canonical_s(&s_be), "s must be canonical-low (s <= n/2)");
+    let _ = s_be;
+
+    Ok(SignedRedemptionV1 { fields, signature })
+}
+
+#[cfg(test)]
+#[allow(clippy::similar_names)] // `signer` + `signed` is the canonical
+                                //                                 alloy/3.1 vocabulary; renaming
+                                //                                 for the linter is pure noise.
+mod redemption_tests {
+    use super::*;
+    use alloy::primitives::{Address, U256};
+
+    /// Build a deterministic local signer for hermetic tests. Same
+    /// scalar the funder-client tests use, so cross-crate audit
+    /// recognises it.
+    fn fixed_local_signer() -> PrivateKeySigner {
+        let hex = "0x4242424242424242424242424242424242424242424242424242424242424242";
+        hex.parse::<PrivateKeySigner>().expect("parse fixed signer")
+    }
+
+    /// L3-equivalent + R-e: the pinned `REDEMPTION_TYPEHASH_V1`
+    /// equals the keccak of the literal struct definition string
+    /// taken verbatim from `EntitlementRegistry.sol:174`.
+    #[test]
+    fn redemption_typehash_matches_pinned_constant() {
+        let literal = "Redemption(bytes32 userId,uint256 amount,uint64 nonce,uint16 schemaVersion,uint64 expiresAt)";
+        let computed = keccak256(literal.as_bytes());
+        assert_eq!(
+            computed.0, REDEMPTION_TYPEHASH_V1,
+            "Redemption typehash literal must keccak to the pinned constant"
+        );
+    }
+
+    /// L2-equivalent + R-e: the EIP-712 domain separator constructed
+    /// via `eip712_domain!` for D-018 matches the value captured
+    /// from the live contract's `DOMAIN_SEPARATOR()` view fn at
+    /// builder time. Catches drift in name / version / chainId /
+    /// verifyingContract.
+    #[test]
+    fn redemption_domain_separator_matches_pinned_constant() {
+        let domain = build_entitlement_domain(
+            ChainEnv::BaseSepolia,
+            EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA,
+        );
+        let sep = domain.separator();
+        assert_eq!(
+            sep.0, ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1,
+            "alloy-constructed entitlement domain separator must equal pinned D-018 value"
+        );
+    }
+
+    /// L1-equivalent: signature is exactly 65 bytes.
+    #[test]
+    fn build_signed_redemption_v1_produces_65_byte_sig() {
+        let signer = fixed_local_signer();
+        let fields = RedemptionFieldsV1 {
+            user_id: [0x11; 32],
+            amount: U256::from(100u64),
+            nonce: 0,
+            schema_version: 1,
+            expires_at: 2_000_000_000,
+        };
+        let signed =
+            build_signed_redemption_v1(&signer, fields, ChainEnv::BaseSepolia).expect("sign");
+        assert_eq!(signed.signature.len(), 65);
+    }
+
+    /// Canonical-low s.
+    #[test]
+    fn build_signed_redemption_v1_canonical_s() {
+        let signer = fixed_local_signer();
+        let fields = RedemptionFieldsV1 {
+            user_id: [0x22; 32],
+            amount: U256::from(50u64),
+            nonce: 3,
+            schema_version: 1,
+            expires_at: 2_000_000_000,
+        };
+        let signed =
+            build_signed_redemption_v1(&signer, fields, ChainEnv::BaseSepolia).expect("sign");
+        let mut s_be = [0u8; 32];
+        s_be.copy_from_slice(&signed.signature[32..64]);
+        assert!(is_canonical_s(&s_be));
+    }
+
+    /// v ∈ {27, 28} (legacy non-EIP-155 form).
+    #[test]
+    fn build_signed_redemption_v1_v_in_27_or_28() {
+        let signer = fixed_local_signer();
+        let fields = RedemptionFieldsV1 {
+            user_id: [0x33; 32],
+            amount: U256::from(75u64),
+            nonce: 1,
+            schema_version: 1,
+            expires_at: 2_000_000_000,
+        };
+        let signed =
+            build_signed_redemption_v1(&signer, fields, ChainEnv::BaseSepolia).expect("sign");
+        let v = signed.signature[64];
+        assert!(v == 27 || v == 28, "v must be 27 or 28, got {v}");
+    }
+
+    /// Recover the signer over the same digest the builder produced;
+    /// must equal `signer.address()`. Hermetic cross-check that the
+    /// digest construction matches between sign-side and verify-side
+    /// (this is the round-trip the contract's `_recover` performs).
+    fn recover_redemption_for_test(
+        signed: &SignedRedemptionV1,
+        chain_env: ChainEnv,
+    ) -> Result<Address, alloy::primitives::SignatureError> {
+        let verifying_contract = match chain_env {
+            ChainEnv::BaseSepolia => EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA,
+            _ => load_deployed_address(chain_env, "EntitlementRegistry").unwrap_or(Address::ZERO),
+        };
+        let domain = build_entitlement_domain(chain_env, verifying_contract);
+        let domain_sep = domain.separator();
+        let s_hash = redemption_struct_hash(&signed.fields);
+        let digest = eip712_digest(domain_sep, s_hash);
+
+        let r = U256::from_be_slice(&signed.signature[0..32]);
+        let s = U256::from_be_slice(&signed.signature[32..64]);
+        let v_byte = signed.signature[64];
+        let y_parity = v_byte == 28;
+        let sig = alloy::primitives::Signature::new(r, s, y_parity);
+        sig.recover_address_from_prehash(&digest)
+    }
+
+    #[test]
+    fn redemption_round_trip_recover_v1() {
+        let signer = fixed_local_signer();
+        let fields = RedemptionFieldsV1 {
+            user_id: [0x44; 32],
+            amount: U256::from(42u64),
+            nonce: 0,
+            schema_version: 1,
+            expires_at: 2_000_000_000,
+        };
+        let signed =
+            build_signed_redemption_v1(&signer, fields, ChainEnv::BaseSepolia).expect("sign");
+        let recovered =
+            recover_redemption_for_test(&signed, ChainEnv::BaseSepolia).expect("recover");
+        assert_eq!(recovered, signer.address());
+    }
+
+    /// Per-field tamper: flipping any of the five struct fields
+    /// changes the recovered signer. Indirect coverage of typehash
+    /// drift + field-order errors (env-quirk #14).
+    #[test]
+    fn redemption_per_field_tamper_changes_signer() {
+        let signer = fixed_local_signer();
+        let base_fields = RedemptionFieldsV1 {
+            user_id: [0x55; 32],
+            amount: U256::from(99u64),
+            nonce: 5,
+            schema_version: 1,
+            expires_at: 2_000_000_000,
+        };
+        let signed = build_signed_redemption_v1(&signer, base_fields, ChainEnv::BaseSepolia)
+            .expect("sign baseline");
+        let baseline =
+            recover_redemption_for_test(&signed, ChainEnv::BaseSepolia).expect("recover baseline");
+        assert_eq!(baseline, signer.address());
+
+        let mut t = signed;
+        t.fields.user_id[0] ^= 0x01;
+        let recovered = recover_redemption_for_test(&t, ChainEnv::BaseSepolia).expect("recover");
+        assert_ne!(recovered, signer.address(), "user_id tamper");
+
+        let mut t = signed;
+        t.fields.amount = U256::from(100u64);
+        let recovered = recover_redemption_for_test(&t, ChainEnv::BaseSepolia).expect("recover");
+        assert_ne!(recovered, signer.address(), "amount tamper");
+
+        let mut t = signed;
+        t.fields.nonce = 6;
+        let recovered = recover_redemption_for_test(&t, ChainEnv::BaseSepolia).expect("recover");
+        assert_ne!(recovered, signer.address(), "nonce tamper");
+
+        let mut t = signed;
+        t.fields.schema_version = 2;
+        let recovered = recover_redemption_for_test(&t, ChainEnv::BaseSepolia).expect("recover");
+        assert_ne!(recovered, signer.address(), "schema_version tamper");
+
+        let mut t = signed;
+        t.fields.expires_at = 2_000_000_001;
+        let recovered = recover_redemption_for_test(&t, ChainEnv::BaseSepolia).expect("recover");
+        assert_ne!(recovered, signer.address(), "expires_at tamper");
+    }
+
+    /// env-quirk #14 live cross-check, `#[ignore]`'d so it doesn't
+    /// run in default CI. The pinned-constant hermetic test above is
+    /// the load-bearing CI-side check; this one is the manual
+    /// pre-merge smoke against the live D-018 contract.
+    ///
+    /// To run:
+    /// ```text
+    /// cast call 0x08F8c394EB0c04ba0A4FBA1e64507b88F4b59D8d \
+    ///     "DOMAIN_SEPARATOR()(bytes32)" \
+    ///     --rpc-url https://sepolia.base.org
+    /// ```
+    /// and confirm output equals
+    /// `ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1`. Re-pin when
+    /// D-019 lands (the new address changes the verifyingContract
+    /// component of the domain → new `DOMAIN_SEPARATOR`).
+    #[test]
+    #[ignore = "manual live-RPC cross-check; documented in docstring"]
+    fn redemption_cross_check_against_live_d018() {
+        // Documented as a runbook check rather than an embedded RPC
+        // call to keep the test crate net-isolated by default.
     }
 }
