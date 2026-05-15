@@ -18,7 +18,8 @@
                 │                                         │
                 │  // both calls are sync; Vault is sync  │
                 │  let signed: SignedRevisionV1           │
-                │      = vault.sign_revision_v1(...)      │
+                │      = vault.sign_revision_v1(          │
+                │            fields, enc_payload, env)?   │
                 │  let wallet: &EvmWallet                 │
                 │      = vault.evm_wallet()?              │
                 │                                         │
@@ -62,8 +63,8 @@
 | **Nonce collision** ("nonce too low", "already known", "replacement underpriced") | Retry: refresh nonce + resubmit | 3 attempts total; then `ChainError::NonceUnresolvable { attempts }` |
 | **RPC transient** ("timeout", "connection reset", 502/503/504, "service unavailable") | Retry with exponential backoff | 250 ms / 1 s / 4 s schedule; then `ChainError::RpcTransient { message, attempts }` |
 | **Insufficient funds** ("insufficient funds for gas * price") | Fatal — no retry | `ChainError::InsufficientFunds` |
-| **Contract revert** (receipt.status == 0) | Fatal — no retry | `ChainError::RevertedV1 { reason, tx_hash }` with reason decoded (when possible) as `ErrInvalidSignature` / `ErrSignerNotRegistered` / `ErrUnsupportedSchemaVersion` / `OutOfGas` / `"unknown revert"` |
-| **Pre-broadcast revert** (eth_estimateGas reverts) | Fatal — no retry; reason decoded | Same as above; `tx_hash = B256::ZERO` since the tx never broadcast |
+| **Contract revert** (receipt.status == 0) | Fatal — no retry | `ChainError::RevertedOnChain { reason, tx_hash }` with reason decoded (when possible) as `ErrInvalidSignature` / `ErrSignerNotRegistered` / `ErrUnsupportedSchemaVersion` / `OutOfGas` / `"unknown revert"` |
+| **Pre-broadcast revert** (eth_estimateGas reverts) | Fatal — no retry; reason decoded | `ChainError::RevertedPreBroadcast { reason }` — no tx_hash since the tx never broadcast (3.3 audit-LOW#2 split from the unified `RevertedV1` variant so operators no longer see `tx=0x000...0` on this path) |
 | **Chain id mismatch** | Fatal at construction | `ChainError::ChainIdMismatch { expected, observed }` |
 | **Deployment address mismatch** | Fatal at construction | `ChainError::DeploymentAddressMismatch { env, expected, actual }` |
 | **Gas-cap exceeded** | Fatal pre-broadcast | `ChainError::GasCapExceeded { observed_gwei, cap_gwei }` |
@@ -73,7 +74,7 @@
 
 1. **Sig pass-through:** the 65-byte `r ‖ s ‖ v` bytes from 3.1 are written into the tx calldata verbatim. No `v` normalisation, no offset shift, no re-signing.
 2. **Same key signs + pays gas (D-006):** the wallet handed to `publish_revision_v1` is the same wallet 3.1 used to sign. After the publish lands, the contract recovers `signer == wallet.address()`; the receipt cross-check `decoded.signer == wallet_address` enforces this client-side too.
-3. **Calldata byte-pinned:** `tests::publish_v1_calldata_byte_pin` asserts the encoded `publishRevision(...)` bytes match a `cast calldata`-derived reference. Selector `0x91f6be2f` is independently pinned by `tests::publish_v1_selector_matches`.
+3. **Calldata byte-pinned:** `tests::publish_v1_calldata_byte_pin` asserts the encoded `publishRevision(...)` bytes match a `cast calldata`-derived reference. Selector `0x91f6be2f` is independently pinned by `tests::publish_v1_selector_matches`. **3.3 audit-HIGH (2026-05-14):** the `encPayload` calldata argument is the raw preimage bytes from `SignedRevisionV1::enc_payload`, NOT the `fields.enc_payload_hash` digest — the contract re-derives `keccak256(encPayload)` from the calldata bytes (`contracts/src/RevisionLogV1.sol:312-314`), so sending the hash would cause it to compute `keccak256(hash)` and recover a wrong signer → `ErrInvalidSignature` revert on every live publish. The struct invariant `keccak256(enc_payload) == fields.enc_payload_hash` is `debug_assert!`'d at `build_signed_revision_v1` construction; the regression guard `tests::publish_v1_calldata_includes_preimage_not_hash` decodes the constructed calldata and asserts the `encPayload` field equals the preimage.
 4. **Address via `load_deployed_address` + pinned cross-check:** the public entry calls `load_deployed_address(env, "RevisionLogV1")` and cross-checks against `EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA` for `BaseSepolia`. Mismatch → `DeploymentAddressMismatch`.
 5. **Active-session-only:** the only way to obtain an `&EvmWallet` is via `Vault::evm_wallet()`. The publish fn takes the reference by argument (no static / `OnceCell` cache).
 6. **Gas-price hard cap 50 gwei:** computed `max_fee_per_gas > MAX_FEE_PER_GAS_CAP_WEI` → `GasCapExceeded` before any tx is constructed.
@@ -102,6 +103,7 @@
 `crates/pangolin-chain/src/chain_submit.rs::tests` — 19 tests, no network:
 
 - `publish_v1_calldata_byte_pin` — alloy's `sol!`-encoded calldata byte-equals `cast calldata` reference.
+- `publish_v1_calldata_includes_preimage_not_hash` — 3.3 audit-HIGH regression guard: constructed calldata's `encPayload` field equals the raw preimage (not the hash).
 - `publish_v1_selector_matches` — `0x91f6be2f` pin.
 - `publish_v1_happy_path_broadcast_leg` — `broadcast_with_retries` returns a `PendingTransactionBuilder` with the asserter's tx hash.
 - `publish_v1_process_receipt_happy_path` — `process_receipt` populates a `ChainAnchorV1` from a synthetic status==1 receipt.
@@ -109,8 +111,8 @@
 - `publish_v1_deployment_address_mismatch_errors` — wrong-address cross-check → `DeploymentAddressMismatch`.
 - `publish_v1_gas_cap_exceeded_errors` — 100 gwei base fee → cap fires; no broadcast attempted.
 - `publish_v1_insufficient_funds_errors` — send_tx returns "insufficient funds" → fatal.
-- `publish_v1_reverted_decodes_reason` — status==0 receipt → `RevertedV1`.
-- `publish_v1_estimate_revert_decodes_signer_not_registered` — `eth_estimateGas` reverts with `ErrSignerNotRegistered` → fatal pre-broadcast with decoded reason.
+- `publish_v1_reverted_decodes_reason` — status==0 receipt → `RevertedOnChain` (3.3 audit-LOW#2 split).
+- `publish_v1_estimate_revert_decodes_signer_not_registered` — `eth_estimateGas` reverts with `ErrSignerNotRegistered` → fatal pre-broadcast with decoded reason; surfaces as the typed `RevertedPreBroadcast` variant (no tx_hash since nothing was sent).
 - `publish_v1_receipt_mismatch_errors` — receipt's `signer` disagrees with wallet → `ReceiptMismatch`.
 - `publish_v1_log_from_wrong_address_treated_as_missing` — MED-4 defensive filter drops foreign logs.
 - `publish_v1_nonce_collision_retries_then_succeeds` — attempt 1 nonce-too-low, attempt 2 succeeds.

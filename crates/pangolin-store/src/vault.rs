@@ -992,9 +992,10 @@ impl Vault {
         Ok(&self.require_active()?.evm_wallet)
     }
 
-    /// **MVP-2 issue 3.1 (R-a..R-e).** Build a v1 signed revision over
-    /// `fields` using the active session's [`EvmWallet`] and the
-    /// deployed `RevisionLogV1` contract address for `chain_env`.
+    /// **MVP-2 issue 3.1 (R-a..R-e) + 3.3 audit-HIGH fix (2026-05-14).**
+    /// Build a v1 signed revision over `fields` using the active
+    /// session's [`EvmWallet`] and the deployed `RevisionLogV1`
+    /// contract address for `chain_env`.
     ///
     /// Per L5 (signing reachable only via active session): this method
     /// calls [`Self::require_active`] before threading the wallet into
@@ -1004,10 +1005,27 @@ impl Vault {
     /// [`StoreError::SessionExpired`] (the existing eager-drop
     /// mechanism).
     ///
-    /// Returns a 65-byte `r ‖ s ‖ v` signature over the EIP-712
-    /// typed-data digest the deployed contract `_recover`s against.
-    /// The broadcast layer (issue 3.3) consumes this output verbatim
-    /// when wiring `publishRevision(...)`.
+    /// Returns a [`SignedRevisionV1`] carrying the fields, the raw
+    /// `enc_payload` preimage, and the 65-byte `r ‖ s ‖ v` signature
+    /// over the EIP-712 typed-data digest the deployed contract
+    /// `_recover`s against. The broadcast layer (issue 3.3) consumes
+    /// this output verbatim when wiring `publishRevision(...)` — it
+    /// reads `signed.enc_payload` (not `fields.enc_payload_hash`) to
+    /// fill the `bytes encPayload` calldata argument, because the
+    /// contract recomputes `keccak256(encPayload)` from the calldata
+    /// bytes.
+    ///
+    /// # Arguments
+    ///
+    /// - `fields` — the six EIP-712 `Revision` struct fields; caller
+    ///   is responsible for populating `fields.enc_payload_hash`
+    ///   `= keccak256(enc_payload)`.
+    /// - `enc_payload` — the raw `encPayload` preimage. Travels
+    ///   downstream onto the returned `SignedRevisionV1` so the
+    ///   broadcast layer can put it on the wire. INVARIANT:
+    ///   `keccak256(enc_payload) == fields.enc_payload_hash`
+    ///   (`debug_assert!` inside the chain crate).
+    /// - `chain_env` — which env to bind the EIP-712 domain to.
     ///
     /// # Errors
     ///
@@ -1019,10 +1037,11 @@ impl Vault {
     pub fn sign_revision_v1(
         &self,
         fields: RevisionFieldsV1,
+        enc_payload: Vec<u8>,
         chain_env: ChainEnv,
     ) -> Result<SignedRevisionV1> {
         let active = self.require_active()?;
-        build_signed_revision_v1(&active.evm_wallet, fields, chain_env)
+        build_signed_revision_v1(&active.evm_wallet, fields, enc_payload, chain_env)
             .map_err(StoreError::ChainSignError)
     }
 
@@ -8581,6 +8600,23 @@ mod tests {
     #[test]
     fn sign_revision_v1_requires_active_session() {
         use pangolin_chain::{ChainEnv, RevisionFieldsV1};
+        // Canonical preimage + matching hash; carried in tandem so the
+        // 3.3 audit-HIGH `SignedRevisionV1` invariant
+        // (`keccak256(enc_payload) == fields.enc_payload_hash`) holds.
+        // The hash below was derived once via:
+        //   cast keccak 0x$(printf 'store-test-encpayload' | xxd -p)
+        // (output `0x9c03f671f049c622c4ada35ebfe4c443eb25050ee033bfbd064df8191cb045b3`).
+        // Pinned as a hex literal so pangolin-store doesn't need a
+        // direct alloy or sha3 dependency just for this one site —
+        // the chain crate's `debug_assert!` re-validates the
+        // invariant when `build_signed_revision_v1` is called, so a
+        // typo in this constant fires loudly in cargo test.
+        let enc_payload: Vec<u8> = b"store-test-encpayload".to_vec();
+        let enc_payload_hash: [u8; 32] = [
+            0x9c, 0x03, 0xf6, 0x71, 0xf0, 0x49, 0xc6, 0x22, 0xc4, 0xad, 0xa3, 0x5e, 0xbf, 0xe4,
+            0xc4, 0x43, 0xeb, 0x25, 0x05, 0x0e, 0xe0, 0x33, 0xbf, 0xbd, 0x06, 0x4d, 0xf8, 0x19,
+            0x1c, 0xb0, 0x45, 0xb3,
+        ];
 
         // Leg 1: Locked → NotUnlocked.
         let dir = TempDir::new().unwrap();
@@ -8593,10 +8629,10 @@ mod tests {
             parent_revision: [0x33; 32],
             device_id: [0x44; 32],
             schema_version: 1,
-            enc_payload_hash: [0xCC; 32],
+            enc_payload_hash,
         };
         let err = v
-            .sign_revision_v1(fields, ChainEnv::BaseSepolia)
+            .sign_revision_v1(fields, enc_payload.clone(), ChainEnv::BaseSepolia)
             .unwrap_err();
         assert!(
             matches!(err, StoreError::NotUnlocked),
@@ -8613,10 +8649,10 @@ mod tests {
             [0x22; 32],
             [0x33; 32],
             1,
-            [0xCC; 32],
+            enc_payload_hash,
         );
         let signed = v
-            .sign_revision_v1(fields, ChainEnv::BaseSepolia)
+            .sign_revision_v1(fields, enc_payload.clone(), ChainEnv::BaseSepolia)
             .expect("active session must sign");
         assert_eq!(signed.signature.len(), 65, "EIP-712 sig is 65 bytes");
         // device_id field carries the left-padded wallet address.
@@ -8624,6 +8660,13 @@ mod tests {
             &signed.fields.device_id[12..],
             wallet_addr.as_slice(),
             "device_id must be the left-padded wallet address"
+        );
+        // 3.3 audit-HIGH: preimage rides through onto the
+        // `SignedRevisionV1` so the broadcast layer can put it on the
+        // wire as the `encPayload` calldata bytes.
+        assert_eq!(
+            signed.enc_payload, enc_payload,
+            "SignedRevisionV1 must carry the preimage through Vault::sign_revision_v1"
         );
 
         // Leg 3: idle-expired session → SessionExpired via the
@@ -8634,14 +8677,16 @@ mod tests {
         Vault::create(&p2, &fresh_password()).unwrap();
         let (mut v2, clock) = open_vault_with_test_clock(&p2);
         v2.unlock(&fresh_presence(), &fresh_pin()).unwrap();
-        assert!(v2.sign_revision_v1(fields, ChainEnv::BaseSepolia).is_ok());
+        assert!(v2
+            .sign_revision_v1(fields, enc_payload.clone(), ChainEnv::BaseSepolia)
+            .is_ok());
         clock.advance(IDLE_TIMEOUT_DEFAULT + Duration::from_secs(1));
         // Trigger expiry via an &mut op — the documented mechanism.
         let err = v2.add_account(fresh_snapshot()).unwrap_err();
         assert!(matches!(err, StoreError::SessionExpired));
         // Now the &self signing call sees no active state.
         let err = v2
-            .sign_revision_v1(fields, ChainEnv::BaseSepolia)
+            .sign_revision_v1(fields, enc_payload, ChainEnv::BaseSepolia)
             .unwrap_err();
         assert!(
             matches!(err, StoreError::NotUnlocked),

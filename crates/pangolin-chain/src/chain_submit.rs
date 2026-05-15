@@ -22,8 +22,9 @@
 //!   [`ChainError::GasCapExceeded`].
 //! - **R-c retry taxonomy verbatim:** retriable = nonce collision
 //!   (max 3 retries) + RPC transient (exp backoff 250ms / 1s / 4s).
-//!   Fatal = `InsufficientFunds`, `RevertedV1` (with decoded reason
-//!   covering `ErrInvalidSignature` / `ErrSignerNotRegistered` /
+//!   Fatal = `InsufficientFunds`, `RevertedOnChain` /
+//!   `RevertedPreBroadcast` (with decoded reason covering
+//!   `ErrInvalidSignature` / `ErrSignerNotRegistered` /
 //!   `ErrUnsupportedSchemaVersion` / `OutOfGas`), `ChainIdMismatch`,
 //!   `DeploymentAddressMismatch`, `GasCapExceeded`, `NonceUnresolvable`,
 //!   `ReceiptMismatch`.
@@ -394,13 +395,27 @@ async fn broadcast_with_retries(
         // alloy's `sol!`-generated bindings expose the function as a
         // helper that builds calldata for us; we use the calldata
         // directly so we can attach a custom (nonce, gas, fee) profile.
+        //
+        // 3.3 audit-HIGH fix (2026-05-14): the `encPayload` calldata
+        // argument MUST be the raw preimage bytes, NOT the
+        // `fields.enc_payload_hash` digest. The on-chain contract
+        // re-derives the hash from the calldata bytes
+        // (`contracts/src/RevisionLogV1.sol:312-314`); passing the
+        // hash would cause the contract to compute `keccak256(hash)`
+        // and recover a wrong signer → `ErrInvalidSignature` revert on
+        // every live publish. The preimage rides on
+        // `SignedRevisionV1::enc_payload`; the EIP-712 digest the
+        // signature was produced over binds
+        // `fields.enc_payload_hash`, which the struct invariant
+        // (asserted at construction in `build_signed_revision_v1`)
+        // pins as `keccak256(enc_payload)`.
         let call = RevisionLogV1::publishRevisionCall {
             vaultId: signed_revision.fields.vault_id.into(),
             accountId: signed_revision.fields.account_id.into(),
             parentRevision: signed_revision.fields.parent_revision.into(),
             deviceId: signed_revision.fields.device_id.into(),
             schemaVersion: signed_revision.fields.schema_version,
-            encPayload: Bytes::copy_from_slice(&signed_revision.fields.enc_payload_hash[..]),
+            encPayload: Bytes::copy_from_slice(&signed_revision.enc_payload),
             signature: Bytes::copy_from_slice(&signed_revision.signature[..]),
         };
         let calldata = alloy::sol_types::SolCall::abi_encode(&call);
@@ -425,12 +440,12 @@ async fn broadcast_with_retries(
                 let msg = e.to_string();
                 // estimate_gas can revert if the call would revert
                 // on-chain; pass it through the same classifier so
-                // contract reverts surface as RevertedV1 not retry.
+                // contract reverts surface as a typed pre-broadcast
+                // revert (no tx_hash — the tx was never sent). The
+                // 3.3 audit-LOW#2 split distinguishes this case from
+                // the post-broadcast receipt-status==0 case.
                 if let Some(reason) = decode_revert_reason_from_msg(&msg) {
-                    return Err(ChainError::RevertedV1 {
-                        reason,
-                        tx_hash: B256::ZERO,
-                    });
+                    return Err(ChainError::RevertedPreBroadcast { reason });
                 }
                 if is_insufficient_funds(&msg) {
                     return Err(ChainError::InsufficientFunds {
@@ -494,7 +509,7 @@ async fn broadcast_with_retries(
 ///
 /// # Cross-checks (R-e + L-rpc-spoof)
 ///
-/// 1. `receipt.status == 1`; else [`ChainError::RevertedV1`].
+/// 1. `receipt.status == 1`; else [`ChainError::RevertedOnChain`].
 /// 2. `block_number` and `block_hash` present; else
 ///    [`ChainError::Decode`].
 /// 3. A `RevisionPublished` log emitted by `contract_address` is
@@ -512,8 +527,9 @@ fn process_receipt(
         // `revertReason`; surface a generic typed error with the
         // tx hash so the operator can look it up. The `decode_revert_reason_from_msg`
         // helper covers the pre-broadcast estimate-revert path
-        // separately.
-        return Err(ChainError::RevertedV1 {
+        // separately (which is the typed
+        // `ChainError::RevertedPreBroadcast` variant, no tx hash).
+        return Err(ChainError::RevertedOnChain {
             reason: "unknown revert (status=0)".to_string(),
             tx_hash,
         });
@@ -771,7 +787,9 @@ mod tests {
             parentRevision: signed.fields.parent_revision.into(),
             deviceId: signed.fields.device_id.into(),
             schemaVersion: signed.fields.schema_version,
-            encPayload: Bytes::copy_from_slice(&signed.fields.enc_payload_hash[..]),
+            // Mirror the on-chain emit: the event carries the raw
+            // `encPayload` preimage, not the `enc_payload_hash` digest.
+            encPayload: Bytes::copy_from_slice(&signed.enc_payload),
             signer,
         };
         let body_data = event.encode_data();
@@ -870,11 +888,21 @@ mod tests {
         asserter.push_success(&format!("{tx_hash:?}"));
     }
 
+    /// Canonical hermetic preimage for the publish tests. Multi-byte,
+    /// recognisable, and distinct from any 32-byte hash so accidental
+    /// hash/preimage swaps inside the test scaffolding are obvious.
+    fn sample_enc_payload() -> (Vec<u8>, [u8; 32]) {
+        let pre = b"pangolin-chain-submit-test-encpayload".to_vec();
+        let h = alloy::primitives::keccak256(&pre).0;
+        (pre, h)
+    }
+
     fn sample_signed_revision(wallet: &EvmWallet) -> SignedRevisionV1 {
+        let (pre, h) = sample_enc_payload();
         let fields = RevisionFieldsV1::with_signer_device_id(
-            wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, [0xCC; 32],
+            wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
         );
-        build_signed_revision_v1(wallet, fields, ChainEnv::BaseSepolia).expect("sign v1")
+        build_signed_revision_v1(wallet, fields, pre, ChainEnv::BaseSepolia).expect("sign v1")
     }
 
     // -----------------------------------------------------------------
@@ -947,6 +975,61 @@ mod tests {
             hex::encode(&encoded),
             hex::encode(&expected),
             "publishRevision calldata MUST byte-equal the `cast calldata` reference"
+        );
+    }
+
+    /// 3.3 audit-HIGH regression guard: the broadcast layer's
+    /// constructed `publishRevision` call MUST put the raw
+    /// `enc_payload` PREIMAGE bytes into the `encPayload` calldata
+    /// argument, NOT the `enc_payload_hash` digest. Without this
+    /// property the on-chain contract recomputes `keccak256(hash)`
+    /// instead of `keccak256(preimage)` and recovers a wrong signer
+    /// → `ErrInvalidSignature` revert on every live publish. The
+    /// hermetic asserter-based tests below would not catch this on
+    /// their own (the mock fakes the receipt). This test pins the
+    /// calldata-encoding contract directly: it builds the same
+    /// `publishRevisionCall` shape the production path builds and
+    /// decodes the resulting calldata's `encPayload` field back out,
+    /// asserting byte-equality with the preimage (not the hash).
+    #[test]
+    fn publish_v1_calldata_includes_preimage_not_hash() {
+        use alloy::sol_types::SolCall;
+        let wallet = fixed_wallet();
+        let pre: Vec<u8> = b"audit-HIGH-preimage-on-the-wire".to_vec();
+        let h = alloy::primitives::keccak256(&pre).0;
+        let fields = RevisionFieldsV1::with_signer_device_id(
+            &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
+        );
+        let signed = build_signed_revision_v1(&wallet, fields, pre.clone(), ChainEnv::BaseSepolia)
+            .expect("sign");
+        // Replicate the production calldata construction from
+        // `broadcast_with_retries`. Any drift between the two
+        // construction sites here would be caught by the byte-pin
+        // test (`publish_v1_calldata_byte_pin`).
+        let call = RevisionLogV1::publishRevisionCall {
+            vaultId: signed.fields.vault_id.into(),
+            accountId: signed.fields.account_id.into(),
+            parentRevision: signed.fields.parent_revision.into(),
+            deviceId: signed.fields.device_id.into(),
+            schemaVersion: signed.fields.schema_version,
+            encPayload: Bytes::copy_from_slice(&signed.enc_payload),
+            signature: Bytes::copy_from_slice(&signed.signature[..]),
+        };
+        let encoded = SolCall::abi_encode(&call);
+        let decoded =
+            RevisionLogV1::publishRevisionCall::abi_decode(&encoded).expect("decode call");
+        // Sanity: the recovered `encPayload` calldata is byte-equal
+        // to the preimage we shipped — NOT to `enc_payload_hash`.
+        assert_eq!(
+            decoded.encPayload.as_ref(),
+            pre.as_slice(),
+            "encPayload calldata MUST be the preimage; got {:?}",
+            decoded.encPayload
+        );
+        assert_ne!(
+            decoded.encPayload.as_ref(),
+            &signed.fields.enc_payload_hash[..],
+            "encPayload calldata MUST NOT equal the enc_payload_hash digest"
         );
     }
 
@@ -1142,12 +1225,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Reverted (status==0) → RevertedV1
+    // Reverted (status==0) → RevertedOnChain
     // -----------------------------------------------------------------
 
-    /// R-c Reverted (receipt leg): receipt.status==0 → `RevertedV1`.
-    /// Tested via `process_receipt` directly so the path is hermetic
-    /// without alloy's heart polling.
+    /// R-c Reverted (receipt leg): receipt.status==0 →
+    /// `RevertedOnChain` (3.3 audit-LOW#2 split — distinct from the
+    /// pre-broadcast estimate-revert variant which carries no
+    /// tx_hash). Tested via `process_receipt` directly so the path is
+    /// hermetic without alloy's heart polling.
     #[test]
     fn publish_v1_reverted_decodes_reason() {
         let wallet = fixed_wallet();
@@ -1165,17 +1250,18 @@ mod tests {
         let err = process_receipt(&receipt, wallet.address(), contract, tx_hash)
             .expect_err("revert must error");
         match err {
-            ChainError::RevertedV1 { tx_hash: h, .. } => {
+            ChainError::RevertedOnChain { tx_hash: h, .. } => {
                 assert_eq!(h, tx_hash);
             }
-            other => panic!("expected RevertedV1, got {other:?}"),
+            other => panic!("expected RevertedOnChain, got {other:?}"),
         }
     }
 
     /// R-c Reverted (pre-broadcast leg): an `eth_estimateGas` revert
-    /// surfaces as `RevertedV1` with a decoded reason BEFORE any
-    /// `send_transaction`. Covers the
-    /// `ErrSignerNotRegistered` reason-decoding path.
+    /// surfaces as `RevertedPreBroadcast` with a decoded reason BEFORE
+    /// any `send_transaction`. No tx_hash carried — the tx never went
+    /// out. Covers the `ErrSignerNotRegistered` reason-decoding path
+    /// + pins the audit-LOW#2 variant split.
     #[tokio::test]
     async fn publish_v1_estimate_revert_decodes_signer_not_registered() {
         let wallet = fixed_wallet();
@@ -1195,10 +1281,10 @@ mod tests {
             .await
             .expect_err("estimate revert must error");
         match err {
-            ChainError::RevertedV1 { reason, .. } => {
+            ChainError::RevertedPreBroadcast { reason } => {
                 assert_eq!(reason, "ErrSignerNotRegistered");
             }
-            other => panic!("expected RevertedV1, got {other:?}"),
+            other => panic!("expected RevertedPreBroadcast, got {other:?}"),
         }
     }
 
@@ -1444,11 +1530,24 @@ mod tests {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         vault_id[24..32].copy_from_slice(&now.to_be_bytes());
+        // 3.3 audit-HIGH fix (2026-05-14): the broadcast layer puts
+        // the preimage (not the hash) on the wire; the EIP-712 digest
+        // we sign binds `fields.enc_payload_hash`. For the live
+        // smoke test, populate a real multi-byte preimage so the
+        // contract's `keccak256(encPayload)` matches the
+        // `enc_payload_hash` the signature was produced over.
+        let enc_payload: Vec<u8> = format!("pangolin-d017-smoke-{now}").into_bytes();
+        let enc_payload_hash = alloy::primitives::keccak256(&enc_payload).0;
         let fields = RevisionFieldsV1::with_signer_device_id(
-            &wallet, vault_id, [0x42; 32], [0u8; 32], 1, [0xCC; 32],
+            &wallet,
+            vault_id,
+            [0x42; 32],
+            [0u8; 32],
+            1,
+            enc_payload_hash,
         );
-        let signed =
-            build_signed_revision_v1(&wallet, fields, ChainEnv::BaseSepolia).expect("sign live");
+        let signed = build_signed_revision_v1(&wallet, fields, enc_payload, ChainEnv::BaseSepolia)
+            .expect("sign live");
         let anchor = publish_revision_v1(&wallet, &signed, ChainEnv::BaseSepolia, &rpc_url)
             .await
             .expect("live publish must succeed");

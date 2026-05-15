@@ -209,17 +209,41 @@ impl RevisionFieldsV1 {
 }
 
 /// Output of [`build_signed_revision_v1`]: the input fields plus the
-/// 65-byte `r ‖ s ‖ v` signature.
+/// raw `encPayload` preimage plus the 65-byte `r ‖ s ‖ v` signature.
 ///
 /// Not a variant of [`crate::types::SignedRevision`] — that one is
 /// Ed25519-shaped (64-byte sig over a `keccak`-of-fixed-fields digest,
 /// retained for v0 read-back per R-b). The clean-break v0 → v1
 /// boundary is at the type level here so a caller cannot accidentally
 /// publish a v0 record under v1's API or vice versa.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// ## INVARIANT (3.3 audit-HIGH fix, 2026-05-14)
+///
+/// `keccak256(enc_payload) == fields.enc_payload_hash`. The EIP-712
+/// digest the signature was produced over binds the 32-byte
+/// `enc_payload_hash` (cheap on-chain) — but the on-chain contract
+/// re-derives that hash from the raw `encPayload` calldata bytes the
+/// broadcast layer sends (`contracts/src/RevisionLogV1.sol:312-314`).
+/// The broadcast layer MUST forward the preimage on the wire, not the
+/// hash; otherwise the contract computes `keccak256(hash)` and recovers
+/// a wrong signer → `ErrInvalidSignature` revert on every live publish.
+///
+/// The invariant is checked at construction in
+/// [`build_signed_revision_v1`] via `debug_assert!`; the broadcast leg
+/// in `chain_submit::broadcast_with_retries` reads `enc_payload` (not
+/// `fields.enc_payload_hash`) when filling the `publishRevision` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedRevisionV1 {
     /// The same field set the digest was computed over.
     pub fields: RevisionFieldsV1,
+    /// The raw `encPayload` preimage bytes the broadcast layer puts on
+    /// the wire as the `bytes encPayload` calldata argument to
+    /// `publishRevision`. INVARIANT: `keccak256(self.enc_payload) ==
+    /// self.fields.enc_payload_hash`. Owning the preimage on
+    /// `SignedRevisionV1` makes the "what gets broadcast" question
+    /// answered at the type — drift between signer + broadcaster is
+    /// impossible by construction.
+    pub enc_payload: Vec<u8>,
     /// Exactly 65 bytes: `r (32) || s (32) || v (1)`; `v ∈ {27,28}`;
     /// `s ≤ secp256k1n/2`.
     pub signature: [u8; 65],
@@ -371,6 +395,20 @@ fn leak_proof_signer_error(_e: &alloy::signers::Error) -> &'static str {
 /// `RevisionLogV1` address equals the source-pinned constant before
 /// signing.
 ///
+/// # Arguments
+///
+/// - `wallet` — the active session's `EvmWallet`.
+/// - `fields` — the six EIP-712 `Revision` struct fields. Caller is
+///   responsible for populating `fields.enc_payload_hash` =
+///   `keccak256(enc_payload)`.
+/// - `enc_payload` — the **raw** `encPayload` preimage. Stored on the
+///   returned [`SignedRevisionV1`] so the broadcast layer puts the
+///   preimage (not the hash) on the wire when calling
+///   `publishRevision`. INVARIANT: `keccak256(enc_payload) ==
+///   fields.enc_payload_hash` (`debug_assert!` in debug builds; the
+///   3.3 audit-HIGH fix is the load-bearing reason this is required).
+/// - `chain_env` — which env to bind the EIP-712 domain to.
+///
 /// # Errors
 ///
 /// - [`ChainError::DeploymentNotFound`] / [`ChainError::DeploymentParseError`]
@@ -382,8 +420,21 @@ fn leak_proof_signer_error(_e: &alloy::signers::Error) -> &'static str {
 pub fn build_signed_revision_v1(
     wallet: &EvmWallet,
     fields: RevisionFieldsV1,
+    enc_payload: Vec<u8>,
     chain_env: ChainEnv,
 ) -> Result<SignedRevisionV1, ChainError> {
+    // 3.3 audit-HIGH fix: the on-chain contract recomputes
+    // `keccak256(encPayload)` on the calldata bytes; the EIP-712 digest
+    // we sign here binds `fields.enc_payload_hash`. If the two are not
+    // identical, the contract recovers a wrong signer at submit time
+    // → `ErrInvalidSignature` revert. `debug_assert!` so cargo test
+    // catches construction-site drift cheaply.
+    debug_assert_eq!(
+        keccak256(&enc_payload).0,
+        fields.enc_payload_hash,
+        "SignedRevisionV1 INVARIANT: keccak256(enc_payload) must equal fields.enc_payload_hash"
+    );
+
     // R-c: deployment-file sourcing of `verifyingContract`.
     let verifying_contract = load_deployed_address(chain_env, "RevisionLogV1")?;
     // L-domain-binding defense: the pinned-at-source constant is the
@@ -425,7 +476,11 @@ pub fn build_signed_revision_v1(
     // Defense-in-depth: zero the local `s_be` view (already a copy of
     // public sig bytes, but the pattern keeps the invariant explicit).
     let _ = s_be;
-    Ok(SignedRevisionV1 { fields, signature })
+    Ok(SignedRevisionV1 {
+        fields,
+        enc_payload,
+        signature,
+    })
 }
 
 #[cfg(test)]
@@ -517,15 +572,26 @@ mod tests {
         );
     }
 
+    /// Test helper: produce `(enc_payload, enc_payload_hash)` for a
+    /// canonical multi-byte preimage. Used wherever a hermetic test
+    /// needs a `RevisionFieldsV1` + matching preimage to satisfy the
+    /// [`SignedRevisionV1`] invariant.
+    fn sample_enc_payload() -> (Vec<u8>, [u8; 32]) {
+        let pre = b"pangolin-test-encpayload-preimage".to_vec();
+        let h = keccak256(&pre).0;
+        (pre, h)
+    }
+
     /// L1: signature is exactly 65 bytes.
     #[test]
     fn build_signed_revision_v1_produces_65_byte_sig() {
         let wallet = fixed_wallet();
+        let (pre, h) = sample_enc_payload();
         let fields = RevisionFieldsV1::with_signer_device_id(
-            &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, [0xCC; 32],
+            &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
         );
         let signed =
-            build_signed_revision_v1(&wallet, fields, ChainEnv::BaseSepolia).expect("sign");
+            build_signed_revision_v1(&wallet, fields, pre, ChainEnv::BaseSepolia).expect("sign");
         assert_eq!(signed.signature.len(), 65, "EIP-712 sig is 65 bytes");
     }
 
@@ -533,11 +599,12 @@ mod tests {
     #[test]
     fn build_signed_revision_v1_canonical_s() {
         let wallet = fixed_wallet();
+        let (pre, h) = sample_enc_payload();
         let fields = RevisionFieldsV1::with_signer_device_id(
-            &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, [0xCC; 32],
+            &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
         );
         let signed =
-            build_signed_revision_v1(&wallet, fields, ChainEnv::BaseSepolia).expect("sign");
+            build_signed_revision_v1(&wallet, fields, pre, ChainEnv::BaseSepolia).expect("sign");
         let mut s_be = [0u8; 32];
         s_be.copy_from_slice(&signed.signature[32..64]);
         assert!(
@@ -550,13 +617,62 @@ mod tests {
     #[test]
     fn build_signed_revision_v1_v_in_27_or_28() {
         let wallet = fixed_wallet();
+        let (pre, h) = sample_enc_payload();
         let fields = RevisionFieldsV1::with_signer_device_id(
-            &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, [0xCC; 32],
+            &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
         );
         let signed =
-            build_signed_revision_v1(&wallet, fields, ChainEnv::BaseSepolia).expect("sign");
+            build_signed_revision_v1(&wallet, fields, pre, ChainEnv::BaseSepolia).expect("sign");
         let v = signed.signature[64];
         assert!(v == 27 || v == 28, "v must be 27 or 28, got {v}");
+    }
+
+    /// 3.3 audit-HIGH regression guard: `SignedRevisionV1` ships with
+    /// the preimage; `build_signed_revision_v1` carries the
+    /// caller-supplied `enc_payload` verbatim onto the output. The
+    /// downstream broadcast layer reads `enc_payload` (not
+    /// `fields.enc_payload_hash`) when filling `publishRevision`'s
+    /// `bytes encPayload` calldata argument; this test pins the
+    /// pass-through.
+    #[test]
+    fn build_signed_revision_v1_carries_preimage() {
+        let wallet = fixed_wallet();
+        let pre: Vec<u8> = b"audit-HIGH-preimage-pass-through".to_vec();
+        let h = keccak256(&pre).0;
+        let fields = RevisionFieldsV1::with_signer_device_id(
+            &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
+        );
+        let signed = build_signed_revision_v1(&wallet, fields, pre.clone(), ChainEnv::BaseSepolia)
+            .expect("sign");
+        assert_eq!(
+            signed.enc_payload, pre,
+            "enc_payload must round-trip onto SignedRevisionV1 verbatim"
+        );
+        // INVARIANT pinned at the type-level.
+        assert_eq!(
+            keccak256(&signed.enc_payload).0,
+            signed.fields.enc_payload_hash,
+            "SignedRevisionV1 invariant must hold: keccak(enc_payload) == fields.enc_payload_hash"
+        );
+    }
+
+    /// 3.3 audit-HIGH: in debug builds (which `cargo test` always
+    /// uses), supplying a mismatched (`enc_payload`,
+    /// `fields.enc_payload_hash`) pair panics via the construction
+    /// `debug_assert!`. Catches caller-side drift between the hash the
+    /// EIP-712 digest binds and the preimage the broadcast layer puts
+    /// on the wire.
+    #[test]
+    #[should_panic(expected = "SignedRevisionV1 INVARIANT")]
+    fn build_signed_revision_v1_debug_asserts_preimage_consistency() {
+        let wallet = fixed_wallet();
+        let pre: Vec<u8> = b"some-preimage".to_vec();
+        // Deliberately wrong hash — not keccak256(pre).
+        let wrong_hash = [0xCCu8; 32];
+        let fields = RevisionFieldsV1::with_signer_device_id(
+            &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, wrong_hash,
+        );
+        let _ = build_signed_revision_v1(&wallet, fields, pre, ChainEnv::BaseSepolia);
     }
 
     /// R-d / round-trip: sign + recover via the test helper; the
@@ -566,11 +682,12 @@ mod tests {
     #[test]
     fn recover_v1_for_test_round_trip() {
         let wallet = fixed_wallet();
+        let (pre, h) = sample_enc_payload();
         let fields = RevisionFieldsV1::with_signer_device_id(
-            &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, [0xCC; 32],
+            &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
         );
         let signed =
-            build_signed_revision_v1(&wallet, fields, ChainEnv::BaseSepolia).expect("sign");
+            build_signed_revision_v1(&wallet, fields, pre, ChainEnv::BaseSepolia).expect("sign");
         let recovered = recover_v1_for_test(&signed, ChainEnv::BaseSepolia).expect("recover");
         assert_eq!(
             recovered,
@@ -588,10 +705,11 @@ mod tests {
     #[test]
     fn per_field_tamper_changes_signer() {
         let wallet = fixed_wallet();
+        let (pre, h) = sample_enc_payload();
         let base_fields = RevisionFieldsV1::with_signer_device_id(
-            &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, [0xCC; 32],
+            &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
         );
-        let signed = build_signed_revision_v1(&wallet, base_fields, ChainEnv::BaseSepolia)
+        let signed = build_signed_revision_v1(&wallet, base_fields, pre, ChainEnv::BaseSepolia)
             .expect("sign baseline");
         let baseline_signer =
             recover_v1_for_test(&signed, ChainEnv::BaseSepolia).expect("recover baseline");
@@ -611,31 +729,32 @@ mod tests {
         };
 
         // Field 1: vault_id
-        let mut t = signed;
+        let mut t = signed.clone();
         t.fields.vault_id[0] ^= 0x01;
         assert_tamper_changes_signer(t);
 
         // Field 2: account_id
-        let mut t = signed;
+        let mut t = signed.clone();
         t.fields.account_id[0] ^= 0x01;
         assert_tamper_changes_signer(t);
 
         // Field 3: parent_revision
-        let mut t = signed;
+        let mut t = signed.clone();
         t.fields.parent_revision[0] ^= 0x01;
         assert_tamper_changes_signer(t);
 
         // Field 4: device_id
-        let mut t = signed;
+        let mut t = signed.clone();
         t.fields.device_id[31] ^= 0x01;
         assert_tamper_changes_signer(t);
 
         // Field 5: schema_version
-        let mut t = signed;
+        let mut t = signed.clone();
         t.fields.schema_version = 2;
         assert_tamper_changes_signer(t);
 
-        // Field 6: enc_payload_hash
+        // Field 6: enc_payload_hash — last use of `signed`, so we
+        // move it directly instead of cloning (clippy::redundant_clone).
         let mut t = signed;
         t.fields.enc_payload_hash[0] ^= 0x01;
         assert_tamper_changes_signer(t);
@@ -652,11 +771,13 @@ mod tests {
     #[test]
     fn wrong_chain_id_produces_different_signer() {
         let wallet = fixed_wallet();
+        let (pre, h) = sample_enc_payload();
         let fields = RevisionFieldsV1::with_signer_device_id(
-            &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, [0xCC; 32],
+            &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
         );
         let signed_sepolia =
-            build_signed_revision_v1(&wallet, fields, ChainEnv::BaseSepolia).expect("sign sepolia");
+            build_signed_revision_v1(&wallet, fields, pre.clone(), ChainEnv::BaseSepolia)
+                .expect("sign sepolia");
 
         // Manually build a `SignedRevisionV1` against the Dev env by
         // signing a digest computed for Dev's domain. We bypass
@@ -671,6 +792,7 @@ mod tests {
         let dev_sig = sign_digest_to_rsv(wallet.signer(), dev_digest).expect("sign dev");
         let signed_dev = SignedRevisionV1 {
             fields,
+            enc_payload: pre,
             signature: dev_sig,
         };
 

@@ -88,26 +88,36 @@ caller fills RevisionFieldsV1 {
     device_id = left-pad-20(wallet.address()),  // R-a Path B
     schema_version, enc_payload_hash,           // = keccak256(encPayload)
 }
+caller also supplies `enc_payload: Vec<u8>` — the raw preimage. INVARIANT:
+keccak256(enc_payload) == fields.enc_payload_hash (debug_assert!).
         │
         ▼
-Vault::sign_revision_v1(fields, ChainEnv::BaseSepolia)
+Vault::sign_revision_v1(fields, enc_payload, ChainEnv::BaseSepolia)
         │  (calls require_active() — L5 session gate)
         ▼
-pangolin_chain::build_signed_revision_v1(&EvmWallet, fields, env)
-        │  (1) load_deployed_address(env, "RevisionLogV1")
-        │  (2) assert == EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA
+pangolin_chain::build_signed_revision_v1(&EvmWallet, fields, enc_payload, env)
+        │  (1) debug_assert!(keccak256(enc_payload) == fields.enc_payload_hash)
+        │      (3.3 audit-HIGH fix: contract recomputes hash from calldata;
+        │       the broadcast layer must put the preimage on the wire,
+        │       so SignedRevisionV1 owns it)
+        │  (2) load_deployed_address(env, "RevisionLogV1")
+        │  (3) assert == EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA
         │      (L-domain-binding cross-check)
-        │  (3) construct domain via eip712_domain!
-        │  (4) struct_hash(fields)
-        │  (5) digest = keccak(0x1901 || sep || struct_hash)
-        │  (6) wallet.signer().sign_hash_sync(&digest) → 65-byte sig
-        │  (7) defensive normalize_s + structural asserts
+        │  (4) construct domain via eip712_domain!
+        │  (5) struct_hash(fields)
+        │  (6) digest = keccak(0x1901 || sep || struct_hash)
+        │  (7) wallet.signer().sign_hash_sync(&digest) → 65-byte sig
+        │  (8) defensive normalize_s + structural asserts
         ▼
-SignedRevisionV1 { fields, signature: [u8; 65] }
+SignedRevisionV1 { fields, enc_payload, signature: [u8; 65] }
         │
         ▼
 (MVP-2 issue 3.3 broadcast layer consumes this output verbatim:
- abi.encodeCall(publishRevision, (fields..., signature)) → eth_sendRawTransaction)
+ abi.encodeCall(publishRevision, (fields-bytes32s..., enc_payload, signature))
+   → eth_sendRawTransaction.
+ The `bytes encPayload` calldata arg is the raw preimage — the on-chain
+ contract re-derives `keccak256(encPayload)` and uses it inside the EIP-712
+ struct_hash to recover the signer.)
 ```
 
 ## What 3.1 does NOT ship

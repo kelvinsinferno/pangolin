@@ -243,19 +243,26 @@ pub enum ChainError {
         message: String,
     },
 
-    /// **MVP-2 issue 3.3 (R-c retry taxonomy).** The tx mined but the
-    /// receipt's status flag was 0 (the contract reverted). The
-    /// decoded revert reason is a best-effort English string; the
-    /// `tx_hash` is always populated so the operator can look up the
-    /// reverting tx on an explorer.
+    /// **MVP-2 issue 3.3 (R-c retry taxonomy + 3.3 audit-LOW#2
+    /// split).** The tx mined but the receipt's `status` flag was 0
+    /// (the contract reverted on-chain). The decoded revert reason is
+    /// a best-effort English string; the `tx_hash` is always populated
+    /// so the operator can look up the reverting tx on an explorer.
+    ///
+    /// Distinct from [`Self::RevertedPreBroadcast`] (estimate-gas
+    /// revert before the tx ever broadcast) — that path has no
+    /// `tx_hash`. The audit-LOW#2 fix (2026-05-14) split a single
+    /// `RevertedV1 { reason, tx_hash: B256 }` variant in two so the
+    /// pre-broadcast path no longer carries a `tx=0x000...0` in its
+    /// operator-facing message.
     ///
     /// Distinct from the v0 [`Self::Reverted`] variant — this one
     /// carries a typed `tx_hash` (B256) and a decoded `reason`,
     /// where v0's variant stringifies the tx hash and has no reason
     /// field. Both variants exist because v0's adapter is the legacy
     /// path; the v1 transport produces this richer form.
-    #[error("revision tx reverted: reason={reason}, tx={tx_hash}")]
-    RevertedV1 {
+    #[error("revision tx reverted on-chain: reason={reason}, tx={tx_hash}")]
+    RevertedOnChain {
         /// Decoded revert reason (best effort). Examples:
         /// `"ErrInvalidSignature"`, `"ErrSignerNotRegistered"`,
         /// `"ErrUnsupportedSchemaVersion"`, `"OutOfGas"`,
@@ -264,6 +271,25 @@ pub enum ChainError {
         /// 32-byte tx hash so the operator can look it up on Base
         /// Sepolia's explorer.
         tx_hash: B256,
+    },
+
+    /// **MVP-2 issue 3.3 (R-c retry taxonomy + 3.3 audit-LOW#2
+    /// split).** The `eth_estimateGas` simulation reverted BEFORE the
+    /// tx was broadcast. The decoded revert reason is a best-effort
+    /// English string; no `tx_hash` is reported because nothing was
+    /// ever sent to the mempool.
+    ///
+    /// Pre-MVP-2 the broadcast layer collapsed both pre- and post-
+    /// broadcast reverts into a single `RevertedV1 { reason, tx_hash:
+    /// B256 }` variant; the pre-broadcast path carried `tx_hash =
+    /// B256::ZERO`, which surfaced as a confusing `tx=0x000...0` in
+    /// the operator-facing error message. The audit-LOW#2 fix splits
+    /// the variants so the no-tx case is typed as such.
+    #[error("revision tx reverted pre-broadcast (estimate-gas): reason={reason}")]
+    RevertedPreBroadcast {
+        /// Decoded revert reason (best effort). Same alphabet as
+        /// [`Self::RevertedOnChain::reason`].
+        reason: String,
     },
 
     /// **MVP-2 issue 3.3 (R-b gas-cap defense; L6).** The computed
