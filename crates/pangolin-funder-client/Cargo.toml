@@ -71,6 +71,14 @@ thiserror = { workspace = true }
 # Tests need a deterministic secp256k1 signer; `LocalSigner::random` is
 # fine for the round-trip + tamper coverage.
 alloy = { workspace = true }
+# MVP-2 issue 3.6 (R-c distributed-impl touchpoint): tests construct
+# `pangolin_chain::DefaultStrategy` + call `transform_funder_response`
+# to assert byte-identity pass-through at the consumer boundary. Dev-
+# dep only — production funder-client does NOT depend on pangolin-chain
+# (L1 invariant of this crate preserved; the dep is dev-only). When
+# Phase-2 lands the real CoinJoin client, this edge may promote to a
+# production dep — that's a Phase-2 audit decision.
+pangolin-chain = { path = "../pangolin-chain" }
 # tokio runtime for the `#[tokio::test]` async harness. Same workspace
 # pin the rest of the stack uses.
 tokio = { workspace = true }

@@ -1324,4 +1324,73 @@ mod redemption_tests {
         // Documented as a runbook check rather than an embedded RPC
         // call to keep the test crate net-isolated by default.
     }
+
+    /// MVP-2 issue 3.6 (R-c distributed-impl touchpoint).
+    ///
+    /// Build a `SignedRevisionV1` whose wallet is sourced via
+    /// `DefaultStrategy::derive_wallet_for_revision` (instead of
+    /// directly via `derive_evm_wallet`) and assert the produced
+    /// signed-revision equals the one built with `derive_evm_wallet`
+    /// directly. Pins the byte-identity property at the signing-
+    /// primitive consumer boundary (3.6 L1 + L4).
+    ///
+    /// The deeper byte-identity proof against the pre-3.6 baseline
+    /// lives in `crates/pangolin-chain/src/privacy/tests.rs`
+    /// (`default_strategy_revision_signature_matches_pre_3_6_baseline`).
+    /// This sibling test pins the structural-equivalence property at
+    /// the signing-module boundary so a regression here fires next to
+    /// the signing primitive too.
+    #[test]
+    fn issue_3_6_default_strategy_yields_same_signed_revision() {
+        use crate::evm::derive_evm_wallet;
+        use crate::privacy::{DefaultStrategy, PrivacyStrategy};
+        use pangolin_crypto::keys::DeviceKey;
+
+        let device = DeviceKey::from_seed([0x42u8; 32]);
+
+        let direct_wallet = derive_evm_wallet(&device).expect("direct derive");
+        let via_default_wallet = DefaultStrategy
+            .derive_wallet_for_revision(&device, 0)
+            .expect("derive via default strategy");
+
+        let enc_payload = b"3.6 secp256k1_signing parity check".to_vec();
+        let enc_payload_hash = keccak256(&enc_payload).0;
+        let fields_direct = RevisionFieldsV1::with_signer_device_id(
+            &direct_wallet,
+            [0x77u8; 32],
+            [0x88u8; 32],
+            [0u8; 32],
+            1,
+            enc_payload_hash,
+        );
+        let fields_via_default = RevisionFieldsV1::with_signer_device_id(
+            &via_default_wallet,
+            [0x77u8; 32],
+            [0x88u8; 32],
+            [0u8; 32],
+            1,
+            enc_payload_hash,
+        );
+
+        let direct = build_signed_revision_v1(
+            &direct_wallet,
+            fields_direct,
+            enc_payload.clone(),
+            ChainEnv::BaseSepolia,
+        )
+        .expect("sign via direct wallet");
+        let via_default = build_signed_revision_v1(
+            &via_default_wallet,
+            fields_via_default,
+            enc_payload,
+            ChainEnv::BaseSepolia,
+        )
+        .expect("sign via default-strategy wallet");
+
+        assert_eq!(
+            direct, via_default,
+            "DefaultStrategy must produce a byte-identical SignedRevisionV1 \
+             at the secp256k1_signing consumer boundary (3.6 L1 + L4)"
+        );
+    }
 }

@@ -8615,6 +8615,115 @@ mod tests {
         );
     }
 
+    /// MVP-2 issue 3.6 (R-c distributed-impl touchpoint).
+    ///
+    /// Verify that `pangolin_chain::DefaultStrategy::select_address_for_vault`
+    /// returns the default address verbatim at the consumer boundary.
+    /// `pangolin-store::Vault` is one of the three Phase-2 hook
+    /// consumers (optional fresh-address-per-vault); this test pins
+    /// that consumers CAN construct + call the trait today AND that
+    /// the no-op default preserves 3.5 behaviour bit-for-bit (L1 +
+    /// L4 verbatim).
+    ///
+    /// The `vault_id` is sourced from the actual `Vault::vault_id`
+    /// surface (3.2 R-a) — the trait method takes `[u8; 32]` so
+    /// callers can wire any 32-byte identifier; here we use the same
+    /// alloy `Address` the wallet returns, padded to 32 bytes for
+    /// shape compatibility.
+    #[test]
+    fn issue_3_6_default_strategy_select_address_for_vault_is_pass_through() {
+        use pangolin_chain::{Address, DefaultStrategy, PrivacyStrategy};
+
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "issue-3-6-select-addr.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let default_addr_bytes = v.evm_wallet_address().expect("unlocked accessor works");
+        let default_addr = Address::from(default_addr_bytes);
+
+        // Synthetic vault-id: the test doesn't have direct access to a
+        // 32-byte vault identifier (pangolin-store identifies devices
+        // by name, not vaults by 32-byte ids), so we use a fixed test
+        // shape. The 3.6 trait method only cares about pass-through.
+        let vault_id_a = [0x11u8; 32];
+        let vault_id_b = [0x22u8; 32];
+
+        let out_a = DefaultStrategy
+            .select_address_for_vault(vault_id_a, default_addr)
+            .expect("default select_address must succeed");
+        let out_b = DefaultStrategy
+            .select_address_for_vault(vault_id_b, default_addr)
+            .expect("default select_address must succeed");
+
+        assert_eq!(
+            out_a, default_addr,
+            "DefaultStrategy must pass through the default address at the \
+             pangolin-store consumer boundary (3.6 L1 + L4)"
+        );
+        assert_eq!(
+            out_a, out_b,
+            "DefaultStrategy must ignore vault_id (no-op invariant)"
+        );
+    }
+
+    /// MVP-2 issue 3.6 (R-c distributed-impl touchpoint).
+    ///
+    /// Verify that
+    /// `pangolin_chain::DefaultStrategy::derive_wallet_for_revision`
+    /// returns the same wallet as `Vault::evm_wallet()` does today.
+    /// `pangolin-store::Vault` is one of the three Phase-2 hook
+    /// consumers (per-revision wallet rotation); this test pins the
+    /// byte-identity property at the signing-side consumer boundary.
+    ///
+    /// `Vault` does not currently expose a `pub fn device_key`
+    /// accessor (the active `DeviceKey` is private to the session
+    /// state). The test uses the gated `device_key_secret_seed`
+    /// affordance to reconstruct a `DeviceKey` from the same seed
+    /// the active session derived its wallet from, then runs both
+    /// the `Vault::evm_wallet` accessor + the
+    /// `DefaultStrategy::derive_wallet_for_revision` hook against
+    /// it. The address-equality assertion is the byte-identity pin.
+    #[test]
+    fn issue_3_6_default_strategy_derive_wallet_matches_vault_wallet() {
+        use pangolin_chain::{DefaultStrategy, PrivacyStrategy};
+        use pangolin_crypto::keys::DeviceKey;
+
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "issue-3-6-derive-wallet.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+
+        let vault_wallet_addr = v.evm_wallet().unwrap().address();
+        let seed = v
+            .device_key_secret_seed()
+            .expect("active session must expose seed via test-utilities affordance");
+        let device_key = DeviceKey::from_seed(*seed);
+
+        // The DefaultStrategy's derive_wallet_for_revision must
+        // produce the SAME address as Vault::evm_wallet at every
+        // revision_index (no-op invariant: index is ignored).
+        let via_default_idx0 = DefaultStrategy
+            .derive_wallet_for_revision(&device_key, 0)
+            .expect("derive via default at idx 0");
+        let via_default_idx_99 = DefaultStrategy
+            .derive_wallet_for_revision(&device_key, 99)
+            .expect("derive via default at idx 99");
+
+        assert_eq!(
+            via_default_idx0.address(),
+            vault_wallet_addr,
+            "DefaultStrategy must produce same wallet address as Vault::evm_wallet \
+             at the pangolin-store consumer boundary (3.6 L1 + L4)"
+        );
+        assert_eq!(
+            via_default_idx_99.address(),
+            vault_wallet_addr,
+            "DefaultStrategy must ignore revision_index at vault layer"
+        );
+    }
+
     /// MVP-2 issue 3.2 (L2): the in-memory `EvmWallet` is dropped on
     /// every session-teardown path — `lock()`, idle expiry, and
     /// absolute expiry — alongside the existing `DeviceKey`. We
