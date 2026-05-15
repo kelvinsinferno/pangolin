@@ -92,7 +92,7 @@ tower-http = { version = "=0.5.2", default-features = false, features = ["trace"
 # default verbosity; userId / deviceAddress / Credit-attestation bytes
 # log at DEBUG only.
 tracing = { version = "=0.1.41", default-features = false, features = ["std", "attributes"] }
-tracing-subscriber = { version = "=0.3.19", default-features = false, features = ["fmt", "env-filter", "std"] }
+tracing-subscriber = { version = "=0.3.20", default-features = false, features = ["fmt", "env-filter", "std"] }
 
 # rusqlite 0.39 — workspace pin (no new dep; pangolin-store also
 # uses this). The funder runs the SQLite ledger on the same vendored
