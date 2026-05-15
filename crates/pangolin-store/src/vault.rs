@@ -992,6 +992,46 @@ impl Vault {
         Ok(&self.require_active()?.evm_wallet)
     }
 
+    /// **MVP-2 issue 3.5 (R-a hybrid).** Read the device's cached EVM
+    /// wallet address from the persistent `devices.evm_address` column.
+    ///
+    /// This is a SYNC accessor that works on a **Locked vault** — the
+    /// address column is on-disk (3.2's R-a vault-sealed-only stores
+    /// only the address publicly; the secret scalar is AEAD-sealed and
+    /// requires unlock). The L5 nuance applies: the chain-crate balance
+    /// helper is policy-agnostic (takes `&Address + rpc_url`), so the
+    /// SYNC accessor at this layer is intentionally NOT
+    /// active-session-gated. Policy/mechanism split: the FFI accessor
+    /// IS active-session-gated (per L5 FFI policy); the host policy
+    /// (render-on-locked-vault vs not) decides.
+    ///
+    /// Returns the 20-byte address as a fixed-size byte array
+    /// (`[u8; EVM_ADDRESS_LEN]` = `[u8; 20]`). Callers in
+    /// `pangolin-chain` / `pangolin-funder-client` convert via
+    /// `alloy::primitives::Address::from(bytes)` to thread into chain
+    /// helpers. Keeping the return type alloy-free at this layer
+    /// preserves `pangolin-store`'s alloy-dep abstinence.
+    ///
+    /// # Errors
+    ///
+    /// - [`StoreError::NotUnlocked`] — no device row has been registered
+    ///   yet (brand-new vault opened but never unlocked).
+    /// - [`StoreError::Sqlite`] / [`StoreError::Corrupted`] — storage
+    ///   failure.
+    /// - [`StoreError::Validation`] (`kind = "evm_address"`) — the row
+    ///   exists but `evm_address` is NULL (legacy 1.5-era row pre-3.2
+    ///   that has not been back-filled by a 3.2-era unlock).
+    pub fn evm_wallet_address(&self) -> Result<[u8; crate::device::EVM_ADDRESS_LEN]> {
+        let identity = device::read_device(&self.conn, &self.device_id, &self.device_id)?
+            .ok_or(StoreError::NotUnlocked)?;
+        identity.evm_address.ok_or_else(|| StoreError::Validation {
+            kind: "evm_address".to_string(),
+            message:
+                "device row missing evm_address; unlock once under a 3.2-era build to back-fill"
+                    .to_string(),
+        })
+    }
+
     /// **MVP-2 issue 3.1 (R-a..R-e) + 3.3 audit-HIGH fix (2026-05-14).**
     /// Build a v1 signed revision over `fields` using the active
     /// session's [`EvmWallet`] and the deployed `RevisionLogV1`
@@ -8517,6 +8557,62 @@ mod tests {
             v.evm_wallet().unwrap_err(),
             StoreError::NotUnlocked
         ));
+    }
+
+    /// MVP-2 issue 3.5 (R-a hybrid): the SYNC accessor
+    /// `Vault::evm_wallet_address` reads the cached `devices.evm_address`
+    /// column on a LOCKED vault. L5 nuance: the chain-crate balance
+    /// helper is policy-agnostic, so this layer is NOT
+    /// active-session-gated (the FFI layer IS gated; see
+    /// `pangolin-ffi/src/balance.rs`).
+    #[test]
+    fn evm_wallet_address_accessor_works_on_locked_vault() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "evm-addr-locked.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        // Unlock once so the device row is registered (3.2-era unlock
+        // back-fills the evm_address column).
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let unlocked_addr = v.evm_wallet_address().expect("unlocked accessor works");
+        // Lock the vault; the cached column survives.
+        v.lock();
+        let locked_addr = v
+            .evm_wallet_address()
+            .expect("LOCKED accessor must work — column is on disk");
+        assert_eq!(
+            unlocked_addr, locked_addr,
+            "sync accessor must return same address before + after lock"
+        );
+        // Cross-check against the cached column reported via
+        // `device_current`.
+        let cached = v
+            .device_current()
+            .unwrap()
+            .evm_address
+            .expect("3.2-era unlock populates the cache");
+        assert_eq!(
+            locked_addr, cached,
+            "sync accessor must match the device_current cached column"
+        );
+    }
+
+    /// MVP-2 issue 3.5 (R-a): on a brand-new vault opened but NEVER
+    /// unlocked, `evm_wallet_address` errors `NotUnlocked` because no
+    /// device row exists yet (register-on-unlock).
+    #[test]
+    fn evm_wallet_address_errors_when_no_device_registered() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "evm-addr-no-device.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let v = Vault::open(&p).unwrap();
+        let err = v
+            .evm_wallet_address()
+            .expect_err("never-unlocked vault has no device row");
+        assert!(
+            matches!(err, StoreError::NotUnlocked),
+            "expected NotUnlocked, got {err:?}"
+        );
     }
 
     /// MVP-2 issue 3.2 (L2): the in-memory `EvmWallet` is dropped on

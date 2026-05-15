@@ -57,6 +57,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod balance;
 pub mod cabi;
 pub mod capture_authority;
 pub mod device;
@@ -88,6 +89,13 @@ pub use identity::{
 pub use capture_authority::{
     CaptureAuthority, CaptureAuthorityEntry, CaptureAuthorityKind, CaptureContext,
     CaptureContextKind,
+};
+// MVP-2 issue 3.5: gas-balance state machine + balance monitor FFI
+// shapes + entry points (additive 1.1-surface amendment — see
+// balance.rs / ffi-surface.md).
+pub use balance::{
+    balance_monitor_start, balance_monitor_stop, gas_balance_state, GasBalanceStateFfi,
+    MonitorHandle,
 };
 // MVP-1 issue 1.5: device-identity FFI shapes + entry points (additive
 // 1.1-surface amendment — see device.rs / ffi-surface.md).

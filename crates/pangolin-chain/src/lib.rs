@@ -96,6 +96,8 @@
 #![cfg_attr(any(test, feature = "test-utilities"), deny(unsafe_code))]
 
 pub mod adapter;
+pub mod balance_check;
+pub mod balance_monitor;
 pub mod base_sepolia;
 pub mod chain_submit;
 pub mod deployments;
@@ -109,11 +111,19 @@ pub mod types;
 pub mod mock;
 
 pub use adapter::ChainAdapter;
+pub use balance_check::{
+    compute_balance_state, estimate_next_publish_cost, query_evm_balance, GasBalanceState,
+    EXPECTED_REVISION_GAS, MIN_BUFFER_REVISIONS,
+};
+pub use balance_monitor::{
+    BalanceMonitor, MonitorError, TopUpNotification, BALANCE_POLL_INTERVAL_SECS,
+};
 pub use base_sepolia::{BaseSepoliaAdapter, BASE_SEPOLIA_CHAIN_ID};
 pub use chain_submit::{
     publish_revision_v1, submit_eth_transfer_v1, submit_redemption_v1, ChainAnchorV1,
-    EthTransferAnchorV1, RedemptionAnchorV1, MAX_FEE_PER_GAS_CAP_WEI, PRIORITY_FEE_DEFAULT_WEI,
-    PUBLISH_REVISION_BACKOFF_MS, PUBLISH_REVISION_MAX_RETRIES, RECEIPT_TIMEOUT_SECS,
+    EthTransferAnchorV1, PublishConfig, RedemptionAnchorV1, MAX_FEE_PER_GAS_CAP_WEI,
+    PRIORITY_FEE_DEFAULT_WEI, PUBLISH_REVISION_BACKOFF_MS, PUBLISH_REVISION_MAX_RETRIES,
+    RECEIPT_TIMEOUT_SECS,
 };
 pub use deployments::{load_deployed_address, ChainEnv};
 pub use error::ChainError;

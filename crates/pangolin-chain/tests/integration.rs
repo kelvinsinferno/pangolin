@@ -103,6 +103,47 @@ async fn runtime_keccak_cross_check_passes_on_live_chain() {
         .expect("post-cross-check provider call works");
 }
 
+/// **MVP-2 issue 3.5 (env-quirk #14 live test).** Query the EVM
+/// balance of a known-funded testnet wallet against Base Sepolia.
+///
+/// `BASE_SEPOLIA_DEV_WALLET` env var carries the 20-byte hex address
+/// of a funded `pangolin-dev` wallet (the same one chaincli's `--keystore`
+/// path uses for live publish smoke tests). Asserts the U256 is
+/// non-zero and prints the wei value at info-level so a human running
+/// the test can sanity-check.
+///
+/// Marked `#[ignore]` so default CI doesn't reach the network.
+/// Manually run with:
+///
+/// ```text
+/// BASE_SEPOLIA_DEV_WALLET=0x... \
+///   cargo test -p pangolin-chain --features integration-tests \
+///   live_balance_query_against_d017_wallet -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "live-RPC test; requires BASE_SEPOLIA_DEV_WALLET + network"]
+async fn live_balance_query_against_d017_wallet() {
+    use pangolin_chain::{query_evm_balance, ChainEnv};
+    let Ok(addr_hex) = std::env::var("BASE_SEPOLIA_DEV_WALLET") else {
+        eprintln!("skipping live balance test: BASE_SEPOLIA_DEV_WALLET not set");
+        return;
+    };
+    let address: alloy::primitives::Address = addr_hex.parse().expect("addr hex");
+    let balance = query_evm_balance(&rpc_url(), address, ChainEnv::BaseSepolia)
+        .await
+        .expect("live balance query");
+    println!(
+        "live balance for {address:?}: {balance} wei (~{:.6} ETH)",
+        f64::from(
+            u32::try_from(balance / alloy::primitives::U256::from(10u64.pow(12))).unwrap_or(0)
+        ) / 1_000_000.0
+    );
+    assert!(
+        balance > alloy::primitives::U256::ZERO,
+        "dev wallet must have a non-zero balance for the live test to be meaningful"
+    );
+}
+
 #[tokio::test]
 async fn pull_since_returns_smoke_revision() {
     let adapter = BaseSepoliaAdapter::new_read_only(&rpc_url(), &deployment_path())

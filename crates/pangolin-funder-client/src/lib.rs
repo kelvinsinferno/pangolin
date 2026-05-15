@@ -248,6 +248,316 @@ pub fn verify_device_binding(
         .is_ok_and(|recovered| recovered == device_address)
 }
 
+// =====================================================================
+// MVP-2 issue 3.5 — R-e two-step manual top-up API.
+// =====================================================================
+//
+// 3.5 ships the actual `POST /funder/v1/top-up` plumbing on the
+// device-side. Per R-e (Kelvin sign-off 2026-05-15 in
+// `docs/issue-plans/3.5.md`):
+//
+// - Manual API only — NO `apps/cli top-up` subcommand (CLI-V1 batch
+//   deferral); NO auto-top-up; NO vault-stored attestations.
+// - Host plumbs the Credit attestation at call-time.
+// - The client constructs the device-binding signature (3.4 R-g) +
+//   POSTs the wire body + decodes the response.
+// - Returns a `TopUpAttempt` the host can stash for tracking; the
+//   monitor optionally consumes the `submitted_at_unix` field via
+//   `BalanceMonitor::register_top_up` to transition the cached state
+//   to `TopUpInFlight` until the next poll.
+
+/// Information recorded on a successful or partial top-up call.
+///
+/// Returned from [`initiate_top_up`]. Carries the client-generated
+/// `attempt_id` (so tests / observability can correlate retries), the
+/// funder's response payload, and the unix-second submission timestamp
+/// (used by [`crate::name`]-side observability + by
+/// `BalanceMonitor::register_top_up` to surface `TopUpInFlight`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopUpAttempt {
+    /// Client-generated v4 UUID. Lets the host correlate the call
+    /// across retries + log lines + on-chain explorer follow-ups.
+    /// NOT sent to the funder (the funder dedups on `attestation_hash`
+    /// per 3.4 R-d ledger discipline).
+    pub attempt_id: uuid::Uuid,
+    /// The funder's response body.
+    pub funder_response: TopUpResponse,
+    /// Unix-second timestamp when the POST was issued (caller-supplied
+    /// via `SystemTime::now()`).
+    pub submitted_at_unix: u64,
+}
+
+/// Errors surfacing from [`initiate_top_up`].
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum FunderClientError {
+    /// HTTP error from the funder. Carries the status code + the
+    /// response body as a `String` (the funder returns structured
+    /// error JSON per 3.4 R-d — we surface it verbatim so the host
+    /// can render the typed error class).
+    #[error("funder returned HTTP {status}: {body}")]
+    Http {
+        /// HTTP status code returned by the funder.
+        status: u16,
+        /// Response body verbatim. Non-secret — the funder's error
+        /// shape includes only the typed error class + a message; never
+        /// a Credit attestation or signature bytes.
+        body: String,
+    },
+    /// JSON serialisation / deserialisation failure. Either the
+    /// request body couldn't be serialised (vanishingly rare —
+    /// `WireTopUpRequest` is total over our typed shapes) or the
+    /// response body wasn't shaped as the wire format expects.
+    /// Field named `detail` (not `source`) because `thiserror`
+    /// reserves `source` for typed `Error` chaining; we surface the
+    /// upstream message as a String.
+    #[error("serialization failure: {detail}")]
+    Serialization {
+        /// Upstream error message (non-secret).
+        detail: String,
+    },
+    /// The HTTP request did not complete within the timeout window
+    /// OR encountered a transport-level error before a response was
+    /// returned. Distinct from `Http` (which has a status code) so
+    /// the host can retry transient transport failures differently
+    /// from terminal HTTP-class errors.
+    #[error("transport error / timeout: {detail}")]
+    Transport {
+        /// Upstream reqwest error message (non-secret — reqwest's
+        /// `Display` includes URL + status text; no body bytes).
+        detail: String,
+    },
+    /// Device-wallet signing failure. The `sign_device_binding`
+    /// helper returned `None` (which indicates an alloy-internal
+    /// failure — vanishingly rare under k256 0.13.x). Fatal — the
+    /// caller cannot recover without a fresh wallet.
+    #[error("device wallet signing failed")]
+    DeviceWalletSigningFailed,
+}
+
+/// Default request timeout for the top-up POST. 30 seconds — long
+/// enough for the funder's redeem + eth-transfer round trip (which on
+/// Base Sepolia is typically 4-10s for one block of confirmation each).
+const DEFAULT_REQUEST_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(30);
+
+// ---- Wire shapes (serde-bearing adapters around the canonical types) ----
+
+/// Wire shape for the request body. Mirrors the funder's
+/// `WireTopUpRequest` (`services/funder/src/http/top_up.rs`) so the
+/// JSON byte-stream is round-trippable.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WireTopUpRequest {
+    credit: WireCredit,
+    device_binding_sig: String,
+    device_address: String,
+}
+
+/// Wire shape for a Credit attestation. Hex-string fields mirror the
+/// funder's `WireCredit`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WireCredit {
+    user_id: String,
+    amount: String,
+    nonce: u64,
+    schema_version: u16,
+    expires_at: u64,
+    signature: String,
+}
+
+/// Wire shape for the response body.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WireTopUpResponse {
+    redeem_tx_hash: String,
+    eth_transfer_tx_hash: Option<String>,
+    eth_transferred_wei: String,
+}
+
+impl WireCredit {
+    fn from_credit(c: &Credit) -> Self {
+        Self {
+            user_id: format!("0x{}", hex_encode(&c.user_id)),
+            amount: format!("0x{:x}", c.amount),
+            nonce: c.nonce,
+            schema_version: c.schema_version,
+            expires_at: c.expires_at,
+            signature: format!("0x{}", hex_encode(&c.signature)),
+        }
+    }
+}
+
+impl WireTopUpRequest {
+    fn from_request(req: &TopUpRequest) -> Self {
+        Self {
+            credit: WireCredit::from_credit(&req.credit),
+            device_binding_sig: format!("0x{}", hex_encode(&req.device_binding_sig)),
+            device_address: format!("{:?}", req.device_address),
+        }
+    }
+}
+
+impl WireTopUpResponse {
+    /// Parse the wire response into the canonical typed shape.
+    fn parse(self) -> Result<TopUpResponse, FunderClientError> {
+        let redeem_tx_hash = parse_b256(&self.redeem_tx_hash)?;
+        let eth_transfer_tx_hash = match self.eth_transfer_tx_hash {
+            Some(s) => Some(parse_b256(&s)?),
+            None => None,
+        };
+        let eth_transferred_wei = parse_u256_hex(&self.eth_transferred_wei).ok_or_else(|| {
+            FunderClientError::Serialization {
+                detail: format!(
+                    "eth_transferred_wei not parseable as U256: {}",
+                    self.eth_transferred_wei
+                ),
+            }
+        })?;
+        Ok(TopUpResponse {
+            redeem_tx_hash,
+            eth_transfer_tx_hash,
+            eth_transferred_wei,
+        })
+    }
+}
+
+/// `POST /funder/v1/top-up` against `funder_url`.
+///
+/// Constructs the device-binding signature via [`sign_device_binding`]
+/// (3.4 R-g), serialises the wire body, POSTs it, and decodes the
+/// response into [`TopUpAttempt`]. The host stashes the returned
+/// attempt for follow-up + optionally notifies
+/// `BalanceMonitor::register_top_up` to flip cached state to
+/// `TopUpInFlight`.
+///
+/// The supplied `device_wallet` is borrowed for the signing call only;
+/// it is NOT held inside the returned [`TopUpAttempt`] (the host owns
+/// the wallet lifetime).
+///
+/// # Arguments
+///
+/// - `funder_url` — base URL of the funder service (e.g.
+///   `"https://funder.pangolin.example"`). The endpoint
+///   `/funder/v1/top-up` is appended.
+/// - `credit` — signed Credit attestation; the host is responsible for
+///   obtaining this from the off-chain payment service.
+/// - `device_wallet` — the device's secp256k1 signer (e.g. from
+///   `Vault::evm_wallet().signer()`).
+///
+/// # Errors
+///
+/// - [`FunderClientError::Http`] — non-2xx status. Caller branches on
+///   status (`429` = rate-limit; `409` = replay; `400` = malformed;
+///   `500` = funder-internal).
+/// - [`FunderClientError::Transport`] — connection failure / timeout.
+/// - [`FunderClientError::Serialization`] — request body couldn't
+///   serialise (vanishingly rare) OR response body wasn't the
+///   expected shape.
+/// - [`FunderClientError::DeviceWalletSigningFailed`] — alloy signer
+///   failure (vanishingly rare under k256 0.13.x).
+pub async fn initiate_top_up(
+    funder_url: &str,
+    credit: Credit,
+    device_wallet: &PrivateKeySigner,
+) -> Result<TopUpAttempt, FunderClientError> {
+    let device_address = device_wallet.address();
+    let attestation_hash = credit.attestation_hash();
+    let device_binding_sig = sign_device_binding(device_wallet, attestation_hash, device_address)
+        .ok_or(FunderClientError::DeviceWalletSigningFailed)?;
+    let request = TopUpRequest {
+        credit,
+        device_binding_sig,
+        device_address,
+    };
+    let wire_request = WireTopUpRequest::from_request(&request);
+
+    let client = reqwest::Client::builder()
+        .timeout(DEFAULT_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|e| FunderClientError::Transport {
+            detail: e.to_string(),
+        })?;
+    let endpoint = format!("{}/funder/v1/top-up", funder_url.trim_end_matches('/'));
+    let resp = client
+        .post(&endpoint)
+        .json(&wire_request)
+        .send()
+        .await
+        .map_err(|e| FunderClientError::Transport {
+            detail: e.to_string(),
+        })?;
+    let status = resp.status();
+    if !status.is_success() {
+        let status_code = status.as_u16();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
+        return Err(FunderClientError::Http {
+            status: status_code,
+            body,
+        });
+    }
+    let wire_response: WireTopUpResponse =
+        resp.json()
+            .await
+            .map_err(|e| FunderClientError::Serialization {
+                detail: e.to_string(),
+            })?;
+    let funder_response = wire_response.parse()?;
+    let submitted_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(TopUpAttempt {
+        attempt_id: uuid::Uuid::new_v4(),
+        funder_response,
+        submitted_at_unix,
+    })
+}
+
+// ---- Hex helpers (local — keeps the dep set tight) ----
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX_CHARS[(b >> 4) as usize] as char);
+        s.push(HEX_CHARS[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+fn parse_b256(s: &str) -> Result<B256, FunderClientError> {
+    let trimmed = s.trim_start_matches("0x");
+    if trimmed.len() != 64 {
+        return Err(FunderClientError::Serialization {
+            detail: format!("expected 32-byte hex string, got len={}", trimmed.len()),
+        });
+    }
+    let mut out = [0u8; 32];
+    for (i, byte_out) in out.iter_mut().enumerate() {
+        let hi = parse_hex_nibble(trimmed.as_bytes()[i * 2])?;
+        let lo = parse_hex_nibble(trimmed.as_bytes()[i * 2 + 1])?;
+        *byte_out = (hi << 4) | lo;
+    }
+    Ok(B256::from(out))
+}
+
+fn parse_u256_hex(s: &str) -> Option<U256> {
+    let trimmed = s.trim_start_matches("0x");
+    U256::from_str_radix(trimmed, 16).ok()
+}
+
+fn parse_hex_nibble(b: u8) -> Result<u8, FunderClientError> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(FunderClientError::Serialization {
+            detail: format!("invalid hex byte: 0x{b:02x}"),
+        }),
+    }
+}
+
 /// Returns the crate name. Useful for diagnostics and version
 /// reporting.
 #[must_use]
@@ -361,6 +671,128 @@ mod tests {
         let mut sig = sign_device_binding(&signer, h, signer.address()).expect("sign");
         sig[0] ^= 0x01;
         assert!(!verify_device_binding(sig, h, signer.address()));
+    }
+
+    // -----------------------------------------------------------------
+    // 3.5 R-e initiate_top_up tests
+    // -----------------------------------------------------------------
+
+    /// `initiate_top_up` constructs a request body whose
+    /// `device_binding_sig` recovers to the device wallet's address
+    /// over the canonical `attestation_hash`. The mock server captures
+    /// the request body + asserts shape.
+    #[tokio::test]
+    async fn initiate_top_up_constructs_correct_request_body() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let signer = fixed_signer();
+        let credit = sample_credit();
+        let expected_attestation_hash = credit.attestation_hash();
+
+        // Compute the expected device_binding_sig client-side so the
+        // body comparison is deterministic.
+        let expected_sig =
+            sign_device_binding(&signer, expected_attestation_hash, signer.address())
+                .expect("sign for fixture");
+        let expected_sig_hex = format!("0x{}", hex_encode(&expected_sig));
+
+        // Funder response: a fake successful response shape.
+        let response_body = serde_json::json!({
+            "redeem_tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "eth_transfer_tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+            "eth_transferred_wei": "0x16345785d8a0000"  // 0.1 ETH
+        });
+        Mock::given(method("POST"))
+            .and(path("/funder/v1/top-up"))
+            .and(header("content-type", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
+            .mount(&mock)
+            .await;
+
+        let attempt = initiate_top_up(&mock.uri(), credit, &signer)
+            .await
+            .expect("initiate_top_up");
+        assert_eq!(
+            attempt.funder_response.redeem_tx_hash,
+            b256!("0x1111111111111111111111111111111111111111111111111111111111111111")
+        );
+        assert!(attempt.funder_response.eth_transfer_tx_hash.is_some());
+        assert_eq!(
+            attempt.funder_response.eth_transferred_wei,
+            U256::from(0x0163_4578_5d8a_0000_u64)
+        );
+
+        // Cross-check the request: inspect the most-recent request
+        // body captured by wiremock.
+        let received = mock.received_requests().await.expect("received requests");
+        assert_eq!(received.len(), 1);
+        let req: WireTopUpRequest = serde_json::from_slice(&received[0].body)
+            .expect("request body must parse as WireTopUpRequest");
+        assert_eq!(req.device_binding_sig, expected_sig_hex);
+        assert_eq!(req.credit.nonce, 7);
+        assert_eq!(req.credit.schema_version, 1);
+    }
+
+    #[tokio::test]
+    async fn initiate_top_up_handles_429_rate_limit() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/funder/v1/top-up"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("rate-limited"))
+            .mount(&mock)
+            .await;
+
+        let signer = fixed_signer();
+        let credit = sample_credit();
+        let err = initiate_top_up(&mock.uri(), credit, &signer)
+            .await
+            .expect_err("429 must error");
+        match err {
+            FunderClientError::Http { status, .. } => {
+                assert_eq!(status, 429);
+            }
+            other => panic!("expected Http 429, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn initiate_top_up_handles_409_replay_conflict() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/funder/v1/top-up"))
+            .respond_with(ResponseTemplate::new(409).set_body_string("replay"))
+            .mount(&mock)
+            .await;
+
+        let signer = fixed_signer();
+        let credit = sample_credit();
+        let err = initiate_top_up(&mock.uri(), credit, &signer)
+            .await
+            .expect_err("409 must error");
+        match err {
+            FunderClientError::Http { status, .. } => {
+                assert_eq!(status, 409);
+            }
+            other => panic!("expected Http 409, got {other:?}"),
+        }
+    }
+
+    /// Live-funder placeholder: we can't really test against D-019
+    /// without a paid Credit attestation. Marker `#[ignore]` so the
+    /// slot exists in CI output but does not gate green.
+    #[tokio::test]
+    #[ignore = "live-funder test; requires real D-019 service + paid Credit"]
+    async fn initiate_top_up_live_d019_placeholder() {
+        // Future: wire a real Credit + real funder URL. For now, the
+        // test is a stub so the slot is reserved.
     }
 
     #[test]
