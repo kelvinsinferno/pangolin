@@ -233,6 +233,77 @@ not yet extended (UniFFI-only, same as `account_*` / `device_*`). The
 `docs/architecture/schema-versioning.md`; the lineage model in
 `docs/architecture/revision-lineage.md`.
 
+### Gas-balance state machine (MVP-2 issue 3.5 amendment)
+
+| Function | Lands in |
+|---|---|
+| `balance_monitor_start(h: Arc<VaultHandle>, rpc_url: String, poll_interval_secs: u64) -> Result<Arc<MonitorHandle>, FfiError>` | 3.5 (**new** entry point) |
+| `balance_monitor_stop(monitor: Arc<MonitorHandle>) -> Result<(), FfiError>` (async) | 3.5 (**new** entry point) |
+| `gas_balance_state(h: Arc<VaultHandle>, monitor: Arc<MonitorHandle>) -> Result<GasBalanceStateFfi, FfiError>` | 3.5 (**new** entry point) |
+
+**Gas-balance behaviour (MVP-2 issue 3.5 — R-a..R-e Kelvin sign-off
+2026-05-15 in `docs/issue-plans/3.5.md`).** The chain crate owns the
+balance read + cost-estimate logic as free async fns + a background-
+poll `BalanceMonitor` (R-a + R-b). The host calls `balance_monitor_start`
+at session-open to spawn the background-poll task on the tokio runtime;
+the task periodically refreshes the cached state every
+`poll_interval_secs` seconds (default 30, per
+`pangolin_chain::BALANCE_POLL_INTERVAL_SECS`). `gas_balance_state`
+reads the cached state non-blocking; `balance_monitor_stop` signals
+cancellation + awaits the task.
+
+**Variant vocabulary (L4 + §8.1.5 verbatim).** `GasBalanceStateFfi` is
+the FFI-mirror of `pangolin_chain::GasBalanceState`:
+
+- `Sufficient { balance_wei_hex, estimate_wei_hex }` — wallet covers
+  `MIN_BUFFER_REVISIONS = 3` future revisions at the currently-
+  observed gas price.
+- `RequiresActiveAccount { balance_wei_hex, estimate_wei_hex }` —
+  wallet does not cover the threshold; host renders the §8.1.5
+  "requires active account" flow. NEVER pricing copy, NEVER "out of
+  gas", NEVER "low balance".
+- `TopUpInFlight { initiated_at_unix }` — a top-up flow has been
+  initiated; the next poll will observe the new balance and naturally
+  transition back to `Sufficient`.
+- `Unknown { reason }` — state could not be determined (RPC failure,
+  monitor not yet polled, etc.). Host renders "checking" — never a
+  pricing-copy fallback.
+
+Wei values cross as **hex strings** (`"0x..."`) so a 100 ETH balance
+(> u64 max in wei) doesn't truncate.
+
+**Active-session gate (L5 FFI policy).** `balance_monitor_start` and
+`gas_balance_state` BOTH require an active (unlocked, non-expired)
+session — locked-vault callers get `FfiError::Session`. The chain-
+crate helper is policy-agnostic (takes `&Address + rpc_url` only); the
+FFI accessor IS policy-gated. The host policy (render-on-locked vs
+not) decides at the host UI layer.
+
+**Pre-publish balance gate (R-b).** SEPARATELY from the monitor,
+`pangolin_chain::publish_revision_v1` calls a synchronous balance read
+BEFORE tx construction (gated by `PublishConfig::pre_publish_balance_check_enabled`,
+default `true`). A below-threshold balance short-circuits to
+`ChainError::PrePublishBalanceInsufficient { balance_wei, estimate_wei }`
+WITHOUT burning the build/sign cost. The freshness check is
+INDEPENDENT of the monitor (L-balance-staleness defense).
+
+**Top-up flow (R-e two-step manual).** The `pangolin-funder-client`
+crate ships `initiate_top_up(funder_url, credit, device_wallet) ->
+TopUpAttempt`. NO `apps/cli top-up` subcommand in 3.5 (CLI-V1 batch
+deferral); NO auto-top-up; NO vault-stored attestations. The host
+plumbs the Credit attestation at call-time and optionally notifies
+the monitor via `BalanceMonitor::register_top_up` to surface
+`TopUpInFlight` until the next poll. `initiate_top_up` is currently
+Rust-only — NOT exposed across the FFI surface — because the host
+needs to obtain the `PrivateKeySigner` via
+`Vault::evm_wallet().signer()` and that signer never crosses FFI
+(L11 + 3.2 R-c).
+
+These are an **additive 1.1-surface amendment** — the 1.1 freeze did
+not declare any `balance_*` entries; nothing external binds the 1.1
+surface yet. Same posture as 1.5's `device_*` widening + 1.6's
+`fork_*` / `resolve_*` widening. See `docs/issue-plans/3.5.md`.
+
 ### TOTP (MVP-1 issue 1.7 — body implemented + additive amendment)
 
 | Function | Backed by | Status |

@@ -152,6 +152,87 @@ key (replaces / shadows the D-018 entry).
 
 ---
 
+## MVP-2 issue 3.5 resolved decisions (R-a..R-e) — 2026-05-15
+
+> **Status:** Locked at the 3.5 plan-gate by Kelvin's sign-off on
+> Q-a..Q-e (`docs/issue-plans/3.5.md` "Resolved decisions" table).
+> Builder agent shipped under `818cfa5..HEAD` of the
+> `issue/3.5-balance-state` worktree.
+
+### R-a · Balance-state tracker location — hybrid
+
+The chain crate owns the balance/estimate logic as free async fns
+(`pangolin-chain::balance_check::{query_evm_balance,
+estimate_next_publish_cost, compute_balance_state}`); the `Vault`
+grows a SYNC `evm_wallet_address` accessor that reads the cached
+`devices.evm_address` column. Vault stays sync per the 1.5 / 3.2 /
+3.3 doctrine. **Why:** preserves dep direction
+(pangolin-store → pangolin-chain) + keeps the policy/mechanism split
+(chain helper policy-agnostic; FFI accessor active-session-gated).
+
+### R-b · Balance-check timing — both eager poll + per-publish freshness check
+
+A `pangolin-chain::balance_monitor::BalanceMonitor` struct owns a
+tokio background-poll task + an `Arc<RwLock<GasBalanceState>>`
+cached state. Host starts via FFI (`balance_monitor_start`); the
+monitor task refreshes every `BALANCE_POLL_INTERVAL_SECS = 30`.
+SEPARATELY, `chain_submit::publish_revision_v1` performs a
+SYNCHRONOUS pre-submit balance check BEFORE tx construction (gated
+by `PublishConfig::pre_publish_balance_check_enabled`, default
+`true`). A below-threshold balance → new variant
+`ChainError::PrePublishBalanceInsufficient { balance_wei,
+estimate_wei }`. **Why:** advisory monitor + authoritative
+per-publish freshness check defends both UX (cached state for
+rendering) and correctness (no doomed broadcast).
+
+### R-c · Next-publish cost estimate — hybrid with `MIN_BUFFER_REVISIONS = 3`
+
+Dynamic via `eth_feeHistory` → `max_fee_per_gas = 2*baseFee + 1
+gwei` (reused from 3.3's formula verbatim) × `EXPECTED_REVISION_GAS
+= 500_000` × `MIN_BUFFER_REVISIONS = 3`. On RPC error / empty
+fee-history → fall back to `MAX_FEE_PER_GAS_CAP_WEI = 50 gwei`
+(conservative ceiling). Computed value is clamped to the same per-tx
+gas-cap defined in 3.3. **Why:** dynamic in the common case;
+fail-safe pessimistic on RPC failure (under-stating the cost would
+render `Sufficient` for a user who actually faces a spike).
+
+### R-d · FFI surface — new method; `DeviceInfo` unchanged
+
+`pub fn gas_balance_state(handle, monitor) -> Result<GasBalanceStateFfi,
+FfiError>` reads the cached state. `balance_monitor_start` +
+`balance_monitor_stop` (async) own the lifecycle. `DeviceInfo` shape
+stays stable. Locked vault at the FFI boundary → `FfiError::Session`
+(active-session-gated at the FFI policy layer; chain-crate helper
+remains policy-agnostic per R-a). Wei values cross as **hex strings**
+to preserve u128 fidelity. **Why:** mirrors §8.1.5 vocabulary; keeps
+the `DeviceInfo` shape stable; matches 1.4 / 1.5's additive-FFI
+discipline.
+
+### R-e · Top-up trigger — two-step manual API
+
+`pangolin-funder-client` ships `pub async fn initiate_top_up(funder_url,
+credit, device_wallet) -> Result<TopUpAttempt, FunderClientError>`.
+Host plumbs the Credit attestation at call-time + the device wallet's
+secp256k1 signer. **NO** vault-stored attestations; **NO** auto-top-up;
+**NO** CLI subcommand (CLI-V1 deferral per 3.1/3.2/3.3/3.4 precedent).
+The monitor optionally accepts `BalanceMonitor::register_top_up(attempt)`
+to transition cached state to `TopUpInFlight` until the next poll.
+Adds `reqwest = "=0.13.3"` (`rustls` / aws-lc-rs; default-features
+off; matches alloy's transitive reqwest version — the 0.12 line's
+`rustls-tls` feature pulls the banned `ring`, hence the 0.13 pin) +
+`uuid = "=1.10.0"` as direct funder-client deps. **Why:** master plan
+§5 row 3.5 says "user pays out-of-band", which favours manual; Option B
+(auto-top-up) widens vault on-disk surface materially and is MVP-3
+territory.
+
+**env-quirk #15 advisories result:** `cargo deny check advisories` +
+`cargo audit` run before merge — see DEVLOG.
+
+**Spec ref:** `docs/issue-plans/3.5.md`; `docs/architecture/ffi-surface.md`
+(amended); `THREAT_MODEL.md` (gas-balance state machine row).
+
+---
+
 ## PoC retrospective: PoC → MVP mapping
 
 > **Status:** Locked at P12 SIGNOFF (2026-05-08).

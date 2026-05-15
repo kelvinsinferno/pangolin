@@ -42,6 +42,20 @@ ignore = [
     # was no longer fully clean. If a future alloy/coins churn
     # re-introduces the path, re-add the entry verbatim with a fresh
     # tracker URL.
+    #
+    # MVP-2 issue 3.5 status update: cargo-audit surfaces
+    # RUSTSEC-2024-0388 again via the reqwest `=0.12.28` dep tree
+    # (reqwest → rustls-platform-verifier → ark-ff → derivative).
+    # `cargo deny check advisories` STILL passes ("advisories ok")
+    # because cargo-deny's default config flags only `vulnerability`
+    # class, not `unmaintained`. We deliberately do NOT add an
+    # ignore entry — cargo-deny treats the absent advisory match
+    # as `advisory-not-detected` (a warning), and the unmaintained
+    # status is informational only. If a future cargo-deny upgrade
+    # promotes `unmaintained` to a hard failure, the ignore entry
+    # MUST be added back. Tracked at
+    # https://github.com/EmbarkStudios/cargo-deny/issues (search
+    # "unmaintained-as-hard-failure").
 ]
 
 [licenses]

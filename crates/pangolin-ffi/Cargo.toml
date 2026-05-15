@@ -100,6 +100,15 @@ pangolin-store  = { path = "../pangolin-store" }
 pangolin-totp   = { path = "../pangolin-totp" }
 pangolin-kdbx   = { path = "../pangolin-kdbx" }
 
+# MVP-2 issue 3.5 (R-d): the FFI wires the balance monitor + the
+# gas-balance state surface. The chain crate owns the typed
+# `BalanceMonitor` + `GasBalanceState`; we re-export the FFI-friendly
+# mirror in `src/balance.rs`. Same workspace alloy + tokio pins the
+# rest of the chain stack uses; no new transitive surface.
+pangolin-chain  = { path = "../pangolin-chain" }
+alloy = { workspace = true }
+tokio = { workspace = true }
+
 # UniFFI: proc-macro mode (the modern path; not UDL). Pinned to the
 # latest stable at the time of MVP-1 issue 1.1 freeze. Apache-2.0 +
 # MIT licensed; pulls `uniffi-macros`, `uniffi-meta`, `uniffi-core`

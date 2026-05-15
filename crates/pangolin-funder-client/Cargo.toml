@@ -18,7 +18,64 @@ workspace = true
 # the rest of the chain stack uses (=2.0.4); no new crypto crate.
 alloy = { workspace = true }
 
+# MVP-2 issue 3.5 R-e two-step manual API: `initiate_top_up` performs
+# the actual `POST /funder/v1/top-up` HTTP call from the device side.
+# 3.4 plan-gate scoped the protocol shapes here but explicitly deferred
+# the POST plumbing; 3.5 lands it.
+#
+# Pin: `reqwest = "=0.13.3"` — latest stable line that uses aws-lc-rs
+# as the rustls crypto provider. The 0.12 line's `rustls-tls` feature
+# transitively pulls `ring`, which is BANNED via `deny.toml` (Pangolin
+# uses RustCrypto / dalek-cryptography crates exclusively per
+# `docs/issue-plans/P1.md`; ring is FFI-laden and outside the audit
+# surface). reqwest 0.13 fixes this — its `rustls-tls` feature wires
+# `rustls/aws-lc-rs` which is permitted in the dep tree (alloy's
+# transitive reqwest 0.13 already uses this path). The dep version
+# now matches alloy's transitive — no version skew in the workspace.
+#
+# Features: `json` (serde-json body marshalling), `rustls` (pure-
+# Rust TLS via aws-lc-rs; avoids the OpenSSL system-dep drift that
+# bit P6 on Windows AND avoids the banned `ring`). In reqwest 0.13
+# the feature is named `rustls` (no `-tls` suffix); 0.12's
+# `rustls-tls` flag is what selected `ring`. `default-features =
+# false` keeps `default-tls` (which would pull `native-tls` + the
+# platform OpenSSL) out of the dep set.
+#
+# `forbid(unsafe_code)` posture survives: reqwest itself contains
+# `unsafe` in the network-buffer hot paths (standard for an HTTP
+# client) but that's a transitive crate, not this one. The L8 invariant
+# is about THIS crate's direct unsafe surface.
+#
+# **TRIGGERS env-quirk #15 advisories check** — every reqwest landing
+# refreshes the cargo-deny / cargo-audit results before merge.
+reqwest = { version = "=0.13.3", default-features = false, features = ["json", "rustls"] }
+
+# `serde` derive for the wire body of the POST. `reqwest`'s `json`
+# feature requires `Serialize` / `Deserialize` on the request +
+# response shapes. Same pin as the funder service uses (=1.0.228).
+serde = { version = "=1.0.228", default-features = false, features = ["std", "derive"] }
+serde_json = { workspace = true }
+
+# `uuid = "=1.10.0"` — client-generated `attempt_id` per R-e. v4 random
+# UUID; no shared state. `v4` feature pulls `rand`. The `serde` feature
+# enables (de)serialization in the response body. No crypto crate
+# overlap with the workspace allowlist — this is a random ID, not a
+# cryptographic primitive.
+uuid = { version = "=1.10.0", default-features = false, features = ["v4", "std"] }
+
+# thiserror — workspace pin; the funder-client error taxonomy uses the
+# same derive macro as the rest of the workspace.
+thiserror = { workspace = true }
+
 [dev-dependencies]
 # Tests need a deterministic secp256k1 signer; `LocalSigner::random` is
 # fine for the round-trip + tamper coverage.
 alloy = { workspace = true }
+# tokio runtime for the `#[tokio::test]` async harness. Same workspace
+# pin the rest of the stack uses.
+tokio = { workspace = true }
+# Hermetic mock HTTP server for `initiate_top_up` tests. `wiremock` is
+# the standard option for reqwest-bearing crates (the funder service
+# uses the same pattern). MIT-licensed; pure Rust; no FFI; commonly
+# audited.
+wiremock = "=0.6.5"

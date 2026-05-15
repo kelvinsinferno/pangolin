@@ -349,4 +349,63 @@ pub enum ChainError {
         /// Number of attempts made before giving up.
         attempts: u8,
     },
+
+    /// **MVP-2 issue 3.5 (R-b pre-publish balance gate).** Surfaced from
+    /// [`crate::publish_revision_v1`] when the configurable pre-submit
+    /// balance check is enabled and the device wallet's observed balance
+    /// is below the `MIN_BUFFER_REVISIONS × estimate_next_publish_cost`
+    /// threshold. Fatal — never retried — and fires BEFORE tx
+    /// construction so the doomed broadcast doesn't burn gas. The host
+    /// surfaces the §8.1.5 `RequiresActiveAccount` state to the user.
+    ///
+    /// Wei values are payload, NOT secrets — the balance is on-chain-
+    /// observable per D-006's known mitigation. Carried so the host can
+    /// render numeric detail or sanity-check the threshold; never logged
+    /// at default verbosity by the upstream observability.
+    #[error(
+        "pre-publish balance insufficient: balance_wei={balance_wei}, \
+         estimate_wei={estimate_wei}; host must surface RequiresActiveAccount"
+    )]
+    PrePublishBalanceInsufficient {
+        /// Observed wallet balance at the time of the pre-submit check, in wei.
+        balance_wei: u128,
+        /// `EXPECTED_REVISION_GAS × max_fee_per_gas × MIN_BUFFER_REVISIONS`
+        /// threshold the balance fell under, in wei.
+        estimate_wei: u128,
+    },
+
+    /// **MVP-2 issue 3.5 (R-a balance read failure).** Surfaced from
+    /// [`crate::balance_check::query_evm_balance`] /
+    /// [`crate::balance_check::estimate_next_publish_cost`] when the
+    /// RPC transport or response decoding fails. Carries the upstream
+    /// message verbatim (no secret material — the alloy transport error
+    /// is itself secret-free).
+    ///
+    /// Distinct from [`Self::Rpc`] / [`Self::RpcTransient`] (which are
+    /// owned by the v0 / 3.3 publish paths) so 3.5's balance-check
+    /// callers can recognise read-side failures without inheriting the
+    /// retry-attempt counter semantics of `RpcTransient`. Named
+    /// `detail` (not `source`) because `thiserror` reserves the
+    /// `source` field name for `std::error::Error::source()` chaining
+    /// over typed `Error` payloads — alloy's transport error is
+    /// already string-formatted by the call site.
+    #[error("balance query failed: {detail}")]
+    BalanceQueryFailed {
+        /// Upstream error description (transport / decode). Non-secret.
+        detail: String,
+    },
+
+    /// **MVP-2 issue 3.5 (R-b balance monitor + L-rpc-spoof).** Surfaced
+    /// when the [`crate::balance_monitor::BalanceMonitor`] cannot
+    /// determine the gas-balance state — typically because the
+    /// background-poll task has not yet completed a single successful
+    /// read, or all reads since startup have errored. Distinct from
+    /// [`Self::BalanceQueryFailed`] (which is the upstream-cause
+    /// variant) so consumers can distinguish "we know it failed once"
+    /// from "we have no signal at all".
+    #[error("balance unknown: {reason}")]
+    BalanceUnknown {
+        /// Non-secret human description of why the state is unknown.
+        reason: String,
+    },
 }
