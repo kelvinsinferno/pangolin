@@ -97,6 +97,7 @@
 
 pub mod adapter;
 pub mod base_sepolia;
+pub mod chain_submit;
 pub mod deployments;
 pub mod error;
 pub mod evm;
@@ -109,6 +110,10 @@ pub mod mock;
 
 pub use adapter::ChainAdapter;
 pub use base_sepolia::{BaseSepoliaAdapter, BASE_SEPOLIA_CHAIN_ID};
+pub use chain_submit::{
+    publish_revision_v1, ChainAnchorV1, MAX_FEE_PER_GAS_CAP_WEI, PRIORITY_FEE_DEFAULT_WEI,
+    PUBLISH_REVISION_BACKOFF_MS, PUBLISH_REVISION_MAX_RETRIES, RECEIPT_TIMEOUT_SECS,
+};
 pub use deployments::{load_deployed_address, ChainEnv};
 pub use error::ChainError;
 pub use evm::{derive_evm_address, derive_evm_wallet, EvmWallet};
