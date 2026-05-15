@@ -24,7 +24,7 @@
 //! propagate that as-is. The `Wallet` family carries only a fixed
 //! string description.
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256, U256};
 use thiserror::Error;
 
 use crate::deployments::ChainEnv;
@@ -208,5 +208,145 @@ pub enum ChainError {
         expected: Address,
         /// The address loaded from the on-disk deployment file.
         actual: Address,
+    },
+
+    /// **MVP-2 issue 3.3 (R-c retry taxonomy).** The RPC's reported
+    /// `eth_chainId` did not match the chain id this build is bound to
+    /// (e.g., Base Sepolia `84_532`). Distinct from
+    /// [`Self::WrongChain`] which the v0 adapter raises against the
+    /// JSON file's recorded `chain_id`; this variant fires from the
+    /// v1 direct-submit transport's pre-broadcast cross-check against
+    /// [`crate::deployments::ChainEnv::chain_id()`].
+    #[error("chain id mismatch (v1 transport): expected {expected}, observed {observed}")]
+    ChainIdMismatch {
+        /// Chain id this build expects (from `ChainEnv::chain_id`).
+        expected: u64,
+        /// Chain id reported by the connected RPC.
+        observed: u64,
+    },
+
+    /// **MVP-2 issue 3.3 (R-c retry taxonomy).** The device wallet has
+    /// insufficient ETH to pay for the transaction. Fatal — never
+    /// retried — so the operator knows to top up the wallet before
+    /// re-attempting. Carries the wallet's currently-observed balance
+    /// (best effort; may be `None` if the RPC's error message did not
+    /// surface a balance number).
+    #[error("insufficient funds in device wallet: {message}")]
+    InsufficientFunds {
+        /// Best-effort balance observed at the time of the failed
+        /// submission, in wei. `None` if the RPC error did not
+        /// surface a numeric balance.
+        observed: Option<U256>,
+        /// Upstream RPC error message verbatim (no secret material —
+        /// it includes the wallet's public address + the requested gas
+        /// cost only).
+        message: String,
+    },
+
+    /// **MVP-2 issue 3.3 (R-c retry taxonomy + 3.3 audit-LOW#2
+    /// split).** The tx mined but the receipt's `status` flag was 0
+    /// (the contract reverted on-chain). The decoded revert reason is
+    /// a best-effort English string; the `tx_hash` is always populated
+    /// so the operator can look up the reverting tx on an explorer.
+    ///
+    /// Distinct from [`Self::RevertedPreBroadcast`] (estimate-gas
+    /// revert before the tx ever broadcast) — that path has no
+    /// `tx_hash`. The audit-LOW#2 fix (2026-05-14) split a single
+    /// `RevertedV1 { reason, tx_hash: B256 }` variant in two so the
+    /// pre-broadcast path no longer carries a `tx=0x000...0` in its
+    /// operator-facing message.
+    ///
+    /// Distinct from the v0 [`Self::Reverted`] variant — this one
+    /// carries a typed `tx_hash` (B256) and a decoded `reason`,
+    /// where v0's variant stringifies the tx hash and has no reason
+    /// field. Both variants exist because v0's adapter is the legacy
+    /// path; the v1 transport produces this richer form.
+    #[error("revision tx reverted on-chain: reason={reason}, tx={tx_hash}")]
+    RevertedOnChain {
+        /// Decoded revert reason (best effort). Examples:
+        /// `"ErrInvalidSignature"`, `"ErrSignerNotRegistered"`,
+        /// `"ErrUnsupportedSchemaVersion"`, `"OutOfGas"`,
+        /// `"unknown revert"`.
+        reason: String,
+        /// 32-byte tx hash so the operator can look it up on Base
+        /// Sepolia's explorer.
+        tx_hash: B256,
+    },
+
+    /// **MVP-2 issue 3.3 (R-c retry taxonomy + 3.3 audit-LOW#2
+    /// split).** The `eth_estimateGas` simulation reverted BEFORE the
+    /// tx was broadcast. The decoded revert reason is a best-effort
+    /// English string; no `tx_hash` is reported because nothing was
+    /// ever sent to the mempool.
+    ///
+    /// Pre-MVP-2 the broadcast layer collapsed both pre- and post-
+    /// broadcast reverts into a single `RevertedV1 { reason, tx_hash:
+    /// B256 }` variant; the pre-broadcast path carried `tx_hash =
+    /// B256::ZERO`, which surfaced as a confusing `tx=0x000...0` in
+    /// the operator-facing error message. The audit-LOW#2 fix splits
+    /// the variants so the no-tx case is typed as such.
+    #[error("revision tx reverted pre-broadcast (estimate-gas): reason={reason}")]
+    RevertedPreBroadcast {
+        /// Decoded revert reason (best effort). Same alphabet as
+        /// [`Self::RevertedOnChain::reason`].
+        reason: String,
+    },
+
+    /// **MVP-2 issue 3.3 (R-b gas-cap defense; L6).** The computed
+    /// `maxFeePerGas` exceeded the build's per-tx hard cap (50 gwei).
+    /// Fatal — never retried. Defends against a malicious RPC that
+    /// reports a huge `baseFeePerGas` (L-gas-griefing).
+    #[error(
+        "gas-cap exceeded: computed max_fee_per_gas {observed_gwei} gwei exceeds \
+         hard cap {cap_gwei} gwei"
+    )]
+    GasCapExceeded {
+        /// Computed `maxFeePerGas`, converted to gwei for display.
+        observed_gwei: u64,
+        /// Per-tx hard cap, in gwei (50 for MVP-2).
+        cap_gwei: u64,
+    },
+
+    /// **MVP-2 issue 3.3 (R-c retry taxonomy).** Nonce-collision
+    /// retries were exhausted (3 attempts). Fatal — surface to the
+    /// operator so they can manually replace via `cast` or a wallet
+    /// UI.
+    #[error("nonce unresolvable after {attempts} retries")]
+    NonceUnresolvable {
+        /// Number of attempts made before giving up (always 3 for
+        /// MVP-2).
+        attempts: u8,
+    },
+
+    /// **MVP-2 issue 3.3 (L-rpc-spoof defense).** The decoded
+    /// `RevisionPublished` event's `signer` field disagreed with the
+    /// wallet's EVM address — the malicious-RPC defense kicked in.
+    /// Fatal — never retried.
+    #[error(
+        "receipt mismatch: RevisionPublished log signer={observed_signer} \
+         disagrees with submitter wallet={expected_signer}"
+    )]
+    ReceiptMismatch {
+        /// Wallet address that submitted the tx.
+        expected_signer: Address,
+        /// Signer address decoded from the on-receipt
+        /// `RevisionPublished` log.
+        observed_signer: Address,
+    },
+
+    /// **MVP-2 issue 3.3 (R-c retry taxonomy).** The RPC transport
+    /// failed repeatedly (timeout, 5xx, connection reset). Exhausted
+    /// retries with exponential backoff. Surfaces the upstream error
+    /// message and the attempt count.
+    #[error("RPC transport transient error (exhausted {attempts} retries): {message}")]
+    RpcTransient {
+        /// Upstream alloy transport error description. Named
+        /// `message` (not `source`) because `thiserror` reserves the
+        /// `source` field name for `std::error::Error::source()` —
+        /// alloy's transport error is already string-formatted by
+        /// the call site, so there is no chained source to expose.
+        message: String,
+        /// Number of attempts made before giving up.
+        attempts: u8,
     },
 }
