@@ -8,17 +8,21 @@
 //! lands an `attestation_hash UNIQUE` row, the second insert errors
 //! out with [`LedgerError::AlreadyExists`].
 //!
-//! ## Schema (initial)
+//! ## Schema (v2, audit fix-pass 2026-05-15)
 //!
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS payments (
-//!     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-//!     attestation_hash    BLOB    NOT NULL UNIQUE,
-//!     user_id             BLOB    NOT NULL,
-//!     device_address      BLOB    NOT NULL,
-//!     credit_amount       BLOB    NOT NULL,      -- 32-byte big-endian U256
-//!     redemption_tx_hash  BLOB,                  -- populated post-submit
-//!     created_at          INTEGER NOT NULL       -- unix seconds
+//!     id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+//!     attestation_hash       BLOB    NOT NULL UNIQUE,
+//!     user_id                BLOB    NOT NULL,
+//!     device_address         BLOB    NOT NULL,
+//!     credit_amount          BLOB    NOT NULL,   -- 32-byte big-endian U256
+//!     redemption_tx_hash     BLOB,               -- populated post-redeem-submit
+//!     state                  TEXT NOT NULL DEFAULT 'pre_redeem',
+//!     eth_transfer_tx_hash   BLOB,               -- populated post-transfer-submit
+//!     eth_transfer_block     INTEGER,            -- populated post-transfer-mine
+//!     eth_transferred_wei    BLOB,               -- 32-byte big-endian U256
+//!     created_at             INTEGER NOT NULL    -- unix seconds
 //! );
 //!
 //! CREATE TABLE IF NOT EXISTS schema_version (
@@ -27,12 +31,28 @@
 //! );
 //! ```
 //!
+//! ## Lifecycle states (L-payment-order per plan-doc)
+//!
+//! The `state` column tracks the two-leg redeem→eth-transfer flow:
+//!
+//! ```text
+//! PreRedeem
+//!   └─→ RedeemSubmitted (eth_sendRawTransaction returned; tx hash known)
+//!       └─→ RedeemMined (redeem receipt status=1; balance debited)
+//!           └─→ EthTransferSubmitted (transfer tx broadcast)
+//!               └─→ EthTransferMined (transfer receipt status=1; ETH delivered)
+//!
+//! From any RedeemMined / EthTransferSubmitted state, a failure
+//! advances to EthTransferFailed (terminal; manual reconciliation).
+//! ```
+//!
 //! ## Schema version
 //!
-//! Initial version is `1`. Future migrations bump this; the open path
-//! reads the current version + applies any pending migrations in
-//! order. Unknown future versions (binary older than db) fail closed
-//! with [`LedgerError::FutureSchemaVersion`].
+//! Current version is `2` (audit fix-pass adds the lifecycle columns).
+//! The migration path is forward-only + idempotent: opening a v1 db
+//! adds the new columns with their defaults (`state = 'pre_redeem'`
+//! for existing rows). Unknown future versions (binary older than db)
+//! fail closed with [`LedgerError::FutureSchemaVersion`].
 //!
 //! ## Threading
 //!
@@ -54,8 +74,65 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 /// Current funder ledger schema version. Bump + ship a migration for
-/// every breaking change to the table layouts.
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+/// every breaking change to the table layouts. v2 (audit fix-pass)
+/// adds the `state` / `eth_transfer_*` columns.
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+
+/// Lifecycle states for the two-leg redeem→eth-transfer flow.
+///
+/// Encoded as a TEXT column in the ledger using the lowercase snake-
+/// case variant name (`pre_redeem` / `redeem_submitted` / ...). New
+/// variants in future schema bumps MUST also append to
+/// [`PaymentState::as_db_str`] + [`PaymentState::parse_db_str`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaymentState {
+    /// Ledger row inserted; redemption tx not yet broadcast.
+    PreRedeem,
+    /// Redemption tx submitted via `eth_sendRawTransaction`; awaiting
+    /// receipt.
+    RedeemSubmitted,
+    /// Redemption tx mined with status=1; user balance debited on
+    /// chain. ETH transfer not yet attempted.
+    RedeemMined,
+    /// ETH-transfer tx submitted; awaiting receipt.
+    EthTransferSubmitted,
+    /// ETH-transfer tx mined with status=1; flow complete.
+    EthTransferMined,
+    /// Terminal failure state: redeem succeeded but the ETH-transfer
+    /// leg failed (RPC timeout, insufficient hot-wallet balance,
+    /// transfer reverted). Manual reconciliation required.
+    EthTransferFailed,
+}
+
+impl PaymentState {
+    /// On-disk encoding (TEXT column value).
+    #[must_use]
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::PreRedeem => "pre_redeem",
+            Self::RedeemSubmitted => "redeem_submitted",
+            Self::RedeemMined => "redeem_mined",
+            Self::EthTransferSubmitted => "eth_transfer_submitted",
+            Self::EthTransferMined => "eth_transfer_mined",
+            Self::EthTransferFailed => "eth_transfer_failed",
+        }
+    }
+
+    /// Inverse of [`Self::as_db_str`]. Unknown strings return `None`
+    /// so the caller can fail closed with [`LedgerError::Sqlite`].
+    #[must_use]
+    pub fn parse_db_str(s: &str) -> Option<Self> {
+        match s {
+            "pre_redeem" => Some(Self::PreRedeem),
+            "redeem_submitted" => Some(Self::RedeemSubmitted),
+            "redeem_mined" => Some(Self::RedeemMined),
+            "eth_transfer_submitted" => Some(Self::EthTransferSubmitted),
+            "eth_transfer_mined" => Some(Self::EthTransferMined),
+            "eth_transfer_failed" => Some(Self::EthTransferFailed),
+            _ => None,
+        }
+    }
+}
 
 /// Errors surfaced by [`PaymentLedger`] operations.
 #[derive(Debug, Error)]
@@ -110,6 +187,17 @@ pub struct PaymentRow {
     /// submitted yet (the handler inserts the row first, then submits
     /// the redeem tx, then updates this column).
     pub redemption_tx_hash: Option<B256>,
+    /// Lifecycle state in the two-leg flow.
+    pub state: PaymentState,
+    /// ETH-transfer tx hash, or `None` if the transfer has not been
+    /// submitted yet.
+    pub eth_transfer_tx_hash: Option<B256>,
+    /// ETH-transfer block number, or `None` if the transfer has not
+    /// mined yet.
+    pub eth_transfer_block: Option<u64>,
+    /// Wei value of the dispatched ETH transfer, or `None` if the
+    /// transfer has not been submitted yet.
+    pub eth_transferred_wei: Option<U256>,
     /// Unix seconds of row creation.
     pub created_at: u64,
 }
@@ -125,6 +213,10 @@ impl fmt::Debug for PaymentRow {
             .field("device_address", &"<redacted>")
             .field("credit_amount", &"<redacted>")
             .field("redemption_tx_hash", &self.redemption_tx_hash)
+            .field("state", &self.state)
+            .field("eth_transfer_tx_hash", &self.eth_transfer_tx_hash)
+            .field("eth_transfer_block", &self.eth_transfer_block)
+            .field("eth_transferred_wei", &"<redacted>")
             .field("created_at", &self.created_at)
             .finish()
     }
@@ -172,6 +264,7 @@ impl PaymentLedger {
     /// Apply pending migrations on an owned connection (pre-wrap).
     /// Idempotent — running on an already-migrated DB is a no-op.
     fn migrate_owned(conn: &Connection) -> Result<(), LedgerError> {
+        // v1 baseline: tables exist with the original column set.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_version (
                 version    INTEGER PRIMARY KEY,
@@ -198,17 +291,43 @@ impl PaymentLedger {
 
         match current {
             None => {
+                // Fresh database: create at the current schema
+                // version directly with all v2 columns.
+                Self::apply_v2_columns(conn)?;
                 conn.execute(
                     "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
                     params![CURRENT_SCHEMA_VERSION, now_unix_seconds_i64()],
                 )?;
                 Ok(())
             }
-            Some(v) if v == CURRENT_SCHEMA_VERSION => Ok(()),
+            Some(v) if v == CURRENT_SCHEMA_VERSION => {
+                // Same version + idempotent column adds: a previous
+                // crash between the `ALTER TABLE` and the version
+                // insert would leave us here legitimately. Re-running
+                // the column adds is a no-op (IF NOT EXISTS would be
+                // nice but SQLite < 3.35 doesn't support it for
+                // `ADD COLUMN`; we instead detect-or-add).
+                Self::apply_v2_columns(conn)?;
+                Ok(())
+            }
             Some(v) if v < CURRENT_SCHEMA_VERSION => {
-                // Apply migrations v..CURRENT here. No migrations
-                // beyond the initial schema today; this arm is the
-                // structural slot for the next bump.
+                // v1 → v2: add the lifecycle columns. Defaults match
+                // the audit-fix-pass plan: existing rows inherit
+                // `state = 'pre_redeem'` (the safe default — the
+                // resume-scan re-classifies them when it sees the
+                // redemption_tx_hash NULL → still PreRedeem; non-NULL
+                // → operator intervention since the row pre-dates
+                // the state column).
+                Self::apply_v2_columns(conn)?;
+                // Promote any v1 rows that already have a
+                // redemption_tx_hash populated to RedeemSubmitted so
+                // the resume-scan picks them up. A v1 row could not
+                // have advanced further than that.
+                conn.execute(
+                    "UPDATE payments SET state = 'redeem_submitted' \
+                     WHERE redemption_tx_hash IS NOT NULL AND state = 'pre_redeem'",
+                    [],
+                )?;
                 conn.execute(
                     "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
                     params![CURRENT_SCHEMA_VERSION, now_unix_seconds_i64()],
@@ -220,6 +339,43 @@ impl PaymentLedger {
                 supported: CURRENT_SCHEMA_VERSION,
             }),
         }
+    }
+
+    /// Add the v2 lifecycle columns to the `payments` table if absent.
+    /// `SQLite` < 3.35 has no `ADD COLUMN IF NOT EXISTS` syntax, so we
+    /// probe the column list via `PRAGMA table_info` first.
+    fn apply_v2_columns(conn: &Connection) -> Result<(), LedgerError> {
+        let mut stmt = conn.prepare("PRAGMA table_info(payments)")?;
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .collect();
+        let has = |name: &str| cols.iter().any(|c| c == name);
+        if !has("state") {
+            conn.execute(
+                "ALTER TABLE payments ADD COLUMN state TEXT NOT NULL DEFAULT 'pre_redeem'",
+                [],
+            )?;
+        }
+        if !has("eth_transfer_tx_hash") {
+            conn.execute(
+                "ALTER TABLE payments ADD COLUMN eth_transfer_tx_hash BLOB",
+                [],
+            )?;
+        }
+        if !has("eth_transfer_block") {
+            conn.execute(
+                "ALTER TABLE payments ADD COLUMN eth_transfer_block INTEGER",
+                [],
+            )?;
+        }
+        if !has("eth_transferred_wei") {
+            conn.execute(
+                "ALTER TABLE payments ADD COLUMN eth_transferred_wei BLOB",
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     /// Insert a new payment row. Returns `Ok(true)` on a fresh
@@ -262,7 +418,8 @@ impl PaymentLedger {
 
     /// Update the `redemption_tx_hash` column for a row identified by
     /// `attestation_hash`. Returns `Ok(true)` on update,
-    /// `Ok(false)` if the row was not found.
+    /// `Ok(false)` if the row was not found. Also advances the
+    /// lifecycle state to `redeem_submitted`.
     pub async fn update_redemption_tx_hash(
         &self,
         attestation_hash: B256,
@@ -270,10 +427,142 @@ impl PaymentLedger {
     ) -> Result<bool, LedgerError> {
         let conn = self.conn.lock().await;
         let n = conn.execute(
-            "UPDATE payments SET redemption_tx_hash = ?1 WHERE attestation_hash = ?2",
+            "UPDATE payments SET redemption_tx_hash = ?1, state = 'redeem_submitted' \
+             WHERE attestation_hash = ?2",
             params![tx_hash.as_slice(), attestation_hash.as_slice()],
         )?;
         Ok(n > 0)
+    }
+
+    /// Atomic state transition. Updates the `state` column for the
+    /// row identified by `attestation_hash`. Returns `Ok(true)` on
+    /// update, `Ok(false)` if no row was affected (caller decides
+    /// whether to treat that as an error).
+    pub async fn transition_state(
+        &self,
+        attestation_hash: B256,
+        new_state: PaymentState,
+    ) -> Result<bool, LedgerError> {
+        let conn = self.conn.lock().await;
+        let n = conn.execute(
+            "UPDATE payments SET state = ?1 WHERE attestation_hash = ?2",
+            params![new_state.as_db_str(), attestation_hash.as_slice()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Mark the ETH-transfer submission: stamp the tx hash + the
+    /// `eth_transferred_wei` value, advance the state to
+    /// `eth_transfer_submitted`. The block number stays NULL until the
+    /// receipt confirms.
+    pub async fn mark_eth_transfer_submitted(
+        &self,
+        attestation_hash: B256,
+        eth_transfer_tx_hash: B256,
+        eth_transferred_wei: U256,
+    ) -> Result<bool, LedgerError> {
+        let conn = self.conn.lock().await;
+        let n = conn.execute(
+            "UPDATE payments \
+             SET eth_transfer_tx_hash = ?1, \
+                 eth_transferred_wei  = ?2, \
+                 state                = 'eth_transfer_submitted' \
+             WHERE attestation_hash = ?3",
+            params![
+                eth_transfer_tx_hash.as_slice(),
+                eth_transferred_wei.to_be_bytes::<32>().as_slice(),
+                attestation_hash.as_slice(),
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Mark the ETH-transfer as mined: stamp the block number, advance
+    /// the state to `eth_transfer_mined`.
+    pub async fn mark_eth_transfer_mined(
+        &self,
+        attestation_hash: B256,
+        eth_transfer_block: u64,
+    ) -> Result<bool, LedgerError> {
+        let conn = self.conn.lock().await;
+        let block_i64 = i64::try_from(eth_transfer_block).unwrap_or(i64::MAX);
+        let n = conn.execute(
+            "UPDATE payments \
+             SET eth_transfer_block = ?1, \
+                 state              = 'eth_transfer_mined' \
+             WHERE attestation_hash = ?2",
+            params![block_i64, attestation_hash.as_slice()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Find rows in resumable in-flight states. Used at startup by
+    /// [`crate::resume`] to pick up in-flight transactions left by a
+    /// previous run (per L-payment-order — the restart-scan resume
+    /// closes the user-paid-for-nothing window).
+    ///
+    /// Returns rows with `state IN ('redeem_submitted', 'redeem_mined',
+    /// 'eth_transfer_submitted')`. Rows in `pre_redeem` are NOT
+    /// resumed — the redemption tx was never broadcast, so the user
+    /// can simply retry. Rows in `eth_transfer_mined` or
+    /// `eth_transfer_failed` are terminal.
+    pub async fn find_resumable_entries(&self) -> Result<Vec<PaymentRow>, LedgerError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT attestation_hash, user_id, device_address, credit_amount, \
+                    redemption_tx_hash, state, eth_transfer_tx_hash, \
+                    eth_transfer_block, eth_transferred_wei, created_at \
+             FROM payments \
+             WHERE state IN ('redeem_submitted', 'redeem_mined', 'eth_transfer_submitted')",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let ah: Vec<u8> = r.get(0)?;
+                let uid: Vec<u8> = r.get(1)?;
+                let da: Vec<u8> = r.get(2)?;
+                let ca: Vec<u8> = r.get(3)?;
+                let rtx: Option<Vec<u8>> = r.get(4)?;
+                let state_s: String = r.get(5)?;
+                let etx: Option<Vec<u8>> = r.get(6)?;
+                let eblock: Option<i64> = r.get(7)?;
+                let ew: Option<Vec<u8>> = r.get(8)?;
+                let created: i64 = r.get(9)?;
+                Ok((ah, uid, da, ca, rtx, state_s, etx, eblock, ew, created))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (ah, uid, da, ca, rtx, state_s, etx, eblock, ew, created) in rows {
+            let attestation_hash = vec_to_b256(&ah)?;
+            let user_id = vec_to_array32(&uid)?;
+            let device_address = vec_to_address(&da)?;
+            let credit_amount = U256::from_be_slice(&ca);
+            let redemption_tx_hash = match rtx {
+                Some(bytes) => Some(vec_to_b256(&bytes)?),
+                None => None,
+            };
+            let state = PaymentState::parse_db_str(&state_s)
+                .ok_or_else(|| LedgerError::Sqlite(format!("unknown payment state {state_s:?}")))?;
+            let eth_transfer_tx_hash = match etx {
+                Some(bytes) => Some(vec_to_b256(&bytes)?),
+                None => None,
+            };
+            let eth_transfer_block = eblock.map(|v| u64::try_from(v).unwrap_or(0));
+            let eth_transferred_wei = ew.as_ref().map(|b| U256::from_be_slice(b));
+            let created_at = u64::try_from(created).unwrap_or(0);
+            out.push(PaymentRow {
+                attestation_hash,
+                user_id,
+                device_address,
+                credit_amount,
+                redemption_tx_hash,
+                state,
+                eth_transfer_tx_hash,
+                eth_transfer_block,
+                eth_transferred_wei,
+                created_at,
+            });
+        }
+        Ok(out)
     }
 
     /// Retrieve a payment row by attestation hash. Returns `None` if
@@ -285,7 +574,9 @@ impl PaymentLedger {
         let conn = self.conn.lock().await;
         let row = conn
             .query_row(
-                "SELECT attestation_hash, user_id, device_address, credit_amount, redemption_tx_hash, created_at \
+                "SELECT attestation_hash, user_id, device_address, credit_amount, \
+                        redemption_tx_hash, state, eth_transfer_tx_hash, \
+                        eth_transfer_block, eth_transferred_wei, created_at \
                  FROM payments WHERE attestation_hash = ?1",
                 params![attestation_hash.as_slice()],
                 |r| {
@@ -294,12 +585,16 @@ impl PaymentLedger {
                     let da: Vec<u8> = r.get(2)?;
                     let ca: Vec<u8> = r.get(3)?;
                     let rtx: Option<Vec<u8>> = r.get(4)?;
-                    let created: i64 = r.get(5)?;
-                    Ok((ah, uid, da, ca, rtx, created))
+                    let state_s: String = r.get(5)?;
+                    let etx: Option<Vec<u8>> = r.get(6)?;
+                    let eblock: Option<i64> = r.get(7)?;
+                    let ew: Option<Vec<u8>> = r.get(8)?;
+                    let created: i64 = r.get(9)?;
+                    Ok((ah, uid, da, ca, rtx, state_s, etx, eblock, ew, created))
                 },
             )
             .optional()?;
-        let Some((ah, uid, da, ca, rtx, created)) = row else {
+        let Some((ah, uid, da, ca, rtx, state_s, etx, eblock, ew, created)) = row else {
             return Ok(None);
         };
         let attestation_hash = vec_to_b256(&ah)?;
@@ -310,6 +605,14 @@ impl PaymentLedger {
             Some(bytes) => Some(vec_to_b256(&bytes)?),
             None => None,
         };
+        let state = PaymentState::parse_db_str(&state_s)
+            .ok_or_else(|| LedgerError::Sqlite(format!("unknown payment state {state_s:?}")))?;
+        let eth_transfer_tx_hash = match etx {
+            Some(bytes) => Some(vec_to_b256(&bytes)?),
+            None => None,
+        };
+        let eth_transfer_block = eblock.map(|v| u64::try_from(v).unwrap_or(0));
+        let eth_transferred_wei = ew.as_ref().map(|b| U256::from_be_slice(b));
         let created_at = u64::try_from(created).unwrap_or(0);
         Ok(Some(PaymentRow {
             attestation_hash,
@@ -317,6 +620,10 @@ impl PaymentLedger {
             device_address,
             credit_amount,
             redemption_tx_hash,
+            state,
+            eth_transfer_tx_hash,
+            eth_transfer_block,
+            eth_transferred_wei,
             created_at,
         }))
     }
@@ -458,5 +765,151 @@ mod tests {
             .await
             .expect("insert");
         assert!(!second, "cold restart should preserve duplicate-detection");
+    }
+
+    #[tokio::test]
+    async fn state_transitions_pre_redeem_to_redeem_mined() {
+        let ledger = PaymentLedger::open_in_memory().expect("open");
+        let h = b256!("0x1010101010101010101010101010101010101010101010101010101010101010");
+        ledger
+            .try_insert(h, sample_user_id(), sample_addr(), U256::from(50u64))
+            .await
+            .expect("insert");
+        // Fresh row starts in PreRedeem.
+        let row = ledger
+            .get_by_attestation_hash(h)
+            .await
+            .expect("query")
+            .expect("present");
+        assert_eq!(row.state, PaymentState::PreRedeem);
+
+        // Stamping the redeem tx hash advances to RedeemSubmitted.
+        let tx = b256!("0x2020202020202020202020202020202020202020202020202020202020202020");
+        ledger
+            .update_redemption_tx_hash(h, tx)
+            .await
+            .expect("update");
+        let row = ledger
+            .get_by_attestation_hash(h)
+            .await
+            .expect("query")
+            .expect("present");
+        assert_eq!(row.state, PaymentState::RedeemSubmitted);
+        assert_eq!(row.redemption_tx_hash, Some(tx));
+
+        // Explicit transition to RedeemMined.
+        let did = ledger
+            .transition_state(h, PaymentState::RedeemMined)
+            .await
+            .expect("transition");
+        assert!(did);
+        let row = ledger
+            .get_by_attestation_hash(h)
+            .await
+            .expect("query")
+            .expect("present");
+        assert_eq!(row.state, PaymentState::RedeemMined);
+    }
+
+    #[tokio::test]
+    async fn state_transitions_redeem_mined_to_eth_transfer_mined() {
+        let ledger = PaymentLedger::open_in_memory().expect("open");
+        let h = b256!("0x3030303030303030303030303030303030303030303030303030303030303030");
+        ledger
+            .try_insert(h, sample_user_id(), sample_addr(), U256::from(50u64))
+            .await
+            .expect("insert");
+        ledger
+            .transition_state(h, PaymentState::RedeemMined)
+            .await
+            .expect("transition");
+
+        let eth_tx = b256!("0x4040404040404040404040404040404040404040404040404040404040404040");
+        let value = U256::from(10_000_000_000_000_000u128);
+        ledger
+            .mark_eth_transfer_submitted(h, eth_tx, value)
+            .await
+            .expect("mark submitted");
+        let row = ledger
+            .get_by_attestation_hash(h)
+            .await
+            .expect("query")
+            .expect("present");
+        assert_eq!(row.state, PaymentState::EthTransferSubmitted);
+        assert_eq!(row.eth_transfer_tx_hash, Some(eth_tx));
+        assert_eq!(row.eth_transferred_wei, Some(value));
+
+        ledger
+            .mark_eth_transfer_mined(h, 1_234)
+            .await
+            .expect("mark mined");
+        let row = ledger
+            .get_by_attestation_hash(h)
+            .await
+            .expect("query")
+            .expect("present");
+        assert_eq!(row.state, PaymentState::EthTransferMined);
+        assert_eq!(row.eth_transfer_block, Some(1_234));
+    }
+
+    #[tokio::test]
+    async fn find_resumable_entries_returns_in_flight_states() {
+        let ledger = PaymentLedger::open_in_memory().expect("open");
+        // Three rows: one PreRedeem (NOT resumable), one RedeemMined,
+        // one EthTransferSubmitted.
+        let h_pre = b256!("0x5050505050505050505050505050505050505050505050505050505050505050");
+        let h_mined = b256!("0x6060606060606060606060606060606060606060606060606060606060606060");
+        let h_sub = b256!("0x7070707070707070707070707070707070707070707070707070707070707070");
+        for h in &[h_pre, h_mined, h_sub] {
+            ledger
+                .try_insert(*h, sample_user_id(), sample_addr(), U256::from(1u64))
+                .await
+                .expect("insert");
+        }
+        ledger
+            .transition_state(h_mined, PaymentState::RedeemMined)
+            .await
+            .expect("transition");
+        ledger
+            .transition_state(h_sub, PaymentState::EthTransferSubmitted)
+            .await
+            .expect("transition");
+
+        let rows = ledger.find_resumable_entries().await.expect("scan");
+        let mut got: Vec<B256> = rows.iter().map(|r| r.attestation_hash).collect();
+        got.sort();
+        let mut want = [h_mined, h_sub];
+        want.sort();
+        assert_eq!(got, want);
+        // PreRedeem must NOT be in the resumable set.
+        assert!(rows.iter().all(|r| r.attestation_hash != h_pre));
+    }
+
+    #[tokio::test]
+    async fn migration_idempotent() {
+        // Opening the same file twice must succeed; the v2 column
+        // adds are guarded by the PRAGMA-table-info probe.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("funder-ledger.sqlite");
+        let h = b256!("0x8080808080808080808080808080808080808080808080808080808080808080");
+        {
+            let ledger = PaymentLedger::open(&path).expect("open");
+            ledger
+                .try_insert(h, sample_user_id(), sample_addr(), U256::from(1u64))
+                .await
+                .expect("insert");
+        }
+        // Re-open: migration should be a no-op + the row preserved
+        // with the default state.
+        let ledger = PaymentLedger::open(&path).expect("reopen");
+        let row = ledger
+            .get_by_attestation_hash(h)
+            .await
+            .expect("query")
+            .expect("present");
+        assert_eq!(row.state, PaymentState::PreRedeem);
+        // Third open: still idempotent.
+        drop(ledger);
+        let _ledger = PaymentLedger::open(&path).expect("reopen again");
     }
 }

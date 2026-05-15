@@ -1150,6 +1150,270 @@ fn decode_redemption_revert_reason_from_msg(msg: &str) -> Option<String> {
     Some("unknown revert".to_string())
 }
 
+// =====================================================================
+// MVP-2 issue 3.4 (audit fix-pass) — `submit_eth_transfer_v1` for the
+// funder service's ETH-transfer leg.
+// =====================================================================
+//
+// After `submit_redemption_v1` decrements the user's on-chain balance,
+// the funder sends ETH from its hot wallet to the device address. This
+// is the second leg of the L-payment-order state machine and the
+// HIGH-1 audit fix (the previous build echoed the redeem tx hash as the
+// "eth_transfer_tx_hash" without ever sending ETH).
+//
+// Shape mirrors `submit_redemption_v1`:
+// - Same EIP-1559 gas-cap envelope (50 gwei max_fee_per_gas).
+// - Same R-c retry taxonomy (nonce-collision + transient-rpc only).
+// - Same receipt-await discipline (1-conf, status==1).
+// - NO calldata; NO event decode (a value transfer has no event).
+// - Hard cap on `value` is enforced UPSTREAM by the funder handler
+//   (the cap-check happens BEFORE the redemption submit so a mis-
+//   sized Credit attestation never debits the user). The transfer
+//   helper itself doesn't re-check the cap — separating the two keeps
+//   the helper's responsibilities concrete.
+
+/// Receipt anchor for a successful ETH-transfer leg.
+///
+/// Distinct from [`RedemptionAnchorV1`] / [`ChainAnchorV1`]: the
+/// transfer tx emits no event; the anchor carries just the tx hash +
+/// block coordinates + the actual `value` field decoded back from the
+/// receipt (defense-in-depth — an RPC returning a stale receipt for a
+/// different tx would not match).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EthTransferAnchorV1 {
+    /// 32-byte transaction hash.
+    pub tx_hash: B256,
+    /// Block number the tx was included in.
+    pub block_number: u64,
+    /// 32-byte hash of the block the tx was included in.
+    pub block_hash: B256,
+    /// ETH value transferred (wei). Cross-checked against the
+    /// requested amount by the caller.
+    pub value_wei: U256,
+}
+
+/// Submit a plain ETH transfer from `signer` to `to_address` for
+/// `value_wei` wei. Block until 1-conf receipt. Returns a populated
+/// [`EthTransferAnchorV1`] on success.
+///
+/// # Arguments
+///
+/// - `signer` — the funder's `PrivateKeySigner`. Pays gas and the
+///   transferred value. The hot-wallet ETH balance bounds the loss
+///   surface per L5.
+/// - `to_address` — destination (the device wallet address). Treated
+///   as opaque from the chain crate's POV; the funder handler is
+///   responsible for verifying the device-binding signature recovers
+///   to this address BEFORE calling here.
+/// - `value_wei` — ETH amount in wei. NOT range-checked here; the
+///   funder handler enforces the per-tx cap upstream.
+/// - `env` — chain env. Only `BaseSepolia` is wired for the
+///   chain-id pin today.
+/// - `rpc_url` — RPC endpoint.
+///
+/// # Errors
+///
+/// Same taxonomy as [`submit_redemption_v1`]:
+/// - Fatal: `InsufficientFunds` (hot-wallet drained / cap exceeded
+///   by gas), `GasCapExceeded`, `ChainIdMismatch`, `NonceUnresolvable`,
+///   `RevertedOnChain` (a plain transfer reverts only when the
+///   recipient is a contract whose receive/fallback reverts; the funder
+///   targets EOAs but the surface exists).
+/// - Retriable: nonce collision (max 3), RPC transient (exp backoff).
+pub async fn submit_eth_transfer_v1(
+    signer: &PrivateKeySigner,
+    to_address: Address,
+    value_wei: U256,
+    env: ChainEnv,
+    rpc_url: &str,
+) -> Result<EthTransferAnchorV1, ChainError> {
+    let provider = build_provider_for_signer(signer, rpc_url).await?;
+    if let Some(expected_chain_id) = env.chain_id() {
+        let observed = provider.get_chain_id().await.map_err(map_rpc_err)?;
+        if observed != expected_chain_id {
+            return Err(ChainError::ChainIdMismatch {
+                expected: expected_chain_id,
+                observed,
+            });
+        }
+    }
+    submit_eth_transfer_v1_with_provider(&provider, signer.address(), to_address, value_wei).await
+}
+
+/// Inner submit loop parameterised over a constructed provider. Used
+/// by hermetic tests + the public entry point.
+async fn submit_eth_transfer_v1_with_provider(
+    provider: &DynProvider,
+    signer_address: Address,
+    to_address: Address,
+    value_wei: U256,
+) -> Result<EthTransferAnchorV1, ChainError> {
+    let pending =
+        broadcast_eth_transfer_with_retries(provider, signer_address, to_address, value_wei)
+            .await?;
+    let tx_hash: B256 = *pending.tx_hash();
+    let pending = pending.with_timeout(Some(Duration::from_secs(RECEIPT_TIMEOUT_SECS)));
+    let receipt = pending
+        .get_receipt()
+        .await
+        .map_err(|e| ChainError::Rpc(format!("get_receipt({tx_hash:?}): {e}")))?;
+    process_eth_transfer_receipt(&receipt, tx_hash, to_address, value_wei)
+}
+
+/// Broadcast leg: nonce + fee + estimate + send with R-c retries.
+/// Mirror of `broadcast_redemption_with_retries` but with empty
+/// calldata and a non-zero `value`. No contract-revert decoder is
+/// invoked (a plain transfer to an EOA cannot trigger
+/// `RevertedPreBroadcast` via a typed Solidity custom error).
+async fn broadcast_eth_transfer_with_retries(
+    provider: &DynProvider,
+    signer_address: Address,
+    to_address: Address,
+    value_wei: U256,
+) -> Result<PendingTransactionBuilder<Ethereum>, ChainError> {
+    let mut attempts: u8 = 0;
+    loop {
+        attempts += 1;
+        let nonce = match provider
+            .get_transaction_count(signer_address)
+            .pending()
+            .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                let msg = e.to_string();
+                if is_transient_rpc_error(&msg) && attempts < PUBLISH_REVISION_MAX_RETRIES {
+                    backoff_for_attempt(attempts).await;
+                    continue;
+                }
+                return Err(ChainError::RpcTransient {
+                    message: msg,
+                    attempts,
+                });
+            }
+        };
+
+        let base_fee = fetch_base_fee(provider).await?;
+        let max_fee_per_gas: u128 = base_fee
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(PRIORITY_FEE_DEFAULT_WEI))
+            .ok_or_else(|| ChainError::Rpc("base fee arithmetic overflow".into()))?;
+        if max_fee_per_gas > MAX_FEE_PER_GAS_CAP_WEI {
+            return Err(ChainError::GasCapExceeded {
+                observed_gwei: u64::try_from(max_fee_per_gas / 1_000_000_000).unwrap_or(u64::MAX),
+                cap_gwei: u64::try_from(MAX_FEE_PER_GAS_CAP_WEI / 1_000_000_000)
+                    .unwrap_or(u64::MAX),
+            });
+        }
+
+        let mut tx = TransactionRequest::default()
+            .with_from(signer_address)
+            .with_to(to_address)
+            .with_nonce(nonce)
+            .with_value(value_wei)
+            .with_max_fee_per_gas(max_fee_per_gas)
+            .with_max_priority_fee_per_gas(PRIORITY_FEE_DEFAULT_WEI);
+        tx.set_chain_id(signed_revision_chain_id());
+
+        let est = match provider.estimate_gas(tx.clone()).await {
+            Ok(g) => g,
+            Err(e) => {
+                let msg = e.to_string();
+                // A plain transfer cannot revert with an `EntitlementRegistry`
+                // custom error, but an EOA target's `receive()` may
+                // revert if the target is actually a contract. Treat
+                // a generic revert as fatal.
+                if msg.to_ascii_lowercase().contains("revert") {
+                    return Err(ChainError::RevertedPreBroadcast {
+                        reason: "eth_transfer estimate reverted".to_string(),
+                    });
+                }
+                if is_insufficient_funds(&msg) {
+                    return Err(ChainError::InsufficientFunds {
+                        observed: None,
+                        message: msg,
+                    });
+                }
+                if is_transient_rpc_error(&msg) && attempts < PUBLISH_REVISION_MAX_RETRIES {
+                    backoff_for_attempt(attempts).await;
+                    continue;
+                }
+                return Err(ChainError::RpcTransient {
+                    message: msg,
+                    attempts,
+                });
+            }
+        };
+        let gas_limit = est
+            .saturating_mul(GAS_ESTIMATE_NUMER)
+            .saturating_div(GAS_ESTIMATE_DENOM);
+        tx = tx.with_gas_limit(gas_limit);
+
+        match provider.send_transaction(tx).await {
+            Ok(p) => return Ok(p),
+            Err(e) => {
+                let msg = e.to_string();
+                if is_nonce_collision(&msg) {
+                    if attempts < PUBLISH_REVISION_MAX_RETRIES {
+                        continue;
+                    }
+                    return Err(ChainError::NonceUnresolvable { attempts });
+                }
+                if is_insufficient_funds(&msg) {
+                    return Err(ChainError::InsufficientFunds {
+                        observed: None,
+                        message: msg,
+                    });
+                }
+                if is_transient_rpc_error(&msg) && attempts < PUBLISH_REVISION_MAX_RETRIES {
+                    backoff_for_attempt(attempts).await;
+                    continue;
+                }
+                return Err(ChainError::RpcTransient {
+                    message: msg,
+                    attempts,
+                });
+            }
+        }
+    }
+}
+
+/// Process the receipt for an ETH-transfer tx. Status must be 1; the
+/// receipt's `to` field must equal the requested destination (RPC-spoof
+/// defense — a stale or fabricated receipt for a different tx is
+/// rejected).
+fn process_eth_transfer_receipt(
+    receipt: &alloy::rpc::types::TransactionReceipt,
+    tx_hash: B256,
+    expected_to: Address,
+    expected_value: U256,
+) -> Result<EthTransferAnchorV1, ChainError> {
+    if !receipt.status() {
+        return Err(ChainError::RevertedOnChain {
+            reason: "unknown revert (status=0)".to_string(),
+            tx_hash,
+        });
+    }
+    let block_number = receipt
+        .block_number
+        .ok_or_else(|| ChainError::Decode("receipt missing block_number".into()))?;
+    let block_hash = receipt
+        .block_hash
+        .ok_or_else(|| ChainError::Decode("receipt missing block_hash".into()))?;
+    if receipt.to != Some(expected_to) {
+        return Err(ChainError::ReceiptMismatch {
+            expected_signer: expected_to,
+            observed_signer: receipt.to.unwrap_or_default(),
+        });
+    }
+    Ok(EthTransferAnchorV1 {
+        tx_hash,
+        block_number,
+        block_hash,
+        value_wei: expected_value,
+    })
+}
+
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------

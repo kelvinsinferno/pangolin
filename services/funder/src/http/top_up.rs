@@ -1,30 +1,39 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! `POST /funder/v1/top-up` — the redemption flow.
+//! `POST /funder/v1/top-up` — the redemption + ETH-transfer flow.
 //!
-//! Per R-c + R-g + L3 + L-payment-order:
+//! Per R-c + R-g + L3 + L-payment-order (audit HIGH-1 fix-pass
+//! 2026-05-15 wires the ETH-transfer leg, the cap-check, and the
+//! lifecycle state machine):
 //!
 //! 1. Rate-limit check (per-address + global). Trip → 429.
 //! 2. Parse + validate the request body. Bad shape → 400 `bad_request`.
 //! 3. Verify the Credit attestation's EIP-712 signature against the
 //!    cached `PAYMENT_AUTHORITY`. Mismatch → 400 `credit_signature_invalid`.
+//!    Defense-in-depth: enforce canonical-low-s on the funder side too
+//!    (audit LOW#3 fix; the contract also enforces this but
+//!    rejecting at the HTTP layer saves a wasted on-chain tx).
 //! 4. Check expiry / schema version. Bad → 400 with the relevant
 //!    class.
 //! 5. Verify the device-binding signature per R-g. Mismatch → 400
 //!    `device_binding_invalid`.
-//! 6. Off-chain replay defense: `INSERT INTO payments` with
+//! 6. ETH-transfer cap pre-check (L-DOS-eth-drain). If the Credit's
+//!    `amount` exceeds the per-tx cap, fail closed with 400 BEFORE
+//!    the redemption submit so the user's on-chain balance is
+//!    preserved.
+//! 7. Off-chain replay defense: `INSERT INTO payments` with
 //!    `attestation_hash UNIQUE`. Conflict → 409 `already_redeemed`.
-//! 7. Sign + submit the `Redemption` attestation (the funder is the
-//!    `REDEMPTION_AUTHORITY` half of 2.2 R-a). Submit failure → 502
-//!    `chain_submit_failed` (the ledger row remains; the operator
-//!    can manually reconcile or the next retry-loop reads + resubmits).
-//! 8. Send ETH to the device address (deferred to MVP-2 issue 18.5
-//!    runbook hardening — the L-payment-order race fix that ships in
-//!    the cold-wallet refill cycle). For 3.4 we update the ledger
-//!    row with the redemption tx hash and return BOTH tx hashes; the
-//!    ETH-transfer hash for now is set equal to the redemption hash
-//!    as a structural placeholder + documented in the integration
-//!    runbook. See `docs/architecture/funder-service.md` for the
-//!    deferred-scope rationale.
+//! 8. Sign + submit the `Redemption` attestation (the funder is the
+//!    `REDEMPTION_AUTHORITY` half of 2.2 R-a). The ledger row's
+//!    `state` advances:
+//!      - on `eth_sendRawTransaction` Ok → `RedeemSubmitted` (the
+//!        `update_redemption_tx_hash` helper sets this atomically).
+//!      - on receipt confirm → `RedeemMined`.
+//! 9. Send ETH to the device address (audit HIGH-1 fix). Build an
+//!    EIP-1559 envelope via `submit_eth_transfer_v1`; await 1-conf
+//!    receipt; advance lifecycle to `EthTransferSubmitted` then
+//!    `EthTransferMined`. On failure the row goes to
+//!    `EthTransferFailed` (terminal; operator reconciliation per the
+//!    funder runbook).
 //!
 //! All error paths log at WARN with the rate-limit-class + the error
 //! class only — no user identifiers per L12.
@@ -36,7 +45,7 @@ use axum::Json;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pangolin_chain::{
-    submit_redemption_v1, ChainEnv, RedemptionFieldsV1,
+    is_canonical_s, submit_eth_transfer_v1, submit_redemption_v1, ChainEnv, RedemptionFieldsV1,
     ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1,
     EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA,
 };
@@ -46,7 +55,9 @@ use pangolin_funder_client::{
 
 use crate::error::FunderError;
 use crate::http::AppState;
+use crate::ledger::PaymentState;
 use crate::rate_limit::RateLimitOutcome;
+use crate::resume::clamp_eth_transfer_amount;
 
 // ---------------------------------------------------------------------
 // Wire shapes (serde adapters around the canonical `pangolin-funder-client`
@@ -79,10 +90,15 @@ pub struct WireCredit {
 }
 
 /// Wire shape for the response body.
+///
+/// `eth_transfer_tx_hash` is `Option<String>` (serialised as JSON
+/// `null` on transfer failure) so the client can tell the redeem-mined-
+/// but-transfer-failed case apart from the happy path. The
+/// `eth_transferred_wei` field is `"0x0"` on failure.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WireTopUpResponse {
     pub redeem_tx_hash: String,
-    pub eth_transfer_tx_hash: String,
+    pub eth_transfer_tx_hash: Option<String>,
     pub eth_transferred_wei: String,
 }
 
@@ -221,7 +237,26 @@ pub async fn handle(
         return Err(FunderError::DeviceBindingInvalid);
     }
 
-    // 6. Off-chain replay defense: insert the ledger row. The
+    // 6. ETH-transfer per-tx cap pre-check (L-DOS-eth-drain). The
+    //    cap is enforced BEFORE the redemption submit so a malicious
+    //    or compromised PAYMENT_AUTHORITY cannot drain the funder
+    //    hot wallet — and a cap-exceeded request never debits the
+    //    user's on-chain balance.
+    let Some(eth_amount) =
+        clamp_eth_transfer_amount(req.credit.amount, state.eth_transfer_per_tx_cap_wei)
+    else {
+        tracing::warn!(
+            target: "pangolin_funder::http::top_up",
+            class = "eth_transfer_cap_exceeded",
+            "credit amount exceeds per-tx ETH-transfer cap; failing closed before redeem"
+        );
+        return Err(FunderError::EthTransferCapExceeded {
+            observed_wei: req.credit.amount,
+            cap_wei: state.eth_transfer_per_tx_cap_wei,
+        });
+    };
+
+    // 7. Off-chain replay defense: insert the ledger row. The
     //    `attestation_hash` column UNIQUE constraint rejects a
     //    duplicate; we surface that as 409 `already_redeemed`.
     let inserted = state
@@ -243,7 +278,7 @@ pub async fn handle(
         return Err(FunderError::AlreadyRedeemed);
     }
 
-    // 7. Sign + submit the Redemption attestation.
+    // 8. Sign + submit the Redemption attestation.
     let redemption_fields = RedemptionFieldsV1 {
         user_id: req.credit.user_id,
         amount: req.credit.amount,
@@ -266,7 +301,7 @@ pub async fn handle(
                 .into(),
         )
     })?;
-    let anchor = submit_redemption_v1(
+    let redeem_anchor = submit_redemption_v1(
         local_signer,
         &signed_redemption,
         state.chain_env,
@@ -274,31 +309,96 @@ pub async fn handle(
     )
     .await?;
 
-    // 8. Update ledger with the redemption tx hash.
+    // 9. Update ledger with the redemption tx hash (advances state to
+    //    RedeemSubmitted) and then explicitly to RedeemMined (the
+    //    redeem path awaits 1-conf receipt before returning Ok).
     state
         .ledger
-        .update_redemption_tx_hash(attestation_hash, anchor.tx_hash)
+        .update_redemption_tx_hash(attestation_hash, redeem_anchor.tx_hash)
+        .await
+        .map_err(FunderError::from)?;
+    state
+        .ledger
+        .transition_state(attestation_hash, PaymentState::RedeemMined)
         .await
         .map_err(FunderError::from)?;
 
-    // ETH-transfer is deferred per the module docstring; the wire
-    // response includes the redemption tx hash twice as a structural
-    // placeholder. When the L-payment-order race fix lands, this
-    // becomes a distinct tx hash.
-    let eth_transfer_tx_hash = anchor.tx_hash;
-    let eth_transferred_wei = U256::ZERO;
+    // 10. ETH transfer (audit HIGH-1 fix). On ANY failure the
+    //     redemption is already on chain — the user's balance was
+    //     debited. We surface HTTP 500 with the redeem tx hash so
+    //     the operator can manually reconcile per the funder runbook;
+    //     the ledger row is marked `EthTransferFailed` (terminal).
+    let eth_anchor = match submit_eth_transfer_v1(
+        local_signer,
+        req.device_address,
+        eth_amount,
+        state.chain_env,
+        &state.rpc_url,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            // Map to a class tag the operator log can correlate
+            // against the L12 redacted-public-class taxonomy.
+            let class: &'static str = match &e {
+                pangolin_chain::ChainError::InsufficientFunds { .. } => "insufficient_funds",
+                pangolin_chain::ChainError::GasCapExceeded { .. } => "gas_cap_exceeded",
+                pangolin_chain::ChainError::Rpc(_)
+                | pangolin_chain::ChainError::RpcTransient { .. } => "rpc_transient",
+                pangolin_chain::ChainError::Reverted { .. }
+                | pangolin_chain::ChainError::RevertedOnChain { .. }
+                | pangolin_chain::ChainError::RevertedPreBroadcast { .. } => "contract_reverted",
+                pangolin_chain::ChainError::ChainIdMismatch { .. } => "chain_id_mismatch",
+                pangolin_chain::ChainError::ReceiptMismatch { .. } => "receipt_mismatch",
+                _ => "eth_transfer_other",
+            };
+            tracing::error!(
+                target: "pangolin_funder::http::top_up",
+                class = "eth_transfer_failed",
+                tx_class = class,
+                redeem_tx = %redeem_anchor.tx_hash,
+                "CRITICAL: redeem mined but ETH transfer failed; manual reconciliation required"
+            );
+            // Mark the ledger row terminal.
+            let _ = state
+                .ledger
+                .transition_state(attestation_hash, PaymentState::EthTransferFailed)
+                .await;
+            return Err(FunderError::EthTransferFailed {
+                redeem_tx_hash: redeem_anchor.tx_hash,
+                class,
+            });
+        }
+    };
+
+    // Stamp the transfer submission + mine in the ledger. The
+    // `submit_eth_transfer_v1` helper awaits the 1-conf receipt
+    // before returning, so by the time we're here both transitions
+    // are valid.
+    state
+        .ledger
+        .mark_eth_transfer_submitted(attestation_hash, eth_anchor.tx_hash, eth_amount)
+        .await
+        .map_err(FunderError::from)?;
+    state
+        .ledger
+        .mark_eth_transfer_mined(attestation_hash, eth_anchor.block_number)
+        .await
+        .map_err(FunderError::from)?;
 
     tracing::info!(
         target: "pangolin_funder::http::top_up",
         class = "ok",
-        tx = %anchor.tx_hash,
-        "redemption submitted"
+        redeem_tx = %redeem_anchor.tx_hash,
+        eth_transfer_tx = %eth_anchor.tx_hash,
+        "redemption + eth-transfer completed"
     );
 
     Ok(Json(WireTopUpResponse {
-        redeem_tx_hash: format!("{:?}", anchor.tx_hash),
-        eth_transfer_tx_hash: format!("{eth_transfer_tx_hash:?}"),
-        eth_transferred_wei: format!("0x{eth_transferred_wei:x}"),
+        redeem_tx_hash: format!("{:?}", redeem_anchor.tx_hash),
+        eth_transfer_tx_hash: Some(format!("{:?}", eth_anchor.tx_hash)),
+        eth_transferred_wei: format!("0x{eth_amount:x}"),
     }))
 }
 
@@ -372,6 +472,19 @@ fn verify_credit_signature(credit: &Credit, payment_authority: Address, env: Cha
     buf[34..66].copy_from_slice(struct_hash.as_slice());
     let digest = keccak256(buf);
 
+    // Defense-in-depth (audit LOW#3): enforce canonical-low-s on the
+    // funder side too. The contract's `_recover` also enforces this,
+    // but rejecting at the HTTP layer saves a wasted on-chain tx and
+    // avoids leaking a queue slot. The pinned half-order constant
+    // lives in pangolin-chain::secp256k1_signing per existing
+    // precedent in 3.1 / 3.3.
+    let s_bytes: [u8; 32] = credit.signature[32..64]
+        .try_into()
+        .expect("64-byte signature slice");
+    if !is_canonical_s(&s_bytes) {
+        return false;
+    }
+
     // Recover the signer.
     let r = U256::from_be_slice(&credit.signature[0..32]);
     let s = U256::from_be_slice(&credit.signature[32..64]);
@@ -426,6 +539,7 @@ mod tests {
             payment_authority,
             chain_env: ChainEnv::BaseSepolia,
             rpc_url: "http://127.0.0.1:0".into(),
+            eth_transfer_per_tx_cap_wei: crate::ETH_TRANSFER_PER_TX_CAP_WEI,
         }
     }
 
@@ -597,5 +711,275 @@ mod tests {
         let authority = fixed_authority_signer();
         let state = build_state(authority.address());
         assert_eq!(state.payment_authority, authority.address());
+    }
+
+    // ---------------------------------------------------------------
+    // Audit fix-pass 2026-05-15 — tests for the HIGH-1 ETH-transfer
+    // wiring + LOW#3 canonical-low-s defense-in-depth.
+    // ---------------------------------------------------------------
+
+    /// LOW#3: a high-s signature must be rejected at the funder's
+    /// HTTP layer BEFORE any chain submission. The verifier wraps the
+    /// pinned `is_canonical_s` check from `pangolin-chain`.
+    #[test]
+    fn canonical_low_s_check_rejects_high_s_credit() {
+        use alloy::primitives::U256;
+        let authority = fixed_authority_signer();
+        let mut credit = fresh_credit();
+        sign_credit(&authority, &mut credit);
+        // Sanity: round-trip still works (the helper canonicalises).
+        assert!(verify_credit_signature(
+            &credit,
+            authority.address(),
+            ChainEnv::BaseSepolia
+        ));
+
+        // Flip s to its high-s representative (n - s). Reload SECP_N
+        // here as the literal n constant.
+        let secp_n_be: [u8; 32] = alloy::primitives::hex!(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"
+        );
+        let n = U256::from_be_slice(&secp_n_be);
+        let s_low = U256::from_be_slice(&credit.signature[32..64]);
+        let s_high = n - s_low;
+        let s_high_be: [u8; 32] = s_high.to_be_bytes();
+        credit.signature[32..64].copy_from_slice(&s_high_be);
+        // Flip v parity to match the high-s recovery (27 ↔ 28).
+        credit.signature[64] = if credit.signature[64] == 27 { 28 } else { 27 };
+
+        // Even though the high-s variant would recover the same
+        // address under raw ecrecover, the canonical-low-s gate rejects.
+        assert!(!verify_credit_signature(
+            &credit,
+            authority.address(),
+            ChainEnv::BaseSepolia
+        ));
+    }
+
+    /// HIGH-1 fix: a Credit with `amount > cap` must be rejected at
+    /// the handler with HTTP 400 + `eth_transfer_cap_exceeded` BEFORE
+    /// any redemption tx submits. We exercise the cap-check helper
+    /// directly here (since the full handler path requires a live
+    /// RPC mock).
+    #[test]
+    fn eth_transfer_cap_exceeded_pre_check_rejects() {
+        let cap: u128 = crate::ETH_TRANSFER_PER_TX_CAP_WEI;
+        let over_cap = U256::from(cap) + U256::from(1u64);
+        assert_eq!(
+            crate::resume::clamp_eth_transfer_amount(over_cap, cap),
+            None,
+            "amount above cap must produce a None clamp (handler maps to 400)"
+        );
+        // At-cap is the boundary; passes.
+        assert_eq!(
+            crate::resume::clamp_eth_transfer_amount(U256::from(cap), cap),
+            Some(U256::from(cap))
+        );
+    }
+
+    /// HIGH-1: the HTTP error variant for the cap-exceeded path
+    /// serialises with the agreed body fields. This is the wire
+    /// surface clients pin against.
+    #[test]
+    fn eth_transfer_cap_exceeded_error_response_shape() {
+        use axum::response::IntoResponse;
+        let err = FunderError::EthTransferCapExceeded {
+            observed_wei: U256::from(2_000_000_000_000_000_000u128),
+            cap_wei: 10_000_000_000_000_000,
+        };
+        assert_eq!(err.class(), "eth_transfer_cap_exceeded");
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+        // The body serialises observed_wei + cap_wei as hex strings.
+        let _resp = err.into_response();
+    }
+
+    /// HIGH-1: the HTTP error variant for the post-redeem transfer
+    /// failure includes the redeem tx hash so the operator can
+    /// reconcile manually per the runbook.
+    #[test]
+    fn eth_transfer_failed_error_response_shape() {
+        use axum::response::IntoResponse;
+        let err = FunderError::EthTransferFailed {
+            redeem_tx_hash: alloy::primitives::b256!(
+                "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+            ),
+            class: "rpc_transient",
+        };
+        assert_eq!(err.class(), "eth_transfer_failed");
+        assert_eq!(err.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let _resp = err.into_response();
+    }
+
+    /// HIGH-1 lifecycle: a ledger row in `RedeemMined` is picked up
+    /// by `find_resumable_entries` — this is the resume contract that
+    /// the restart-scan in `main.rs` relies on. The actual ETH-transfer
+    /// drive requires a live RPC and is covered by the live
+    /// integration test (network-gated).
+    #[tokio::test]
+    async fn restart_scan_resumes_redeem_mined_entries() {
+        let ledger = PaymentLedger::open_in_memory().expect("ledger");
+        let h = alloy::primitives::b256!(
+            "0xABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB"
+        );
+        ledger
+            .try_insert(
+                h,
+                [0xAAu8; 32],
+                fixed_device_signer().address(),
+                U256::from(1u64),
+            )
+            .await
+            .expect("insert");
+        ledger
+            .transition_state(h, PaymentState::RedeemMined)
+            .await
+            .expect("transition");
+        let rows = ledger.find_resumable_entries().await.expect("scan");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, PaymentState::RedeemMined);
+        assert_eq!(rows[0].attestation_hash, h);
+    }
+
+    /// HIGH-1 lifecycle: a ledger row in `EthTransferSubmitted` is
+    /// also picked up by `find_resumable_entries`; the resume path
+    /// closes the receipt-poll race per L-payment-order.
+    #[tokio::test]
+    async fn restart_scan_resumes_eth_transfer_submitted_entries() {
+        let ledger = PaymentLedger::open_in_memory().expect("ledger");
+        let h = alloy::primitives::b256!(
+            "0xCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCD"
+        );
+        ledger
+            .try_insert(
+                h,
+                [0xAAu8; 32],
+                fixed_device_signer().address(),
+                U256::from(1u64),
+            )
+            .await
+            .expect("insert");
+        let eth_tx = alloy::primitives::b256!(
+            "0xEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEF"
+        );
+        ledger
+            .mark_eth_transfer_submitted(h, eth_tx, U256::from(1u64))
+            .await
+            .expect("mark submitted");
+        let rows = ledger.find_resumable_entries().await.expect("scan");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, PaymentState::EthTransferSubmitted);
+        assert_eq!(rows[0].eth_transfer_tx_hash, Some(eth_tx));
+    }
+
+    /// HIGH-1 happy-path lifecycle drive: simulate the handler's
+    /// post-redeem ledger transitions WITHOUT going through a live
+    /// chain. The handler's flow updates ledger state
+    /// `pre_redeem → redeem_submitted → redeem_mined →
+    /// eth_transfer_submitted → eth_transfer_mined`; this test
+    /// asserts the ledger surface supports each transition in
+    /// sequence.
+    #[tokio::test]
+    async fn happy_path_full_flow_with_eth_transfer() {
+        let ledger = PaymentLedger::open_in_memory().expect("ledger");
+        let h = alloy::primitives::b256!(
+            "0x4242424242424242424242424242424242424242424242424242424242424242"
+        );
+        let device = fixed_device_signer().address();
+        let credit_amount = U256::from(1_000_000_000_000u128); // 0.000001 ETH
+        let eth_amount = credit_amount;
+
+        // Insert (PreRedeem) → stamp redeem (RedeemSubmitted) →
+        // RedeemMined → stamp transfer (EthTransferSubmitted) →
+        // EthTransferMined.
+        ledger
+            .try_insert(h, [0xAAu8; 32], device, credit_amount)
+            .await
+            .expect("insert");
+        let redeem_tx = alloy::primitives::b256!(
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        ledger
+            .update_redemption_tx_hash(h, redeem_tx)
+            .await
+            .expect("stamp redeem");
+        let row = ledger
+            .get_by_attestation_hash(h)
+            .await
+            .expect("query")
+            .expect("present");
+        assert_eq!(row.state, PaymentState::RedeemSubmitted);
+
+        ledger
+            .transition_state(h, PaymentState::RedeemMined)
+            .await
+            .expect("transition");
+        let eth_tx = alloy::primitives::b256!(
+            "0x2222222222222222222222222222222222222222222222222222222222222222"
+        );
+        ledger
+            .mark_eth_transfer_submitted(h, eth_tx, eth_amount)
+            .await
+            .expect("stamp transfer");
+        ledger
+            .mark_eth_transfer_mined(h, 100)
+            .await
+            .expect("mark mined");
+
+        let row = ledger
+            .get_by_attestation_hash(h)
+            .await
+            .expect("query")
+            .expect("present");
+        assert_eq!(row.state, PaymentState::EthTransferMined);
+        assert_eq!(row.redemption_tx_hash, Some(redeem_tx));
+        assert_eq!(row.eth_transfer_tx_hash, Some(eth_tx));
+        assert_eq!(row.eth_transferred_wei, Some(eth_amount));
+        assert_eq!(row.eth_transfer_block, Some(100));
+    }
+
+    /// HIGH-1 sad-path: when the ETH transfer fails post-redeem, the
+    /// ledger row transitions to `EthTransferFailed` (terminal). The
+    /// operator runbook covers the manual reconciliation.
+    #[tokio::test]
+    async fn eth_transfer_failure_marks_terminal_state() {
+        let ledger = PaymentLedger::open_in_memory().expect("ledger");
+        let h = alloy::primitives::b256!(
+            "0xBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABEBABE"
+        );
+        ledger
+            .try_insert(
+                h,
+                [0xAAu8; 32],
+                fixed_device_signer().address(),
+                U256::from(1u64),
+            )
+            .await
+            .expect("insert");
+        // Simulate: redeem advanced through RedeemSubmitted +
+        // RedeemMined, then the transfer leg blew up.
+        let redeem_tx = alloy::primitives::b256!(
+            "0x3333333333333333333333333333333333333333333333333333333333333333"
+        );
+        ledger
+            .update_redemption_tx_hash(h, redeem_tx)
+            .await
+            .expect("stamp redeem");
+        ledger
+            .transition_state(h, PaymentState::RedeemMined)
+            .await
+            .expect("transition");
+        // The handler's failure arm marks the row terminal.
+        ledger
+            .transition_state(h, PaymentState::EthTransferFailed)
+            .await
+            .expect("transition");
+        let row = ledger
+            .get_by_attestation_hash(h)
+            .await
+            .expect("query")
+            .expect("present");
+        assert_eq!(row.state, PaymentState::EthTransferFailed);
+        assert_eq!(row.redemption_tx_hash, Some(redeem_tx));
+        assert_eq!(row.eth_transfer_tx_hash, None);
     }
 }

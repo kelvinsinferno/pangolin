@@ -55,16 +55,20 @@ pub trait FunderSigner: Send + Sync + fmt::Debug {
     /// Borrow the underlying `PrivateKeySigner`, if this impl is
     /// file-backed.
     ///
-    /// Required for the chain-submit path (`submit_redemption_v1`
-    /// + the ETH-transfer alloy wallet construction): alloy 2.x
-    /// expects a `PrivateKeySigner` for `ProviderBuilder::wallet`,
-    /// and the HSM-shaped future impl will surface this via a
-    /// different code path (a `SignerSync`-implementing adapter
-    /// constructed from RPC, not a literal scalar).
-    ///
-    /// `FileKeystoreSigner::inner` returns `Some`; the (future) HSM
-    /// signer would return `None`, forcing the caller to use the
-    /// HSM-RPC adapter instead.
+    /// **Design note (audit LOW#2, acknowledged-deferred 2026-05-15):**
+    /// the `local_signer` accessor is **file-backed-only by design**.
+    /// The chain-submit helpers (`submit_redemption_v1`,
+    /// `submit_eth_transfer_v1`) take a `&PrivateKeySigner` because
+    /// alloy 2.x's `ProviderBuilder::wallet` expects that concrete
+    /// type. A future HSM impl returns `None` from this method and
+    /// takes a **different code path** — a `SignerSync`-implementing
+    /// RPC adapter rather than a literal scalar in process memory.
+    /// The handler's `FunderError::Configuration("local_signer
+    /// unavailable...")` branch is the surface that triggers when
+    /// an HSM signer is wired in but the HSM-RPC adapter path is not
+    /// yet shipped (deferred to mainnet per the plan-gate). Per the
+    /// audit: this is an acknowledged future-work surface, not a
+    /// 3.4 bug.
     fn local_signer(&self) -> Option<&PrivateKeySigner>;
 }
 

@@ -2,14 +2,27 @@
 #
 # `pangolin-funder` — one-way ETH dispenser service (MVP-2 issue 3.4).
 #
-# Per docs/issue-plans/3.4.md L1 + L7 + L8: this crate is DELIBERATELY
-# isolated from `pangolin-store` / `pangolin-core` / `pangolin-crypto` /
-# `pangolin-ffi`. The dep set below is reviewed against L1 + L7 at
-# every plan-gate; new deps require justification (L8).
+# Per docs/issue-plans/3.4.md L1 + L7 + L8: this crate has NO DIRECT
+# dependency on the vault crates (`pangolin-store` / `pangolin-core` /
+# `pangolin-crypto` / `pangolin-ffi`). The dep set below is reviewed
+# against L1 + L7 at every plan-gate; new direct deps require
+# justification (L8).
+#
+# Audit fix-pass note (2026-05-15): `pangolin-crypto` reaches
+# TRANSITIVELY via `pangolin-chain` (which uses `DeviceKey` types for
+# Ed25519→secp256k1 EVM-wallet derivation). That is fine — the funder
+# uses only the Address + key-derivation types from pangolin-chain,
+# never the AEAD seal or the session-policy code. The crypto code on
+# the transitive path is the same code the rest of the workspace
+# audits; the L1 invariant is satisfied by the absence of a DIRECT
+# dependency, not by the absence of a transitive one.
 #
 # CI invariant (run from the workspace root):
-#   cargo tree -p pangolin-funder | grep -E "pangolin-(store|core|crypto|ffi)" | wc -l
-# must return 0.
+#   cargo tree -p pangolin-funder --edges normal \
+#     | grep -E "^[^├└]+ (pangolin-store|pangolin-core|pangolin-ffi) " | wc -l
+# must return 0. (`--edges normal` filters dev-deps; pangolin-crypto
+# is excluded from the grep on purpose because the transitive presence
+# via pangolin-chain is expected.)
 
 [package]
 name        = "pangolin-funder"

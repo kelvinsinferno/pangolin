@@ -48,6 +48,10 @@ pub struct AppState {
     pub chain_env: ChainEnv,
     /// RPC URL the chain submit path uses.
     pub rpc_url: String,
+    /// Per-tx ETH-transfer hard cap (wei). L-DOS-eth-drain defense:
+    /// a Credit attestation with `amount > cap` is rejected BEFORE the
+    /// redeem submit so the user's balance is preserved.
+    pub eth_transfer_per_tx_cap_wei: u128,
 }
 
 impl core::fmt::Debug for AppState {

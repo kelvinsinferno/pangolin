@@ -75,6 +75,35 @@ pub enum FunderError {
         class: &'static str,
     },
 
+    /// The Credit attestation's `amount` exceeds the funder's per-tx
+    /// ETH-transfer hard cap (L-DOS-eth-drain). HTTP 400. Per the
+    /// L-payment-order doctrine: fail closed BEFORE the redemption tx
+    /// so the user's on-chain balance is preserved. Wei values are
+    /// rendered as hex strings in the response body to avoid surfacing
+    /// `U256` decimal arithmetic in JSON.
+    #[error("eth transfer cap exceeded")]
+    EthTransferCapExceeded {
+        /// Requested wei (from the Credit attestation amount).
+        observed_wei: alloy::primitives::U256,
+        /// Per-tx cap in wei.
+        cap_wei: u128,
+    },
+
+    /// The redemption tx mined successfully but the ETH-transfer leg
+    /// failed (RPC timeout, insufficient hot-wallet balance, transfer
+    /// reverted). HTTP 500. The response body includes the redeem
+    /// tx hash so the operator can manually reconcile per the
+    /// funder runbook.
+    #[error("eth transfer failed (class={class})")]
+    EthTransferFailed {
+        /// 32-byte hash of the successfully-mined redemption tx. The
+        /// user's balance was debited; manual recovery via the
+        /// funder runbook is required.
+        redeem_tx_hash: alloy::primitives::B256,
+        /// Short class tag — one of the `ChainError` variant names.
+        class: &'static str,
+    },
+
     /// Ledger write failed. HTTP 500.
     #[error("ledger operation failed")]
     Ledger,
@@ -110,6 +139,8 @@ impl FunderError {
             Self::DeviceBindingInvalid => "device_binding_invalid",
             Self::AlreadyRedeemed => "already_redeemed",
             Self::ChainSubmit { .. } => "chain_submit_failed",
+            Self::EthTransferCapExceeded { .. } => "eth_transfer_cap_exceeded",
+            Self::EthTransferFailed { .. } => "eth_transfer_failed",
             Self::Ledger => "ledger_error",
             Self::Keystore(_) | Self::Configuration(_) => "configuration_error",
             Self::Internal => "internal_error",
@@ -125,12 +156,15 @@ impl FunderError {
             | Self::CreditSigInvalid
             | Self::CreditExpired
             | Self::CreditSchemaUnsupported
-            | Self::DeviceBindingInvalid => StatusCode::BAD_REQUEST,
+            | Self::DeviceBindingInvalid
+            | Self::EthTransferCapExceeded { .. } => StatusCode::BAD_REQUEST,
             Self::AlreadyRedeemed => StatusCode::CONFLICT,
             Self::ChainSubmit { .. } => StatusCode::BAD_GATEWAY,
-            Self::Ledger | Self::Keystore(_) | Self::Configuration(_) | Self::Internal => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::EthTransferFailed { .. }
+            | Self::Ledger
+            | Self::Keystore(_)
+            | Self::Configuration(_)
+            | Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -186,18 +220,96 @@ pub struct ErrorBody {
     /// Present only on rate-limit responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_seconds: Option<u64>,
+    /// Present only on `eth_transfer_cap_exceeded` responses. Hex
+    /// string (`0x...`) representation of the requested wei value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_wei: Option<String>,
+    /// Present only on `eth_transfer_cap_exceeded` responses. Hex
+    /// string representation of the configured cap (wei).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cap_wei: Option<String>,
+    /// Present only on `eth_transfer_failed` responses. The 32-byte
+    /// redeem tx hash the operator uses for manual recovery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redeem_tx_hash: Option<String>,
+    /// Present only on `eth_transfer_failed` responses. When the
+    /// `eth_transfer_failed` class is set, this serialises as JSON
+    /// `null` so the client always sees the key (matching the success
+    /// response's `eth_transfer_tx_hash` field shape but with no
+    /// value). Skipped entirely on other error classes.
+    #[serde(skip_serializing_if = "EthTransferTxField::is_absent")]
+    pub eth_transfer_tx_hash: EthTransferTxField,
+}
+
+/// Marker for the `eth_transfer_tx_hash` field in the
+/// `eth_transfer_failed` error body. Serialises as JSON `null` when
+/// `Present`, omitted when `Absent`.
+#[derive(Debug, Default, Clone, Copy)]
+pub enum EthTransferTxField {
+    /// Field not in this response.
+    #[default]
+    Absent,
+    /// Field present but value is `null` (the transfer failed; the
+    /// redeem tx hash carries the recoverable identity).
+    PresentNull,
+}
+
+impl EthTransferTxField {
+    #[must_use]
+    pub const fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+}
+
+impl serde::Serialize for EthTransferTxField {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        match self {
+            // Absent variants are filtered by `is_absent` upstream.
+            Self::Absent | Self::PresentNull => ser.serialize_none(),
+        }
+    }
 }
 
 impl IntoResponse for FunderError {
     fn into_response(self) -> Response {
         let status = self.status();
-        let body = ErrorBody {
-            error: self.class(),
-            retry_after_seconds: match &self {
-                Self::RateLimited {
-                    retry_after_seconds,
-                } => Some(*retry_after_seconds),
-                _ => None,
+        let body = match &self {
+            Self::RateLimited {
+                retry_after_seconds,
+            } => ErrorBody {
+                error: self.class(),
+                retry_after_seconds: Some(*retry_after_seconds),
+                observed_wei: None,
+                cap_wei: None,
+                redeem_tx_hash: None,
+                eth_transfer_tx_hash: EthTransferTxField::Absent,
+            },
+            Self::EthTransferCapExceeded {
+                observed_wei,
+                cap_wei,
+            } => ErrorBody {
+                error: self.class(),
+                retry_after_seconds: None,
+                observed_wei: Some(format!("0x{observed_wei:x}")),
+                cap_wei: Some(format!("0x{cap_wei:x}")),
+                redeem_tx_hash: None,
+                eth_transfer_tx_hash: EthTransferTxField::Absent,
+            },
+            Self::EthTransferFailed { redeem_tx_hash, .. } => ErrorBody {
+                error: self.class(),
+                retry_after_seconds: None,
+                observed_wei: None,
+                cap_wei: None,
+                redeem_tx_hash: Some(format!("{redeem_tx_hash:?}")),
+                eth_transfer_tx_hash: EthTransferTxField::PresentNull,
+            },
+            _ => ErrorBody {
+                error: self.class(),
+                retry_after_seconds: None,
+                observed_wei: None,
+                cap_wei: None,
+                redeem_tx_hash: None,
+                eth_transfer_tx_hash: EthTransferTxField::Absent,
             },
         };
         let json = Json(body);

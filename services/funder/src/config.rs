@@ -17,6 +17,7 @@ use crate::rate_limit::{
     RateLimitConfig, GLOBAL_CAP_PER_HOUR, PER_ADDRESS_BUCKET_SIZE,
     PER_ADDRESS_REPLENISH_INTERVAL_SECS,
 };
+use crate::ETH_TRANSFER_PER_TX_CAP_WEI;
 
 /// Default bind address. `127.0.0.1` (NOT `0.0.0.0`) per L-funder-service-MITM:
 /// the funder is expected to sit behind a TLS-terminating reverse proxy.
@@ -59,6 +60,9 @@ pub struct FunderConfig {
     pub rate_limit: RateLimitConfig,
     /// HTTP body size limit (bytes).
     pub body_size_limit_bytes: usize,
+    /// Per-tx ETH-transfer hard cap (wei). Override via
+    /// `FUNDER_ETH_TRANSFER_PER_TX_CAP_WEI` (decimal or 0x-hex).
+    pub eth_transfer_per_tx_cap_wei: u128,
 }
 
 impl FunderConfig {
@@ -97,6 +101,9 @@ impl FunderConfig {
         };
         let body_size_limit_bytes =
             env_var_usize("FUNDER_BODY_SIZE_LIMIT_BYTES")?.unwrap_or(DEFAULT_BODY_SIZE_LIMIT_BYTES);
+        let eth_transfer_per_tx_cap_wei =
+            env_var_u128_hex_or_dec("FUNDER_ETH_TRANSFER_PER_TX_CAP_WEI")?
+                .unwrap_or(ETH_TRANSFER_PER_TX_CAP_WEI);
 
         Ok(Self {
             chain_env,
@@ -108,7 +115,25 @@ impl FunderConfig {
             dev_private_key_hex,
             rate_limit,
             body_size_limit_bytes,
+            eth_transfer_per_tx_cap_wei,
         })
+    }
+}
+
+fn env_var_u128_hex_or_dec(key: &str) -> Result<Option<u128>, FunderError> {
+    match env::var(key) {
+        Ok(v) => {
+            let trimmed = v.trim();
+            let parsed = if let Some(hex) = trimmed.strip_prefix("0x") {
+                u128::from_str_radix(hex, 16)
+            } else {
+                trimmed.parse::<u128>()
+            };
+            parsed
+                .map(Some)
+                .map_err(|e| FunderError::Configuration(format!("{key}={trimmed:?} not u128: {e}")))
+        }
+        Err(_) => Ok(None),
     }
 }
 

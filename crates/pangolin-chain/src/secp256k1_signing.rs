@@ -326,7 +326,13 @@ fn eip712_digest(domain_sep: B256, struct_hash_value: B256) -> B256 {
 
 /// Assert that `s ≤ secp256k1n/2` (canonical-low-s per EIP-2). Returns
 /// `true` if the input is canonical-low.
-fn is_canonical_s(s_be: &[u8; 32]) -> bool {
+///
+/// Public so client-side verifiers (e.g., the funder's Credit-sig
+/// verifier, audit LOW#3 defense-in-depth) can reject high-s sigs at
+/// the HTTP layer before consuming chain resources. Same constant
+/// (`SECP256K1_HALF_N`) every other call site uses.
+#[must_use]
+pub fn is_canonical_s(s_be: &[u8; 32]) -> bool {
     // Compare as big-endian unsigned ints. `<=` is a constant-time
     // pattern on the [u8; 32] representation; the comparison value is
     // public (a curve constant) so timing leakage is moot, but the

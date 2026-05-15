@@ -151,16 +151,25 @@ pub struct TopUpRequest {
 
 /// Response body for a successful `POST /funder/v1/top-up`.
 ///
-/// Per the master plan §5 funder protocol: returns BOTH transaction
-/// hashes (the on-chain `redeem` call + the subsequent ETH transfer)
-/// so the client can independently verify both legs on-chain.
+/// Per the master plan §5 funder protocol + the 3.4 audit fix-pass
+/// (2026-05-15): returns the redeem tx hash and — when the ETH
+/// transfer succeeded — the transfer tx hash. When
+/// `eth_transfer_tx_hash` is `None` but `redeem_tx_hash` is populated,
+/// the user's on-chain balance was debited but the ETH transfer
+/// failed; **manual recovery via the funder runbook is required**.
+/// The funder also returns HTTP 500 with class `eth_transfer_failed`
+/// in that scenario, so a typed client distinguishes the partial
+/// state from the success case without inspecting the body alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TopUpResponse {
     /// Tx hash of the `redeem(...)` call to the `EntitlementRegistry`.
     pub redeem_tx_hash: B256,
-    /// Tx hash of the ETH-transfer to `device_address`.
-    pub eth_transfer_tx_hash: B256,
-    /// ETH transferred (wei). Cross-check against the explorer.
+    /// Tx hash of the ETH-transfer to `device_address`. `None` when
+    /// the redeem succeeded but the transfer leg failed (operator
+    /// reconciliation required).
+    pub eth_transfer_tx_hash: Option<B256>,
+    /// ETH transferred (wei). `U256::ZERO` when the transfer leg
+    /// failed. Cross-check against the explorer.
     pub eth_transferred_wei: U256,
 }
 

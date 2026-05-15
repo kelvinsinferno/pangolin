@@ -101,13 +101,33 @@ pub mod error;
 pub mod http;
 pub mod ledger;
 pub mod rate_limit;
+pub mod resume;
 pub mod signer;
+
+/// Hard cap on the per-tx ETH amount the funder will dispense (wei).
+///
+/// Default: 0.01 ETH = `10_000_000_000_000_000` wei. Defends against a
+/// malicious or compromised `PAYMENT_AUTHORITY` minting a Credit
+/// attestation with a wildly oversized `amount` field that would
+/// otherwise drain the funder hot wallet on a single redeem
+/// (L-DOS-eth-drain per the plan-doc L-section). The audit-HIGH fix
+/// (2026-05-15) wires this cap into the top-up handler BEFORE the
+/// redemption submit, so a cap-exceeded request fails closed with the
+/// user's on-chain balance preserved.
+///
+/// Overridable at startup via the `FUNDER_ETH_TRANSFER_PER_TX_CAP_WEI`
+/// env var (parsed as u128 decimal or `0x`-prefixed hex). Override is
+/// recorded in the startup log; setting it ABOVE the on-disk default
+/// in production is an operational decision that goes through the
+/// funder runbook.
+pub const ETH_TRANSFER_PER_TX_CAP_WEI: u128 = 10_000_000_000_000_000;
 
 pub use config::FunderConfig;
 pub use error::FunderError;
 pub use http::AppState;
-pub use ledger::PaymentLedger;
+pub use ledger::{PaymentLedger, PaymentState};
 pub use rate_limit::{RateLimitConfig, RateLimitOutcome, RateLimiter};
+pub use resume::resume_in_flight;
 pub use signer::{FileKeystoreSigner, FunderSigner};
 
 /// Crate name. Useful for diagnostics + version reporting (e.g., the

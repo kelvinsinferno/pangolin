@@ -23,6 +23,7 @@ use pangolin_funder::{
     http::{routes::router, AppState},
     ledger::PaymentLedger,
     rate_limit::RateLimiter,
+    resume,
     signer::{FileKeystoreSigner, FunderSigner},
 };
 
@@ -82,6 +83,26 @@ async fn run() -> Result<(), FunderError> {
         "PAYMENT_AUTHORITY cached from on-chain read"
     );
 
+    // ---- Restart-scan resume (L-payment-order) ----
+    // Pick up any in-flight rows left by a previous run; drive each
+    // to a terminal state in the background. The INFO summary is the
+    // only public log; per-entry details stay at DEBUG per L12.
+    let resumed = resume::resume_in_flight(
+        ledger.clone(),
+        Arc::clone(&signer),
+        cfg.chain_env,
+        cfg.rpc_url.clone(),
+        cfg.eth_transfer_per_tx_cap_wei,
+    )
+    .await?;
+    if resumed > 0 {
+        tracing::info!(
+            target: "pangolin_funder::main",
+            count = resumed,
+            "resumed in-flight payment entries from previous run",
+        );
+    }
+
     // ---- State + router ----
     let rate_limiter = RateLimiter::new(cfg.rate_limit);
     let state = AppState {
@@ -92,6 +113,7 @@ async fn run() -> Result<(), FunderError> {
         payment_authority,
         chain_env: cfg.chain_env,
         rpc_url: cfg.rpc_url.clone(),
+        eth_transfer_per_tx_cap_wei: cfg.eth_transfer_per_tx_cap_wei,
     };
     let app = router(state, cfg.body_size_limit_bytes);
 
