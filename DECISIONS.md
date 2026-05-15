@@ -233,6 +233,93 @@ territory.
 
 ---
 
+## MVP-2 issue 3.6 resolved decisions (R-a..R-d) — 2026-05-15
+
+> **Status:** Locked at the 3.6 plan-gate by Kelvin's sign-off on
+> Q-a..Q-d (`docs/issue-plans/3.6.md` "Resolved decisions" table at
+> commit `a0f6d2a`). Builder agent shipped under the
+> `issue/3.6-privacy-scaffolding` worktree.
+>
+> **Status of the deliverable:** **scaffolding only**; ZERO production
+> logic for rotation / mixing / fresh-address ships in 3.6. Phase-2
+> Enhanced Privacy Mode implementation is deferred to MVP-3 / MVP-4.
+> See `docs/architecture/privacy.md` for the architectural overview
+> and `docs/issue-plans/3.6.md` for the L1..L7 invariants verbatim.
+
+### R-a · Abstraction shape — both `PrivacyMode` enum + `PrivacyStrategy` trait
+
+The enum (`PrivacyMode::{Default, EnhancedPrivacy}`) is the user-
+facing config surface; the trait (`PrivacyStrategy: Send + Sync`) is
+the internal hook-points contract with three methods
+(`derive_wallet_for_revision`, `transform_funder_response`,
+`select_address_for_vault`). `DefaultStrategy` is a verbatim no-op
+preserving 3.5 behaviour bit-for-bit (L1 + L4); `EnhancedPrivacyStrategy`
+is a fail-loudly stub returning `PrivacyError::NotYetImplemented`
+from every hook (L7). **Why:** matches the 3.4 `FunderSigner` trait +
+`FileKeystoreSigner` impl pattern (user-facing config + trait-based
+impl); architectural-locking property holds without the dyn-dispatch
+overhead becoming a hot-path concern.
+
+### R-b · All three Phase-2 modes scaffolded
+
+Per-revision wallet rotation hook + CoinJoin pre-mixing of funder
+top-ups hook + optional fresh-address-per-vault hook. CoinJoin reduced
+to a placeholder method on the trait (no concrete mixer wiring — the
+chosen mixer is a Phase-2 audit-gated decision). **Why:** Whitepaper
+§8.3 names only CoinJoin; master plan §5 row 3.6 expands to all three
+modes. 3.6 scaffolds master plan §5 row 3.6 per Kelvin's call; the
+Phase-2 issue will reconcile the formal-spec gap. Closing all three
+at the architectural level so MVP-3 / MVP-4 Phase-2 work has clean
+plug-points for any of them.
+
+### R-c · Central in `pangolin-chain::privacy` + distributed-impl consumer tests
+
+Enum + trait + error type + `DefaultStrategy` / `EnhancedPrivacyStrategy`
+impls all live in `crates/pangolin-chain/src/privacy/{mod.rs,
+default.rs, enhanced.rs, tests.rs}`. NO new workspace crate. Consumer
+crates (`pangolin-chain::secp256k1_signing`, `pangolin-store::Vault`,
+`pangolin-funder-client`) ship 3.6 touchpoint tests asserting the
+trait is callable + the no-op default preserves byte-identity at
+their consumer boundaries. Production fn signatures are NOT yet
+threaded with `&dyn PrivacyStrategy` parameters — that's Phase-2
+work. The `pangolin-funder-client` dev-dep on `pangolin-chain` is
+scoped to tests (the production L1 invariant of that crate is
+preserved). **Why:** central declarations live where wallet
+primitives already are (`pangolin-chain::evm`); impls live next to
+the callsites they hook into; no new crate edge in production.
+
+### R-d · Fail-loudly + byte-identity proof
+
+Three test classes in `crates/pangolin-chain/src/privacy/tests.rs`:
+(a) compile-time trait shape (`Send + Sync` on impls + on `Box<dyn
+PrivacyStrategy + Send + Sync>` + variant-label pinning); (b) byte-
+identity vs the 3.5 baseline (a `[u8; 65]` const captured from `main`
+at `3227d38` via the builder-time
+`crates/pangolin-chain/tests/baseline_capture.rs` harness; the 3.6
+test re-runs the equivalent path through `DefaultStrategy` and
+asserts byte-equality); (c) fail-loudly (3 tests, one per hook,
+asserting `PrivacyError::NotYetImplemented { mode: EnhancedPrivacy,
+hook: "..." }` fires). **Why:** the byte-identity property is the
+load-bearing L4 invariant — CI catches a regression immediately.
+
+### Whitepaper-§8.3-vs-master-plan-§5 gap (documented)
+
+§8.3 names only CoinJoin mixing; master plan §5 row 3.6 expands to
+THREE modes (rotation + CoinJoin + fresh-address-per-vault). 3.6
+scaffolds master plan §5 row 3.6 per Kelvin's R-b call. The Phase-2
+issue that lands the real impl will reconcile the formal-spec gap.
+
+**env-quirk #15 advisories result:** TRIVIAL — L2 invariant verbatim
+means no new external crate dep, so `cargo deny check advisories` +
+`cargo audit` are unchanged from 3.5. See DEVLOG.
+
+**Spec ref:** `docs/issue-plans/3.6.md`; `docs/architecture/privacy.md`
+(new); `THREAT_MODEL.md` (new "Privacy Mitigation Phase-2 hooks
+(3.6 scaffolding)" row). Master plan §5 row 3.6 + D-006 + Whitepaper
+§8.3 are the underlying spec references.
+
+---
+
 ## PoC retrospective: PoC → MVP mapping
 
 > **Status:** Locked at P12 SIGNOFF (2026-05-08).

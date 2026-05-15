@@ -3180,6 +3180,7 @@ name = "pangolin-funder-client"
 version = "0.0.0"
 dependencies = [
  "alloy",
+ "pangolin-chain",
  "reqwest",
  "serde",
  "serde_json",

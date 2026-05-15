@@ -807,4 +807,40 @@ mod tests {
         sig[64] = 29;
         assert!(!verify_device_binding(sig, h, signer.address()));
     }
+
+    // =================================================================
+    // MVP-2 issue 3.6 (R-c distributed-impl touchpoint).
+    // =================================================================
+
+    /// Issue 3.6 (R-c). Verify that
+    /// `pangolin_chain::DefaultStrategy::transform_funder_response`
+    /// passes the response through unchanged at the consumer
+    /// boundary. The funder-client crate is one of the three
+    /// Phase-2 hook consumers (`CoinJoin` pre-mixing of funder
+    /// top-ups); this test pins that consumers CAN construct + call
+    /// the trait today, AND that the no-op default preserves 3.5
+    /// behaviour bit-for-bit (L1 + L4 verbatim).
+    ///
+    /// The dev-dep on `pangolin-chain` is scoped to this test
+    /// (`[dev-dependencies]`); the production funder-client crate
+    /// does NOT depend on `pangolin-chain` (L1 invariant of this
+    /// crate preserved).
+    #[test]
+    fn issue_3_6_default_strategy_transform_funder_response_is_pass_through() {
+        use alloy::primitives::b256;
+        use pangolin_chain::{DefaultStrategy, FunderResponseShape, PrivacyStrategy};
+
+        let response = FunderResponseShape {
+            tx_hash: b256!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+            eth_transferred_wei: U256::from(42_u64),
+        };
+        let out = DefaultStrategy
+            .transform_funder_response(response)
+            .expect("default transform must succeed");
+        assert_eq!(
+            out, response,
+            "DefaultStrategy must pass through the funder response unchanged at \
+             the pangolin-funder-client consumer boundary (3.6 L1 + L4)"
+        );
+    }
 }
