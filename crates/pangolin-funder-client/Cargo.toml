@@ -11,3 +11,14 @@ description = "Client for the Pangolin funder service — requests gas top-ups; 
 
 [lints]
 workspace = true
+
+[dependencies]
+# alloy primitives for `Address`, `B256`, `U256`, `keccak256` + the
+# secp256k1 signer used by `sign_device_binding`. Same workspace pin
+# the rest of the chain stack uses (=2.0.4); no new crypto crate.
+alloy = { workspace = true }
+
+[dev-dependencies]
+# Tests need a deterministic secp256k1 signer; `LocalSigner::random` is
+# fine for the round-trip + tamper coverage.
+alloy = { workspace = true }

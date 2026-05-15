@@ -87,6 +87,7 @@ use alloy::network::{Ethereum, EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::{DynProvider, PendingTransactionBuilder, Provider, ProviderBuilder};
 use alloy::rpc::types::{BlockNumberOrTag, TransactionRequest};
+use alloy::signers::local::PrivateKeySigner;
 #[allow(unused_imports)] // SolEvent's `SIGNATURE_HASH` / `decode_log` /
 // `encode_data` trait methods are used via the `RevisionLogV1`
 // binding; clippy doesn't see the trait dispatch through the macro.
@@ -713,6 +714,704 @@ async fn backoff_for_attempt(attempts: u8) {
         return;
     }
     tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
+// =====================================================================
+// MVP-2 issue 3.4 — `submit_redemption_v1` for the funder service
+// =====================================================================
+//
+// Mirrors `publish_revision_v1` (3.3) for the EntitlementRegistry's
+// `redeem(...)` mutator. Reuses the per-tx gas cap, retry taxonomy,
+// receipt-await discipline, and emitter-address filter from 3.3
+// verbatim — L11 verbatim: this is a separate codepath, not a shared
+// helper; the discipline is the same but the binding + receipt event
+// are distinct.
+//
+// IMPORTANT: this submit path is the funder service's ONLY on-chain
+// write surface. The funder does NOT call `publishRevision` (L4 + L11
+// mechanical defense: only the EntitlementRegistry sol! binding is
+// declared below; the RevisionLogV1 binding is unreachable from the
+// funder code path via the visibility discipline + the fact that the
+// funder crate doesn't import `publish_revision_v1`).
+
+// alloy's `sol!` macro expands into helper functions whose argument
+// count tracks the underlying Solidity ABI; clippy's
+// `too-many-arguments` cap fires on `redeem`'s 6-arg signature + the
+// `Redeemed` event's 5-field constructor. Same allow pattern as the
+// RevisionLogV1 binding above.
+#[allow(clippy::too_many_arguments, clippy::module_name_repetitions)]
+pub(crate) mod entitlement_registry_binding {
+    use alloy::sol;
+
+    sol! {
+        /// Mirror of `contracts/src/EntitlementRegistry.sol`. MUST
+        /// stay byte-for-byte aligned with the .sol source. Drift is
+        /// caught by `redeem_v1_calldata_byte_pin` (3.4 test).
+        ///
+        /// L4 + L11 mechanical defense: only `redeem` + `balance` +
+        /// the two authority views + the typed event are declared
+        /// here. No `publishRevision` binding is reachable; the
+        /// funder service's submit path cannot accidentally call into
+        /// the revision log.
+        #[sol(rpc)]
+        contract EntitlementRegistry {
+            function redeem(
+                bytes32 userId,
+                uint256 amount,
+                uint64 attestationNonce,
+                uint16 schemaVersion,
+                uint64 expiresAt,
+                bytes calldata signature
+            ) external returns (uint256 newBalance);
+
+            function balance(bytes32 userId) external view returns (uint256);
+
+            function nonce(bytes32 userId) external view returns (uint64);
+
+            function PAYMENT_AUTHORITY() external view returns (address);
+
+            function REDEMPTION_AUTHORITY() external view returns (address);
+
+            event Redeemed(
+                bytes32 indexed userId,
+                uint256 amount,
+                uint256 newBalance,
+                uint64 nonce,
+                uint16 schemaVersion
+            );
+        }
+    }
+}
+
+pub use entitlement_registry_binding::EntitlementRegistry;
+
+use crate::secp256k1_signing::{
+    SignedRedemptionV1, EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA,
+};
+
+/// Receipt anchor returned from a successful v1 redemption submission.
+///
+/// Distinct from [`ChainAnchorV1`] (revision-publish anchor): the
+/// redemption receipt's `Redeemed` event carries the post-redemption
+/// `newBalance` + the contract-side `nonce` value (the pre-bump
+/// `attestationNonce`), not a sequence counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedemptionAnchorV1 {
+    /// 32-byte transaction hash.
+    pub tx_hash: B256,
+    /// Block number the tx was included in.
+    pub block_number: u64,
+    /// 32-byte hash of the block the tx was included in.
+    pub block_hash: B256,
+    /// Index of the `Redeemed` log within the block's log stream.
+    pub log_index: u64,
+    /// Post-redemption user balance (decoded from the event).
+    pub new_balance: U256,
+    /// Pre-bump attestation nonce (decoded from the event).
+    pub nonce: u64,
+}
+
+/// Submit a v1 signed redemption to the `EntitlementRegistry` and
+/// block until 1-conf receipt. Returns a populated
+/// [`RedemptionAnchorV1`] on success.
+///
+/// # Arguments
+///
+/// - `signer` — the funder's `PrivateKeySigner` (loaded from a Foundry
+///   keystore at startup; per R-f the `FunderSigner` trait wraps
+///   this).
+///   The signer pays gas for the redeem tx. NOT derived from a
+///   Pangolin device key (L1 isolation).
+/// - `signed_redemption` — 3.4's `build_signed_redemption_v1` output:
+///   field set + 65-byte signature.
+/// - `env` — which `ChainEnv` to submit under. Only `BaseSepolia` is
+///   wired today with the address cross-check.
+/// - `rpc_url` — http(s) URL of the RPC endpoint.
+///
+/// # Errors
+///
+/// Same taxonomy as [`publish_revision_v1`] — fatal class on contract
+/// reverts / insufficient funds / gas-cap / chain-id mismatch /
+/// receipt-mismatch; retriable class on nonce collision / transient
+/// RPC. Bounded retry budget [`PUBLISH_REVISION_MAX_RETRIES`].
+pub async fn submit_redemption_v1(
+    signer: &PrivateKeySigner,
+    signed_redemption: &SignedRedemptionV1,
+    env: ChainEnv,
+    rpc_url: &str,
+) -> Result<RedemptionAnchorV1, ChainError> {
+    // ---- Construction-time cross-checks (all fatal; no retry) ----
+    let contract_address = load_deployed_address(env, "EntitlementRegistry")?;
+    if matches!(env, ChainEnv::BaseSepolia)
+        && contract_address != EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA
+    {
+        return Err(ChainError::DeploymentAddressMismatch {
+            env,
+            expected: EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA,
+            actual: contract_address,
+        });
+    }
+
+    let provider = build_provider_for_signer(signer, rpc_url).await?;
+    // L-rpc-spoof partial defense.
+    if let Some(expected_chain_id) = env.chain_id() {
+        let observed = provider.get_chain_id().await.map_err(map_rpc_err)?;
+        if observed != expected_chain_id {
+            return Err(ChainError::ChainIdMismatch {
+                expected: expected_chain_id,
+                observed,
+            });
+        }
+    }
+
+    submit_redemption_v1_with_provider(
+        &provider,
+        signer.address(),
+        contract_address,
+        signed_redemption,
+    )
+    .await
+}
+
+/// Inner submit loop parameterised over a constructed provider.
+async fn submit_redemption_v1_with_provider(
+    provider: &DynProvider,
+    signer_address: Address,
+    contract_address: Address,
+    signed_redemption: &SignedRedemptionV1,
+) -> Result<RedemptionAnchorV1, ChainError> {
+    let pending = broadcast_redemption_with_retries(
+        provider,
+        signer_address,
+        contract_address,
+        signed_redemption,
+    )
+    .await?;
+
+    let tx_hash: B256 = *pending.tx_hash();
+    let pending = pending.with_timeout(Some(Duration::from_secs(RECEIPT_TIMEOUT_SECS)));
+    let receipt = pending
+        .get_receipt()
+        .await
+        .map_err(|e| ChainError::Rpc(format!("get_receipt({tx_hash:?}): {e}")))?;
+    process_redemption_receipt(&receipt, contract_address, tx_hash, signed_redemption)
+}
+
+/// Broadcast leg of [`submit_redemption_v1_with_provider`]: nonce +
+/// fee + estimate + send, with the R-c retry taxonomy applied. Mirror
+/// of [`broadcast_with_retries`] but with `EntitlementRegistry::redeemCall`
+/// calldata.
+#[allow(clippy::too_many_lines)]
+async fn broadcast_redemption_with_retries(
+    provider: &DynProvider,
+    signer_address: Address,
+    contract_address: Address,
+    signed_redemption: &SignedRedemptionV1,
+) -> Result<PendingTransactionBuilder<Ethereum>, ChainError> {
+    let mut attempts: u8 = 0;
+
+    loop {
+        attempts += 1;
+        let nonce = match provider
+            .get_transaction_count(signer_address)
+            .pending()
+            .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                let msg = e.to_string();
+                if is_transient_rpc_error(&msg) && attempts < PUBLISH_REVISION_MAX_RETRIES {
+                    backoff_for_attempt(attempts).await;
+                    continue;
+                }
+                return Err(ChainError::RpcTransient {
+                    message: msg,
+                    attempts,
+                });
+            }
+        };
+
+        let base_fee = fetch_base_fee(provider).await?;
+        let max_fee_per_gas: u128 = base_fee
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(PRIORITY_FEE_DEFAULT_WEI))
+            .ok_or_else(|| ChainError::Rpc("base fee arithmetic overflow".into()))?;
+        if max_fee_per_gas > MAX_FEE_PER_GAS_CAP_WEI {
+            return Err(ChainError::GasCapExceeded {
+                observed_gwei: u64::try_from(max_fee_per_gas / 1_000_000_000).unwrap_or(u64::MAX),
+                cap_gwei: u64::try_from(MAX_FEE_PER_GAS_CAP_WEI / 1_000_000_000)
+                    .unwrap_or(u64::MAX),
+            });
+        }
+
+        let call = EntitlementRegistry::redeemCall {
+            userId: signed_redemption.fields.user_id.into(),
+            amount: signed_redemption.fields.amount,
+            attestationNonce: signed_redemption.fields.nonce,
+            schemaVersion: signed_redemption.fields.schema_version,
+            expiresAt: signed_redemption.fields.expires_at,
+            signature: Bytes::copy_from_slice(&signed_redemption.signature[..]),
+        };
+        let calldata = alloy::sol_types::SolCall::abi_encode(&call);
+
+        let mut tx = TransactionRequest::default()
+            .with_from(signer_address)
+            .with_to(contract_address)
+            .with_nonce(nonce)
+            .with_input(Bytes::from(calldata.clone()))
+            .with_value(U256::ZERO)
+            .with_max_fee_per_gas(max_fee_per_gas)
+            .with_max_priority_fee_per_gas(PRIORITY_FEE_DEFAULT_WEI);
+        tx.set_chain_id(signed_revision_chain_id());
+
+        let est = match provider.estimate_gas(tx.clone()).await {
+            Ok(g) => g,
+            Err(e) => {
+                let msg = e.to_string();
+                if let Some(reason) = decode_redemption_revert_reason_from_msg(&msg) {
+                    return Err(ChainError::RevertedPreBroadcast { reason });
+                }
+                if is_insufficient_funds(&msg) {
+                    return Err(ChainError::InsufficientFunds {
+                        observed: None,
+                        message: msg,
+                    });
+                }
+                if is_transient_rpc_error(&msg) && attempts < PUBLISH_REVISION_MAX_RETRIES {
+                    backoff_for_attempt(attempts).await;
+                    continue;
+                }
+                return Err(ChainError::RpcTransient {
+                    message: msg,
+                    attempts,
+                });
+            }
+        };
+        let gas_limit = est
+            .saturating_mul(GAS_ESTIMATE_NUMER)
+            .saturating_div(GAS_ESTIMATE_DENOM);
+        tx = tx.with_gas_limit(gas_limit);
+
+        match provider.send_transaction(tx).await {
+            Ok(p) => return Ok(p),
+            Err(e) => {
+                let msg = e.to_string();
+                if is_nonce_collision(&msg) {
+                    if attempts < PUBLISH_REVISION_MAX_RETRIES {
+                        continue;
+                    }
+                    return Err(ChainError::NonceUnresolvable { attempts });
+                }
+                if is_insufficient_funds(&msg) {
+                    return Err(ChainError::InsufficientFunds {
+                        observed: None,
+                        message: msg,
+                    });
+                }
+                if is_transient_rpc_error(&msg) && attempts < PUBLISH_REVISION_MAX_RETRIES {
+                    backoff_for_attempt(attempts).await;
+                    continue;
+                }
+                return Err(ChainError::RpcTransient {
+                    message: msg,
+                    attempts,
+                });
+            }
+        }
+    }
+}
+
+/// Process an alloy `TransactionReceipt` into a [`RedemptionAnchorV1`]
+/// + run all post-receipt cross-checks.
+///
+/// Mirror of [`process_receipt`] for the Redeemed event. Receipt-level
+/// cross-check: the decoded event's userId + amount must match the
+/// submitted attestation's fields (L-rpc-spoof defense — same shape
+/// as the revision-publish path's signer field cross-check).
+fn process_redemption_receipt(
+    receipt: &alloy::rpc::types::TransactionReceipt,
+    contract_address: Address,
+    tx_hash: B256,
+    signed_redemption: &SignedRedemptionV1,
+) -> Result<RedemptionAnchorV1, ChainError> {
+    if !receipt.status() {
+        return Err(ChainError::RevertedOnChain {
+            reason: "unknown revert (status=0)".to_string(),
+            tx_hash,
+        });
+    }
+
+    let block_number = receipt
+        .block_number
+        .ok_or_else(|| ChainError::Decode("receipt missing block_number".into()))?;
+    let block_hash = receipt
+        .block_hash
+        .ok_or_else(|| ChainError::Decode("receipt missing block_hash".into()))?;
+
+    // L-rpc-spoof: filter logs to the EntitlementRegistry's address +
+    // the Redeemed topic. A spoofing RPC injecting a fabricated event
+    // is rejected.
+    let target_topic = EntitlementRegistry::Redeemed::SIGNATURE_HASH;
+    let log = receipt
+        .inner
+        .logs()
+        .iter()
+        .find(|l| {
+            l.address() == contract_address && l.topics().first().copied() == Some(target_topic)
+        })
+        .ok_or_else(|| ChainError::MissingEvent {
+            tx_hash: format!("{tx_hash:?}"),
+        })?;
+
+    let decoded = EntitlementRegistry::Redeemed::decode_log(&log.inner)
+        .map_err(|e| ChainError::Decode(format!("Redeemed log: {e}")))?;
+
+    // Receipt cross-check: the decoded userId + amount + nonce MUST
+    // match the submitted attestation. A divergence indicates an RPC
+    // either spoofing or returning a stale-cached receipt for a
+    // different tx.
+    let expected_user_id: B256 = signed_redemption.fields.user_id.into();
+    if decoded.userId != expected_user_id {
+        return Err(ChainError::Decode(format!(
+            "Redeemed log userId mismatch: expected {expected_user_id}, got {}",
+            decoded.userId
+        )));
+    }
+    if decoded.amount != signed_redemption.fields.amount {
+        return Err(ChainError::Decode(format!(
+            "Redeemed log amount mismatch: expected {}, got {}",
+            signed_redemption.fields.amount, decoded.amount
+        )));
+    }
+    if decoded.nonce != signed_redemption.fields.nonce {
+        return Err(ChainError::Decode(format!(
+            "Redeemed log nonce mismatch: expected {}, got {}",
+            signed_redemption.fields.nonce, decoded.nonce
+        )));
+    }
+
+    let log_index = log
+        .log_index
+        .ok_or_else(|| ChainError::Decode("Redeemed log missing log_index".into()))?;
+
+    Ok(RedemptionAnchorV1 {
+        tx_hash,
+        block_number,
+        block_hash,
+        log_index,
+        new_balance: decoded.newBalance,
+        nonce: decoded.nonce,
+    })
+}
+
+/// Build a wallet-bearing alloy provider for a raw `PrivateKeySigner`
+/// (the funder service path). Mirror of [`build_provider`] but without
+/// the `EvmWallet` wrapper (which is reserved for the device-key
+/// derivation path).
+async fn build_provider_for_signer(
+    signer: &PrivateKeySigner,
+    rpc_url: &str,
+) -> Result<DynProvider, ChainError> {
+    let eth_wallet = EthereumWallet::from(signer.clone());
+    let provider = ProviderBuilder::new()
+        .wallet(eth_wallet)
+        .connect(rpc_url)
+        .await
+        .map_err(|e| ChainError::Rpc(format!("connect {rpc_url}: {e}")))?;
+    Ok(provider.erased())
+}
+
+/// Best-effort decoder for an `EntitlementRegistry` custom error /
+/// revert reason embedded in an alloy error message. Mirror of
+/// [`decode_revert_reason_from_msg`] but recognises the
+/// `EntitlementRegistry` custom-error set from
+/// `EntitlementRegistry.sol`.
+fn decode_redemption_revert_reason_from_msg(msg: &str) -> Option<String> {
+    let lower = msg.to_ascii_lowercase();
+    if !(lower.contains("revert") || lower.contains("execution reverted")) {
+        return None;
+    }
+    for known in [
+        "ErrInvalidSignature",
+        "ErrUnauthorizedSigner",
+        "ErrInsufficientBalance",
+        "ErrNonceTooLow",
+        "ErrUnsupportedSchemaVersion",
+        "ErrAttestationExpired",
+        "ErrZeroAuthority",
+    ] {
+        if msg.contains(known) {
+            return Some((*known).to_string());
+        }
+    }
+    if lower.contains("out of gas") || lower.contains("outofgas") {
+        return Some("OutOfGas".to_string());
+    }
+    Some("unknown revert".to_string())
+}
+
+// =====================================================================
+// MVP-2 issue 3.4 (audit fix-pass) — `submit_eth_transfer_v1` for the
+// funder service's ETH-transfer leg.
+// =====================================================================
+//
+// After `submit_redemption_v1` decrements the user's on-chain balance,
+// the funder sends ETH from its hot wallet to the device address. This
+// is the second leg of the L-payment-order state machine and the
+// HIGH-1 audit fix (the previous build echoed the redeem tx hash as the
+// "eth_transfer_tx_hash" without ever sending ETH).
+//
+// Shape mirrors `submit_redemption_v1`:
+// - Same EIP-1559 gas-cap envelope (50 gwei max_fee_per_gas).
+// - Same R-c retry taxonomy (nonce-collision + transient-rpc only).
+// - Same receipt-await discipline (1-conf, status==1).
+// - NO calldata; NO event decode (a value transfer has no event).
+// - Hard cap on `value` is enforced UPSTREAM by the funder handler
+//   (the cap-check happens BEFORE the redemption submit so a mis-
+//   sized Credit attestation never debits the user). The transfer
+//   helper itself doesn't re-check the cap — separating the two keeps
+//   the helper's responsibilities concrete.
+
+/// Receipt anchor for a successful ETH-transfer leg.
+///
+/// Distinct from [`RedemptionAnchorV1`] / [`ChainAnchorV1`]: the
+/// transfer tx emits no event; the anchor carries just the tx hash +
+/// block coordinates + the actual `value` field decoded back from the
+/// receipt (defense-in-depth — an RPC returning a stale receipt for a
+/// different tx would not match).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EthTransferAnchorV1 {
+    /// 32-byte transaction hash.
+    pub tx_hash: B256,
+    /// Block number the tx was included in.
+    pub block_number: u64,
+    /// 32-byte hash of the block the tx was included in.
+    pub block_hash: B256,
+    /// ETH value transferred (wei). Cross-checked against the
+    /// requested amount by the caller.
+    pub value_wei: U256,
+}
+
+/// Submit a plain ETH transfer from `signer` to `to_address` for
+/// `value_wei` wei. Block until 1-conf receipt. Returns a populated
+/// [`EthTransferAnchorV1`] on success.
+///
+/// # Arguments
+///
+/// - `signer` — the funder's `PrivateKeySigner`. Pays gas and the
+///   transferred value. The hot-wallet ETH balance bounds the loss
+///   surface per L5.
+/// - `to_address` — destination (the device wallet address). Treated
+///   as opaque from the chain crate's POV; the funder handler is
+///   responsible for verifying the device-binding signature recovers
+///   to this address BEFORE calling here.
+/// - `value_wei` — ETH amount in wei. NOT range-checked here; the
+///   funder handler enforces the per-tx cap upstream.
+/// - `env` — chain env. Only `BaseSepolia` is wired for the
+///   chain-id pin today.
+/// - `rpc_url` — RPC endpoint.
+///
+/// # Errors
+///
+/// Same taxonomy as [`submit_redemption_v1`]:
+/// - Fatal: `InsufficientFunds` (hot-wallet drained / cap exceeded
+///   by gas), `GasCapExceeded`, `ChainIdMismatch`, `NonceUnresolvable`,
+///   `RevertedOnChain` (a plain transfer reverts only when the
+///   recipient is a contract whose receive/fallback reverts; the funder
+///   targets EOAs but the surface exists).
+/// - Retriable: nonce collision (max 3), RPC transient (exp backoff).
+pub async fn submit_eth_transfer_v1(
+    signer: &PrivateKeySigner,
+    to_address: Address,
+    value_wei: U256,
+    env: ChainEnv,
+    rpc_url: &str,
+) -> Result<EthTransferAnchorV1, ChainError> {
+    let provider = build_provider_for_signer(signer, rpc_url).await?;
+    if let Some(expected_chain_id) = env.chain_id() {
+        let observed = provider.get_chain_id().await.map_err(map_rpc_err)?;
+        if observed != expected_chain_id {
+            return Err(ChainError::ChainIdMismatch {
+                expected: expected_chain_id,
+                observed,
+            });
+        }
+    }
+    submit_eth_transfer_v1_with_provider(&provider, signer.address(), to_address, value_wei).await
+}
+
+/// Inner submit loop parameterised over a constructed provider. Used
+/// by hermetic tests + the public entry point.
+async fn submit_eth_transfer_v1_with_provider(
+    provider: &DynProvider,
+    signer_address: Address,
+    to_address: Address,
+    value_wei: U256,
+) -> Result<EthTransferAnchorV1, ChainError> {
+    let pending =
+        broadcast_eth_transfer_with_retries(provider, signer_address, to_address, value_wei)
+            .await?;
+    let tx_hash: B256 = *pending.tx_hash();
+    let pending = pending.with_timeout(Some(Duration::from_secs(RECEIPT_TIMEOUT_SECS)));
+    let receipt = pending
+        .get_receipt()
+        .await
+        .map_err(|e| ChainError::Rpc(format!("get_receipt({tx_hash:?}): {e}")))?;
+    process_eth_transfer_receipt(&receipt, tx_hash, to_address, value_wei)
+}
+
+/// Broadcast leg: nonce + fee + estimate + send with R-c retries.
+/// Mirror of `broadcast_redemption_with_retries` but with empty
+/// calldata and a non-zero `value`. No contract-revert decoder is
+/// invoked (a plain transfer to an EOA cannot trigger
+/// `RevertedPreBroadcast` via a typed Solidity custom error).
+async fn broadcast_eth_transfer_with_retries(
+    provider: &DynProvider,
+    signer_address: Address,
+    to_address: Address,
+    value_wei: U256,
+) -> Result<PendingTransactionBuilder<Ethereum>, ChainError> {
+    let mut attempts: u8 = 0;
+    loop {
+        attempts += 1;
+        let nonce = match provider
+            .get_transaction_count(signer_address)
+            .pending()
+            .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                let msg = e.to_string();
+                if is_transient_rpc_error(&msg) && attempts < PUBLISH_REVISION_MAX_RETRIES {
+                    backoff_for_attempt(attempts).await;
+                    continue;
+                }
+                return Err(ChainError::RpcTransient {
+                    message: msg,
+                    attempts,
+                });
+            }
+        };
+
+        let base_fee = fetch_base_fee(provider).await?;
+        let max_fee_per_gas: u128 = base_fee
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(PRIORITY_FEE_DEFAULT_WEI))
+            .ok_or_else(|| ChainError::Rpc("base fee arithmetic overflow".into()))?;
+        if max_fee_per_gas > MAX_FEE_PER_GAS_CAP_WEI {
+            return Err(ChainError::GasCapExceeded {
+                observed_gwei: u64::try_from(max_fee_per_gas / 1_000_000_000).unwrap_or(u64::MAX),
+                cap_gwei: u64::try_from(MAX_FEE_PER_GAS_CAP_WEI / 1_000_000_000)
+                    .unwrap_or(u64::MAX),
+            });
+        }
+
+        let mut tx = TransactionRequest::default()
+            .with_from(signer_address)
+            .with_to(to_address)
+            .with_nonce(nonce)
+            .with_value(value_wei)
+            .with_max_fee_per_gas(max_fee_per_gas)
+            .with_max_priority_fee_per_gas(PRIORITY_FEE_DEFAULT_WEI);
+        tx.set_chain_id(signed_revision_chain_id());
+
+        let est = match provider.estimate_gas(tx.clone()).await {
+            Ok(g) => g,
+            Err(e) => {
+                let msg = e.to_string();
+                // A plain transfer cannot revert with an `EntitlementRegistry`
+                // custom error, but an EOA target's `receive()` may
+                // revert if the target is actually a contract. Treat
+                // a generic revert as fatal.
+                if msg.to_ascii_lowercase().contains("revert") {
+                    return Err(ChainError::RevertedPreBroadcast {
+                        reason: "eth_transfer estimate reverted".to_string(),
+                    });
+                }
+                if is_insufficient_funds(&msg) {
+                    return Err(ChainError::InsufficientFunds {
+                        observed: None,
+                        message: msg,
+                    });
+                }
+                if is_transient_rpc_error(&msg) && attempts < PUBLISH_REVISION_MAX_RETRIES {
+                    backoff_for_attempt(attempts).await;
+                    continue;
+                }
+                return Err(ChainError::RpcTransient {
+                    message: msg,
+                    attempts,
+                });
+            }
+        };
+        let gas_limit = est
+            .saturating_mul(GAS_ESTIMATE_NUMER)
+            .saturating_div(GAS_ESTIMATE_DENOM);
+        tx = tx.with_gas_limit(gas_limit);
+
+        match provider.send_transaction(tx).await {
+            Ok(p) => return Ok(p),
+            Err(e) => {
+                let msg = e.to_string();
+                if is_nonce_collision(&msg) {
+                    if attempts < PUBLISH_REVISION_MAX_RETRIES {
+                        continue;
+                    }
+                    return Err(ChainError::NonceUnresolvable { attempts });
+                }
+                if is_insufficient_funds(&msg) {
+                    return Err(ChainError::InsufficientFunds {
+                        observed: None,
+                        message: msg,
+                    });
+                }
+                if is_transient_rpc_error(&msg) && attempts < PUBLISH_REVISION_MAX_RETRIES {
+                    backoff_for_attempt(attempts).await;
+                    continue;
+                }
+                return Err(ChainError::RpcTransient {
+                    message: msg,
+                    attempts,
+                });
+            }
+        }
+    }
+}
+
+/// Process the receipt for an ETH-transfer tx. Status must be 1; the
+/// receipt's `to` field must equal the requested destination (RPC-spoof
+/// defense — a stale or fabricated receipt for a different tx is
+/// rejected).
+fn process_eth_transfer_receipt(
+    receipt: &alloy::rpc::types::TransactionReceipt,
+    tx_hash: B256,
+    expected_to: Address,
+    expected_value: U256,
+) -> Result<EthTransferAnchorV1, ChainError> {
+    if !receipt.status() {
+        return Err(ChainError::RevertedOnChain {
+            reason: "unknown revert (status=0)".to_string(),
+            tx_hash,
+        });
+    }
+    let block_number = receipt
+        .block_number
+        .ok_or_else(|| ChainError::Decode("receipt missing block_number".into()))?;
+    let block_hash = receipt
+        .block_hash
+        .ok_or_else(|| ChainError::Decode("receipt missing block_hash".into()))?;
+    if receipt.to != Some(expected_to) {
+        return Err(ChainError::ReceiptMismatch {
+            expected_signer: expected_to,
+            observed_signer: receipt.to.unwrap_or_default(),
+        });
+    }
+    Ok(EthTransferAnchorV1 {
+        tx_hash,
+        block_number,
+        block_hash,
+        value_wei: expected_value,
+    })
 }
 
 // ---------------------------------------------------------------------
