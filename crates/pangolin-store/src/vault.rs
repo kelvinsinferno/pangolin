@@ -105,6 +105,44 @@ static_assertions::assert_not_impl_any!(Vault: Sync);
 /// failure probability, vanishing for any plausible vault size.
 pub(crate) const ADD_ACCOUNT_RETRY_BUDGET: u32 = 4;
 
+// ---------------------------------------------------------------------
+// MVP-2 issue 5.1 — publish queue + batching constants.
+// ---------------------------------------------------------------------
+
+/// **MVP-2 issue 5.1 (R-a).** Default 30s coalescing window.
+///
+/// Master-plan §5 row 5.1 verbatim.
+pub const BATCH_WINDOW_SECS_DEFAULT: u64 = 30;
+
+/// **MVP-2 issue 5.1 (R-a).** Lower clamp on the env-var override.
+/// Below this would coalesce nothing meaningful (sub-second windows
+/// invalidate the "rapid edits" UX premise).
+pub const BATCH_WINDOW_SECS_MIN: u64 = 1;
+
+/// **MVP-2 issue 5.1 (R-a).** Upper clamp on the env-var override.
+/// Above this would let a malicious host wrapper hide unsent edits
+/// from the user for too long; L-window-DoS defense.
+pub const BATCH_WINDOW_SECS_MAX: u64 = 300;
+
+/// **MVP-2 issue 5.1 (R-a).** Env-var name the override is read from.
+pub const BATCH_WINDOW_SECS_ENV_VAR: &str = "PANGOLIN_BATCH_WINDOW_SECS";
+
+/// **MVP-2 issue 5.1 (R-b).** Hard cap on dirty-marker COUNT.
+///
+/// Once the queue reaches this size the host SHOULD invoke
+/// [`Vault::flush_publish_queue`] regardless of the window timer;
+/// the L-balance-blocked-grows-unbounded mitigation. Local edits
+/// are NEVER refused — the cap is a flush trigger, not a refusal
+/// gate.
+pub const PUBLISH_QUEUE_COUNT_CAP: usize = 100;
+
+/// **MVP-2 issue 5.1 (R-b).** Hard cap on total `enc_payload` bytes.
+///
+/// Same posture as the count cap: flush trigger, not refusal gate.
+/// 1 MiB matches the conservative chain-tx-size budget and is well
+/// above realistic single-account payloads.
+pub const PUBLISH_QUEUE_BYTE_CAP_BYTES: u64 = 1_000_000;
+
 /// One-stop per-account status view (MVP-1 issue 1.6).
 ///
 /// Returned by [`Vault::account_status`]. All fields non-secret. A host
@@ -509,6 +547,31 @@ struct ActiveState {
     /// edits on the affected account surface a typed error without
     /// re-decrypting. Empty for a vault with no future-versioned heads.
     requires_upgrade: std::collections::HashSet<AccountId>,
+    /// **MVP-2 issue 5.1 (R-d) — publish-queue 30s window.** Unix-ms
+    /// instant at which the current coalescing window started, set on
+    /// the FIRST dirty marker stamped after the queue is empty (or
+    /// after a successful flush resets it). `None` between an empty
+    /// queue and the next edit. Cleared on every successful
+    /// [`Vault::flush_publish_queue`]. Not persisted — survives
+    /// nowhere across `lock()` / unlock cycles; the next unlock starts
+    /// a fresh window if there are dirty markers (R-d Option A).
+    window_started_at_unix_ms: Option<i64>,
+    /// **MVP-2 issue 5.1 (L11) — opt-in window-elapsed auto-flush.**
+    /// Default `false`. When the host calls
+    /// [`Vault::enable_window_elapsed_flush`] with `true`, subsequent
+    /// `account_add` / `account_update` / `delete_account` calls
+    /// check the window deadline and trigger an opportunistic
+    /// `flush_publish_queue` BEFORE handling the new edit if the
+    /// window has elapsed. 5.4 will wire this on by default; 5.1
+    /// ships the primitive only.
+    window_elapsed_flush_enabled: bool,
+    /// **MVP-2 issue 5.1 — diagnostic.** `true` if the most recent
+    /// `flush_publish_queue` invocation returned
+    /// [`crate::publish::BatchFlushError::BalanceInsufficientForBatch`].
+    /// Cleared on the next successful flush. Read-only outside the
+    /// flush path; the chain-side per-revision balance gate (3.3) IS
+    /// the authoritative defense — this flag is host-UX hinting only.
+    last_flush_failed_balance: bool,
 }
 
 impl Vault {
@@ -1012,6 +1075,17 @@ impl Vault {
             device_key,
             last_presence_at: Some(now),
             requires_upgrade,
+            // MVP-2 issue 5.1 (R-d): fresh window state on every unlock.
+            // The persisted `dirty_accounts` table survives lock cycles
+            // unaltered, so this unlock either resumes a partly-full
+            // queue (with the window restarted from the next edit) or
+            // starts clean. Either way the in-memory window timer is
+            // re-zeroed.
+            window_started_at_unix_ms: None,
+            // L11: opt-in window-elapsed auto-flush defaults OFF in 5.1.
+            // 5.4 will flip the default to ON when the host wiring lands.
+            window_elapsed_flush_enabled: false,
+            last_flush_failed_balance: false,
         });
         self.session_state = SessionState::Active {
             expires_at: next_idle_deadline(now, now, self.session_idle),
@@ -1698,6 +1772,11 @@ impl Vault {
         )?;
         tx.commit()?;
 
+        // MVP-2 issue 5.1 (R-d): stamp the in-memory window-start if
+        // this is the first dirty marker after an empty queue / a
+        // successful flush. Cheap no-op otherwise.
+        self.note_dirty_marker_stamped(now);
+
         // 1.3: keep the `:memory:` FTS5 index in sync (V0 shim — no
         // tags; the single `url` is host-extracted like a V1 URL).
         let projection = SearchProjection::from_snapshot(&snapshot);
@@ -1844,6 +1923,9 @@ impl Vault {
         )?;
         tx.commit()?;
 
+        // MVP-2 issue 5.1 (R-d): window-start hook.
+        self.note_dirty_marker_stamped(now);
+
         // 1.3: resync the `:memory:` FTS5 index (V0 shim).
         let projection = SearchProjection::from_snapshot(&new_snapshot);
         let active = self.require_active_mut()?;
@@ -1949,6 +2031,14 @@ impl Vault {
             ],
         )?;
         tx.commit()?;
+
+        // MVP-2 issue 5.1 (R-d + L10): window-start hook. Tombstones
+        // are stamped same as any other revision; the L10 invariant
+        // "tombstone always wins" is enforced inside
+        // `coalesce_dirty_markers` via the head-pointer rule (the
+        // tombstone's revision_id == the account's new head, so it
+        // is the marker preserved).
+        self.note_dirty_marker_stamped(now);
 
         // 1.3: a tombstoned account must not appear in search — drop
         // its `:memory:` FTS5 row (makes the whitelist structural for
@@ -4361,6 +4451,9 @@ impl Vault {
         )?;
         tx.commit()?;
 
+        // MVP-2 issue 5.1 (R-d): window-start hook.
+        self.note_dirty_marker_stamped(now);
+
         // 1.3: keep the `:memory:` FTS5 index in sync. Runs after the
         // blob write commits, so the index never reflects an
         // uncommitted revision; a crash before this line just means the
@@ -4476,6 +4569,9 @@ impl Vault {
             ],
         )?;
         tx.commit()?;
+
+        // MVP-2 issue 5.1 (R-d): window-start hook.
+        self.note_dirty_marker_stamped(now);
 
         // 1.3: resync the `:memory:` FTS5 index for this account.
         let projection = SearchProjection::from_identity(&identity);
@@ -4972,6 +5068,14 @@ impl Vault {
             is_tombstone,
         )?;
 
+        // MVP-2 issue 5.1 (R-d): window-start hook for the merge
+        // revision's dirty marker. Stamped here rather than inside
+        // `resolve_fork_commit` because that helper is `&self` (its
+        // SQL discipline takes an interior borrow of `conn`); the
+        // hook needs `&mut self` for the in-memory window-state
+        // mutation.
+        self.note_dirty_marker_stamped(now);
+
         // Prune any pending_merges stash row whose target_head_id is no
         // longer a current head (the just-resolved losing leaves, and
         // the resolved target itself if it was stashed). Best-effort —
@@ -5351,6 +5455,39 @@ impl Vault {
     /// # Errors
     ///
     /// Same set as `update_account`, plus `RevisionNotFound` if the
+    /// **MVP-2 issue 5.1 test helper.** Force-set the `marked_at`
+    /// column of a specific `dirty_accounts` row. Used by the
+    /// L-clock-skew coalescing test to simulate a backwards-jumping
+    /// host clock without `Instant`-mocking gymnastics. Gated behind
+    /// `cfg(any(test, feature = "test-utilities"))` so production
+    /// builds cannot link against it.
+    ///
+    /// No-op if the `(account_id, revision_id)` pair has no marker.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` for any database issue.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utilities"))]
+    pub fn __test_set_dirty_marker_timestamp(
+        &self,
+        account_id: AccountId,
+        revision_id: RevisionId,
+        new_marked_at: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE dirty_accounts
+             SET marked_at = ?1
+             WHERE account_id = ?2 AND revision_id = ?3",
+            params![
+                new_marked_at,
+                account_id.as_bytes().as_slice(),
+                revision_id.as_bytes().as_slice(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// declared parent is not in the account's revision history.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-utilities"))]
@@ -6675,7 +6812,7 @@ impl Vault {
         // ingestion paths).
         self.refuse_if_frozen(account_id)?;
         let now = current_unix_ms();
-        self.conn.execute(
+        let affected = self.conn.execute(
             "INSERT OR IGNORE INTO dirty_accounts
                 (account_id, revision_id, marked_at)
              VALUES (?1, ?2, ?3)",
@@ -6685,6 +6822,13 @@ impl Vault {
                 now,
             ],
         )?;
+        // MVP-2 issue 5.1 (R-d): only stamp the window when a NEW
+        // marker is inserted (INSERT OR IGNORE returns 0 affected on
+        // a duplicate pair). Re-marking the same pair shouldn't
+        // reset the window.
+        if affected > 0 {
+            self.note_dirty_marker_stamped(now);
+        }
         self.touch_session();
         Ok(())
     }
@@ -6763,8 +6907,340 @@ impl Vault {
     }
 
     // -----------------------------------------------------------------
-    // MVP-2 issue 4.1 (R-e + R-a + R-c + R-d): async orchestration
+    // MVP-2 issue 5.1 — publish queue + batching (30s same-account
+    // coalescing layer on top of the P8-2 dirty_accounts table).
     // -----------------------------------------------------------------
+
+    /// **MVP-2 issue 5.1 (R-d).** Window-start hook called by every
+    /// op that stamps a dirty marker (`add_account` / `update_account`
+    /// / `delete_account` / `account_add` / `account_update` /
+    /// `resolve_fork`). Sets `ActiveState.window_started_at_unix_ms`
+    /// to `now_ms` IF the field is currently `None`. Cheap no-op on
+    /// a vault without an active session (the dirty marker was
+    /// already persisted; the in-memory window state is just unset
+    /// until the next unlock).
+    fn note_dirty_marker_stamped(&mut self, now_ms: i64) {
+        if let Some(active) = self.active.as_mut() {
+            if active.window_started_at_unix_ms.is_none() {
+                active.window_started_at_unix_ms = Some(now_ms);
+            }
+        }
+    }
+
+    /// **MVP-2 issue 5.1 (L11).** Host opts in (or out) of the
+    /// window-elapsed auto-flush primitive. Default: `false` in 5.1
+    /// (this issue ships the primitive only; 5.4 will flip the
+    /// host default to `true` when the always-on wiring lands).
+    ///
+    /// When `true`, the next `account_add` / `account_update` /
+    /// `delete_account` (etc.) call that finds the 30s window
+    /// elapsed will attempt a best-effort [`Self::flush_publish_queue`]
+    /// BEFORE handling the new edit. Best-effort: the flush is run
+    /// with a caller-supplied `ChainAdapter`; if no adapter is
+    /// registered (the default for 5.1) the auto-flush primitive is
+    /// inert until the host explicitly calls `flush_publish_queue`.
+    ///
+    /// Idempotent — calling with the same value twice is a no-op.
+    /// Returns `Ok(())` even on a Locked vault (the field is part of
+    /// the in-memory session state; a Locked vault preserves the
+    /// LAST-known value but the unlock path re-zeroes it).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] if the vault has never been
+    /// unlocked (there is no `ActiveState` to hold the flag).
+    pub fn enable_window_elapsed_flush(&mut self, on: bool) -> Result<()> {
+        let active = self.require_active_mut()?;
+        active.window_elapsed_flush_enabled = on;
+        Ok(())
+    }
+
+    /// **MVP-2 issue 5.1.** Snapshot of the publish queue state for
+    /// host UI rendering. Metadata-only — works on a Locked vault
+    /// (the dirty markers persist; only the in-memory window state
+    /// goes away).
+    ///
+    /// `window_started_at_unix_ms` is `None` on a Locked vault even
+    /// if dirty markers exist; the next unlock will start a fresh
+    /// window if the queue is non-empty.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` for any database issue. `StoreError::Corrupted`
+    /// if a stored row's `enc_payload` size doesn't fit `i64` (storage
+    /// corruption — impossible in practice given the 4 MiB chain-tx
+    /// cap on a single revision).
+    pub fn publish_queue_state(&self) -> Result<crate::publish::PublishQueueState> {
+        let dirty = self.list_dirty()?;
+        let dirty_count = dirty.len();
+
+        // Sum enc_payload sizes for the byte-cap (R-b option 8).
+        let mut dirty_byte_size: u64 = 0;
+        for entry in &dirty {
+            let size_i64: i64 = self
+                .conn
+                .query_row(
+                    "SELECT LENGTH(enc_payload)
+                     FROM revisions
+                     WHERE account_id = ?1 AND revision_id = ?2",
+                    params![
+                        entry.account_id.as_bytes().as_slice(),
+                        entry.revision_id.as_bytes().as_slice(),
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            let size_bytes = u64::try_from(size_i64).unwrap_or(0);
+            dirty_byte_size = dirty_byte_size.saturating_add(size_bytes);
+        }
+
+        let (window_started_at_unix_ms, blocked_on_balance) =
+            self.active.as_ref().map_or((None, false), |a| {
+                (a.window_started_at_unix_ms, a.last_flush_failed_balance)
+            });
+
+        Ok(crate::publish::PublishQueueState {
+            window_started_at_unix_ms,
+            dirty_count,
+            dirty_byte_size,
+            blocked_on_balance,
+        })
+    }
+
+    /// **MVP-2 issue 5.1 (R-c) — per-account coalescing pass.**
+    ///
+    /// Walks the `dirty_accounts` table and, for every account that
+    /// has MORE than one dirty marker, prunes all markers except the
+    /// one that points at the account's CURRENT head (read from
+    /// `account_identities.head_revision_id`, NOT `MAX(marked_at)` —
+    /// the head pointer is updated atomically inside the
+    /// `add_account` / `update_account` / `delete_account` /
+    /// `resolve_fork` transactions, so it is the authoritative,
+    /// clock-skew-immune source of truth per L-clock-skew-coalesce-
+    /// wrong-order in the 5.1 plan).
+    ///
+    /// **Tombstone-wins invariant (L10).** When an account's head is
+    /// a tombstone revision, the tombstone's dirty marker is the one
+    /// preserved (because the head pointer == the tombstone's id);
+    /// prior live-update markers for the same account are pruned.
+    /// Conversely, an in-flight "update X, delete X" within a single
+    /// window collapses to the tombstone being preserved — the
+    /// deletion intent always ships to chain.
+    ///
+    /// Returns the number of markers pruned. `Ok(0)` is the common
+    /// case (no account has > 1 marker).
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` for any database issue. `StoreError::Corrupted`
+    /// for malformed BLOB columns.
+    pub fn coalesce_dirty_markers(&mut self) -> Result<usize> {
+        // Group dirty markers by account_id; for each group with > 1
+        // marker, read the canonical head from account_identities and
+        // prune every other marker.
+        let dirty = self.list_dirty()?;
+        if dirty.is_empty() {
+            return Ok(0);
+        }
+        // Build a per-account marker count first so we only do the
+        // SQL work for accounts that actually have > 1 marker.
+        let mut per_account: std::collections::HashMap<AccountId, Vec<RevisionId>> =
+            std::collections::HashMap::new();
+        for entry in &dirty {
+            per_account
+                .entry(entry.account_id)
+                .or_default()
+                .push(entry.revision_id);
+        }
+        let mut pruned: usize = 0;
+        let tx = self.conn.unchecked_transaction()?;
+        for (account_id, revisions) in per_account {
+            if revisions.len() < 2 {
+                continue;
+            }
+            // Authoritative head from account_identities.
+            let head_blob: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT head_revision_id
+                     FROM account_identities WHERE account_id = ?1",
+                    params![account_id.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(head_blob) = head_blob else {
+                // Account row missing — unusual but defensive: do not
+                // prune anything for this account. (A missing row
+                // would also mean the dirty markers are orphans and
+                // should ideally be cleaned by a separate maintenance
+                // path; 5.1 stays conservative.)
+                continue;
+            };
+            let head_arr: [u8; REVISION_ID_LEN] = head_blob
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Corrupted("head_revision_id not 32 bytes".into()))?;
+            let head_id = RevisionId::from_bytes(head_arr);
+            for rev in revisions {
+                if rev == head_id {
+                    continue;
+                }
+                let affected = tx.execute(
+                    "DELETE FROM dirty_accounts
+                     WHERE account_id = ?1 AND revision_id = ?2",
+                    params![account_id.as_bytes().as_slice(), rev.as_bytes().as_slice(),],
+                )?;
+                pruned = pruned.saturating_add(affected);
+            }
+        }
+        tx.commit()?;
+        Ok(pruned)
+    }
+
+    /// **MVP-2 issue 5.1 — batched publish-queue flush.**
+    ///
+    /// Top-level flush entry point. Per the plan §R-c / §R-e:
+    ///
+    /// 1. **Coalesce** dirty markers via [`Self::coalesce_dirty_markers`]
+    ///    (per-account; tombstone-wins). After this pass, every
+    ///    account has at most one marker pointing at its canonical
+    ///    head.
+    /// 2. **Top-of-flush balance gate (R-e + L2 + L12).** Sum
+    ///    `queued_count × estimate_next_publish_cost`; if the wallet
+    ///    balance is below the sum, return
+    ///    [`crate::publish::BatchFlushError::BalanceInsufficientForBatch`]
+    ///    BEFORE any chain submit is attempted. The dirty markers
+    ///    stay; the next call re-runs the gate (with whatever extra
+    ///    markers may have been appended per R-f).
+    /// 3. **Per-account publish loop.** Delegate to
+    ///    [`crate::publish::publish_all_for_vault`] with the supplied
+    ///    adapter and the device key from the active session.
+    ///    Per-account failures surface as
+    ///    [`crate::publish::PublishOutcome::Failed`] rows in the wrapped
+    ///    report — the outer `Result` stays `Ok`.
+    ///
+    /// The `force` flag is reserved for callers that want to skip
+    /// the (future) 30s window gate when 5.4 ships always-on
+    /// auto-flush. In 5.1 `flush_publish_queue` ALWAYS flushes when
+    /// invoked (the host is in control of the cadence); `force` is
+    /// kept on the signature for forward-compat without API churn.
+    ///
+    /// # Window state side effects
+    ///
+    /// On a SUCCESSFUL flush (no balance-gate failure), the window
+    /// state is reset: `window_started_at_unix_ms = None`,
+    /// `last_flush_failed_balance = false`. The NEXT dirty marker
+    /// after the flush starts a fresh 30s window.
+    ///
+    /// On a `BalanceInsufficientForBatch` return,
+    /// `last_flush_failed_balance` is set to `true` so the host UI
+    /// can render the blocked-on-balance hint.
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::publish::BatchFlushError`].
+    pub async fn flush_publish_queue<A: pangolin_chain::ChainAdapter + ?Sized>(
+        &mut self,
+        adapter: &A,
+        device_key: &pangolin_crypto::keys::DeviceKey,
+        _force: bool,
+    ) -> core::result::Result<crate::publish::BatchFlushReport, crate::publish::BatchFlushError>
+    {
+        // The flush path requires an active session for two reasons:
+        // (1) `read_revision_for_publish` is gated by an active
+        //     session (it's the read path the publish loop calls); a
+        //     Locked vault returns NotUnlocked from the inner call.
+        // (2) The L11 invariant says only flush_publish_queue (and
+        //     its drain-on-teardown invocations) reaches publish; we
+        //     enforce it structurally by requiring `active` here.
+        if self.active.is_none() {
+            return Err(crate::publish::BatchFlushError::NoActiveSession);
+        }
+
+        // ---- Step 1: coalesce. ----
+        let coalesced_markers_pruned = self
+            .coalesce_dirty_markers()
+            .map_err(crate::publish::BatchFlushError::Store)?;
+
+        // ---- Step 2: pre-flight batch balance gate (R-e + L2 + L12). ----
+        //
+        // After coalesce, count the rows that will actually attempt
+        // chain submission. Then ask the adapter for a pre-flight
+        // balance projection. If the adapter reports
+        // `Some(BatchBalanceCheck)` AND the check is insufficient,
+        // fail-fast with the typed L12 variant carrying the actual
+        // wei values — BEFORE any chain submit. The "everything-or-
+        // nothing" guarantee per R-e.
+        //
+        // Adapters that pre-date 5.1 (e.g., `MockChainAdapter` in some
+        // PoC tests) return `Ok(None)` from the default-impl, in which
+        // case we fall back to the per-revision gate inside
+        // `publish_revision_v1` (defense-in-depth; same posture the
+        // pre-fix-pass code had).
+        let queued_count_after_coalesce = self
+            .list_dirty()
+            .map_err(crate::publish::BatchFlushError::Store)?
+            .len();
+        if let Some(check) = adapter
+            .pre_flight_batch_balance(queued_count_after_coalesce)
+            .await
+            .map_err(crate::publish::BatchFlushError::ChainError)?
+        {
+            if !check.is_sufficient() {
+                if let Some(active) = self.active.as_mut() {
+                    active.last_flush_failed_balance = true;
+                }
+                return Err(
+                    crate::publish::BatchFlushError::BalanceInsufficientForBatch {
+                        needed: check.total_estimated_cost_wei,
+                        available: check.current_balance_wei,
+                        queued_count: queued_count_after_coalesce,
+                    },
+                );
+            }
+        }
+
+        // ---- Step 3: per-account publish loop. ----
+        let publish_report = crate::publish::publish_all_for_vault(self, adapter, device_key)
+            .await
+            .map_err(crate::publish::BatchFlushError::Store)?;
+
+        // ---- Step 4: window-state reset on successful flush. ----
+        if let Some(active) = self.active.as_mut() {
+            active.window_started_at_unix_ms = None;
+            active.last_flush_failed_balance = false;
+        }
+
+        Ok(crate::publish::BatchFlushReport {
+            coalesced_markers_pruned,
+            publish_report,
+        })
+    }
+
+    /// **MVP-2 issue 5.1 (R-a) — env-var-clamped batch window.**
+    ///
+    /// Resolves the 30s coalescing window from
+    /// `PANGOLIN_BATCH_WINDOW_SECS` (clamped `1..=300`), defaulting
+    /// to `BATCH_WINDOW_SECS_DEFAULT = 30`. Pure function (the env
+    /// var is read once per call); host can override the default for
+    /// testing without using `env::set_var` (a process-global side
+    /// effect) by using [`Self::resolve_batch_window_secs_from`].
+    #[must_use]
+    pub fn resolve_batch_window_secs() -> u64 {
+        Self::resolve_batch_window_secs_from(
+            std::env::var(BATCH_WINDOW_SECS_ENV_VAR).ok().as_deref(),
+        )
+    }
+
+    /// Pure version of [`Self::resolve_batch_window_secs`] for
+    /// testability. The env var is read separately so hermetic tests
+    /// can drive the clamp logic deterministically.
+    #[must_use]
+    pub fn resolve_batch_window_secs_from(raw: Option<&str>) -> u64 {
+        let parsed = raw.and_then(|s| s.parse::<u64>().ok());
+        let value = parsed.unwrap_or(BATCH_WINDOW_SECS_DEFAULT);
+        value.clamp(BATCH_WINDOW_SECS_MIN, BATCH_WINDOW_SECS_MAX)
+    }
 
     /// **MVP-2 issue 4.1 (R-e + R-a + R-c + R-d).** Pull v1
     /// `RevisionPublished` events from D-017 + ingest them into the

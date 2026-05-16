@@ -105,6 +105,19 @@ hex      = { workspace = true }
 # is transitively in pangolin-store's dep tree via pangolin-chain,
 # so the addition is dev-only and introduces no new external crate.
 tokio    = { workspace = true }
+# MVP-2 issue 5.1: hermetic flush-queue tests in `publish.rs` impl
+# the `ChainAdapter` async-trait against test-only fakes
+# (BalanceInsufficientAdapter, CountingAdapter). The chain crate's
+# trait is `#[async_trait::async_trait]`, so impls in this crate's
+# tests need the same proc-macro. Same workspace pin pangolin-chain
+# already uses for the trait declaration itself.
+async-trait = { workspace = true }
+# MVP-2 issue 5.1: the hermetic flush tests reuse `MockChainAdapter`
+# (from `pangolin-chain`'s test-utilities feature) plus build a few
+# fail-injecting wrappers around it. The feature flag is dev-only;
+# the production build of `pangolin-store` cannot link against the
+# mock because this dependency line is in `[dev-dependencies]`.
+pangolin-chain = { path = "../pangolin-chain", features = ["test-utilities"] }
 
 # P9 fix-pass LOW-1: integration tests in `tests/e2e.rs` use the
 # `__test_synthesize_sibling_revision` helper which is now gated

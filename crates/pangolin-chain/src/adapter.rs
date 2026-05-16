@@ -23,6 +23,39 @@ use async_trait::async_trait;
 use crate::error::ChainError;
 use crate::types::{ChainAnchor, EventLocation, RevisionEvent, SignedRevision, VaultId};
 
+/// **MVP-2 issue 5.1 (R-e).** Pre-flight balance projection for batched flushes.
+///
+/// Returned by [`ChainAdapter::pre_flight_batch_balance`]. The store crate's
+/// `Vault::flush_publish_queue` uses this to fail-fast a batch BEFORE any
+/// chain submission when the projected total cost exceeds the wallet's
+/// current balance — the load-bearing "everything-or-nothing" guarantee
+/// per the R-e plan-gate decision.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchBalanceCheck {
+    /// Projected total cost in wei: `queued_count * estimated_per_revision_cost`.
+    pub total_estimated_cost_wei: u128,
+    /// Wallet's current balance in wei at the moment of the check.
+    pub current_balance_wei: u128,
+}
+
+impl BatchBalanceCheck {
+    /// Construct with explicit fields. Useful for tests + non-default impls.
+    #[must_use]
+    pub fn new(total_estimated_cost_wei: u128, current_balance_wei: u128) -> Self {
+        Self {
+            total_estimated_cost_wei,
+            current_balance_wei,
+        }
+    }
+
+    /// `true` iff `current_balance_wei >= total_estimated_cost_wei`.
+    /// Use this to drive the fail-fast branch in batched flushes.
+    #[must_use]
+    pub fn is_sufficient(&self) -> bool {
+        self.current_balance_wei >= self.total_estimated_cost_wei
+    }
+}
+
 /// Async transport for `RevisionLogV0` reads + writes.
 ///
 /// All methods are network-bound for the production impl; the
@@ -110,4 +143,30 @@ pub trait ChainAdapter: Send + Sync {
     /// the call. Reorgs may move this number backward in extreme
     /// cases; reorg handling is P8's job.
     async fn current_block(&self) -> Result<u64, ChainError>;
+
+    /// **MVP-2 issue 5.1 (R-e) — pre-flight batch balance gate.**
+    ///
+    /// Returns a [`BatchBalanceCheck`] projecting the total cost of
+    /// publishing `queued_count` revisions vs the wallet's current
+    /// balance, OR `None` if the adapter does not support pre-flight
+    /// checking (in which case the store crate falls back to the
+    /// per-revision balance gate inside `publish_revision_v1`).
+    ///
+    /// The store crate's `Vault::flush_publish_queue` calls this BEFORE
+    /// any chain submit; an insufficient result surfaces as
+    /// `BatchFlushError::BalanceInsufficientForBatch` without attempting
+    /// any chain submission. Per L2 + L12 + R-e: the load-bearing
+    /// "everything-or-nothing" guarantee for batched flushes.
+    ///
+    /// Default impl returns `Ok(None)` for back-compat with adapters
+    /// that pre-date 5.1 (notably `MockChainAdapter` in proof-of-concept
+    /// + early-MVP-2 tests). Production adapters (`BaseSepoliaAdapter`)
+    /// override.
+    async fn pre_flight_batch_balance(
+        &self,
+        queued_count: usize,
+    ) -> Result<Option<BatchBalanceCheck>, ChainError> {
+        let _ = queued_count;
+        Ok(None)
+    }
 }

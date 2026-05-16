@@ -34,208 +34,33 @@ use pangolin_chain::{
     build_signed_revision, ChainAdapter, ChainError, RevisionEvent, SignedRevision, VaultId,
 };
 use pangolin_crypto::keys::DeviceKey;
-use pangolin_store::{
-    AccountId, ChainAnchor, DirtyEntry, PendingMerge, RevisionId, StoreError, Vault,
-};
+use pangolin_store::{AccountId, ChainAnchor, PendingMerge, RevisionId, StoreError, Vault};
 
-/// Outcome of a single publish attempt within `publish_all`.
-#[derive(Debug, Clone)]
-pub enum PublishOutcome {
-    /// The revision was freshly published on chain by this run.
-    /// `anchor` is the chain anchor; `was_already_on_chain` is
-    /// `false`.
-    Published {
-        anchor: ChainAnchor,
-        was_already_on_chain: bool,
-    },
-    /// The on-chain step or local commit step failed. The dirty
-    /// marker was preserved; a re-run will retry.
-    Failed { error: String },
-}
-
-/// One row of the per-(account, revision) outcome list produced by
-/// `publish_all`.
-#[derive(Debug, Clone)]
-pub struct PublishOutcomeRow {
-    pub account_id: AccountId,
-    pub revision_id: RevisionId,
-    pub outcome: PublishOutcome,
-}
-
-/// Aggregate report from a `publish_all` run.
-#[derive(Debug, Clone, Default)]
-pub struct PublishReport {
-    /// Per-row outcomes in the order entries were attempted.
-    pub rows: Vec<PublishOutcomeRow>,
-}
-
-impl PublishReport {
-    /// Number of rows that successfully landed on chain in this run
-    /// (counts the A3 "already on chain" case as a success too —
-    /// the chain has the revision regardless of whether THIS run
-    /// put it there).
-    #[must_use]
-    pub fn published_count(&self) -> usize {
-        self.rows
-            .iter()
-            .filter(|r| matches!(r.outcome, PublishOutcome::Published { .. }))
-            .count()
-    }
-
-    /// Number of rows that failed in this run.
-    #[must_use]
-    pub fn failed_count(&self) -> usize {
-        self.rows
-            .iter()
-            .filter(|r| matches!(r.outcome, PublishOutcome::Failed { .. }))
-            .count()
-    }
-
-    /// `true` iff every entry in `rows` succeeded (or there were
-    /// no entries — a no-op publish is also "no failures").
-    #[must_use]
-    pub fn all_ok(&self) -> bool {
-        self.failed_count() == 0
-    }
-}
+// MVP-2 issue 5.1 (R-h refactor):
+// `publish_all` + `publish_one` + the per-row outcome / report types
+// were moved into `pangolin_store::publish` so that 5.1's batched
+// `Vault::flush_publish_queue` AND this CLI orchestrator share ONE
+// engine. The CLI's old type names are re-exported here verbatim so
+// every existing test in this module (and downstream test crates) keeps
+// compiling without churn — the body is now a thin delegation.
+pub use pangolin_store::publish::{PublishOutcome, PublishOutcomeRow, PublishReport};
 
 /// Walk `Vault::list_dirty()` and publish every entry through the
 /// supplied adapter.
 ///
-/// Per-entry semantics (per `P8.md` §A3):
+/// **MVP-2 issue 5.1 (R-h):** thin shell over
+/// [`pangolin_store::publish::publish_all_for_vault`].
 ///
-/// 1. Read `(parent, schema_version, enc_payload)` from the local
-///    revisions row.
-/// 2. Build a `SignedRevision` via
-///    [`pangolin_chain::signing::build_signed_revision`] using the
-///    supplied `device_key` (`PoC` two-key model — the gas-paying
-///    secp256k1 wallet is internal to the adapter).
-/// 3. **Pre-publish check**: query
-///    `adapter.pull_since(vault_id, last_pulled_block, None)` and
-///    inspect every event's `device_id` + canonical-hash. If an
-///    event with the same canonical-hash as our `signed` already
-///    appears on chain, skip the `publish` call and run only the
-///    local commit (`mark_published` + `clear_dirty`).
-/// 4. Otherwise, call [`ChainAdapter::publish`].
-/// 5. On success (or the A3-detected "already on chain" path),
-///    update `revisions.chain_anchor_*` via [`Vault::mark_published`]
-///    and remove the marker via [`Vault::clear_dirty`].
-/// 6. On failure, leave the marker in place; the next run retries.
-///
-/// `publish_all` is generic over `ChainAdapter` so unit tests can
-/// pass `MockChainAdapter`. The vault must be unlocked (we read
-/// payload bytes via `read_revision_for_publish`, which is metadata-
-/// ish but the dirty list itself was stamped only after a successful
-/// unlock — calling this on a fresh vault simply yields an empty
-/// dirty list and a no-op return).
+/// The library helper now owns the canonical publish engine (extracted
+/// from this module in 5.1). Per-entry semantics — A3 pre-publish
+/// dedupe check, `mark_published` then `clear_dirty` ordering, and
+/// per-account error isolation — are preserved verbatim.
 pub async fn publish_all<A: ChainAdapter + ?Sized>(
     vault: &mut Vault,
     adapter: &A,
     device_key: &DeviceKey,
 ) -> Result<PublishReport, StoreError> {
-    let vault_id: VaultId = vault.vault_id();
-    let last_pulled = vault.last_pulled_block()?;
-    let dirty: Vec<DirtyEntry> = vault.list_dirty()?;
-
-    // Pre-fetch the chain's view of "everything since last_pulled"
-    // exactly once per run — re-using it for the A3 check across
-    // every dirty entry. We tolerate a chain-side error here only by
-    // skipping the A3 optimization; a true network failure surfaces
-    // again at the per-entry `publish` call where it correctly fails
-    // that entry.
-    let chain_view: Option<Vec<RevisionEvent>> =
-        adapter.pull_since(&vault_id, last_pulled, None).await.ok();
-
-    let mut report = PublishReport::default();
-    for entry in dirty {
-        let row = match publish_one(vault, adapter, device_key, &entry, chain_view.as_deref()).await
-        {
-            Ok(outcome) => PublishOutcomeRow {
-                account_id: entry.account_id,
-                revision_id: entry.revision_id,
-                outcome,
-            },
-            Err(e) => PublishOutcomeRow {
-                account_id: entry.account_id,
-                revision_id: entry.revision_id,
-                outcome: PublishOutcome::Failed {
-                    error: format!("{e}"),
-                },
-            },
-        };
-        report.rows.push(row);
-    }
-    Ok(report)
-}
-
-/// Per-entry helper: factored out so `publish_all`'s loop body stays
-/// flat. Returns the outcome enum directly; failure conditions are
-/// caught by the surrounding match in `publish_all`.
-async fn publish_one<A: ChainAdapter + ?Sized>(
-    vault: &mut Vault,
-    adapter: &A,
-    device_key: &DeviceKey,
-    entry: &DirtyEntry,
-    chain_view: Option<&[RevisionEvent]>,
-) -> Result<PublishOutcome, anyhow::Error> {
-    let payload = vault.read_revision_for_publish(entry.account_id, entry.revision_id)?;
-    let signed: SignedRevision = build_signed_revision(
-        device_key,
-        vault.vault_id(),
-        *entry.account_id.as_bytes(),
-        *payload.parent_revision.as_bytes(),
-        payload.schema_version,
-        payload.enc_payload,
-    );
-
-    // A3 pre-publish check: if the chain view shows an event with
-    // the same canonical hash already on chain, skip the publish
-    // call. We compare by recomputing the canonical hash on each
-    // candidate event (cheap; keccak over ~160 bytes) so the match
-    // does not depend on whatever device_id is stored in the local
-    // row (which, for the PoC, may be a random 32 bytes that don't
-    // correspond to any actual signing key — see crate-level docs).
-    if let Some(events) = chain_view {
-        let our_hash = pangolin_chain::canonical_hash(
-            &signed.vault_id,
-            &signed.account_id,
-            &signed.parent_revision,
-            &signed.device_id,
-            signed.schema_version,
-            &signed.enc_payload,
-        );
-        for ev in events {
-            let ev_hash = pangolin_chain::canonical_hash(
-                &ev.vault_id,
-                &ev.account_id,
-                &ev.parent_revision,
-                &ev.device_id,
-                ev.schema_version,
-                &ev.enc_payload,
-            );
-            if ev_hash == our_hash {
-                // Already on chain. Run only the local commit.
-                vault.mark_published(entry.revision_id, ev.anchor)?;
-                vault.clear_dirty(entry.account_id, entry.revision_id)?;
-                return Ok(PublishOutcome::Published {
-                    anchor: ev.anchor,
-                    was_already_on_chain: true,
-                });
-            }
-        }
-    }
-
-    // No A3 hit — submit fresh.
-    let anchor: ChainAnchor = adapter
-        .publish(&signed)
-        .await
-        .map_err(|e: ChainError| anyhow::anyhow!("publish failed: {e}"))?;
-    vault.mark_published(entry.revision_id, anchor)?;
-    vault.clear_dirty(entry.account_id, entry.revision_id)?;
-    Ok(PublishOutcome::Published {
-        anchor,
-        was_already_on_chain: false,
-    })
+    pangolin_store::publish::publish_all_for_vault(vault, adapter, device_key).await
 }
 
 // ---------------------------------------------------------------------
