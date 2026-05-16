@@ -55,7 +55,9 @@ pub mod error;
 pub mod protocol;
 pub mod session;
 
-pub use cipher::{NoOpCipher, TempDbCipher};
+#[cfg(any(test, feature = "test-utilities"))]
+pub use cipher::NoOpCipher;
+pub use cipher::{AeadCipher, CipherError, TempDbCipher, AEAD_KEY_LEN};
 pub use error::IndexerError;
 pub use protocol::{
     IndexedEvent, IndexerEvent, IndexerRequest, IndexerResponse, MAX_REQUEST_LINE_BYTES,

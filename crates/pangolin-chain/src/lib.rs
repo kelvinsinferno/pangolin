@@ -129,7 +129,9 @@ pub use chain_submit::{
 };
 pub use deployments::{load_deployed_address, ChainEnv};
 pub use error::ChainError;
-pub use evm::{derive_evm_address, derive_evm_wallet, EvmWallet};
+pub use evm::{
+    derive_evm_address, derive_evm_wallet, derive_indexer_key, EvmWallet, INDEXER_KEY_DOMAIN,
+};
 pub use privacy::{
     DefaultStrategy, EnhancedPrivacyStrategy, FunderResponseShape, PrivacyError, PrivacyMode,
     PrivacyStrategy,

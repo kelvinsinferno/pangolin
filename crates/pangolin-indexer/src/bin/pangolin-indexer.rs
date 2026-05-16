@@ -31,8 +31,10 @@ use tokio::time::{sleep_until, Instant};
 use tracing_subscriber::EnvFilter;
 
 use pangolin_chain::ChainEnv;
+use pangolin_crypto::rng::fill_random;
+use pangolin_crypto::secret::SecretBytes;
 use pangolin_indexer::{
-    IndexerConfig, IndexerError, IndexerRequest, IndexerResponse, IndexerSession, NoOpCipher,
+    AeadCipher, IndexerConfig, IndexerError, IndexerRequest, IndexerResponse, IndexerSession,
     MAX_REQUEST_LINE_BYTES,
 };
 
@@ -99,7 +101,28 @@ async fn run() -> Result<(), IndexerError> {
     );
 
     // ---- Session ----
-    let mut session = IndexerSession::new(config, NoOpCipher::new_arc())?;
+    // 4.3 R-b + L10: production builds construct `AeadCipher` with
+    // a fresh random 32-byte key per run. The key never persists to
+    // disk; on Drop the SecretBytes wrapper zeroes it.
+    //
+    // For host integrations that want a deterministic key derived
+    // from the device secret (e.g., the desktop CLI wrapper that
+    // already holds an unlocked Vault), the in-process API
+    // `pangolin_chain::derive_indexer_key` produces an equivalent
+    // 32-byte SecretBytes. The standalone `pangolin-indexer` binary
+    // does NOT receive the device secret — it generates a fresh key
+    // here so the binary's blast radius stays minimal (4.3 plan-gate
+    // L-indexer-grows-pangolin-crypto-secret-material-reach).
+    let mut key_bytes = [0u8; 32];
+    fill_random(&mut key_bytes);
+    let cipher = AeadCipher::new_arc(SecretBytes::new(key_bytes.to_vec()));
+    // Wipe the stack-side copy now that the bytes are inside the
+    // SecretBytes heap allocation.
+    {
+        use zeroize::Zeroize;
+        key_bytes.zeroize();
+    }
+    let mut session = IndexerSession::new(config, cipher)?;
 
     // ---- Stdio loop ----
     let stdin = tokio::io::stdin();

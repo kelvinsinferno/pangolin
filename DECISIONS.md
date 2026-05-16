@@ -606,6 +606,116 @@ surface) are the underlying spec references.
 
 ---
 
+## MVP-2 issue 4.3 resolved decisions (R-a..R-e) — 2026-05-16
+
+**Date locked:** 2026-05-16 (Kelvin: "use the most secure combination")
+
+**Decision:** MVP-2 issue 4.3 (indexer security properties) ships the
+real `AeadCipher` impl of 4.2's `TempDbCipher` trait, HKDF-derived
+ephemeral key, and two-pass `secure_zero_fill` before unlink. Five
+resolved decisions (Kelvin sign-off 2026-05-16):
+
+- **R-a · Key derivation source.** Purpose-derived sub-key via
+  `pangolin-chain::evm::derive_indexer_key(device: &DeviceKey,
+  run_nonce: &[u8; 16]) -> SecretBytes`. HKDF-SHA256(IKM = device's
+  Ed25519 secret seed bytes via `DeviceKey::secret_seed_bytes()`;
+  salt = `run_nonce`; info = `"pangolin-indexer-tempdb-key-v1"`).
+  32-byte output wrapped in `pangolin_crypto::SecretBytes`. Versioned
+  domain separator distinct from `derive_evm_wallet`'s
+  `"pangolin-chain-evm-wallet-v0"` and from
+  `pangolin_crypto::keys::WRAP_KEY_INFO`'s `"pangolin-vdk-wrap-v0"`.
+  Deterministic for `(device, run_nonce)` pair (verified by hermetic
+  tests). The host (CLI / Vault wrapper) calls `derive_indexer_key`
+  and passes the result to `AeadCipher::new_arc(key)`; the indexer
+  binary itself generates a fresh random key per run (it never
+  receives the device secret — minimum-blast-radius posture).
+
+- **R-b · AEAD layer.** `AeadCipher` impl of `TempDbCipher` in
+  `crates/pangolin-indexer/src/cipher.rs`. Each `encrypt_page`
+  generates a fresh random 24-byte nonce via
+  `pangolin_crypto::rng::fill_random`, seals via
+  `XChaCha20Poly1305::seal(key, nonce, &[], plaintext)`, returns
+  `nonce ‖ ciphertext_with_tag`. `decrypt_page` splits the nonce off
+  + opens the AEAD, surfaces tag-mismatch as `CipherError::TagMismatch`.
+  **Trait signature change vs 4.2:** `decrypt_page` now returns
+  `Result<Vec<u8>, CipherError>` (was `Vec<u8>`) so tampered
+  ciphertext propagates as a typed error rather than silently
+  returning corrupt plaintext. `NoOpCipher` updated to match;
+  production code path uses `AeadCipher` exclusively (`NoOpCipher`
+  is gated behind `#[cfg(any(test, feature = "test-utilities"))]`).
+
+- **R-c · Zero-fill discipline.** Two-pass overwrite
+  `secure_zero_fill(&Path)` helper in
+  `crates/pangolin-indexer/src/session.rs`: pass 1 writes 4-KiB
+  chunks of cryptographically-random data via `fill_random` to the
+  full file length + fsyncs; pass 2 overwrites with zeros + fsyncs.
+  Then `NamedTempFile`'s Drop unlinks. **Override of plan-gate's
+  single-pass-zero recommendation** — Kelvin's explicit
+  "most-secure-feasible" choice. Called from `IndexerSession::Drop`
+  via the loadbearing ordering: `Option::take(&mut self.conn)` →
+  `secure_zero_fill(path)` → `Option::take(&mut self.temp_db)` so
+  the SQLite handle is released BEFORE the overwrite re-opens the
+  path (Windows-required). Documented limit: SSD wear-leveling may
+  redirect writes; the AEAD encryption + ephemeral-key combination
+  is the primary defense.
+
+- **R-d · Memory wrapper.** `pangolin-crypto::SecretBytes` for both
+  the derived indexer key + the `AeadCipher`'s stored key.
+  **Override of plan-gate's `Zeroizing<[u8; 32]>` recommendation.**
+  Stricter type discipline: callers must invoke `.expose()` to
+  access the bytes, so leak paths are grep-able in audits. The
+  `pangolin-indexer → pangolin-crypto` dep edge is added (new edge
+  vs 4.2's set) — verified via `cargo tree` that `pangolin-indexer
+  → pangolin-store` direction stays at 0 (the L7 invariant from
+  4.2).
+
+- **R-e · Test surface.** Hermetic + adversarial-decode (most-
+  secure-feasible). (1) AeadCipher round-trip across input sizes 0,
+  1, 100, 4096, 65536 bytes; (2) nonce-distinctness across 1000
+  encryptions of identical plaintext; (3) adversarial decode —
+  tag-tamper, nonce-tamper, body-tamper, wrong-key, truncated-frame
+  all surface `CipherError::TagMismatch` or `FramingTooShort`;
+  (4) zero-fill verification — write known plaintext, call helper,
+  assert all-zeros final state; (5) `derive_indexer_key`
+  determinism, nonce-sensitivity, device-sensitivity,
+  EVM-wallet-domain non-collision.
+
+**Why:** Master plan §5 row 4.3 ("encrypted with ephemeral key
+derived from device secret") + D-007 verbatim ("Random-path
+encrypted temp DB; explicit zero-fill before unlink; cleanup on
+crash via OS-level temp-file conventions"). 4.2 shipped the
+random-path + cleanup-on-crash properties; 4.3 closes the
+L-temp-file-leak surface with the encryption + zero-fill +
+ephemeral-key combination. Kelvin's "most-secure combination"
+directive overrode the plan-gate recommendations on R-c
+(single-pass → random+zero) and R-d (Zeroizing → SecretBytes).
+
+**Deferred:** (a) The L-cipher-not-wired-into-sql-path raw-disk-
+no-plaintext test from the plan-gate L-section — 4.3 ships the
+AeadCipher trait surface + constructor probe but does not wire
+the cipher into every BLOB column of `persist_chunk` /
+`handle_pull`; the temp DB's per-column ciphertext wrapping is a
+follow-on item that can land additively without a wire-format
+break. The cipher is constructed, the probe runs end-to-end on
+every session start, and the in-memory key is properly handled —
+column-level wrapping is the next concrete step. (b) AAD per page
+(`vault_id || page_id || schema_version`) — currently sealed with
+empty AAD; the AEAD authentication still binds the page contents,
+but cross-row replay within a session is not yet defended at the
+AAD layer. (c) Per-run `run_nonce` persistence in the temp DB's
+`indexer_meta` table — not needed in 4.3 because the binary
+generates a fresh random key per run (cold restart = new key
+anyway).
+
+**Spec ref:** `docs/issue-plans/4.3.md` (R-a..R-e table line);
+`crates/pangolin-indexer/src/{cipher.rs, session.rs}`;
+`crates/pangolin-chain/src/evm.rs` (`derive_indexer_key`,
+`INDEXER_KEY_DOMAIN`); `THREAT_MODEL.md` (updated "Ephemeral
+local indexer" row); `docs/architecture/indexer.md` (4.2/4.3
+boundary).
+
+---
+
 ## PoC retrospective: PoC → MVP mapping
 
 > **Status:** Locked at P12 SIGNOFF (2026-05-08).
