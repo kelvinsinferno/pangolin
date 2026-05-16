@@ -161,7 +161,7 @@ const GAS_ESTIMATE_DENOM: u64 = 10;
 // constructor. Wrapping in a `mod` lets us silence the lint at
 // the boundary without sprinkling allows inside generated code.
 #[allow(clippy::too_many_arguments, clippy::module_name_repetitions)]
-pub(crate) mod revision_log_v1_binding {
+pub mod revision_log_v1_binding {
     use alloy::sol;
 
     sol! {

@@ -257,7 +257,7 @@ pub struct SignedRevisionV1 {
 /// their `verifyingContract` from the deployment file too; the
 /// pinned-constant cross-check in [`build_signed_revision_v1`] only
 /// applies to `BaseSepolia`.
-fn build_domain(env: ChainEnv, verifying_contract: Address) -> Eip712Domain {
+pub(crate) fn build_domain(env: ChainEnv, verifying_contract: Address) -> Eip712Domain {
     let chain_id = env.chain_id().unwrap_or(0);
     // The macro stamps `name` / `version` into a `Cow<'static, str>`
     // — passing the literal directly via `String::from(...)` would be
@@ -288,7 +288,7 @@ fn build_domain(env: ChainEnv, verifying_contract: Address) -> Eip712Domain {
 ///     )
 /// )
 /// ```
-fn struct_hash(fields: &RevisionFieldsV1) -> B256 {
+pub(crate) fn struct_hash(fields: &RevisionFieldsV1) -> B256 {
     // 7 × 32 bytes = 224 bytes.
     let mut buf = [0u8; 7 * 32];
     let mut o = 0usize;
@@ -314,7 +314,7 @@ fn struct_hash(fields: &RevisionFieldsV1) -> B256 {
 
 /// EIP-712 final digest: `keccak256(0x1901 ‖ domainSeparator ‖
 /// structHash)`.
-fn eip712_digest(domain_sep: B256, struct_hash_value: B256) -> B256 {
+pub(crate) fn eip712_digest(domain_sep: B256, struct_hash_value: B256) -> B256 {
     // 2 + 32 + 32 = 66 bytes.
     let mut buf = [0u8; 66];
     buf[0] = 0x19;
@@ -345,6 +345,122 @@ pub fn is_canonical_s(s_be: &[u8; 32]) -> bool {
         }
     }
     true // exact equality is canonical (s == n/2).
+}
+
+/// Recover the secp256k1 EVM address that signed the EIP-712 digest
+/// built from `signed_revision.fields` under `chain_env`.
+///
+/// **MVP-2 issue 4.1 R-d (productionised 3.1 R-d's test-only helper).**
+/// Reuses the exact same `build_domain` / `struct_hash` /
+/// `eip712_digest` helpers the signing path uses — byte-identical
+/// digest construction is the load-bearing property that lets a sign +
+/// recover round-trip recover the wallet's own address (L1 invariant).
+///
+/// Per L-domain-binding (and the
+/// [`EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA`] cross-check): for
+/// `BaseSepolia`, the helper expects the on-disk deployment file's
+/// `RevisionLogV1` address to equal the pinned constant. Mismatch
+/// fails closed with [`ChainError::DeploymentAddressMismatch`] (same
+/// posture as [`build_signed_revision_v1`]).
+///
+/// # Errors
+///
+/// - [`ChainError::DeploymentNotFound`] /
+///   [`ChainError::DeploymentParseError`] if the env's deployment file
+///   is missing / malformed.
+/// - [`ChainError::DeploymentAddressMismatch`] for `BaseSepolia` if the
+///   deployment file points anywhere other than D-017.
+/// - [`ChainError::SignerRecoveryFailed`] if alloy's
+///   `recover_address_from_prehash` fails to recover a well-formed
+///   address (e.g., the signature bytes are malformed at the curve
+///   level — `r` is zero, `s` is zero, etc.).
+pub fn recover_signer_v1(
+    signed_revision: &SignedRevisionV1,
+    chain_env: ChainEnv,
+) -> Result<Address, ChainError> {
+    recover_signer_v1_raw(
+        &signed_revision.fields,
+        &signed_revision.signature,
+        chain_env,
+    )
+}
+
+/// Lower-level variant of [`recover_signer_v1`]: raw inputs entry.
+///
+/// Takes the raw fields + signature bytes directly. Used by the
+/// event-decode path in [`crate::chain_sync`] which naturally produces
+/// these inputs from decoded `RevisionPublished` log fields rather
+/// than from a [`SignedRevisionV1`] struct.
+///
+/// Per LOW#3 defense-in-depth (mirrors 3.5's `is_canonical_s` posture):
+/// the recovery side asserts `s ≤ secp256k1n/2` BEFORE attempting
+/// `recover_address_from_prehash`. A high-s sig from a misbehaving
+/// publisher / RPC is rejected with
+/// [`ChainError::SignerRecoveryFailed`] rather than silently malleating
+/// to a different recovered address.
+///
+/// # Errors
+///
+/// Same taxonomy as [`recover_signer_v1`].
+pub fn recover_signer_v1_raw(
+    fields: &RevisionFieldsV1,
+    signature: &[u8; 65],
+    chain_env: ChainEnv,
+) -> Result<Address, ChainError> {
+    // R-c: deployment-file sourcing of `verifyingContract`. Same load
+    // helper the signing path uses → digest reconstruction is identical
+    // by construction.
+    let verifying_contract = load_deployed_address(chain_env, "RevisionLogV1")?;
+    // L-domain-binding defense: the pinned-at-source constant is the
+    // ground-truth address; mismatch fails closed.
+    if matches!(chain_env, ChainEnv::BaseSepolia)
+        && verifying_contract != EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA
+    {
+        return Err(ChainError::DeploymentAddressMismatch {
+            env: chain_env,
+            expected: EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA,
+            actual: verifying_contract,
+        });
+    }
+
+    // L1 verbatim: re-use the same helpers the signing side ran;
+    // re-implementing the digest would create silent-drift surface.
+    let domain = build_domain(chain_env, verifying_contract);
+    let domain_sep = domain.separator();
+    let s_hash = struct_hash(fields);
+    let digest = eip712_digest(domain_sep, s_hash);
+
+    // LOW#3 defense-in-depth: a malicious publisher / RPC could submit
+    // a high-s signature that the on-chain `ecrecover` would tolerate
+    // (Ethereum's precompile is permissive); the client-side recovery
+    // is canonical-only so the local revision-graph never absorbs a
+    // malleability twin.
+    let mut s_be = [0u8; 32];
+    s_be.copy_from_slice(&signature[32..64]);
+    if !is_canonical_s(&s_be) {
+        return Err(ChainError::SignerRecoveryFailed {
+            detail: "signature s component is non-canonical (high-s)".to_string(),
+        });
+    }
+    // `v` byte sanity — alloy's `Signature::new(y_parity: bool)`
+    // accepts either parity but EIP-712 binds `v ∈ {27,28}`. Reject
+    // anything else early so a malformed publish fires loudly here
+    // rather than landing under a wrong address downstream.
+    let v_byte = signature[64];
+    if v_byte != 27 && v_byte != 28 {
+        return Err(ChainError::SignerRecoveryFailed {
+            detail: format!("signature v byte not in {{27,28}}: got {v_byte}"),
+        });
+    }
+
+    let r = U256::from_be_slice(&signature[0..32]);
+    let s = U256::from_be_slice(&signature[32..64]);
+    let y_parity = v_byte == 28;
+    let sig = alloy::primitives::Signature::new(r, s, y_parity);
+    sig.recover_address_from_prehash(&digest)
+        .map_err(|e| ChainError::SignerRecoveryFailed {
+            detail: format!("alloy recover_address_from_prehash failed: {e}"),
+        })
 }
 
 /// Sign the EIP-712 digest with `signer`, returning a 65-byte
