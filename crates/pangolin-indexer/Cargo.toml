@@ -1,3 +1,30 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# `pangolin-indexer` — MVP-2 issue 4.2 (ephemeral local indexer).
+#
+# Per D-007 + 4.2 R-a..R-f (Kelvin sign-off 2026-05-16): a single crate
+# exposes both:
+#   * a library (`pangolin_indexer::IndexerSession` + `protocol` + `cipher`)
+#     consumed by the mobile in-process flow and by integration tests;
+#   * a thin binary (`src/bin/pangolin-indexer.rs`) gated behind the
+#     `bin` feature so the library-only build path (mobile) does not
+#     drag clap into the dep set.
+#
+# L6 (dep discipline): the only net-new runtime dep this crate brings
+# in over what the rest of the workspace already uses is `tempfile`
+# promoted from a workspace dev-dep to a runtime dep on this crate.
+# Everything else (alloy, tokio, rusqlite, serde_json, thiserror, hex,
+# tracing/tracing-subscriber, clap) is already present in the
+# workspace lockfile via `pangolin-chain` / `pangolin-store` /
+# `services/funder` — no new transitive surface.
+#
+# L7 (dep direction): `pangolin-indexer` is downstream of
+# `pangolin-chain` (reuses `fetch_and_verify_chunk` +
+# `VerifiedRevisionEvent` + `ChainEnv` + `SyncReport`) and MUST NOT
+# depend on `pangolin-store`. CI invariant:
+#   cargo tree -p pangolin-indexer --no-default-features \
+#     --edges normal | grep -c pangolin-store == 0
+
 [package]
 name = "pangolin-indexer"
 version.workspace = true
@@ -11,3 +38,113 @@ description = "Ephemeral local indexer — auto-deletes its temp DB when sync co
 
 [lints]
 workspace = true
+
+[lib]
+# Default library target. Mobile + tests consume this directly.
+
+[[bin]]
+name = "pangolin-indexer"
+path = "src/bin/pangolin-indexer.rs"
+# R-e: the binary requires the `bin` feature, so library-only builds
+# (mobile + crate test harnesses that don't exercise the binary)
+# skip clap and the binary compilation entirely.
+required-features = ["bin"]
+
+[features]
+# 4.2 R-e: the binary ships by default in workspace builds (desktop
+# subprocess flow); mobile builds pass `--no-default-features` to
+# omit clap + the binary altogether.
+default = ["bin"]
+bin = ["dep:clap"]
+
+# Exposes session inspection helpers (e.g., `IndexerSession::temp_db_path`)
+# to integration tests + downstream test harnesses. Production builds
+# leave this OFF so the temp-file path is never reachable from user
+# code (L1 hygiene). Hermetic + crash-cleanup integration tests pull
+# this feature in via the dev-dependencies self-reference below.
+# Mirrors `pangolin-chain`'s `test-utilities` flag.
+test-utilities = []
+
+[dependencies]
+
+# ---- Internal workspace deps ----
+# L7: `pangolin-chain` exposes `fetch_and_verify_chunk`, the
+# `VerifiedRevisionEvent` shape, `ChainEnv`, `SyncReport`, and the
+# `d017_deploy_block` cursor constant. This is the verifier +
+# decoder + reorg-detector substrate 4.1 ships and 4.2 reuses
+# verbatim per L4 (byte-identical revision-graph output vs slow
+# mode).
+pangolin-chain = { path = "../pangolin-chain" }
+
+# ---- External deps (each justified below) ----
+
+# alloy 2.0.4 — Address / B256 / U256 primitives reused for the
+# verified-event payloads we hand to the protocol layer. The
+# indexer does NOT construct a Provider directly; the read provider
+# is built by `pangolin_chain::chain_sync::fetch_and_verify_chunk`.
+# Same workspace pin the rest of the chain stack uses; no new
+# transitive surface.
+alloy = { workspace = true }
+
+# tokio 1.52.2 — async runtime + `select!` macro for the
+# request-or-idle-timeout race + signal handling on the binary
+# entry. Features mirror the funder service entry (`rt-multi-thread`,
+# `macros`, `time`, `sync`, `io-util` for stdin BufReader,
+# `signal` for ctrl_c).
+tokio = { version = "=1.52.2", default-features = false, features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "io-std", "signal"] }
+
+# tempfile 3.13.0 — the L1/L11 random-path + Drop-on-exit + OS
+# temp-dir-conventions cleanup primitive. Previously a workspace
+# dev-dep (used by `pangolin-store` vault-file tests); promoted to
+# runtime dep for the indexer per 4.2 L6.
+tempfile = { workspace = true }
+
+# rusqlite 0.39 — workspace pin (same `bundled` SQLite the rest of
+# the storage stack uses). The temp DB is opened via this crate.
+# The schema is fresh per-run; this is a SEPARATE store from the
+# vault's `.pvf` (L7 — pangolin-indexer never touches
+# pangolin-store).
+rusqlite = { workspace = true }
+
+# serde + serde_json — 4.2 R-b stdio JSON protocol. `serde` is the
+# derive target for the `IndexerRequest` / `IndexerResponse` /
+# `IndexerEvent` enums; `serde_json` is the wire codec. Same
+# `serde = =1.0.228` pin the funder service uses (already in the
+# workspace lockfile); `serde_json` is a workspace dep.
+serde = { version = "=1.0.228", default-features = false, features = ["std", "derive"] }
+serde_json = { workspace = true }
+
+# thiserror — error taxonomy. Workspace pin.
+thiserror = { workspace = true }
+
+# hex — encoding bytes (vault_id, signer, block_hash, tx_hash,
+# enc_payload) into the JSON protocol envelope so the wire format
+# stays cross-platform readable. Workspace pin.
+hex = { workspace = true }
+
+# tracing + tracing-subscriber — stderr logs for the binary entry.
+# Same `=0.1.41` / `=0.3.20` pins the funder service uses.
+# Stderr-only per the R-b protocol contract: stdout is reserved for
+# the JSON protocol; stderr carries operator logs.
+tracing = { version = "=0.1.41", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "=0.3.20", default-features = false, features = ["fmt", "env-filter", "std"] }
+
+# clap — optional, gated behind the `bin` feature per R-e. Only
+# the desktop subprocess binary needs argv parsing; mobile builds
+# pass `--no-default-features` and never link clap.
+clap = { workspace = true, optional = true }
+
+[dev-dependencies]
+# `#[tokio::test]` for async test cases + `test-util` for
+# `time::advance` driving the idle-timeout sim (no wall-clock
+# sleeps in hermetic tests).
+tokio = { version = "=1.52.2", default-features = false, features = ["rt-multi-thread", "macros", "time", "sync", "test-util", "io-util", "io-std"] }
+tempfile = { workspace = true }
+# `serde_json::from_str` round-trips in tests.
+serde_json = { workspace = true }
+hex = { workspace = true }
+# Self-feature so integration tests under `tests/*.rs` can reach
+# `IndexerSession::temp_db_path` + other test-helper accessors. Same
+# pattern `pangolin-chain` / `pangolin-store` use for their own
+# test-utilities flags.
+pangolin-indexer = { path = ".", features = ["test-utilities"] }

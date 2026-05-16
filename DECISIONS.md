@@ -448,6 +448,164 @@ security-critical surface) are the underlying spec references.
 
 ---
 
+## MVP-2 issue 4.2 resolved decisions (R-a..R-f) — 2026-05-16
+
+> **Status:** Locked. Plan-gate sign-off in `docs/issue-plans/4.2.md`
+> "Resolved decisions" table. Builder agent shipped under the
+> `issue/4.2-ephemeral-indexer` worktree.
+>
+> **Scope:** ship the structural skeleton for the opt-in fast-mode
+> sync path. Stands up the `pangolin-indexer` crate as a single
+> library + binary entry, wraps the SAME chain primitive 4.1 ships
+> (`pangolin_chain::fetch_and_verify_chunk`) in a per-run temp DB
+> backed lifecycle, defines the stdio JSON protocol the host uses to
+> drive the indexer, and stubs the `TempDbCipher` trait so 4.3 can
+> swap in the real AEAD impl without callsite churn. **4.2 is the
+> skeleton; 4.3 is the security hardening (ephemeral key + zero-fill
+> + AEAD layer); 4.4 is the mode-selector heuristic.** See
+> `docs/issue-plans/4.2.md` for the L1..L12 invariants and the
+> threat-model row for the load-bearing risks (L-temp-file-leak,
+> L-vault-id-disclosure, L-stdio-injection, L-idle-timeout-DoS,
+> L-spurious-spawn, L-host-indexer-mismatch, L-temp-dir-tampering).
+
+### R-a · Crate organization — single crate (library + binary)
+
+`crates/pangolin-indexer/` exposes `[lib]` + `[[bin]]` from one
+Cargo.toml. `src/lib.rs` re-exports `IndexerSession`,
+`IndexerConfig`, `IndexerRequest`, `IndexerResponse`, `IndexedEvent`,
+`TempDbCipher`, `NoOpCipher`, `IndexerError`, and the lifecycle
+constants. `src/bin/pangolin-indexer.rs` is a ~120-LoC shim that
+wires argv (via clap) + stdio I/O + ctrl_c + idle-timeout +
+`IndexerSession::handle_request` dispatch. NO separate
+`pangolin-indexer-client` crate (plan-gate Q-a Option C was tabled
+in favour of the simpler single-crate shape). **Why:** mirrors the
+funder shape's substrate idea but without the cross-crate
+bookkeeping; mobile in-process flow imports the library directly,
+desktop subprocess flow spawns the binary — both call the same
+`IndexerSession` API.
+
+### R-b · Communication channel — stdio JSON (line-delimited, tag-discriminated)
+
+Host writes one JSON `IndexerRequest` per line on the indexer's
+stdin; the indexer writes one `IndexerResponse` per line on stdout.
+Stderr is reserved for `tracing` logs (so the host can capture both
+streams separately). `IndexerRequest` is a `serde(tag = "type",
+deny_unknown_fields)` enum with variants `start_index`, `pull`,
+`heartbeat`, `stop`; `IndexerResponse` is a `serde(tag = "type")`
+enum (forward-compat: response fields can grow additively) with
+variants `started`, `batch`, `progress`, `heartbeat`, `complete`,
+`stopped`, `error`. Byte-bag fields (`vault_id`, `signer`,
+`block_hash`, `tx_hash`, `parent_revision`, `device_id`,
+`account_id`, `enc_payload`) are encoded as lowercase hex strings
+without `0x` prefix for cross-platform JSON compat. **L-stdio-
+injection defense:** `MAX_REQUEST_LINE_BYTES = 65_536` cap rejects
+oversized lines before any parse attempt; unknown variants +
+unknown fields are rejected via `deny_unknown_fields`. **L-host-
+indexer-mismatch defense:** `IndexerResponse::Started` carries a
+`protocol_version` field equal to const `PROTOCOL_VERSION = 1`; the
+host MUST cross-check on receipt and abort on mismatch. Mobile
+in-process callers skip the framing layer and call
+`session.handle_request` directly with the same enums.
+
+### R-c · Idle timeout — const default + env override with hard ceiling clamp
+
+`pub const IDLE_TIMEOUT_DEFAULT_SECS: u64 = 300` (5 minutes per
+D-007); `pub const IDLE_TIMEOUT_MAX_SECS: u64 = 3_600` (1-hour hard
+ceiling — L-idle-timeout-DoS bound); `pub const
+IDLE_TIMEOUT_MIN_SECS: u64 = 60` (lower floor for sanity).
+`PANGOLIN_INDEXER_IDLE_TIMEOUT_SECS` env var overrides the default;
+the resolver clamps the parsed value to `[60, 3_600]` so a hostile
+env-var setting cannot push the timeout outside this range.
+Invalid env values (non-numeric, empty) fall back to the
+`300`-second default. Implementation: a pure function
+`resolve_idle_timeout_from(raw: Option<&str>) -> u64` lets hermetic
+tests exercise the clamp logic without process-global `env::set_var`.
+
+### R-d · Temp DB security boundary — 4.2 ships skeleton + `TempDbCipher` trait stub
+
+4.2 ships: (a) `tempfile::NamedTempFile::new_in(env::temp_dir())`
+for random-path + OS-temp-dir cleanup-on-crash (L1 + L11);
+(b) `pub trait TempDbCipher: Send + Sync + Debug` with
+`encrypt_page(&self, plaintext) -> Vec<u8>` + `decrypt_page(&self,
+ciphertext) -> Vec<u8>`; (c) `NoOpCipher` impl that returns input
+unchanged; (d) lifecycle wiring (the `IndexerSession` holds an
+`Arc<dyn TempDbCipher>`) + auto-delete on normal exit via the
+field-declaration-order discipline (`Connection` drops before
+`NamedTempFile` so the Windows unlink succeeds). 4.3 adds: (e) the
+ephemeral per-run encryption key (256-bit random; never persisted;
+process-memory-only); (f) `AeadCipher` impl (XChaCha20-Poly1305 per
+page; reuses `pangolin-crypto`); (g) explicit zero-fill before
+unlink; (h) potential SQLite cipher / raw-file AEAD integration.
+**Architectural-locking property:** 4.3's swap is a single-line
+constructor change (`NoOpCipher::new_arc()` →
+`AeadCipher::new_arc()`); the trait surface stays.
+
+### R-e · Mobile + desktop — library + binary, gated via Cargo features
+
+Library exposes `IndexerSession` (mobile in-process entry + tests);
+binary in `src/bin/pangolin-indexer.rs` wires argv + stdio +
+`IndexerSession::run`. Cargo features: `default = ["bin"]`, `bin =
+["dep:clap"]`, `test-utilities = []`. Mobile builds pass
+`--no-default-features` to omit clap + the binary entirely.
+`[[bin]] required-features = ["bin"]` ensures library-only builds
+skip the binary compilation. The `test-utilities` feature exposes
+`IndexerSession::temp_db_path` to integration tests + downstream
+test harnesses (production-default OFF for L1 hygiene). L12
+verified: the lifecycle code path is identical in both flows; the
+only difference is how the host invokes it
+(`std::process::Command::spawn(...)` vs.
+`tokio::spawn(session.handle_request(...))`).
+
+### R-f · Test depth — hermetic + cleanup-on-crash + `#[ignore]`'d live parity (max coverage)
+
+Three test classes shipped: (a) **hermetic** —
+`tests/hermetic.rs`: 26 tests covering constants pinning (R-c
+clamp bounds; `PROTOCOL_VERSION = 1`; `PULL_BATCH_SIZE_MAX`;
+`MAX_REQUEST_LINE_BYTES`), lifecycle (temp-file existence +
+unlink-on-drop; Debug-impl path leak hygiene), stdio JSON
+contract (round-trip + reject malformed + reject unknown variant +
+reject unknown field), heartbeat / stop dispatch, pull-before-
+start-index error, `NoOpCipher` round-trip + Send+Sync,
+`IndexedEvent` JSON pinning. (b) **cleanup-on-crash** —
+`tests/crash_cleanup.rs`: 5 tests covering panic-during-task →
+Drop unlinks (L11 panic branch); task-completion → Drop unlinks;
+multiple sessions get unique paths + all clean up; sync-context
+Drop without async runtime; idle-timeout-driven cleanup path.
+(c) **`#[ignore]`'d live parity** — `tests/parity.rs`: 1 test
+that spawns the indexer against a live `BASE_SEPOLIA_RPC_URL` +
+`PANGOLIN_INDEXER_VAULT_ID` env, drains, and (once a known D-017
+event fixture is captured — same deferral as 4.1 R-f) compares
+byte-for-byte against slow-mode 4.1 output. **Builder note on
+fixture deferral:** no historical `RevisionPublished` event has
+been captured from D-017 yet; the test docstring documents the
+`cast logs` capture procedure for the operational follow-up.
+
+**Test counts at SIGNOFF:** 35 lib + 26 hermetic + 5 crash_cleanup
++ 1 ignored live = 66 pass + 1 ignored. L7 invariant verified:
+`cargo tree -p pangolin-indexer --no-default-features --edges
+normal | grep -c pangolin-store == 0`. Lib-only build
+(`cargo build -p pangolin-indexer --no-default-features`) succeeds
+clean (R-e mobile flow). `cargo deny check advisories` clean (no
+new deps beyond promoting `tempfile` from dev-dep to runtime dep
+on the indexer); `cargo audit` 0 vulnerabilities, 2 allowed
+warnings (unchanged from 4.1).
+
+**Open follow-ups (deferred to 4.3 / 4.4):** (a) `AeadCipher` real
+impl + ephemeral key + zero-fill before unlink (4.3 — the
+`TempDbCipher` trait is the hook). (b) Mode-selector heuristic +
+host wrapper that translates `IndexerResponse::Batch` →
+`Vault::ingest_pending_chain_revision` (4.4). (c) Live parity test
+event fixture capture — same deferral as 4.1 R-f; one-shot `cast
+logs` against D-017 once a known event payload exists.
+
+**Spec ref:** `docs/issue-plans/4.2.md`; `docs/architecture/indexer.md`;
+`THREAT_MODEL.md` (new "Ephemeral local indexer (4.2 skeleton; 4.3
+hardening)" row). Master plan §5 row 4.2 + D-007 (no persistent
+indexer service) + §16.3 (chain reader / sync security-critical
+surface) are the underlying spec references.
+
+---
+
 ## PoC retrospective: PoC → MVP mapping
 
 > **Status:** Locked at P12 SIGNOFF (2026-05-08).
