@@ -98,6 +98,13 @@ nix = { version = "=0.29.0", default-features = false, features = ["fs"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 hex      = { workspace = true }
+# MVP-2 issue 4.4: the sync-mode selector `Vault::select_sync_mode` is
+# `async fn` (its API signature reserves the option to call a chain
+# RPC from future heuristics; today the body never awaits). Tests
+# need an async test harness; tokio is already a workspace dep and
+# is transitively in pangolin-store's dep tree via pangolin-chain,
+# so the addition is dev-only and introduces no new external crate.
+tokio    = { workspace = true }
 
 # P9 fix-pass LOW-1: integration tests in `tests/e2e.rs` use the
 # `__test_synthesize_sibling_revision` helper which is now gated

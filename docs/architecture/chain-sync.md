@@ -173,6 +173,108 @@ Accessors:
 - `Vault::update_last_synced_block_v1(new_block: u64) -> Result<()>` —
   monotonic; refuses backward moves with `StoreError::Corrupted`.
 
+## Sync-mode selector (MVP-2 issue 4.4)
+
+> **Status:** shipped 2026-05-16 under `issue/4.4-sync-mode-selector`
+> worktree. See [`docs/issue-plans/4.4.md`](../issue-plans/4.4.md)
+> for the plan-gate, L1..L7 invariants, and the L-section
+> adversarial-framing rows. R-a..R-e resolved decisions
+> ([`DECISIONS.md`](../../DECISIONS.md)).
+
+Issue 4.4 ships the **client-side picker** that decides whether to
+invoke 4.1's in-process slow-mode sync (`Vault::sync_from_chain`) or to
+surface a "Spin up faster sync? (uses temporary local indexer that
+auto-deletes)" prompt that — on user assent — spawns 4.2/4.3's
+ephemeral `pangolin-indexer`. 4.4 is **read-only logic + a vault-stored
+UX preference**; it does NOT spawn the indexer (the host owns that on
+user assent — L1) and does NOT change either underlying sync path.
+
+### What the picker decides
+
+[`Vault::select_sync_mode`](../../crates/pangolin-store/src/vault.rs)
+returns one of three `SyncMode` variants:
+
+- **`SyncMode::Slow`** — host runs `Vault::sync_from_chain` in-process
+  (the 4.1 R-e path).
+- **`SyncMode::OfferFast`** — host renders the D-007 prompt; on user
+  accept, spawn `pangolin-indexer` (4.2 + 4.3); on user decline, fall
+  through to slow-mode.
+- **`SyncMode::AlwaysFast`** — host spawns `pangolin-indexer` directly
+  without a per-session prompt. This is the only path where the host
+  spawns without per-session assent — the user pre-assented when they
+  set `SyncModePreference::AlwaysFast`.
+
+### The first-sync heuristic (R-a)
+
+| `last_synced_block_v1` | `sync_mode_preference` (Auto) | returns |
+|---|---|---|
+| `Some(_)` | Auto | `Slow` |
+| `None` | Auto | `OfferFast` |
+
+Single-axis: did this vault, on this device, ever complete a slow-mode
+sync? If yes → slow-mode is good enough. If no → offer the user the
+fast path because a brand-new vault (or one restored on a fresh device)
+faces a potentially long first-sync window.
+
+The plan-gate's master-plan-§5 wording ("<100 unsynced revisions →
+slow-mode; ≥100 → offer fast") was reframed by Kelvin during
+sign-off: the only realistic ≥100-revisions case is a first sync on
+this device. Long-offline-catchup users still get slow-mode (a
+"tolerable UX cost" per the resolved-decisions narrative). NO
+threshold value lives in code; NO env-var override; NO `eth_getLogs`
+revision count.
+
+### The three-state preference flag (R-b)
+
+`meta.sync_mode_preference TEXT` column on the vault file. Three
+states:
+
+- `NULL` (=`SyncModePreference::Auto`; the default for all existing
+  vaults) — defer to the heuristic.
+- `'always_slow'` — force `SyncMode::Slow` regardless of checkpoint.
+- `'always_fast'` — force `SyncMode::AlwaysFast` regardless of
+  checkpoint.
+
+Cleartext column by design (L2 — UX state, not secret material;
+mirrors the 1.4 `session_idle_secs` precedent). A filesystem-tamperer
+who flips the value causes a UX degrade (denied fast-mode UX, or
+forced indexer spawn — both no worse than the underlying surfaces
+already exposed in 4.2/4.3). The user retains the ability to flip via
+`Vault::set_sync_mode_preference` at any time.
+
+Migration: `migrate_sync_mode_preference_column` in
+`crates/pangolin-store/src/schema.rs` — additive
+nullable-column on `meta`. NO `format_version` bump. Legacy
+vaults open on new code and read the column as NULL → `Auto`.
+
+### The host's responsibility
+
+Per L1, the picker NEVER auto-spawns the indexer. The host (CLI,
+Tauri shell, mobile UI) owns:
+
+1. Calling `vault.select_sync_mode(rpc_url, env).await` at the
+   sync-trigger boundary.
+2. Rendering the D-007 "Spin up faster sync? (uses temporary local
+   indexer that auto-deletes)" prompt on `SyncMode::OfferFast`.
+3. On `OfferFast→accept` or `AlwaysFast`, spawning the
+   `pangolin-indexer` binary (4.2 lifecycle) + draining its output into
+   `Vault::ingest_pending_chain_revision`.
+4. On `OfferFast→decline` or `Slow`, invoking
+   `Vault::sync_from_chain` directly.
+5. Surfacing `Vault::set_sync_mode_preference` as a user-settable knob
+   (Settings page; CLI subcommand; FFI — deferred to a CLI-V1 batch
+   per the plan-gate's "Out of scope" boundary).
+
+### The `async fn` signature
+
+`select_sync_mode` is `async` even though the current implementation
+never awaits — the R-c plan-gate signature reserves the option to
+call a chain RPC (`pangolin_chain::fetch_current_block_number`) from
+future heuristics without breaking the public API. The `rpc_url` +
+`env` parameters are placeholders for that future refinement. Today
+the body only reads `self.last_synced_block_v1()?` +
+`self.sync_mode_preference()?` and dispatches on the combined table.
+
 ## Threat-model touch-points
 
 See [`THREAT_MODEL.md`](../../THREAT_MODEL.md) "Slow-mode chain sync
@@ -181,6 +283,12 @@ L-rpc-spoof-events, L-rpc-omits-events, L-reorg-rollback,
 L-checkpoint-corruption, L-malicious-vault-id-substitution,
 L-schemaVersion-future-poison, L-verifier-domain-binding-drift, and
 L-permissive-auto-register-could-add-spam (R-d trade-off).
+
+4.4's three L-rows (L-malicious-RPC-fakes-chain-head,
+L-vault-state-staleness, L-preference-flag-tamper) are tracked in the
+new "Sync-mode selector (4.4)" row. All three are UX-degrade-only —
+the load-bearing security defenses live in 4.1's verifier + chain-id
+check + 4.2/4.3's ephemeral indexer + temp-DB cipher.
 
 ## File layout
 
@@ -213,4 +321,12 @@ L-permissive-auto-register-could-add-spam (R-d trade-off).
 - `crates/pangolin-store/src/schema.rs` — additive migrations for
   `revisions.{revision_status, observed_at_block, observed_block_hash}` +
   `devices.{discovered_via_chain_sync, discovered_at_block}` +
-  `chain_sync_v1_state` table.
+  `chain_sync_v1_state` table + (4.4) `meta.sync_mode_preference`
+  via `migrate_sync_mode_preference_column`.
+- `crates/pangolin-store/src/vault.rs` — **(4.4)** `SyncMode` +
+  `SyncModePreference` + `Vault::select_sync_mode` (async picker) +
+  `Vault::sync_mode_preference` (read) + `Vault::set_sync_mode_preference`
+  (write).
+- `crates/pangolin-store/src/meta.rs` — **(4.4)** `read_sync_mode_preference`
+  + `write_sync_mode_preference` (mirror `read_session_idle_secs` /
+  `write_session_idle_secs` byte-for-byte in shape).

@@ -73,7 +73,18 @@ CREATE TABLE IF NOT EXISTS meta (
     -- state -- same doctrine as the sync_state / dirty_accounts additive
     -- tables (no format_version bump). Legacy vault files get the column
     -- via migrate_session_idle_secs_column at open time.
-    session_idle_secs INTEGER
+    session_idle_secs INTEGER,
+    -- MVP-2 issue 4.4: three-state sync-mode preference. NULL means
+    -- Auto (default behavior: first-sync-on-device offers fast,
+    -- else slow); the two string values 'always_slow' and
+    -- 'always_fast' force the corresponding SyncMode regardless of
+    -- the first-sync heuristic. Additive column; absence is a valid
+    -- (default) state -- same doctrine as the session_idle_secs row
+    -- above (no format_version bump). Legacy vault files get the
+    -- column via migrate_sync_mode_preference_column at open time.
+    -- This is UX state, not secret material; lives in plaintext
+    -- alongside session_idle_secs by precedent.
+    sync_mode_preference TEXT
 );
 
 CREATE TABLE IF NOT EXISTS account_identities (
@@ -323,6 +334,14 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     // `SessionDuration::from_meta_secs(None)` maps to the 15-min default.
     migrate_session_idle_secs_column(conn)?;
 
+    // MVP-2 issue 4.4 migration: add `sync_mode_preference` to `meta` on
+    // vaults written before 4.4. Idempotent — `PRAGMA table_info` check
+    // first. Nullable, no default → existing rows pick up NULL, which
+    // `SyncModePreference::from_meta_str(None)` maps to `Auto` (the
+    // first-sync-on-device heuristic). Same additive-nullable-column
+    // doctrine as 1.4 above (no `format_version` bump).
+    migrate_sync_mode_preference_column(conn)?;
+
     // MVP-1 issue 1.5 migrations: the `devices` table grows four
     // additive columns (`capabilities`, `last_sync_at`, `public_key`,
     // `schema_version`) on legacy P2 vaults, and the new single-row
@@ -523,6 +542,35 @@ fn migrate_session_idle_secs_column(conn: &Connection) -> Result<()> {
     drop(stmt);
     if !has_column {
         conn.execute("ALTER TABLE meta ADD COLUMN session_idle_secs INTEGER", [])?;
+    }
+    Ok(())
+}
+
+/// **MVP-2 issue 4.4 migration.** Add the nullable
+/// `sync_mode_preference` TEXT column to `meta` on vaults that predate
+/// 4.4. Idempotent — checks `PRAGMA table_info(meta)` first. Existing
+/// rows pick up NULL, which the read path
+/// ([`crate::vault::SyncModePreference::from_meta_str`]) maps to
+/// `SyncModePreference::Auto` (the default first-sync-on-device
+/// heuristic). Mirrors the 1.4 `session_idle_secs` precedent
+/// byte-for-byte; no `format_version` bump per the additive-
+/// nullable-column doctrine (§18.7).
+fn migrate_sync_mode_preference_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(meta)")?;
+    let rows = stmt.query_map([], |row| {
+        let name: String = row.get(1)?;
+        Ok(name)
+    })?;
+    let mut has_column = false;
+    for r in rows {
+        if r? == "sync_mode_preference" {
+            has_column = true;
+            break;
+        }
+    }
+    drop(stmt);
+    if !has_column {
+        conn.execute("ALTER TABLE meta ADD COLUMN sync_mode_preference TEXT", [])?;
     }
     Ok(())
 }
@@ -948,6 +996,104 @@ mod tests {
         assert!(
             evm.is_none(),
             "legacy row's evm_address must be NULL pre-backfill"
+        );
+    }
+
+    /// MVP-2 issue 4.4: the `meta.sync_mode_preference` column lands
+    /// via `apply_pragmas_and_schema` and stays singular under
+    /// idempotent re-run.
+    #[test]
+    fn migrate_sync_mode_preference_column_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_pragmas_and_schema(&conn).unwrap();
+        apply_pragmas_and_schema(&conn).unwrap();
+        let cols = column_names(&conn, "meta");
+        assert_eq!(
+            cols.iter()
+                .filter(|c| c.as_str() == "sync_mode_preference")
+                .count(),
+            1,
+            "meta.sync_mode_preference should appear exactly once \
+             after idempotent re-run"
+        );
+    }
+
+    /// MVP-2 issue 4.4: a legacy `meta` table lacking the
+    /// `sync_mode_preference` column (a vault written before 4.4)
+    /// gets the column added on the next migration; the pre-existing
+    /// row's value reads as NULL (= `SyncModePreference::Auto`).
+    #[test]
+    fn migrate_sync_mode_preference_column_on_legacy_vault() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Hand-build a pre-4.4 meta table (every column 1.4 carries
+        // present except sync_mode_preference). The PRIMARY KEY check
+        // mirrors the production DDL exactly.
+        conn.execute_batch(
+            "CREATE TABLE meta (
+                id                INTEGER PRIMARY KEY CHECK (id = 0),
+                magic             BLOB    NOT NULL,
+                format_version    INTEGER NOT NULL,
+                vault_id          BLOB    NOT NULL,
+                created_at        INTEGER NOT NULL,
+                kdf_memory_kib    INTEGER NOT NULL,
+                kdf_time_cost     INTEGER NOT NULL,
+                kdf_parallelism   INTEGER NOT NULL,
+                kdf_salt          BLOB    NOT NULL,
+                schema_version    INTEGER NOT NULL,
+                wrapped_ct        BLOB    NOT NULL,
+                wrapped_nonce     BLOB    NOT NULL,
+                session_idle_secs INTEGER
+            );",
+        )
+        .unwrap();
+        // Seed a pre-4.4 row.
+        conn.execute(
+            "INSERT INTO meta (
+                id, magic, format_version, vault_id, created_at,
+                kdf_memory_kib, kdf_time_cost, kdf_parallelism, kdf_salt,
+                schema_version, wrapped_ct, wrapped_nonce
+            ) VALUES (
+                0, ?1, 0, ?2, 0,
+                65536, 3, 1, ?3,
+                0, ?4, ?5
+            )",
+            rusqlite::params![
+                &[0u8; 8] as &[u8],
+                &[0u8; 32] as &[u8],
+                &[0u8; 16] as &[u8],
+                &[0u8; 32] as &[u8],
+                &[0u8; 24] as &[u8],
+            ],
+        )
+        .unwrap();
+        // Pre-migration: the column does not exist.
+        let cols_before = column_names(&conn, "meta");
+        assert!(
+            !cols_before
+                .iter()
+                .any(|c| c.as_str() == "sync_mode_preference"),
+            "pre-migration meta must lack sync_mode_preference"
+        );
+        // Run the full migration runner.
+        apply_pragmas_and_schema(&conn).unwrap();
+        let cols_after = column_names(&conn, "meta");
+        assert!(
+            cols_after
+                .iter()
+                .any(|c| c.as_str() == "sync_mode_preference"),
+            "sync_mode_preference column must be added to a legacy meta table"
+        );
+        // The existing row's column reads NULL.
+        let pref: Option<String> = conn
+            .query_row(
+                "SELECT sync_mode_preference FROM meta WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            pref.is_none(),
+            "legacy row's sync_mode_preference must read as NULL pre-backfill"
         );
     }
 }

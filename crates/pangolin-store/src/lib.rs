@@ -90,7 +90,7 @@ pub use session::{
     SessionDuration, SessionState, SystemClock, ABSOLUTE_MAX_DEFAULT, IDLE_TIMEOUT_DEFAULT,
     PRESENCE_FRESHNESS, PROMPT_TIMEOUT, SESSION_IDLE_UNTIL_DEVICE_LOCK,
 };
-pub use vault::{AccountStatus, Vault, VaultState};
+pub use vault::{AccountStatus, SyncMode, SyncModePreference, Vault, VaultState};
 
 /// Returns the crate name. Useful for diagnostics and version reporting.
 #[must_use]

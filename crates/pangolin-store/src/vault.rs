@@ -143,6 +143,121 @@ pub enum VaultState {
     Active,
 }
 
+// ---------------------------------------------------------------------
+// MVP-2 issue 4.4 — sync-mode selector (Kelvin sign-off 2026-05-16).
+//
+// The picker decides whether to use 4.1's in-process slow-mode sync
+// (`Vault::sync_from_chain`) or to offer the user 4.2/4.3's ephemeral
+// `pangolin-indexer` ("Spin up faster sync?") path. 4.4 is read-only
+// logic: it returns the decision; the host (CLI / Tauri shell) renders
+// the prompt + spawns the indexer on user assent (L1 — selector NEVER
+// auto-spawns; "AlwaysFast" is a pre-elected user assent recorded in
+// the preference flag).
+//
+// Heuristic (R-a, locked 2026-05-16): first-sync-on-this-device only.
+// `vault.last_synced_block_v1().is_none()` ⇒ `SyncMode::OfferFast`;
+// else `SyncMode::Slow`. NO threshold, NO env-var override, NO
+// eth_getLogs count. Subject to R-b override.
+//
+// Preference (R-b, locked 2026-05-16): three-state `meta.sync_mode_preference`
+// TEXT column. NULL = Auto (default; run R-a heuristic). `'always_slow'`
+// = force `SyncMode::Slow`. `'always_fast'` = force `SyncMode::AlwaysFast`.
+// Cleartext (L2) — UX preference, not secret material; mirrors the 1.4
+// `session_idle_secs` precedent.
+// ---------------------------------------------------------------------
+
+/// **MVP-2 issue 4.4 — R-b.** Three-state UX preference flag.
+///
+/// Recorded in the `meta.sync_mode_preference` column. `Auto` (the
+/// default) defers to the first-sync-on-this-device heuristic;
+/// `AlwaysSlow` / `AlwaysFast` are explicit user pre-elections that
+/// override the heuristic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncModePreference {
+    /// Default behavior — `Vault::select_sync_mode` runs the first-sync
+    /// heuristic (`last_synced_block_v1().is_none() →
+    /// SyncMode::OfferFast`, else `SyncMode::Slow`).
+    Auto,
+    /// User pre-elected "never offer fast-mode" — selector always
+    /// returns `SyncMode::Slow` regardless of checkpoint state.
+    AlwaysSlow,
+    /// User pre-elected "skip the prompt, always go fast-mode" —
+    /// selector always returns `SyncMode::AlwaysFast`. This is the
+    /// only path where the host spawns the ephemeral indexer without
+    /// a per-session prompt (the user assented when they set the
+    /// preference).
+    AlwaysFast,
+}
+
+impl SyncModePreference {
+    /// Encode the preference into the storage representation used by
+    /// the `meta.sync_mode_preference` column. `Auto` maps to SQL NULL
+    /// (= `None`); the two explicit pre-elections map to fixed string
+    /// literals.
+    #[must_use]
+    pub fn to_meta_str(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::AlwaysSlow => Some("always_slow"),
+            Self::AlwaysFast => Some("always_fast"),
+        }
+    }
+
+    /// Decode a value read from the `meta.sync_mode_preference` column.
+    /// `None` (SQL NULL — both the row-absent and column-NULL cases per
+    /// [`crate::meta::read_sync_mode_preference`]) maps to `Auto`. The
+    /// two recognized strings map to the corresponding variants;
+    /// anything else surfaces as
+    /// [`StoreError::Corrupted`] so a tampered column value cannot
+    /// silently degrade to a default.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupted`] if `s` is `Some(_)` with an
+    /// unrecognized value (anything other than `"always_slow"` or
+    /// `"always_fast"`).
+    pub fn from_meta_str(s: Option<&str>) -> Result<Self> {
+        match s {
+            None => Ok(Self::Auto),
+            Some("always_slow") => Ok(Self::AlwaysSlow),
+            Some("always_fast") => Ok(Self::AlwaysFast),
+            Some(other) => Err(StoreError::Corrupted(format!(
+                "meta.sync_mode_preference contains unrecognized value {other:?}; \
+                 expected NULL, 'always_slow', or 'always_fast'"
+            ))),
+        }
+    }
+}
+
+/// **MVP-2 issue 4.4 — R-e.** Decision returned by
+/// [`Vault::select_sync_mode`]. Carries no payload — the host renders
+/// its own prompt copy without needing the picker to count anything.
+///
+/// Semantics (R-a + R-b, combined):
+///
+/// | `last_synced_block_v1` | preference | returns |
+/// |---|---|---|
+/// | `Some(_)` | `Auto` | `Slow` |
+/// | `None` | `Auto` | `OfferFast` |
+/// | any | `AlwaysSlow` | `Slow` |
+/// | any | `AlwaysFast` | `AlwaysFast` |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    /// In-process slow-mode chain sync via `Vault::sync_from_chain`
+    /// (4.1 R-e). The host runs the sync directly; no indexer spawn.
+    Slow,
+    /// First-sync-on-this-device detected; host SHOULD render the D-007
+    /// "Spin up faster sync? (uses temporary local indexer that
+    /// auto-deletes)" prompt and, on user accept, spawn the
+    /// `pangolin-indexer` (4.2/4.3). On user decline, fall through to
+    /// `Slow`.
+    OfferFast,
+    /// User pre-elected always-fast; host spawns the
+    /// `pangolin-indexer` without a per-session prompt. The user
+    /// assented when they set `SyncModePreference::AlwaysFast`.
+    AlwaysFast,
+}
+
 /// Encrypted local vault.
 ///
 /// Owns a `SQLite` connection and (when `Active`) the unwrapped VDK plus
@@ -6195,6 +6310,133 @@ impl Vault {
         Ok(())
     }
 
+    // -----------------------------------------------------------------
+    // MVP-2 issue 4.4 — sync-mode selector (R-a..R-e).
+    // -----------------------------------------------------------------
+
+    /// **MVP-2 issue 4.4 (R-b).** Read the per-vault sync-mode
+    /// preference from `meta.sync_mode_preference`. SQL NULL ⇒
+    /// [`SyncModePreference::Auto`]. The two non-NULL string values
+    /// (`"always_slow"`, `"always_fast"`) decode to the explicit
+    /// pre-election variants.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] for a DB error;
+    /// [`StoreError::Corrupted`] if the column value is non-NULL but
+    /// not one of the two recognized strings (forwarded from
+    /// [`SyncModePreference::from_meta_str`]).
+    pub fn sync_mode_preference(&self) -> Result<SyncModePreference> {
+        let raw = meta::read_sync_mode_preference(&self.conn)?;
+        SyncModePreference::from_meta_str(raw.as_deref())
+    }
+
+    /// **MVP-2 issue 4.4 (R-b).** Persist the per-vault sync-mode
+    /// preference into `meta.sync_mode_preference`. `Auto` writes
+    /// SQL NULL (the column's default state); `AlwaysSlow` /
+    /// `AlwaysFast` write the corresponding string literal.
+    ///
+    /// This is a UX preference (L2), NOT secret material. The column
+    /// is cleartext by design — a filesystem-tamperer who flips the
+    /// value causes a UX degrade (denied fast-mode UX, or forced
+    /// indexer spawn), nothing more. The user retains the ability to
+    /// flip the value via this accessor at any time.
+    ///
+    /// `&mut self` (mirroring `set_session_idle`) — the preference is
+    /// a write to the vault file.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] for a persistence failure.
+    pub fn set_sync_mode_preference(&mut self, pref: SyncModePreference) -> Result<()> {
+        meta::write_sync_mode_preference(&self.conn, pref.to_meta_str())?;
+        Ok(())
+    }
+
+    /// **MVP-2 issue 4.4 (R-c).** Pure picker — decide whether the
+    /// host should run an in-process slow-mode sync
+    /// ([`Self::sync_from_chain`], 4.1 R-e) or offer the user the
+    /// ephemeral `pangolin-indexer` fast-mode path (4.2 / 4.3).
+    ///
+    /// Returns a [`SyncMode`] decision; **does NOT spawn the indexer
+    /// (L1)**. The host is responsible for rendering the D-007
+    /// "Spin up faster sync? (uses temporary local indexer that
+    /// auto-deletes)" prompt on `OfferFast` and spawning the indexer
+    /// on user assent. `AlwaysFast` (a pre-elected user preference)
+    /// is the only variant where the host may spawn without a per-
+    /// session prompt — the user assented when they wrote the
+    /// preference.
+    ///
+    /// Heuristic (R-a, locked 2026-05-16): first-sync-on-this-device.
+    /// `vault.last_synced_block_v1().is_none() →
+    /// SyncMode::OfferFast`; else `SyncMode::Slow`. NO threshold, NO
+    /// env-var override, NO `eth_getLogs` count. Long-offline-catchup
+    /// users get slow-mode; tolerable.
+    ///
+    /// Preference (R-b) override:
+    ///
+    /// | `last_synced_block_v1` | preference | returns |
+    /// |---|---|---|
+    /// | `Some(_)` | `Auto` | `Slow` |
+    /// | `None` | `Auto` | `OfferFast` |
+    /// | any | `AlwaysSlow` | `Slow` |
+    /// | any | `AlwaysFast` | `AlwaysFast` |
+    ///
+    /// # The `async fn` signature
+    ///
+    /// `async` is locked at the API boundary even though this current
+    /// implementation never awaits — the R-c plan-gate signature
+    /// reserves the option to call a chain RPC (e.g.,
+    /// `pangolin_chain::fetch_current_block_number`) from future
+    /// heuristics without breaking the public API. Today the heuristic
+    /// only looks at vault-local state (the v1 checkpoint + the
+    /// preference column), so `rpc_url` and `env` are unused. Future
+    /// refinements (e.g., a sample-based count of unsynced events) can
+    /// wire RPC traffic in without an SemVer-relevant change.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] for a DB error;
+    /// [`StoreError::Corrupted`] from
+    /// [`Self::sync_mode_preference`] if the preference column is
+    /// tampered.
+    // `clippy::future_not_send` — `Vault` is intentionally `!Sync`
+    // (P4 audit M-3: the inner `rusqlite::Connection` holds a
+    // `RefCell` and the `dyn Clock` is not `Sync`). The picker
+    // returns a future that holds `&Vault` for its (single,
+    // never-yielding) suspension; that future is therefore also
+    // `!Send`. Same posture as `sync_from_chain` (which sidesteps
+    // the lint because its awaits actually yield); ours collapses
+    // back to ready-without-yield, so the lint flags it. The
+    // caller's runtime is single-threaded (host = CLI / Tauri main
+    // thread / mobile UI thread) so `!Send` is the correct shape.
+    #[allow(
+        clippy::unused_async,
+        clippy::needless_pass_by_value,
+        clippy::future_not_send,
+        unused_variables
+    )]
+    pub async fn select_sync_mode(&self, rpc_url: &str, env: ChainEnv) -> Result<SyncMode> {
+        // Read the user-preference first — a pre-election overrides
+        // the heuristic in both directions.
+        let pref = self.sync_mode_preference()?;
+        match pref {
+            SyncModePreference::AlwaysSlow => return Ok(SyncMode::Slow),
+            SyncModePreference::AlwaysFast => return Ok(SyncMode::AlwaysFast),
+            SyncModePreference::Auto => { /* fall through to heuristic */ }
+        }
+        // R-a heuristic: first sync on this device → OfferFast; else
+        // Slow. The L-malicious-RPC-fakes-chain-head defense lives
+        // in the underlying 4.1 / 4.2 sync paths (chain-id check,
+        // pinned-address check, per-event signer recovery); the
+        // selector itself is advisory.
+        if self.last_synced_block_v1()?.is_none() {
+            Ok(SyncMode::OfferFast)
+        } else {
+            Ok(SyncMode::Slow)
+        }
+    }
+
     /// **MVP-2 issue 4.1 (R-c rollback).** Mark all `Pending` revisions
     /// whose `observed_at_block` falls in `[block_low, block_high]` as
     /// rolled-back. The current implementation is a soft delete: the
@@ -11982,5 +12224,254 @@ mod tests {
         assert!(!inserted_second, "second call is idempotent");
         let count = v.count_chain_sync_discovered_devices().unwrap();
         assert_eq!(count, 1);
+    }
+
+    // -----------------------------------------------------------------
+    // MVP-2 issue 4.4 — sync-mode selector tests
+    // -----------------------------------------------------------------
+    //
+    // The picker is `async fn` per the locked R-c API signature, even
+    // though the current implementation never awaits. We drive it
+    // through a small tokio current-thread runtime so the test path
+    // mirrors the production caller shape.
+
+    use crate::vault::{SyncMode, SyncModePreference};
+    use pangolin_chain::ChainEnv;
+
+    /// Helper: drive an async future to completion on a fresh tokio
+    /// current-thread runtime. Tokio is a dev-only dep on this crate
+    /// (added in 4.4); the runtime is small + per-call so tests stay
+    /// hermetic.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
+    /// **MVP-2 issue 4.4 (R-a).** Fresh vault (no v1 checkpoint) +
+    /// preference NULL ⇒ `SyncMode::OfferFast`.
+    #[test]
+    fn select_sync_mode_returns_offer_fast_for_first_sync() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let v = Vault::open(&p).unwrap();
+        assert_eq!(v.last_synced_block_v1().unwrap(), None);
+        assert_eq!(v.sync_mode_preference().unwrap(), SyncModePreference::Auto);
+        let mode =
+            block_on(v.select_sync_mode("http://unused.example", ChainEnv::BaseSepolia)).unwrap();
+        assert_eq!(mode, SyncMode::OfferFast);
+    }
+
+    /// **MVP-2 issue 4.4 (R-a).** Vault that has synced at least once
+    /// (checkpoint = Some) + preference NULL ⇒ `SyncMode::Slow`.
+    #[test]
+    fn select_sync_mode_returns_slow_after_first_sync() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.update_last_synced_block_v1(42).unwrap();
+        let mode =
+            block_on(v.select_sync_mode("http://unused.example", ChainEnv::BaseSepolia)).unwrap();
+        assert_eq!(mode, SyncMode::Slow);
+    }
+
+    /// **MVP-2 issue 4.4 (R-b).** `AlwaysSlow` preference + fresh
+    /// checkpoint = None overrides the would-be `OfferFast`.
+    #[test]
+    fn select_sync_mode_respects_always_slow() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.set_sync_mode_preference(SyncModePreference::AlwaysSlow)
+            .unwrap();
+        assert_eq!(v.last_synced_block_v1().unwrap(), None);
+        let mode =
+            block_on(v.select_sync_mode("http://unused.example", ChainEnv::BaseSepolia)).unwrap();
+        assert_eq!(mode, SyncMode::Slow);
+    }
+
+    /// **MVP-2 issue 4.4 (R-b).** `AlwaysSlow` preference + non-fresh
+    /// checkpoint still returns `Slow` (preference dominates).
+    #[test]
+    fn select_sync_mode_respects_always_slow_with_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.update_last_synced_block_v1(42).unwrap();
+        v.set_sync_mode_preference(SyncModePreference::AlwaysSlow)
+            .unwrap();
+        let mode =
+            block_on(v.select_sync_mode("http://unused.example", ChainEnv::BaseSepolia)).unwrap();
+        assert_eq!(mode, SyncMode::Slow);
+    }
+
+    /// **MVP-2 issue 4.4 (R-b).** `AlwaysFast` preference + fresh
+    /// checkpoint = None returns `AlwaysFast` (preference forces fast
+    /// even on first sync, skipping the prompt).
+    #[test]
+    fn select_sync_mode_respects_always_fast() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.set_sync_mode_preference(SyncModePreference::AlwaysFast)
+            .unwrap();
+        let mode =
+            block_on(v.select_sync_mode("http://unused.example", ChainEnv::BaseSepolia)).unwrap();
+        assert_eq!(mode, SyncMode::AlwaysFast);
+    }
+
+    /// **MVP-2 issue 4.4 (R-b).** `AlwaysFast` preference + non-fresh
+    /// checkpoint still returns `AlwaysFast` — preference forces fast
+    /// even when caught up.
+    #[test]
+    fn select_sync_mode_respects_always_fast_with_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.update_last_synced_block_v1(42).unwrap();
+        v.set_sync_mode_preference(SyncModePreference::AlwaysFast)
+            .unwrap();
+        let mode =
+            block_on(v.select_sync_mode("http://unused.example", ChainEnv::BaseSepolia)).unwrap();
+        assert_eq!(mode, SyncMode::AlwaysFast);
+    }
+
+    /// **MVP-2 issue 4.4 (R-b persistence).** `set_sync_mode_preference`
+    /// → close + reopen the vault → preference reads back as
+    /// `AlwaysSlow`.
+    #[test]
+    fn sync_mode_preference_round_trip_always_slow() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        {
+            let mut v = Vault::open(&p).unwrap();
+            v.set_sync_mode_preference(SyncModePreference::AlwaysSlow)
+                .unwrap();
+        }
+        // Re-open and read.
+        let v2 = Vault::open(&p).unwrap();
+        assert_eq!(
+            v2.sync_mode_preference().unwrap(),
+            SyncModePreference::AlwaysSlow
+        );
+    }
+
+    /// **MVP-2 issue 4.4 (R-b persistence).** Same as above with
+    /// `AlwaysFast`.
+    #[test]
+    fn sync_mode_preference_round_trip_always_fast() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        {
+            let mut v = Vault::open(&p).unwrap();
+            v.set_sync_mode_preference(SyncModePreference::AlwaysFast)
+                .unwrap();
+        }
+        let v2 = Vault::open(&p).unwrap();
+        assert_eq!(
+            v2.sync_mode_preference().unwrap(),
+            SyncModePreference::AlwaysFast
+        );
+    }
+
+    /// **MVP-2 issue 4.4 (R-b default).** A freshly-created vault
+    /// reads as `SyncModePreference::Auto` (column is NULL by default).
+    #[test]
+    fn sync_mode_preference_default_is_auto() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let v = Vault::open(&p).unwrap();
+        assert_eq!(v.sync_mode_preference().unwrap(), SyncModePreference::Auto);
+    }
+
+    /// **MVP-2 issue 4.4 (R-b reversibility).** Setting a preference
+    /// then clearing back to `Auto` writes SQL NULL and reads `Auto`.
+    #[test]
+    fn sync_mode_preference_can_be_cleared() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.set_sync_mode_preference(SyncModePreference::AlwaysSlow)
+            .unwrap();
+        assert_eq!(
+            v.sync_mode_preference().unwrap(),
+            SyncModePreference::AlwaysSlow
+        );
+        // Clear back to Auto.
+        v.set_sync_mode_preference(SyncModePreference::Auto)
+            .unwrap();
+        assert_eq!(v.sync_mode_preference().unwrap(), SyncModePreference::Auto);
+        // Confirm the underlying column is SQL NULL (not the literal
+        // string "auto" or similar — Auto ⇔ NULL is load-bearing per
+        // R-b).
+        let raw: Option<String> = v
+            .conn
+            .query_row(
+                "SELECT sync_mode_preference FROM meta WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            raw.is_none(),
+            "Auto must serialize as SQL NULL, not a string literal"
+        );
+    }
+
+    /// **MVP-2 issue 4.4 (R-b).** An unrecognized value in the
+    /// `meta.sync_mode_preference` column surfaces as
+    /// `StoreError::Corrupted` rather than silently degrading to a
+    /// default — defense against tampered cleartext flags.
+    #[test]
+    fn from_meta_str_rejects_unknown_value() {
+        let err = SyncModePreference::from_meta_str(Some("garbage")).unwrap_err();
+        match err {
+            StoreError::Corrupted(msg) => {
+                assert!(msg.contains("garbage"));
+                assert!(msg.contains("always_slow"));
+                assert!(msg.contains("always_fast"));
+            }
+            other => panic!("expected Corrupted, got {other:?}"),
+        }
+    }
+
+    /// **MVP-2 issue 4.4 (R-d doc-spec parity).** Exhaustive
+    /// round-trip: `from_meta_str(to_meta_str(x)) == Ok(x)` for all
+    /// three variants. Pins the storage encoding so a future
+    /// refactor cannot silently re-map (e.g., flipping the
+    /// `"always_slow"` / `"always_fast"` string literals).
+    #[test]
+    fn sync_mode_preference_meta_str_round_trip() {
+        for variant in [
+            SyncModePreference::Auto,
+            SyncModePreference::AlwaysSlow,
+            SyncModePreference::AlwaysFast,
+        ] {
+            let s = variant.to_meta_str();
+            let back = SyncModePreference::from_meta_str(s).unwrap();
+            assert_eq!(back, variant, "round-trip mismatch for {variant:?}");
+        }
+        // Also pin the actual literal strings — drift defense.
+        assert_eq!(SyncModePreference::Auto.to_meta_str(), None);
+        assert_eq!(
+            SyncModePreference::AlwaysSlow.to_meta_str(),
+            Some("always_slow")
+        );
+        assert_eq!(
+            SyncModePreference::AlwaysFast.to_meta_str(),
+            Some("always_fast")
+        );
     }
 }
