@@ -290,6 +290,31 @@ new "Sync-mode selector (4.4)" row. All three are UX-degrade-only —
 the load-bearing security defenses live in 4.1's verifier + chain-id
 check + 4.2/4.3's ephemeral indexer + temp-DB cipher.
 
+## Pull loop (5.2)
+
+**MVP-2 issue 5.2** wraps the 4.4 picker + 4.1 slow-mode delegate in a
+per-cycle async primitive `Vault::pull_once(rpc_url, env, &vault_id)`
+that the host scheduler drives every 60 seconds while a session is
+active. Master plan §5 row 5.2 verbatim: *"On unlock + periodic (every
+60s while session active). Apply non-conflicted heads automatically."*
+
+5.2 is **host-owned timer** (R-a) — `pangolin-store` exposes only the
+primitive; the host (CLI / Tauri / mobile) owns the
+`tokio::time::interval` scheduler. The engine never spawns the loop,
+which preserves the zero-`tokio::spawn` discipline inside the store
+crate. The loop is implicitly canceled by every session-teardown path
+via `PullError::NoActiveSession` (R-e — mirrors 5.1's
+`BatchFlushError::NoActiveSession` posture verbatim).
+
+`OfferFast` / `AlwaysFast` cycles return signal-only (the engine
+NEVER spawns the indexer subprocess per L2); the host owns the
+indexer-spawn decision. `Slow` cycles delegate to 4.1's
+`Vault::sync_from_chain` verbatim (L4 — no duplicate logic; inherits
+the full L1..L12 defensive surface).
+
+Full design + canonical host scheduler loop body + threat model in
+[`pull-loop.md`](pull-loop.md).
+
 ## File layout
 
 - `crates/pangolin-chain/src/chain_sync.rs` — module root, constants,

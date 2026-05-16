@@ -43,6 +43,7 @@ pub mod error;
 pub mod export;
 pub mod pending;
 pub mod publish;
+pub mod pull;
 pub mod revision;
 pub mod session;
 pub mod vault;
@@ -89,6 +90,13 @@ pub use pending::{PendingMerge, PENDING_MERGE_NONCE_LEN, PENDING_MERGE_SECRET_LE
 pub use publish::{
     publish_all_for_vault, publish_one, BatchFlushError, BatchFlushReport, PublishOutcome,
     PublishOutcomeRow, PublishQueueState, PublishReport,
+};
+// MVP-2 issue 5.2: pull-loop primitive types. `Vault::pull_once` is
+// defined alongside `flush_publish_queue` in `vault.rs`; the report /
+// error types + cadence constants live in `pull.rs`.
+pub use pull::{
+    PullError, PullReport, PULL_INTERVAL_SECS_DEFAULT, PULL_INTERVAL_SECS_ENV_VAR,
+    PULL_INTERVAL_SECS_MAX, PULL_INTERVAL_SECS_MIN,
 };
 pub use revision::{
     ChainAnchor, DeviceId, RevisionGraph, RevisionId, RevisionMeta, REVISION_SCHEMA_VERSION_MAX,

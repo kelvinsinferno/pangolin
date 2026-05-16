@@ -572,6 +572,16 @@ struct ActiveState {
     /// flush path; the chain-side per-revision balance gate (3.3) IS
     /// the authoritative defense — this flag is host-UX hinting only.
     last_flush_failed_balance: bool,
+    /// **MVP-2 issue 5.2 (R-c diagnostic).** Unix-ms instant of the
+    /// last successful [`Vault::pull_once`] cycle's dispatch — the
+    /// stamp is taken inside the same call after the
+    /// [`Vault::select_sync_mode`] picker (so `OfferFast` /
+    /// `AlwaysFast` ticks also stamp the field; they DID run a pull
+    /// cycle even if no chain read happened on this leg). Not
+    /// persisted across `lock()` / unlock; 5.4 will use this as the
+    /// "Syncing… / Synced N min ago" indicator-state-machine input
+    /// and may revisit the persistence story then.
+    last_pull_at_unix_ms: Option<i64>,
 }
 
 impl Vault {
@@ -1086,6 +1096,10 @@ impl Vault {
             // 5.4 will flip the default to ON when the host wiring lands.
             window_elapsed_flush_enabled: false,
             last_flush_failed_balance: false,
+            // MVP-2 issue 5.2: no pull has run on this fresh session
+            // yet. Stamped by every successful `Vault::pull_once` cycle
+            // (including OfferFast / AlwaysFast signal cycles).
+            last_pull_at_unix_ms: None,
         });
         self.session_state = SessionState::Active {
             expires_at: next_idle_deadline(now, now, self.session_idle),
@@ -7388,6 +7402,202 @@ impl Vault {
         // R-b: in MVP-2 the WS path defers to HTTP polling.
         report.event_source = ChainEventSource::HttpPolling;
         Ok(report)
+    }
+
+    // -----------------------------------------------------------------
+    // MVP-2 issue 5.2 — pull-loop primitive (R-a + R-c + R-e).
+    // -----------------------------------------------------------------
+
+    /// **MVP-2 issue 5.2 (R-a + R-c + R-e).** Single pull cycle.
+    ///
+    /// Re-picks the [`SyncMode`] via [`Self::select_sync_mode`] (R-c
+    /// re-pick per cycle) and dispatches:
+    ///
+    /// - [`SyncMode::Slow`] — delegates to [`Self::sync_from_chain`]
+    ///   with [`pangolin_chain::SyncOptions::default`] (L4: NO
+    ///   duplicate logic; inherits 4.1's full L1..L12 defensive
+    ///   surface).
+    /// - [`SyncMode::OfferFast`] / [`SyncMode::AlwaysFast`] — surfaces
+    ///   the signal in [`crate::pull::PullReport::mode`] with
+    ///   `sync_report = None`; the host owns the indexer-spawn
+    ///   decision per 4.4 L1 + 5.2 L2 (the loop NEVER spawns).
+    ///
+    /// Returns [`crate::pull::PullError::NoActiveSession`] BEFORE any
+    /// RPC call if the vault is not in the
+    /// [`VaultState::Active`] state (L1 + R-e: covers every
+    /// session-teardown path — `lock()`, idle-expire, 4h-absolute,
+    /// `device_locked()`). The host scheduler's canonical loop body
+    /// exits on this variant; the worst-case lock→exit latency is one
+    /// tick (≤60s default), bounded by the host's interval.
+    ///
+    /// Stamps `ActiveState.last_pull_at_unix_ms` on every successful
+    /// dispatch — diagnostic only (5.4 will wire the
+    /// "Synced / Syncing… / Offline" indicator state machine on top
+    /// of this stamp; not persisted across `lock()` / unlock).
+    ///
+    /// # Adapter-less API shape note (deviation explainer for auditors)
+    ///
+    /// The plan-gate left the choice between adapter-less and
+    /// adapter-threaded shapes to the builder; 5.2 ships the
+    /// adapter-less form because slow-mode delegates to
+    /// [`Self::sync_from_chain`] which takes raw `rpc_url` + `env` +
+    /// `vault_id` (NOT a [`pangolin_chain::ChainAdapter`]) and the
+    /// `OfferFast` / `AlwaysFast` branches return signal-only (the
+    /// host invokes the indexer with its own adapter machinery on
+    /// accept).
+    /// If a future cycle needs an adapter (e.g., the 5.4
+    /// `SyncOrchestrator` fuses pull + flush behind one adapter
+    /// handle), the additive change is to introduce a second method
+    /// that threads it through; this primitive stays minimal.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::pull::PullError::NoActiveSession`] when the vault
+    ///   is locked / expired / pending; no RPC call is made.
+    /// - [`crate::pull::PullError::Chain`] when the Slow-mode
+    ///   delegate surfaces a chain-side error
+    ///   ([`pangolin_chain::ChainError`]). Per R-d the host retries
+    ///   on the next regular interval (flat retry); the engine does
+    ///   not implement backoff.
+    /// - [`crate::pull::PullError::Store`] when the picker or
+    ///   delegate surfaces a store-side error
+    ///   ([`crate::StoreError`]).
+    // `clippy::future_not_send` — `Vault` is intentionally `!Sync`
+    // (P4 audit M-3: inner `rusqlite::Connection` holds a `RefCell`;
+    // the `dyn Clock` is also not `Sync`). The future returned by
+    // `pull_once` holds `&mut self` for its suspension; that future
+    // is therefore `!Send`. Same posture as `select_sync_mode` and
+    // `sync_from_chain`. The caller's runtime is single-threaded
+    // (host = CLI / Tauri main thread / mobile UI thread) so `!Send`
+    // is the correct shape per R-a.
+    #[allow(clippy::future_not_send)]
+    pub async fn pull_once(
+        &mut self,
+        rpc_url: &str,
+        env: pangolin_chain::ChainEnv,
+        vault_id: &[u8; 32],
+    ) -> core::result::Result<crate::pull::PullReport, crate::pull::PullError> {
+        // (1) L1 + R-e structural cancellation. Mirrors 5.1's
+        // `flush_publish_queue` early-return shape verbatim. The
+        // existing `lock()` / `check_session_freshness` /
+        // `device_locked()` / absolute-expiry paths already drop
+        // `active`; we just observe the result here and short-circuit
+        // BEFORE any chain primitive is touched (L-pull-after-lock-races).
+        if self.active.is_none() {
+            return Err(crate::pull::PullError::NoActiveSession);
+        }
+
+        // (2) R-c: re-pick per cycle. Cheap — single SQL read + None
+        // check; no RPC under 4.4's first-sync-only heuristic. The
+        // `clippy::map_err_ignore` lint would prefer `.map_err(Into::into)?`
+        // here, but the explicit form documents the variant routing
+        // for auditors.
+        let mode = self
+            .select_sync_mode(rpc_url, env)
+            .await
+            .map_err(crate::pull::PullError::Store)?;
+
+        // (3) Dispatch (L2 + L4). Slow goes through 4.1; OfferFast +
+        // AlwaysFast return signal-only (engine never spawns).
+        let sync_report = match mode {
+            SyncMode::Slow => Some(
+                self.sync_from_chain(
+                    rpc_url,
+                    env,
+                    vault_id,
+                    pangolin_chain::SyncOptions::default(),
+                )
+                .await
+                .map_err(|store_err| match store_err {
+                    // `sync_from_chain` returns `Result<SyncReport,
+                    // StoreError>`; chain-side errors propagate via
+                    // the `From<ChainError> for StoreError` impl
+                    // which wraps them in `StoreError::ChainSyncError`
+                    // (per 4.1). We unwrap that wrapping here so
+                    // callers see `PullError::Chain` for chain-side
+                    // errors (R-d: host retries on next tick) vs
+                    // `PullError::Store` for true store errors
+                    // (typically unrecoverable; the host breaks).
+                    StoreError::ChainSyncError(chain_err) => {
+                        crate::pull::PullError::Chain(chain_err)
+                    }
+                    other => crate::pull::PullError::Store(other),
+                })?,
+            ),
+            // L2: signal-only; host owns indexer spawn per 4.4 L1.
+            SyncMode::OfferFast | SyncMode::AlwaysFast => None,
+        };
+
+        // (4) Stamp the diagnostic field on success. We re-check
+        // `active` here because the await above released the borrow;
+        // a parallel teardown can't happen (we hold &mut self), but
+        // the `if let Some` keeps the type machinery honest.
+        let now_ms = current_unix_ms();
+        if let Some(active) = self.active.as_mut() {
+            active.last_pull_at_unix_ms = Some(now_ms);
+        }
+
+        Ok(crate::pull::PullReport {
+            mode,
+            sync_report,
+            pulled_at_unix_ms: now_ms,
+        })
+    }
+
+    /// **MVP-2 issue 5.2 (R-b).** Env-var-clamped pull-loop interval
+    /// in seconds.
+    ///
+    /// Resolves the 60-second cadence from
+    /// [`crate::pull::PULL_INTERVAL_SECS_ENV_VAR`]
+    /// (`PANGOLIN_PULL_INTERVAL_SECS`; clamped
+    /// `5..=3600`), defaulting to
+    /// [`crate::pull::PULL_INTERVAL_SECS_DEFAULT`] (60). Pure function
+    /// (the env var is read once per call); host can override the
+    /// default for testing without using `env::set_var` (a
+    /// process-global side effect) by using
+    /// [`Self::resolve_pull_interval_secs_from`].
+    ///
+    /// Mirrors 5.1's [`Self::resolve_batch_window_secs`] verbatim.
+    #[must_use]
+    pub fn resolve_pull_interval_secs() -> u64 {
+        Self::resolve_pull_interval_secs_from(
+            std::env::var(crate::pull::PULL_INTERVAL_SECS_ENV_VAR)
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// Pure version of [`Self::resolve_pull_interval_secs`] for
+    /// testability. The env var is read separately so hermetic tests
+    /// can drive the clamp logic deterministically.
+    ///
+    /// MVP-2 issue 5.2 (R-b).
+    #[must_use]
+    pub fn resolve_pull_interval_secs_from(raw: Option<&str>) -> u64 {
+        let parsed = raw.and_then(|s| s.parse::<u64>().ok());
+        let value = parsed.unwrap_or(crate::pull::PULL_INTERVAL_SECS_DEFAULT);
+        value.clamp(
+            crate::pull::PULL_INTERVAL_SECS_MIN,
+            crate::pull::PULL_INTERVAL_SECS_MAX,
+        )
+    }
+
+    /// **MVP-2 issue 5.2 (diagnostic).** Read the last successful
+    /// pull cycle's unix-ms timestamp from `ActiveState`.
+    ///
+    /// Returns `None` if the vault is not Active OR if no pull cycle
+    /// has run on this session yet. 5.4 will consume this for the
+    /// "Synced N min ago" indicator; 5.2 ships it as the diagnostic
+    /// accessor only.
+    ///
+    /// # Errors
+    ///
+    /// None — the accessor returns `None` for both "locked" and
+    /// "active-but-no-pull-yet" because the host's UI treatment is
+    /// identical (show "—" / "never").
+    #[must_use]
+    pub fn last_pull_at_unix_ms(&self) -> Option<i64> {
+        self.active.as_ref().and_then(|a| a.last_pull_at_unix_ms)
     }
 }
 
