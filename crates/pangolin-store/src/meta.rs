@@ -127,6 +127,46 @@ pub fn write_session_idle_secs(conn: &Connection, secs: Option<i64>) -> Result<(
     Ok(())
 }
 
+/// Read the `meta.sync_mode_preference` column (MVP-2 issue 4.4 — the
+/// three-state sync-mode preference flag).
+///
+/// Returns `Ok(None)` when the row is absent (fresh database not yet
+/// written) **or** the column is NULL (a vault that predates 4.4, or
+/// one that never explicitly set the preference). Both map to
+/// `SyncModePreference::Auto` at the call site via
+/// [`crate::vault::SyncModePreference::from_meta_str`]. A present value
+/// is returned verbatim; the caller validates it against the
+/// `'always_slow'` / `'always_fast'` set.
+///
+/// Mirrors `read_session_idle_secs` byte-for-byte in shape.
+pub fn read_sync_mode_preference(conn: &Connection) -> Result<Option<String>> {
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT sync_mode_preference FROM meta WHERE id = 0",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    // Outer Option = "row present?"; inner Option = "column non-NULL?".
+    Ok(raw.flatten())
+}
+
+/// Persist (or clear, with `None`) the `meta.sync_mode_preference`
+/// column. `Some(pref)` writes the literal string (the caller is
+/// expected to have validated it against the `'always_slow'` /
+/// `'always_fast'` set via
+/// [`crate::vault::SyncModePreference::to_meta_str`]); `None` writes
+/// SQL `NULL`, which the read path interprets as
+/// `SyncModePreference::Auto`. UPDATE-only (the meta row exists by
+/// construction after `Vault::create`).
+pub fn write_sync_mode_preference(conn: &Connection, pref: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE meta SET sync_mode_preference = ?1 WHERE id = 0",
+        params![pref],
+    )?;
+    Ok(())
+}
+
 /// Read the meta row. Returns `Ok(None)` when the row has not yet been
 /// written (fresh database).
 pub fn read(conn: &Connection) -> Result<Option<VaultMeta>> {

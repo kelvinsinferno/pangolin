@@ -716,6 +716,134 @@ boundary).
 
 ---
 
+## MVP-2 issue 4.4 resolved decisions (R-a..R-e) — 2026-05-16
+
+**Date locked:** 2026-05-16 (Kelvin reframed Q-a around first-sync
+scenario; plan-gate recommendations adopted with the collapse
+spelled out)
+
+**Decision:** MVP-2 issue 4.4 (sync-mode selector) ships the
+client-side picker that decides between 4.1's in-process slow-mode
+sync and 4.2/4.3's ephemeral fast-mode indexer. Five resolved
+decisions (Kelvin sign-off 2026-05-16):
+
+- **R-a · Heuristic — first-sync-only.**
+  `vault.last_synced_block_v1().is_none()` ⇒ `SyncMode::OfferFast`;
+  else `SyncMode::Slow` (subject to R-b override). NO threshold,
+  NO env-var override, NO `eth_getLogs` count, NO clamps. The
+  ≥100-revision threshold from the master plan §5 row 4.4 wording
+  collapses entirely. Long-offline-catchup users get slow-mode;
+  tolerable UX cost.
+
+- **R-b · Preference flag — three-state `meta.sync_mode_preference TEXT`
+  column.** Values: `NULL` (= `Auto` = default), `'always_slow'`,
+  `'always_fast'`. Additive nullable column, idempotent migration
+  (`migrate_sync_mode_preference_column` in
+  `crates/pangolin-store/src/schema.rs`), **NO `format_version`
+  bump.** Mirrors the 1.4 `session_idle_secs` precedent byte-for-byte
+  in shape — `read_sync_mode_preference` / `write_sync_mode_preference`
+  in `meta.rs`, `Vault::sync_mode_preference` / `set_sync_mode_preference`
+  accessors. Cleartext (L2) — UX state, not secret material.
+  `SyncModePreference::from_meta_str(Some("garbage"))` returns
+  `StoreError::Corrupted` so a tampered cleartext flag is loudly
+  rejected rather than silently degrading.
+
+- **R-c · API shape — pure picker as a `Vault` method.**
+  `impl Vault { pub async fn select_sync_mode(&self, rpc_url: &str,
+  env: ChainEnv) -> Result<SyncMode> }`. Returns the decision; caller
+  renders prompt + spawns indexer on user assent (L1 — selector
+  NEVER auto-spawns). **The `async fn` signature is locked even
+  though the current implementation never awaits** — the API
+  reserves the option for future heuristics to call
+  `pangolin_chain::fetch_current_block_number` without breaking the
+  public API. `rpc_url` + `env` parameters are placeholders for that
+  future refinement; today the body only reads vault-local state
+  (`last_synced_block_v1` + `sync_mode_preference`).
+
+  **Deviation from plan-gate spec:** the spec literal showed
+  `Result<SyncMode, ChainError>` but every other `Vault` method in
+  `pangolin-store::vault` returns `Result<T, StoreError>` (= the
+  crate's `Result<T>` alias). The picker fires no chain errors today
+  (no RPC call) and surfaces only `StoreError::Sqlite` /
+  `StoreError::Corrupted`, so `Result<SyncMode, StoreError>` is the
+  correct taxon. `StoreError` already has a `From<ChainError>` impl
+  for future heuristics that DO call the chain. The deviation is
+  documented in the commit body + this entry.
+
+- **R-d · Test depth — hermetic + doc-spec parity.** 11 unit tests
+  + 1 const-pin test + 2 schema migration tests = 14 new tests
+  total. NO proptest. NO live test (pure logic; env-quirk #14
+  inapplicable). Coverage:
+  `select_sync_mode_returns_offer_fast_for_first_sync`,
+  `select_sync_mode_returns_slow_after_first_sync`,
+  `select_sync_mode_respects_always_slow`,
+  `select_sync_mode_respects_always_slow_with_checkpoint`,
+  `select_sync_mode_respects_always_fast`,
+  `select_sync_mode_respects_always_fast_with_checkpoint`,
+  `sync_mode_preference_round_trip_always_slow`,
+  `sync_mode_preference_round_trip_always_fast`,
+  `sync_mode_preference_default_is_auto`,
+  `sync_mode_preference_can_be_cleared` (incl. NULL-storage
+  pin), `from_meta_str_rejects_unknown_value`,
+  `sync_mode_preference_meta_str_round_trip` (exhaustive
+  three-variant round-trip + literal-string drift defense),
+  `migrate_sync_mode_preference_column_idempotent`,
+  `migrate_sync_mode_preference_column_on_legacy_vault`.
+
+- **R-e · `SyncMode` shape — 3-variant unit enum.**
+  `enum SyncMode { Slow, OfferFast, AlwaysFast }`. Carries no
+  payload (the heuristic doesn't compute a count; the host renders
+  its own prompt copy). The plan-gate option of adding a
+  `last_synced_block: Option<u64>` payload to OfferFast / AlwaysFast
+  was rejected as YAGNI; the 3-variant unit-enum is the simpler
+  shape and matches the "first sync OR explicit user preference"
+  semantic exactly.
+
+**Master plan §5 row 4.4 wording amendment.** Kelvin's reframing
+during plan-gate sign-off shifted the row from "<100 unsynced
+revisions → slow-mode in-process. ≥100 → offer 'Spin up faster
+sync?'" to "first sync on this device → offer fast; else slow".
+The threshold concept dropped entirely. Per project doctrine,
+master plan §5 is NOT retroactively edited; DECISIONS.md is
+authoritative for this amendment (same precedent as the 4.1 R-b
+WS-deferral and the 4.3 R-c/R-d overrides). The plan-gate
+`docs/issue-plans/4.4.md` is the load-bearing R-a..R-e source.
+
+**Why:** The original master-plan threshold framing ("≥100 unsynced
+revisions") assumed a block-distance proxy as a UX nudge; the actual
+user scenario that ≥100 covers is almost exclusively first-sync-on-
+this-device (a steady-state user with ≥100 unsynced revisions has
+already configured their machine and is presumably online enough
+that 100 won't accumulate uneventfully). Collapsing the heuristic
+to "first sync" removes the threshold-tuning surface, the env-var
+override surface, the clamp-range surface, and the eth_getLogs
+counting surface — all in service of a UX nudge that the user can
+override per-vault via the preference flag. The cleartext
+preference flag is the right doctrine inheritance from 1.4 (UX
+state belongs in `meta` cleartext alongside `session_idle_secs`,
+not in the AEAD payload — L2).
+
+**Deferred:** (a) FFI exposure of `select_sync_mode` /
+`sync_mode_preference` accessors — deferred to a CLI-V1 batch
+follow-up per 3.x/4.x precedent. (b) CLI subcommand wiring
+(`pangolin sync-mode set always_slow` etc.) — same batch. (c)
+`VaultMeta` export-struct integration (round-trip of the
+preference through `.pvea` archive export/restore) — additive
+follow-up; plan-gate explicitly defers per the "Affected crates"
+table.
+
+**Spec ref:** `docs/issue-plans/4.4.md` (Resolved decisions table);
+`crates/pangolin-store/src/vault.rs` (`SyncMode`,
+`SyncModePreference`, `Vault::select_sync_mode`,
+`Vault::sync_mode_preference`, `Vault::set_sync_mode_preference`);
+`crates/pangolin-store/src/meta.rs` (`read_sync_mode_preference`,
+`write_sync_mode_preference`);
+`crates/pangolin-store/src/schema.rs::migrate_sync_mode_preference_column`;
+`THREAT_MODEL.md` ("Sync-mode selector (4.4)" deep-dive section);
+`docs/architecture/chain-sync.md` (Sync-mode selector section).
+
+---
+
 ## PoC retrospective: PoC → MVP mapping
 
 > **Status:** Locked at P12 SIGNOFF (2026-05-08).
