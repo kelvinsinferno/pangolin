@@ -408,4 +408,77 @@ pub enum ChainError {
         /// Non-secret human description of why the state is unknown.
         reason: String,
     },
+
+    /// **MVP-2 issue 4.1 (L5 verifier).** Alloy's
+    /// `recover_address_from_prehash` failed to recover a well-formed
+    /// EVM address from a `RevisionPublished` event's signature bytes
+    /// — either the signature is malformed at the curve level (`r` is
+    /// zero, `s` is zero, non-canonical s, v ∉ {27,28}) or the digest
+    /// was somehow malformed. Surfaces from
+    /// [`crate::recover_signer_v1`] / [`crate::recover_signer_v1_raw`]
+    /// when a chain-sync sees an event it cannot verify; the event is
+    /// skipped (counted in `SyncReport.revisions_rejected`) rather
+    /// than ingested into the local graph.
+    #[error("signer recovery failed: {detail}")]
+    SignerRecoveryFailed {
+        /// Non-secret human description of the recovery failure.
+        detail: String,
+    },
+
+    /// **MVP-2 issue 4.1 (L5 verifier defense-in-depth).** The
+    /// `RevisionPublished` event's unindexed `signer` field disagreed
+    /// with the address recovered from the event's signature +
+    /// EIP-712 digest. Either a misbehaving RPC fabricated a `signer`
+    /// field on a syntactically-valid signature for a different
+    /// address, or the publisher's submitter wallet differs from the
+    /// signing key (which the contract refuses on chain via
+    /// `ErrSignerNotRegistered`). Either way → fatal for that event;
+    /// it does NOT land in the local graph.
+    #[error("event signer mismatch: claimed_signer={claimed}, recovered_signer={recovered}")]
+    EventSignerMismatch {
+        /// `signer` field as decoded from the `RevisionPublished` log.
+        claimed: Address,
+        /// Address recovered from `recover_signer_v1_raw`.
+        recovered: Address,
+    },
+
+    /// **MVP-2 issue 4.1 (L-malicious-vault-id-substitution).** The
+    /// `RevisionPublished` event's indexed `vaultId` topic did not
+    /// match the vault the sync was requested for. Server-side filter
+    /// is the first defense; this client-side check is
+    /// defense-in-depth.
+    #[error("event vault id mismatch: requested={requested:?}, observed={observed:?}")]
+    EventVaultIdMismatch {
+        /// 32-byte `vaultId` the sync was scoped to.
+        requested: [u8; 32],
+        /// 32-byte `vaultId` decoded from the event topic.
+        observed: [u8; 32],
+    },
+
+    /// **MVP-2 issue 4.1 (L-schemaVersion-future-poison + §18.7).**
+    /// The `RevisionPublished` event's `schemaVersion` field exceeded
+    /// the `MAX_KNOWN_CLIENT_SCHEMA_VERSION` constant; the event is
+    /// rejected rather than landing under a not-yet-known shape.
+    #[error("unsupported event schema version: observed={observed}, max_known={max_known}")]
+    UnsupportedSchemaVersionEvent {
+        /// Schema version decoded from the event.
+        observed: u16,
+        /// Maximum schema version this client build supports.
+        max_known: u16,
+    },
+
+    /// **MVP-2 issue 4.1 (L-checkpoint-corruption).** The
+    /// `last_synced_block` checkpoint read from a `.pvf` file points
+    /// past the current chain tip — the file was either tampered or
+    /// the build is running against the wrong chain.
+    #[error(
+        "checkpoint out of range: persisted last_synced_block={observed}, \
+         current chain tip={tip}"
+    )]
+    CheckpointOutOfRange {
+        /// Persisted checkpoint value from the `.pvf`.
+        observed: u64,
+        /// Current chain tip from `eth_blockNumber`.
+        tip: u64,
+    },
 }

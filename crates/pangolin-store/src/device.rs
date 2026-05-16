@@ -649,6 +649,70 @@ pub fn read_device(
     }
 }
 
+/// **MVP-2 issue 4.1 (R-d permissive auto-register).** Insert a peer
+/// device row first observed via chain sync.
+///
+/// Inserts a fresh `devices` row representing a peer device first
+/// observed via the slow-mode chain sync. Idempotent: re-inserting the
+/// same EVM address is a no-op (the `device_id` primary key collides;
+/// `INSERT OR IGNORE` keeps the original row).
+///
+/// The synthetic `device_id` is the 20-byte EVM address left-padded
+/// with 12 zero bytes to 32 bytes. This is the same shape D-017 emits
+/// as the indexed `deviceId` field of `RevisionPublished` events; the
+/// padding doctrine matches `RevisionFieldsV1::device_id_from_address`.
+///
+/// `public_key` is left NULL because the chain event does not carry an
+/// Ed25519 verifying key — the contract emits the secp256k1 signer's
+/// EVM address only. The pre-existing devices-table machinery treats
+/// a NULL `public_key` as "legacy / non-Ed25519-backed", which is
+/// correct semantics here.
+///
+/// `discovered_via_chain_sync = 1` flags the audit trail per R-d;
+/// `discovered_at_block` records the block height the event was
+/// first seen (so a future re-sync from genesis would not re-flag the
+/// device "newly discovered" — idempotent).
+///
+/// Returns `true` if a new row was inserted, `false` if a row with
+/// the same `device_id` already existed.
+///
+/// # Errors
+///
+/// `StoreError::Sqlite` for any DB issue.
+pub fn auto_register_device_from_chain_sync(
+    conn: &Connection,
+    evm_address: [u8; EVM_ADDRESS_LEN],
+    discovered_at_block: u64,
+    now_ms: i64,
+) -> Result<bool> {
+    // Build the synthetic device_id: 12 zero bytes ‖ 20 address bytes.
+    let mut synthetic_device_id = [0u8; DEVICE_ID_LEN];
+    synthetic_device_id[12..].copy_from_slice(&evm_address);
+
+    let block_i = i64::try_from(discovered_at_block).map_err(|_| {
+        StoreError::Corrupted(
+            "auto_register_device_from_chain_sync: discovered_at_block overflow".into(),
+        )
+    })?;
+    let label = "discovered-via-chain-sync";
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO devices \
+            (device_id, label, added_at, revoked_at, capabilities, last_sync_at, public_key, \
+             schema_version, evm_address, discovered_via_chain_sync, discovered_at_block) \
+         VALUES (?1, ?2, ?3, NULL, ?4, NULL, NULL, ?5, ?6, 1, ?7)",
+        params![
+            synthetic_device_id.as_slice(),
+            label,
+            now_ms,
+            DeviceCapabilities::Full.to_repr(),
+            i64::from(DEVICE_IDENTITY_SCHEMA_VERSION),
+            evm_address.as_slice(),
+            block_i,
+        ],
+    )?;
+    Ok(inserted > 0)
+}
+
 /// Update the `label` column for `device_id`. Returns
 /// [`StoreError::AccountNotFound`] (re-used as "no such device row") if
 /// the id is not in the trust list. `label` must already be validated.

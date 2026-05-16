@@ -225,6 +225,25 @@ CREATE TABLE IF NOT EXISTS pending_merges (
     PRIMARY KEY (account_id, target_head_id)
 );
 
+-- MVP-2 issue 4.1: per-vault checkpoint table for the v1 slow-mode
+-- chain sync read path (R-a). Distinct from the v0-era `sync_state`
+-- table above so v0 read-back and v1 chain sync can advance
+-- independently. Single row (CHECK id = 0); INSERT OR REPLACE keyed on
+-- id = 0 is what `Vault::update_last_synced_block_v1` writes.
+-- Additive `CREATE TABLE IF NOT EXISTS` (no format_version bump);
+-- legacy P0..3.6 vaults pick it up on next open through
+-- `apply_pragmas_and_schema`. `chain_env_tag` carries which env the
+-- checkpoint binds to so a future cross-env build can store separate
+-- cursors without colliding (in MVP-2 only `BaseSepolia` is wired;
+-- the tag is `1`).
+CREATE TABLE IF NOT EXISTS chain_sync_v1_state (
+    id                  INTEGER PRIMARY KEY CHECK (id = 0),
+    chain_env_tag       INTEGER NOT NULL DEFAULT 1,
+    last_synced_block   INTEGER NOT NULL DEFAULT 0,
+    last_synced_at      INTEGER,
+    schema_version      INTEGER NOT NULL DEFAULT 1
+);
+
 -- MVP-1 issue 1.11 / Browser-Ext spec §2.3 / Threat Model invariant #8.
 -- Vault-level registry of which component (desktop / browser-ext /
 -- mobile-OS autofill) owns credential capture per context. At most one
@@ -331,6 +350,105 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     // `resolve_fork`.
     migrate_revision_superseded_by_column(conn)?;
 
+    // MVP-2 issue 4.1 migrations:
+    // - `revisions.revision_status` (TEXT, DEFAULT 'finalized') — R-c
+    //   two-stage status. Pre-4.1 rows default to 'finalized' so
+    //   existing graphs survive the schema bump as-is.
+    // - `revisions.observed_at_block` (INTEGER, nullable) — block
+    //   height the revision was observed at; populated only for
+    //   chain-sync-ingested rows in `Pending` status.
+    // - `revisions.observed_block_hash` (BLOB, nullable) — same row
+    //   companion field for reorg detection.
+    // - `devices.discovered_via_chain_sync` (INTEGER, DEFAULT 0) —
+    //   R-d audit flag.
+    // - `devices.discovered_at_block` (INTEGER, nullable) — block
+    //   height the device was first observed publishing.
+    // - `chain_sync_v1_state` table — R-a checkpoint persistence.
+    //   Belt + suspenders against legacy files where `apply_*` runs
+    //   under an older DDL string.
+    migrate_revision_chain_sync_columns(conn)?;
+    migrate_devices_chain_sync_columns(conn)?;
+    migrate_chain_sync_v1_state_table(conn)?;
+
+    Ok(())
+}
+
+/// **MVP-2 issue 4.1 migration.** Add the three `revisions` columns
+/// (`revision_status`, `observed_at_block`, `observed_block_hash`)
+/// required by R-c (two-stage rollback). Idempotent — each column
+/// gated by a `PRAGMA table_info(revisions)` check.
+fn migrate_revision_chain_sync_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(revisions)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut have: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in rows {
+        have.insert(r?);
+    }
+    drop(stmt);
+    if !have.contains("revision_status") {
+        conn.execute(
+            "ALTER TABLE revisions ADD COLUMN revision_status TEXT NOT NULL DEFAULT 'finalized'",
+            [],
+        )?;
+    }
+    if !have.contains("observed_at_block") {
+        conn.execute(
+            "ALTER TABLE revisions ADD COLUMN observed_at_block INTEGER",
+            [],
+        )?;
+    }
+    if !have.contains("observed_block_hash") {
+        conn.execute(
+            "ALTER TABLE revisions ADD COLUMN observed_block_hash BLOB",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// **MVP-2 issue 4.1 migration.** Add the two `devices` columns
+/// (`discovered_via_chain_sync`, `discovered_at_block`) required by
+/// R-d (permissive auto-register). Idempotent.
+fn migrate_devices_chain_sync_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(devices)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut have: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in rows {
+        have.insert(r?);
+    }
+    drop(stmt);
+    if !have.contains("discovered_via_chain_sync") {
+        conn.execute(
+            "ALTER TABLE devices ADD COLUMN discovered_via_chain_sync INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !have.contains("discovered_at_block") {
+        conn.execute(
+            "ALTER TABLE devices ADD COLUMN discovered_at_block INTEGER",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// **MVP-2 issue 4.1 migration.** Ensure the `chain_sync_v1_state`
+/// table exists on legacy vaults. Same pattern as
+/// `migrate_pending_merges_table` — the `SCHEMA_DDL` string above
+/// already contains the `CREATE TABLE IF NOT EXISTS`; this helper is
+/// belt + suspenders for files whose `apply_pragmas_and_schema` ran
+/// under an older DDL.
+fn migrate_chain_sync_v1_state_table(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS chain_sync_v1_state (
+            id                  INTEGER PRIMARY KEY CHECK (id = 0),
+            chain_env_tag       INTEGER NOT NULL DEFAULT 1,
+            last_synced_block   INTEGER NOT NULL DEFAULT 0,
+            last_synced_at      INTEGER,
+            schema_version      INTEGER NOT NULL DEFAULT 1
+        )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -684,6 +802,104 @@ mod tests {
             );
         }
         assert!(table_exists(&conn, "device_key"));
+    }
+
+    /// MVP-2 issue 4.1: the chain-sync columns (`revision_status`,
+    /// `observed_at_block`, `observed_block_hash` on `revisions`;
+    /// `discovered_via_chain_sync`, `discovered_at_block` on
+    /// `devices`) land via `apply_pragmas_and_schema` and stay
+    /// singular under idempotent re-run.
+    #[test]
+    fn chain_sync_columns_migration_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_pragmas_and_schema(&conn).unwrap();
+        apply_pragmas_and_schema(&conn).unwrap();
+        let rev_cols = column_names(&conn, "revisions");
+        for needed in [
+            "revision_status",
+            "observed_at_block",
+            "observed_block_hash",
+        ] {
+            assert_eq!(
+                rev_cols.iter().filter(|c| c.as_str() == needed).count(),
+                1,
+                "revisions.{needed} should appear exactly once"
+            );
+        }
+        let dev_cols = column_names(&conn, "devices");
+        for needed in ["discovered_via_chain_sync", "discovered_at_block"] {
+            assert_eq!(
+                dev_cols.iter().filter(|c| c.as_str() == needed).count(),
+                1,
+                "devices.{needed} should appear exactly once"
+            );
+        }
+        assert!(table_exists(&conn, "chain_sync_v1_state"));
+    }
+
+    /// MVP-2 issue 4.1: a legacy `revisions` table lacking the
+    /// chain-sync columns gets them added on next migration; the
+    /// `revision_status` column defaults to 'finalized' so existing
+    /// (pre-4.1) rows continue to read as finalized.
+    #[test]
+    fn legacy_revisions_table_gets_chain_sync_columns_with_finalized_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Hand-build a pre-4.1 revisions table (the columns 1.6
+        // baseline carries — including `superseded_by` so the legacy
+        // 1.6 schema doesn't trip migrations above).
+        conn.execute_batch(
+            "CREATE TABLE account_identities (account_id BLOB PRIMARY KEY, created_at INTEGER NOT NULL, last_modified_at INTEGER NOT NULL, tombstoned INTEGER NOT NULL DEFAULT 0, head_revision_id BLOB NOT NULL);
+             CREATE TABLE revisions (
+                revision_id          BLOB PRIMARY KEY,
+                account_id           BLOB    NOT NULL,
+                parent_revision_id   BLOB    NOT NULL,
+                device_id            BLOB    NOT NULL,
+                schema_version       INTEGER NOT NULL,
+                created_at           INTEGER NOT NULL,
+                enc_payload          BLOB    NOT NULL,
+                enc_nonce            BLOB    NOT NULL,
+                is_tombstone         INTEGER NOT NULL DEFAULT 0,
+                chain_tx_hash        BLOB,
+                chain_block_number   INTEGER,
+                chain_log_index      INTEGER,
+                superseded_by        BLOB,
+                FOREIGN KEY (account_id) REFERENCES account_identities(account_id)
+             );",
+        )
+        .unwrap();
+        // Seed a pre-4.1 row.
+        conn.execute(
+            "INSERT INTO account_identities (account_id, created_at, last_modified_at, head_revision_id) VALUES (?1, 0, 0, ?2)",
+            [&[0xAAu8; 32] as &[u8], &[0xBBu8; 32] as &[u8]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO revisions
+                (revision_id, account_id, parent_revision_id, device_id, schema_version,
+                 created_at, enc_payload, enc_nonce)
+             VALUES (?1, ?2, ?3, ?4, 1, 0, ?5, ?6)",
+            [
+                &[0xBBu8; 32] as &[u8],
+                &[0xAAu8; 32] as &[u8],
+                &[0x00u8; 32] as &[u8],
+                &[0xCCu8; 32] as &[u8],
+                &[0xDEu8; 4] as &[u8],
+                &[0xEEu8; 24] as &[u8],
+            ],
+        )
+        .unwrap();
+        apply_pragmas_and_schema(&conn).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT revision_status FROM revisions WHERE revision_id = ?1",
+                [&[0xBBu8; 32] as &[u8]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "finalized",
+            "pre-4.1 rows must default to 'finalized' under the new column"
+        );
     }
 
     /// MVP-2 issue 3.2: a 1.5-era `devices` table that already carries

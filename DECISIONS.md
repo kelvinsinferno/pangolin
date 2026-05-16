@@ -320,6 +320,134 @@ means no new external crate dep, so `cargo deny check advisories` +
 
 ---
 
+## MVP-2 issue 4.1 resolved decisions (R-a..R-f) — 2026-05-15
+
+> **Status:** Locked. Plan-gate sign-off in `docs/issue-plans/4.1.md`
+> "Resolved decisions" table at commit `6ce608a`. Builder agent
+> shipped under the `issue/4.1-chain-sync` worktree.
+>
+> **Scope:** ship the first MVP-2 issue that reads from chain — the
+> §4 cluster's default-mode foundation. Consumes `RevisionPublished`
+> events from D-017; filters by vault id; per-event recovers the
+> secp256k1 signer via the production Rust v1 verifier
+> (`recover_signer_v1` + `recover_signer_v1_raw`); feeds verified
+> events into `Vault::ingest_pending_chain_revision` + advances a
+> per-vault `last_synced_block` checkpoint. See
+> `docs/issue-plans/4.1.md` for the L1..L12 invariants and the
+> threat model rows for the load-bearing risks (L-rpc-spoof-events,
+> L-rpc-omits-events, L-reorg-rollback, L-checkpoint-corruption,
+> L-malicious-vault-id-substitution, L-verifier-domain-binding-drift,
+> L-schemaVersion-future-poison).
+
+### R-a · Checkpoint persistence — persist in `.pvf` (Option A + escape hatch)
+
+New single-row `chain_sync_v1_state` table (id = 0; CHECK enforces
+single-row) holds `(chain_env_tag, last_synced_block, last_synced_at,
+schema_version)`. Distinct from the v0-era `sync_state` table so the
+v0 readback + v1 chain sync advance independently. The `SyncOptions
+{ from_genesis: true }` flag is the user-facing escape hatch (Option
+C) — `pangolin sync --from-genesis` (future CLI-V1 batch) calls into
+`Vault::sync_from_chain` with this option set. **Why:** the §4
+cluster's "slow mode" framing matches "first sync is slow, subsequent
+syncs are fast" — Option B (in-memory only) makes every session slow,
+undermining the framing.
+
+### R-b · Event fetch — WebSocket preferred, HTTP-poll fallback (deferred WS)
+
+`ChainEventSource` enum (`WebSocket` / `HttpPolling`) tracks which
+backend ran for `SyncReport.event_source`. The state machine + the
+reconnect-with-backoff helper + the adapter that converts WS payloads
+to the same shape HTTP polling produces are fully present in
+`crates/pangolin-chain/src/chain_sync/{ws.rs, poll.rs}`. **NOTE on L8
+deferral:** alloy's WS provider lives behind the `ws` feature on the
+umbrella `alloy` crate; enabling it pulls `alloy-pubsub`,
+`tokio-tungstenite`, `tungstenite`, and an OS-level tls stack. The
+MVP-2 workspace `Cargo.toml` does NOT enable that feature (per L8 —
+no new external crate dep in 4.1). The WS-open path in
+`chain_sync::ws::open_subscription` returns `WsOpenError::Unavailable`
+immediately so the orchestrator falls back to HTTP polling
+unconditionally in this MVP-2 build. The MVP-3 issue 4.1.x feature-
+flag flip is: (a) add `features = ["ws", ...]` to the `alloy` dep;
+(b) replace the `Unavailable` branch in `open_subscription` with a
+real `ProviderBuilder::new().on_ws(...)` call. Every other consumer
+(the orchestrator, the reorg detector, the verifier) is shape-stable
+across both branches.
+
+### R-c · Reorg handling — two-stage optimistic finalize + rollback
+
+`RevisionStatus::Pending { observed_at_block, block_hash }` for
+optimistic 1-conf application; promote to `RevisionStatus::Finalized`
+at depth ≥ `CONFIRMATION_DEPTH_FOR_FINALIZATION = 12`. The
+`revisions` table gains three additive columns (`revision_status`
+TEXT DEFAULT 'finalized'; `observed_at_block` INTEGER; `observed_block_hash`
+BLOB). The reorg detector (`pangolin_chain::chain_sync::reorg::ReorgDetector`)
+caches `(block_number → block_hash)` observations, compares against
+canonical chain on every poll iteration, returns a `ReorgInfo`
+window for the orchestrator to feed into
+`Vault::rollback_pending_revisions_in_range(block_low, block_high)`.
+`Vault::promote_finalized_revisions(current_head)` runs after every
+chunk to advance pending → finalized at the 12-depth threshold. Tests
+cover (a) happy-path 1-conf insert; (b) shallow 2-block reorg
+rollback; (c) deep 10-block reorg rollback; (d) finalized rows never
+rolled back; (e) depth-5 rows stay pending.
+
+### R-d · Device cross-check — permissive auto-register
+
+`devices` table gains two additive columns (`discovered_via_chain_sync`
+INTEGER DEFAULT 0; `discovered_at_block` INTEGER). New helper
+`device::auto_register_device_from_chain_sync(conn, evm_address,
+discovered_at_block, now_ms) -> Result<bool>` inserts a synthetic
+device row whose `device_id` is the EVM address left-padded with 12
+zero bytes; idempotent via `INSERT OR IGNORE`. `public_key` is NULL
+because the chain event carries no Ed25519 verifying key — the
+contract emits only the secp256k1 signer's EVM address. **Why:** the
+contract enforces device registration on-chain at publish time (per
+2.1 R-b self-bootstrap), so any revision that's on chain has been
+signed by a registered device. Client-side strict-check breaks
+multi-device sync (a second device legitimately self-bootstrapping
+looks "unknown" to the first device until it syncs).
+
+### R-e · API surface — async-only on `pangolin-store::Vault` (L7-preserving)
+
+The orchestration helper `Vault::sync_from_chain(&mut self, rpc_url,
+env, vault_id, options) -> Result<SyncReport, StoreError>` lives on
+`pangolin-store::Vault` (NOT on `pangolin-chain`) because the
+direction `pangolin-chain → pangolin-store` would violate L7. The
+primitives (signer recovery, event-decode + verify chunk fetch, the
+reorg detector, the WS placeholder) live on `pangolin-chain` and
+expose only sync-safe + async-safe public functions; the Vault-side
+orchestrator drives them. The dep-direction concern flagged in
+plan-gate R-e was the load-bearing call here — we adopted the
+alternative shape (Vault hosts the orchestration; chain hosts the
+primitives). L7 invariant verified: `cargo tree -p pangolin-chain
+--no-default-features --edges normal | grep -c pangolin-store == 0`.
+
+### R-f · Test surface — hermetic + reorg simulator (live `#[ignore]`'d)
+
+Three test classes in `crates/pangolin-chain/src/chain_sync/tests.rs`
++ inline `crates/pangolin-store/src/vault.rs::tests`: (a) hermetic
+with alloy `Asserter` — round-trip verifier (`recover_signer_v1` +
+`recover_signer_v1_raw`); high-s rejection (LOW#3 defense-in-depth);
+wrong-v-byte rejection; tampered-sig rejection; chain-id mismatch;
+deployment-address resolution; foreign-emitter rejection; wrong
+vault-id rejection; future-schema-version rejection;
+signer-field-mismatch detection; (b) reorg simulator — shallow
+2-block + deep 10-block + forget_window state mgmt; (c) Vault
+accessor tests — `last_synced_block_v1` round-trip + monotonic
+guard; rollback_pending skips finalized; promote_finalized at
+12-conf threshold; auto-register idempotency. The live
+`#[ignore]`'d `live_recover_signer_from_d017_history` test is NOT
+shipped in 4.1 — Kelvin's call to defer pending the captured-event
+hex pin (env-quirk #14: rerun + recapture when the next 3.3 / 2.3
+deploy smoke produces a known event payload).
+
+**Spec ref:** `docs/issue-plans/4.1.md`; `THREAT_MODEL.md` (new
+"Slow-mode chain sync (read path + v1 verifier)" row). Master plan
+§4 (slow-mode chain sync cluster) + §16.3 (chain reader / sync
+security-critical surface) are the underlying spec references.
+
+---
+
 ## PoC retrospective: PoC → MVP mapping
 
 > **Status:** Locked at P12 SIGNOFF (2026-05-08).

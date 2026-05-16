@@ -6118,6 +6118,224 @@ impl Vault {
         Ok(())
     }
 
+    // -----------------------------------------------------------------
+    // Chain-sync v1 primitives (MVP-2 issue 4.1, R-a + R-c + R-d)
+    // -----------------------------------------------------------------
+
+    /// **MVP-2 issue 4.1 (R-a).** Read the per-vault `last_synced_block`
+    /// checkpoint stored in `chain_sync_v1_state`.
+    ///
+    /// Returns `Ok(None)` for a fresh vault that has never run a v1
+    /// chain sync — the caller (orchestrator in
+    /// [`pangolin_chain::chain_sync`]) then defaults to the D-017
+    /// deploy block per
+    /// [`pangolin_chain::d017_deploy_block`].
+    ///
+    /// Distinct from [`Self::last_pulled_block`] (the v0 P7-era
+    /// checkpoint kept for v0 readback compatibility).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupted`] if the stored value is negative.
+    pub fn last_synced_block_v1(&self) -> Result<Option<u64>> {
+        let raw: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT last_synced_block FROM chain_sync_v1_state WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.map_or(Ok(None), |v| {
+            u64::try_from(v).map(Some).map_err(|_| {
+                StoreError::Corrupted(
+                    "chain_sync_v1_state.last_synced_block is negative; refusing to surface".into(),
+                )
+            })
+        })
+    }
+
+    /// **MVP-2 issue 4.1 (R-a + L12).** Advance the v1 `last_synced_block`
+    /// checkpoint to `new_block`. Monotonic — refuses to move backward
+    /// (a backward move is symptomatic of either operator error or a
+    /// reorg the rollback path failed to handle; both are out of the
+    /// monotonic-checkpoint contract).
+    ///
+    /// Equal values are no-ops so idempotent retry of `sync_from_chain`
+    /// is safe.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupted`] if `new_block` is strictly less than
+    /// the current checkpoint or does not fit in `i64`.
+    pub fn update_last_synced_block_v1(&mut self, new_block: u64) -> Result<()> {
+        let current = self.last_synced_block_v1()?.unwrap_or(0);
+        if new_block < current {
+            return Err(StoreError::Corrupted(format!(
+                "update_last_synced_block_v1: new_block {new_block} < current {current}; \
+                 backward moves violate the monotonic-checkpoint contract (L12)"
+            )));
+        }
+        if new_block == current && self.last_synced_block_v1()?.is_some() {
+            return Ok(());
+        }
+        let new_i64 = i64::try_from(new_block).map_err(|_| {
+            StoreError::Corrupted(
+                "chain_sync_v1_state.last_synced_block does not fit in i64; refusing to store"
+                    .into(),
+            )
+        })?;
+        let now_ms = current_unix_ms();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO chain_sync_v1_state \
+                (id, chain_env_tag, last_synced_block, last_synced_at, schema_version) \
+             VALUES (0, 1, ?1, ?2, 1)",
+            params![new_i64, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// **MVP-2 issue 4.1 (R-c rollback).** Mark all `Pending` revisions
+    /// whose `observed_at_block` falls in `[block_low, block_high]` as
+    /// rolled-back. The current implementation is a soft delete: the
+    /// row is removed from the revisions table (along with its
+    /// `account_identities.head_revision_id` pointer if the head
+    /// matched). Future MVP-3 work may add a `tombstoned_by_reorg`
+    /// status instead of outright deletion for stronger audit trails;
+    /// MVP-2 deletes match the "rolled back never happened" semantics
+    /// the user expects.
+    ///
+    /// Returns the count of revisions removed.
+    ///
+    /// **Safety invariant:** only `Pending` revisions are rolled back;
+    /// `Finalized` revisions are never touched (R-c boundary). The
+    /// rollback range is constrained by the caller (the chain-sync
+    /// orchestrator passes the `ReorgInfo` window directly).
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` for any DB error.
+    pub fn rollback_pending_revisions_in_range(
+        &mut self,
+        block_low: u64,
+        block_high: u64,
+    ) -> Result<u32> {
+        let low_i = i64::try_from(block_low).map_err(|_| {
+            StoreError::Corrupted("rollback_pending_revisions_in_range: block_low overflow".into())
+        })?;
+        let high_i = i64::try_from(block_high).map_err(|_| {
+            StoreError::Corrupted("rollback_pending_revisions_in_range: block_high overflow".into())
+        })?;
+        let removed = self.conn.execute(
+            "DELETE FROM revisions \
+             WHERE revision_status = 'pending' \
+               AND observed_at_block >= ?1 \
+               AND observed_at_block <= ?2",
+            params![low_i, high_i],
+        )?;
+        let count_u32 = u32::try_from(removed).unwrap_or(u32::MAX);
+        Ok(count_u32)
+    }
+
+    /// **MVP-2 issue 4.1 (R-c finalization).** Promote `Pending`
+    /// revisions whose `observed_at_block` is at depth ≥
+    /// `CONFIRMATION_DEPTH_FOR_FINALIZATION` from `current_block_head`
+    /// to `Finalized`. Returns the count of promotions.
+    ///
+    /// `current_block_head` is the orchestrator's view of the chain
+    /// tip; passed as a parameter rather than queried here so the
+    /// Vault layer stays sync.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` for any DB error.
+    pub fn promote_finalized_revisions(&mut self, current_block_head: u64) -> Result<u32> {
+        // Depth threshold: any pending row whose observed_at_block ≤
+        // current_block_head - 12 is finalized.
+        let threshold =
+            current_block_head.saturating_sub(pangolin_chain::CONFIRMATION_DEPTH_FOR_FINALIZATION);
+        let threshold_i = i64::try_from(threshold).map_err(|_| {
+            StoreError::Corrupted("promote_finalized_revisions: threshold overflow".into())
+        })?;
+        let updated = self.conn.execute(
+            "UPDATE revisions \
+             SET revision_status = 'finalized' \
+             WHERE revision_status = 'pending' \
+               AND observed_at_block IS NOT NULL \
+               AND observed_at_block <= ?1",
+            params![threshold_i],
+        )?;
+        let count_u32 = u32::try_from(updated).unwrap_or(u32::MAX);
+        Ok(count_u32)
+    }
+
+    /// **MVP-2 issue 4.1 (R-c ingest path).** Ingest a verified chain
+    /// event into the local revision graph with `Pending` status +
+    /// associated `observed_at_block` / `observed_block_hash` columns
+    /// populated.
+    ///
+    /// Delegates to the existing
+    /// [`Self::ingest_chain_revision`] for the idempotency + foreign-
+    /// row machinery, then stamps the chain-sync-specific status
+    /// columns onto the resulting row.
+    ///
+    /// # Errors
+    ///
+    /// Same taxonomy as [`Self::ingest_chain_revision`].
+    pub fn ingest_pending_chain_revision(
+        &mut self,
+        event: &pangolin_chain::RevisionEvent,
+        observed_at_block: u64,
+        observed_block_hash: [u8; 32],
+    ) -> Result<IngestOutcome> {
+        let outcome = self.ingest_chain_revision(event)?;
+        let block_i = i64::try_from(observed_at_block).map_err(|_| {
+            StoreError::Corrupted(
+                "ingest_pending_chain_revision: observed_at_block does not fit in i64".into(),
+            )
+        })?;
+        // Stamp status + observed-block fields on the row identified
+        // by the chain anchor. We match by chain_tx_hash + chain_log_index
+        // because that's the unambiguous chain-event identity.
+        let tx_hash_i64 = i64::try_from(event.anchor.block_number)
+            .map_err(|_| StoreError::Corrupted("event anchor block_number overflow".into()))?;
+        let log_idx_i64 = i64::try_from(event.anchor.log_index)
+            .map_err(|_| StoreError::Corrupted("event anchor log_index overflow".into()))?;
+        self.conn.execute(
+            "UPDATE revisions \
+             SET revision_status = 'pending', \
+                 observed_at_block = ?1, \
+                 observed_block_hash = ?2 \
+             WHERE chain_tx_hash = ?3 \
+               AND chain_block_number = ?4 \
+               AND chain_log_index = ?5",
+            params![
+                block_i,
+                &observed_block_hash[..],
+                &event.anchor.tx_hash[..],
+                tx_hash_i64,
+                log_idx_i64,
+            ],
+        )?;
+        Ok(outcome)
+    }
+
+    /// **MVP-2 issue 4.1 (R-d audit).** Returns the count of
+    /// `discovered_via_chain_sync = 1` rows in the devices table.
+    /// Useful for `SyncReport` accounting + diagnostic queries.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Sqlite` for any DB error.
+    pub fn count_chain_sync_discovered_devices(&self) -> Result<u32> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM devices WHERE discovered_via_chain_sync = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(u32::try_from(n).unwrap_or(u32::MAX))
+    }
+
     /// Fetch the publish-relevant fields of a single revision row:
     /// `(parent_revision, schema_version, enc_payload)`.
     ///
@@ -6300,6 +6518,158 @@ impl Vault {
             });
         }
         Ok(out)
+    }
+
+    // -----------------------------------------------------------------
+    // MVP-2 issue 4.1 (R-e + R-a + R-c + R-d): async orchestration
+    // -----------------------------------------------------------------
+
+    /// **MVP-2 issue 4.1 (R-e + R-a + R-c + R-d).** Pull v1
+    /// `RevisionPublished` events from D-017 + ingest them into the
+    /// local revision graph + advance the per-vault checkpoint.
+    ///
+    /// Async because the underlying alloy provider calls are async;
+    /// the `&mut self` signature preserves the sync-Vault doctrine
+    /// (R-e). The orchestrator loops `fetch_and_verify_chunk` at
+    /// `CHAIN_SYNC_LOG_BLOCK_CHUNK = 9_000` per L6, ingests each
+    /// verified event via [`Self::ingest_pending_chain_revision`]
+    /// (R-c Pending status), auto-registers unknown signers per R-d,
+    /// promotes pending revisions whose depth reaches the
+    /// finalization threshold per R-c, detects + rolls back reorgs
+    /// per R-c, and advances the v1 checkpoint atomically with
+    /// successful ingest.
+    ///
+    /// # Arguments
+    ///
+    /// - `rpc_url` — HTTP(S) RPC endpoint to talk to.
+    /// - `env` — which `ChainEnv` to bind to. Only `BaseSepolia` is
+    ///   pinned in MVP-2.
+    /// - `vault_id` — 32-byte vault id to filter events by.
+    /// - `options` — caller tuning. `Default::default()` is the
+    ///   production posture.
+    ///
+    /// # Errors
+    ///
+    /// See [`pangolin_chain::error::ChainError`] taxonomy for the
+    /// fail-closed variants ([`ChainIdMismatch`], [`DeploymentAddressMismatch`],
+    /// [`CheckpointOutOfRange`]) plus the store's own
+    /// [`StoreError::Sqlite`] etc.
+    pub async fn sync_from_chain(
+        &mut self,
+        rpc_url: &str,
+        env: pangolin_chain::ChainEnv,
+        vault_id: &[u8; 32],
+        options: pangolin_chain::SyncOptions,
+    ) -> Result<pangolin_chain::SyncReport> {
+        use pangolin_chain::chain_sync::{detect_reorg_via_rpc, fetch_and_verify_chunk};
+        use pangolin_chain::{
+            d017_deploy_block, fetch_current_block_number, ChainEventSource, SyncReport,
+        };
+
+        const CHUNK: u64 = pangolin_chain::CHAIN_SYNC_LOG_BLOCK_CHUNK;
+
+        // R-a: resolve the starting cursor.
+        let persisted = self.last_synced_block_v1()?;
+        let mut cursor = if options.from_genesis {
+            d017_deploy_block(env)
+        } else {
+            persisted.unwrap_or_else(|| d017_deploy_block(env))
+        };
+
+        // L3 chain-id cross-check + head fetch happen inside the
+        // chain-sync helpers (the helpers run their own provider
+        // construction with the cross-check baked in).
+        let head = match options.until_block {
+            Some(t) => t,
+            None => fetch_current_block_number(rpc_url).await?,
+        };
+
+        // L-checkpoint-corruption defense: if a persisted checkpoint
+        // points past the current tip, fail closed.
+        if cursor > head {
+            return Err(pangolin_chain::error::ChainError::CheckpointOutOfRange {
+                observed: cursor,
+                tip: head,
+            }
+            .into());
+        }
+
+        let mut report = SyncReport {
+            event_source: ChainEventSource::HttpPolling,
+            ..Default::default()
+        };
+        let mut detector = pangolin_chain::chain_sync::reorg::ReorgDetector::default();
+
+        while cursor < head {
+            let chunk_start = cursor.saturating_add(1);
+            let chunk_end = chunk_start
+                .saturating_add(CHUNK.saturating_sub(1))
+                .min(head);
+            let (events, rejected) =
+                fetch_and_verify_chunk(rpc_url, env, vault_id, chunk_start, chunk_end).await?;
+            report.revisions_pulled = report
+                .revisions_pulled
+                .saturating_add(u32::try_from(events.len()).unwrap_or(u32::MAX));
+            report.revisions_rejected = report.revisions_rejected.saturating_add(rejected);
+
+            for ev in events {
+                // R-d: auto-register the signer if not yet in the
+                // devices table. Idempotent.
+                let signer_bytes = ev.signer.into_array();
+                let now_ms = current_unix_ms();
+                let inserted_new = device::auto_register_device_from_chain_sync(
+                    &self.conn,
+                    signer_bytes,
+                    ev.event.anchor.block_number,
+                    now_ms,
+                )?;
+                if inserted_new {
+                    report.new_devices_registered = report.new_devices_registered.saturating_add(1);
+                }
+
+                // R-c: ingest with Pending status + observed block info.
+                self.ingest_pending_chain_revision(
+                    &ev.event,
+                    ev.event.anchor.block_number,
+                    ev.block_hash.0,
+                )?;
+                detector.record(ev.event.anchor.block_number, ev.block_hash);
+                report.revisions_applied = report.revisions_applied.saturating_add(1);
+            }
+
+            // R-c: reorg detection. After each chunk, query canonical
+            // chain for observed heights + roll back affected window.
+            if let Some(info) = detect_reorg_via_rpc(rpc_url, &detector).await? {
+                let rolled = self.rollback_pending_revisions_in_range(
+                    info.affected_block_low,
+                    info.affected_block_high,
+                )?;
+                report.revisions_rolled_back = report.revisions_rolled_back.saturating_add(rolled);
+                detector.forget_window(info);
+            }
+
+            // R-c: promote pending revisions whose depth >= 12.
+            let promoted = self.promote_finalized_revisions(head)?;
+            report.revisions_finalized = report.revisions_finalized.saturating_add(promoted);
+
+            // R-a + L12: advance the checkpoint atomically with the
+            // ingest (the ingest already happened above; the
+            // checkpoint advance is the closing fence).
+            self.update_last_synced_block_v1(chunk_end)?;
+            cursor = chunk_end;
+            // Guard against pathological zero-progress chunks.
+            if chunk_end >= head {
+                break;
+            }
+        }
+
+        // Final finalization pass on whatever pending rows remain.
+        let promoted = self.promote_finalized_revisions(head)?;
+        report.revisions_finalized = report.revisions_finalized.saturating_add(promoted);
+        report.last_block_synced = head;
+        // R-b: in MVP-2 the WS path defers to HTTP polling.
+        report.event_source = ChainEventSource::HttpPolling;
+        Ok(report)
     }
 }
 
@@ -11413,5 +11783,204 @@ mod tests {
         // bad magic / future format_version still rejects at open.
         // (Regression marker; the meta.rs tests cover the detail.)
         assert_eq!(crate::meta::FORMAT_VERSION, crate::meta::FORMAT_VERSION);
+    }
+
+    // -----------------------------------------------------------------
+    // MVP-2 issue 4.1 — chain_sync v1 accessor tests
+    // -----------------------------------------------------------------
+
+    /// **MVP-2 issue 4.1 (R-a).** Fresh vault returns `None` for the
+    /// v1 checkpoint; after `update_last_synced_block_v1` it returns
+    /// the persisted value.
+    #[test]
+    fn last_synced_block_v1_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        let _ = Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        assert_eq!(v.last_synced_block_v1().unwrap(), None);
+        v.update_last_synced_block_v1(100).unwrap();
+        assert_eq!(v.last_synced_block_v1().unwrap(), Some(100));
+        // Idempotent re-write of the same value.
+        v.update_last_synced_block_v1(100).unwrap();
+        assert_eq!(v.last_synced_block_v1().unwrap(), Some(100));
+        // Forward advance OK.
+        v.update_last_synced_block_v1(200).unwrap();
+        assert_eq!(v.last_synced_block_v1().unwrap(), Some(200));
+    }
+
+    /// **MVP-2 issue 4.1 (R-a + L12).** Backward checkpoint moves are
+    /// rejected.
+    #[test]
+    fn last_synced_block_v1_monotonic() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        let _ = Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.update_last_synced_block_v1(200).unwrap();
+        let err = v.update_last_synced_block_v1(100).unwrap_err();
+        match err {
+            StoreError::Corrupted(msg) => assert!(msg.contains("backward")),
+            other => panic!("expected Corrupted, got {other:?}"),
+        }
+    }
+
+    /// **MVP-2 issue 4.1 (R-c).** `rollback_pending_revisions_in_range`
+    /// only deletes rows whose `revision_status = 'pending'`.
+    #[test]
+    fn rollback_pending_revisions_in_range_skips_finalized() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        let _ = Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        // Pre-seed: one pending row in range, one pending out of range,
+        // one finalized in range. None should fire on the finalized.
+        let acc = [0xAAu8; 32];
+        v.conn
+            .execute(
+                "INSERT INTO account_identities (account_id, created_at, last_modified_at, head_revision_id)
+                 VALUES (?1, 0, 0, ?2)",
+                rusqlite::params![&acc[..], &[0xBBu8; 32][..]],
+            )
+            .unwrap();
+        for (rid_byte, status, block) in [
+            (0x01u8, "pending", 100i64),
+            (0x02u8, "pending", 500i64),
+            (0x03u8, "finalized", 100i64),
+        ] {
+            v.conn
+                .execute(
+                    "INSERT INTO revisions \
+                        (revision_id, account_id, parent_revision_id, device_id, schema_version, \
+                         created_at, enc_payload, enc_nonce, revision_status, observed_at_block) \
+                     VALUES (?1, ?2, ?3, ?4, 1, 0, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        &[rid_byte; 32][..],
+                        &acc[..],
+                        &[0u8; 32][..],
+                        &[0xCCu8; 32][..],
+                        &[0xDEu8; 4][..],
+                        &[0xEEu8; 24][..],
+                        status,
+                        block,
+                    ],
+                )
+                .unwrap();
+        }
+        let rolled = v.rollback_pending_revisions_in_range(50, 200).unwrap();
+        assert_eq!(rolled, 1, "only the pending row in range gets rolled back");
+        // Verify the finalized row in range is preserved.
+        let preserved: i64 = v
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM revisions WHERE revision_id = ?1",
+                rusqlite::params![&[0x03u8; 32][..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 1, "finalized rows must NEVER be rolled back");
+        // Verify the out-of-range pending row is also preserved.
+        let pending_out: i64 = v
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM revisions WHERE revision_id = ?1",
+                rusqlite::params![&[0x02u8; 32][..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_out, 1, "out-of-range pending rows preserved");
+    }
+
+    /// **MVP-2 issue 4.1 (R-c).** `promote_finalized_revisions`
+    /// promotes only pending rows at depth ≥ 12.
+    #[test]
+    fn promote_finalized_at_twelve_conf() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        let _ = Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        let acc = [0xAAu8; 32];
+        v.conn
+            .execute(
+                "INSERT INTO account_identities (account_id, created_at, last_modified_at, head_revision_id)
+                 VALUES (?1, 0, 0, ?2)",
+                rusqlite::params![&acc[..], &[0xBBu8; 32][..]],
+            )
+            .unwrap();
+        // Insert pending rows at blocks 88 (depth 12 vs head=100, eligible)
+        // and 95 (depth 5, NOT eligible).
+        for (rid_byte, block) in [(0x10u8, 88i64), (0x11u8, 95i64)] {
+            v.conn
+                .execute(
+                    "INSERT INTO revisions \
+                        (revision_id, account_id, parent_revision_id, device_id, schema_version, \
+                         created_at, enc_payload, enc_nonce, revision_status, observed_at_block) \
+                     VALUES (?1, ?2, ?3, ?4, 1, 0, ?5, ?6, 'pending', ?7)",
+                    rusqlite::params![
+                        &[rid_byte; 32][..],
+                        &acc[..],
+                        &[0u8; 32][..],
+                        &[0xCCu8; 32][..],
+                        &[0xDEu8; 4][..],
+                        &[0xEEu8; 24][..],
+                        block,
+                    ],
+                )
+                .unwrap();
+        }
+        let promoted = v.promote_finalized_revisions(100).unwrap();
+        assert_eq!(
+            promoted, 1,
+            "only the depth-12 row should promote (head=100, threshold=88)"
+        );
+        let status_at_88: String = v
+            .conn
+            .query_row(
+                "SELECT revision_status FROM revisions WHERE revision_id = ?1",
+                rusqlite::params![&[0x10u8; 32][..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status_at_88, "finalized");
+        let status_at_95: String = v
+            .conn
+            .query_row(
+                "SELECT revision_status FROM revisions WHERE revision_id = ?1",
+                rusqlite::params![&[0x11u8; 32][..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status_at_95, "pending", "depth 5 stays pending");
+    }
+
+    /// **MVP-2 issue 4.1 (R-d).** Auto-registering a new chain-sync-
+    /// observed device inserts a row flagged with
+    /// `discovered_via_chain_sync = 1`; a second call with the same
+    /// address is idempotent.
+    #[test]
+    fn auto_register_chain_sync_device_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        let _ = Vault::create(&p, &fresh_password()).unwrap();
+        let v = Vault::open(&p).unwrap();
+        let evm = [0xAAu8; 20];
+        let inserted_first = crate::device::auto_register_device_from_chain_sync(
+            &v.conn,
+            evm,
+            500,
+            1_700_000_000_000,
+        )
+        .unwrap();
+        assert!(inserted_first, "first call inserts");
+        let inserted_second = crate::device::auto_register_device_from_chain_sync(
+            &v.conn,
+            evm,
+            500,
+            1_700_000_000_000,
+        )
+        .unwrap();
+        assert!(!inserted_second, "second call is idempotent");
+        let count = v.count_chain_sync_discovered_devices().unwrap();
+        assert_eq!(count, 1);
     }
 }

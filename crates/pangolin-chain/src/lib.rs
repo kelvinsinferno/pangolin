@@ -100,6 +100,7 @@ pub mod balance_check;
 pub mod balance_monitor;
 pub mod base_sepolia;
 pub mod chain_submit;
+pub mod chain_sync;
 pub mod deployments;
 pub mod error;
 pub mod evm;
@@ -140,9 +141,17 @@ pub use privacy::{
 /// adding a direct `alloy` dep. MVP-2 issue 3.6 R-c: keeps the
 /// distributed-impl pattern friction-free at the consumer boundary.
 pub use alloy::primitives::Address;
+pub use chain_sync::{
+    d017_deploy_block, fetch_and_verify_chunk, fetch_current_block_number, ChainEventSource,
+    RevisionStatus, SyncOptions, SyncReport, VerifiedRevisionEvent,
+    CONFIRMATION_DEPTH_FOR_FINALIZATION, HTTP_POLL_INTERVAL_SECS,
+    LOG_BLOCK_CHUNK as CHAIN_SYNC_LOG_BLOCK_CHUNK, MAX_KNOWN_CLIENT_SCHEMA_VERSION,
+    WS_RECONNECT_INITIAL_BACKOFF_MS, WS_RECONNECT_MAX_BACKOFF_MS,
+};
 pub use secp256k1_signing::{
-    build_signed_redemption_v1, build_signed_revision_v1, is_canonical_s, RedemptionFieldsV1,
-    RevisionFieldsV1, SignedRedemptionV1, SignedRevisionV1, DOMAIN_SEPARATOR_BASE_SEPOLIA_V1,
+    build_signed_redemption_v1, build_signed_revision_v1, is_canonical_s, recover_signer_v1,
+    recover_signer_v1_raw, RedemptionFieldsV1, RevisionFieldsV1, SignedRedemptionV1,
+    SignedRevisionV1, DOMAIN_SEPARATOR_BASE_SEPOLIA_V1,
     ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1, EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA,
     EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA, REDEMPTION_TYPEHASH_V1,
     REVISION_TYPEHASH_V1, SIGNED_REVISION_DOMAIN_V1,

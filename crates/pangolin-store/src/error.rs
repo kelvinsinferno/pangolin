@@ -311,6 +311,17 @@ pub enum StoreError {
     /// proof-class.
     #[error("chain signing error: {0}")]
     ChainSignError(ChainError),
+
+    /// **MVP-2 issue 4.1.** A chain-sync read operation failed. The
+    /// wrapped [`ChainError`] carries the underlying cause (RPC
+    /// transport, chain-id mismatch, deployment-address mismatch,
+    /// signer recovery, checkpoint-out-of-range). Distinct from
+    /// [`Self::ChainSignError`] because the 4.1 read path is wholly
+    /// independent of the 3.1 sign path; surfacing it as its own
+    /// variant lets a host distinguish "we couldn't write to chain"
+    /// from "we couldn't read from chain".
+    #[error("chain sync error: {0}")]
+    ChainSyncError(ChainError),
 }
 
 impl StoreError {
@@ -359,6 +370,17 @@ impl From<KdfError> for StoreError {
         // tamper from a salt or ciphertext tamper. Indistinguishability
         // is the explicit promise of `THREAT_MODEL.md` row #7.
         Self::AuthenticationFailed
+    }
+}
+
+impl From<ChainError> for StoreError {
+    fn from(err: ChainError) -> Self {
+        // MVP-2 issue 4.1: chain-sync read errors flow up through the
+        // `Vault::sync_from_chain` orchestrator. They are surfaced as
+        // a distinct `ChainSyncError` variant so the host can
+        // distinguish read-path failures from sign-path failures
+        // ([`Self::ChainSignError`]) and from session/auth failures.
+        Self::ChainSyncError(err)
     }
 }
 
