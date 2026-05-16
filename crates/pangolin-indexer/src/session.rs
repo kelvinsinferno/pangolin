@@ -36,9 +36,13 @@
 //! - **L12:** Same lifecycle code path in desktop + mobile flows.
 
 use std::env;
+use std::fs::OpenOptions;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pangolin_crypto::rng::fill_random;
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
 
@@ -50,6 +54,12 @@ use pangolin_chain::{
 use crate::cipher::TempDbCipher;
 use crate::error::IndexerError;
 use crate::protocol::{IndexedEvent, IndexerRequest, IndexerResponse, PROTOCOL_VERSION};
+
+/// 4.3 R-c: chunk size for the random + zero overwrite passes in
+/// [`secure_zero_fill`]. 4 KiB matches the typical SQLite page size
+/// and the OS page boundary on every supported platform — keeps the
+/// write loop bounded without surfacing a per-platform tunable.
+pub(crate) const SECURE_ZERO_FILL_CHUNK_BYTES: usize = 4096;
 
 /// Default idle-timeout seconds (D-007 + R-c).
 pub const IDLE_TIMEOUT_DEFAULT_SECS: u64 = 300;
@@ -137,21 +147,19 @@ pub struct IndexerSession {
     // L1: the temp file's path is unguessable + the Drop unlinks on
     // normal exit (panic = unwind in workspace builds). The
     // connection holds an open file handle to the same path; on
-    // Windows the SQLite handle keeps the file open until both are
-    // dropped. Rust drops struct fields in declaration order — we
-    // declare `conn` BEFORE `temp_db` so the SQLite connection
-    // closes first; the `NamedTempFile` then succeeds in unlinking
-    // the file on Windows where MoveFileEx-style cleanup needs the
-    // last handle to be closed.
-    conn: Connection,
-    // `temp_db` is held only for its Drop side-effect (L1 unlink on
-    // exit) in production lib-only builds. The `test-utilities`
-    // feature reads `.path()` for cleanup-on-crash + lifecycle
-    // assertions. The conditional `dead_code` allow keeps the
-    // mobile / library-only build clean while preserving the
-    // load-bearing field.
+    // Windows the SQLite handle keeps the file open until the
+    // connection is dropped, which would block the
+    // `secure_zero_fill` re-open AND the `NamedTempFile` unlink.
+    //
+    // 4.3 L4 + L11 ordering: both `conn` and `temp_db` are wrapped
+    // in `Option` so the `Drop` impl can `take()` them in the right
+    // order — close the SQLite connection FIRST (releases the
+    // Windows file handle), then run `secure_zero_fill` on the
+    // path, then let `NamedTempFile`'s own Drop unlink the file.
+    // This sequencing is the L4 + L11 load-bearing piece.
+    conn: Option<Connection>,
     #[cfg_attr(not(any(test, feature = "test-utilities")), allow(dead_code))]
-    temp_db: NamedTempFile,
+    temp_db: Option<NamedTempFile>,
     bound_vault: Option<[u8; 32]>,
     /// Number of events already streamed back to the host via
     /// `Pull`. The session uses this to drain the temp DB in order.
@@ -211,17 +219,25 @@ impl IndexerSession {
             message: format!("open SQLite: {e}"),
         })?;
         Self::run_migration(&conn)?;
-        // Touch the cipher once so the field is reachable from the
-        // session — 4.3 will replace this with the actual page
-        // encrypt/decrypt round-trip. The probe is a no-op for
-        // `NoOpCipher`.
-        let probe = cipher.decrypt_page(&cipher.encrypt_page(b"4.2-cipher-probe"));
-        debug_assert_eq!(probe, b"4.2-cipher-probe");
+        // 4.3-probe: round-trip a known input through the cipher so
+        // any constructor/key issue surfaces at session creation
+        // (NOT at first persist). With 4.3's `AeadCipher` this
+        // exercises the full seal/open path; with the test-only
+        // `NoOpCipher` it stays a passthrough.
+        let probe_plain: &[u8] = b"4.3-cipher-probe";
+        let probe_sealed = cipher.encrypt_page(probe_plain);
+        let probe_recovered =
+            cipher
+                .decrypt_page(&probe_sealed)
+                .map_err(|e| IndexerError::TempDbInit {
+                    message: format!("cipher constructor probe failed: {e}"),
+                })?;
+        debug_assert_eq!(probe_recovered.as_slice(), probe_plain);
         Ok(Self {
             config,
             cipher,
-            temp_db,
-            conn,
+            temp_db: Some(temp_db),
+            conn: Some(conn),
             bound_vault: None,
             next_pull_offset: 0,
             start_block: 0,
@@ -281,13 +297,18 @@ impl IndexerSession {
     #[cfg(any(test, feature = "test-utilities"))]
     #[must_use]
     pub fn temp_db_path(&self) -> &std::path::Path {
-        self.temp_db.path()
+        self.temp_db
+            .as_ref()
+            .expect("temp_db is Some for the entire session lifetime")
+            .path()
     }
 
     /// Number of events currently cached in the temp DB.
     pub fn cached_event_count(&self) -> Result<u64, IndexerError> {
         let mut stmt = self
             .conn
+            .as_ref()
+            .expect("conn is Some for the entire session lifetime")
             .prepare("SELECT COUNT(*) FROM cached_revisions")
             .map_err(|e| IndexerError::TempDbIo {
                 message: format!("prepare count: {e}"),
@@ -401,6 +422,8 @@ impl IndexerSession {
     ) -> Result<(), IndexerError> {
         let mut stmt = self
             .conn
+            .as_ref()
+            .expect("conn is Some for the entire session lifetime")
             .prepare(
                 "INSERT INTO cached_revisions (
                     vault_id, account_id, parent_revision, device_id,
@@ -458,6 +481,8 @@ impl IndexerSession {
         };
         let mut stmt = self
             .conn
+            .as_ref()
+            .expect("conn is Some for the entire session lifetime")
             .prepare(
                 "SELECT vault_id, account_id, parent_revision, device_id,
                         schema_version, sequence, enc_payload, signer,
@@ -571,6 +596,139 @@ impl IndexerSession {
 fn map_io(e: &rusqlite::Error) -> IndexerError {
     IndexerError::TempDbIo {
         message: format!("row read: {e}"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// 4.3 R-c: secure_zero_fill + Drop wiring
+// ---------------------------------------------------------------------
+
+/// 4.3 R-c: two-pass overwrite of the temp DB file before unlink.
+///
+/// Pass 1 writes 4 KiB chunks of cryptographically-random data via
+/// `pangolin_crypto::rng::fill_random` to the full file length and
+/// fsyncs. Pass 2 overwrites with zeros at the same length and
+/// fsyncs. The caller (`IndexerSession::Drop`) then lets
+/// `tempfile::NamedTempFile`'s Drop unlink the file. The combined
+/// random+zero discipline is marginally more forensic-recovery-
+/// resistant than single-pass zero on classic HDDs (defeats
+/// signatures that look for "zeroed = recently deleted" patterns);
+/// SSD wear-leveling defeats both single-pass and multi-pass, but
+/// 4.3's threat model accepts this — the file content was already
+/// AEAD-encrypted with an ephemeral key (R-b), so SSD-physical-block
+/// residue is ciphertext residue and the key is gone with the
+/// process (L3).
+///
+/// **Windows nuance.** The SQLite connection MUST be dropped BEFORE
+/// this function is called. On Windows the `Connection`'s file
+/// handle would otherwise prevent the subsequent unlink. The
+/// `IndexerSession::Drop` impl handles the ordering by reopening
+/// the file fresh through `OpenOptions` after the connection is
+/// dropped (the `Connection` field is declared first and so drops
+/// first per Rust's drop order).
+///
+/// # Errors
+///
+/// Returns `std::io::Result` for the underlying file operations.
+/// Any error in either pass leaves the file in a partially-
+/// overwritten state; the caller proceeds to unlink either way
+/// (best-effort defense — failing here doesn't stop the unlink).
+pub(crate) fn secure_zero_fill(path: &std::path::Path) -> std::io::Result<()> {
+    // Open with read+write + truncate-OFF so we preserve the file
+    // length. Tempfile creates the file with 0o600 perms; OpenOptions
+    // re-opens at the same path after the SQLite connection has been
+    // closed.
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        // Nothing to overwrite — empty temp DB (e.g., session
+        // dropped before any write); proceed to unlink without
+        // touching disk further.
+        return Ok(());
+    }
+
+    // ---- Pass 1: random ----
+    file.seek(SeekFrom::Start(0))?;
+    let mut chunk = [0u8; SECURE_ZERO_FILL_CHUNK_BYTES];
+    let mut written: u64 = 0;
+    while written < len {
+        let remaining = len - written;
+        // `remaining > 0` (loop guard) and bounded above by
+        // SECURE_ZERO_FILL_CHUNK_BYTES (4096), so the cast to usize
+        // is lossless on all supported platforms (the workspace
+        // targets only 64-bit windows/linux/macos; even on hypo-
+        // thetical 32-bit, 4096 fits in usize trivially).
+        let chunk_u64 = SECURE_ZERO_FILL_CHUNK_BYTES as u64;
+        let take = std::cmp::min(chunk_u64, remaining);
+        let to_write = usize::try_from(take).expect("4096-bounded value fits in usize");
+        fill_random(&mut chunk[..to_write]);
+        file.write_all(&chunk[..to_write])?;
+        written += to_write as u64;
+    }
+    file.sync_data()?;
+
+    // ---- Pass 2: zeros ----
+    file.seek(SeekFrom::Start(0))?;
+    chunk.fill(0);
+    written = 0;
+    while written < len {
+        let remaining = len - written;
+        let chunk_u64 = SECURE_ZERO_FILL_CHUNK_BYTES as u64;
+        let take = std::cmp::min(chunk_u64, remaining);
+        let to_write = usize::try_from(take).expect("4096-bounded value fits in usize");
+        file.write_all(&chunk[..to_write])?;
+        written += to_write as u64;
+    }
+    file.sync_data()?;
+
+    Ok(())
+}
+
+/// 4.3 L4 + L11: on session Drop, secure-zero-fill the temp DB
+/// file BEFORE the inner `NamedTempFile` Drop unlinks it. This
+/// fires on normal exit AND on stack-unwinding panics.
+///
+/// Field declaration order in [`IndexerSession`] is `conn` first
+/// then `temp_db` — Rust drops fields in declaration order, so the
+/// `Connection` closes first (releasing its file handle on Windows),
+/// then this Drop runs `secure_zero_fill` on the path, then the
+/// `NamedTempFile` Drop unlinks. Errors during zero-fill are
+/// suppressed — the unlink must still happen; the failure is an
+/// operational signal but not a fatal one (the AEAD-encrypted
+/// content was already on disk in ciphertext form).
+impl Drop for IndexerSession {
+    fn drop(&mut self) {
+        // 4.3 L4 + L11: load-bearing sequencing.
+        //
+        // 1. Snapshot the temp_db path BEFORE we touch any field —
+        //    we need it for the secure_zero_fill call.
+        let path: Option<PathBuf> = self.temp_db.as_ref().map(|t| t.path().to_path_buf());
+
+        // 2. Drop the SQLite connection FIRST. On Windows this
+        //    releases the handle to the temp DB file; without this,
+        //    the OpenOptions::open call inside secure_zero_fill
+        //    would fail with sharing-violation, and the
+        //    NamedTempFile unlink would fail.
+        let _ = self.conn.take();
+
+        // 3. Run secure_zero_fill on the path now that no handle
+        //    is open. Best-effort — errors are logged but not
+        //    propagated (Drop cannot return Result).
+        if let Some(p) = path {
+            if let Err(e) = secure_zero_fill(&p) {
+                tracing::warn!(
+                    target: "pangolin_indexer::session",
+                    error = %e,
+                    "secure_zero_fill failed during Drop; relying on AEAD encryption + tempfile unlink",
+                );
+            }
+        }
+
+        // 4. The NamedTempFile drops next (when its Option<>
+        //    field destructor runs), unlinking the file. We
+        //    explicitly take + drop here to make the sequencing
+        //    obvious to a reader.
+        let _ = self.temp_db.take();
     }
 }
 
@@ -745,5 +903,124 @@ mod tests {
     #[test]
     fn pull_batch_size_max_is_pinned() {
         assert_eq!(PULL_BATCH_SIZE_MAX, 1_024);
+    }
+
+    // ---------- 4.3 R-c: secure_zero_fill ----------
+
+    /// 4.3 R-c + L4: write a known plaintext to a file in a
+    /// tempdir, call `secure_zero_fill`, re-read the file content,
+    /// assert all zeros. The random-pass intermediate is irrelevant
+    /// — we check the FINAL on-disk state.
+    #[test]
+    fn secure_zero_fill_overwrites_file_content() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("secure_zero_fill_test.bin");
+        // 8 KiB of recognizable plaintext (0xCC sentinel) — large
+        // enough to span two 4 KiB chunks plus exercise the
+        // chunk-boundary branch.
+        let plaintext = vec![0xCCu8; 8192];
+        std::fs::write(&path, &plaintext).unwrap();
+        // Sanity: file is on disk + readable.
+        assert_eq!(std::fs::read(&path).unwrap(), plaintext);
+
+        // Run the helper.
+        secure_zero_fill(&path).expect("secure_zero_fill must succeed");
+
+        // Verify all-zeros final state.
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            after.len(),
+            plaintext.len(),
+            "file length must be preserved"
+        );
+        assert!(
+            after.iter().all(|&b| b == 0),
+            "all bytes must be zero after secure_zero_fill",
+        );
+    }
+
+    /// 4.3 R-c: secure_zero_fill on an empty file is a no-op and
+    /// returns Ok(()) without touching disk. Defends against the
+    /// edge case where the IndexerSession Drops before any write.
+    #[test]
+    fn secure_zero_fill_empty_file_is_noop() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("empty.bin");
+        std::fs::write(&path, &[] as &[u8]).unwrap();
+        secure_zero_fill(&path).expect("empty-file fill succeeds");
+        let after = std::fs::read(&path).unwrap();
+        assert!(after.is_empty(), "empty file stays empty");
+    }
+
+    /// 4.3 R-c: secure_zero_fill on a file smaller than the chunk
+    /// size (4096) — exercises the partial-chunk branch of the
+    /// write loop. Must still zero the file completely.
+    #[test]
+    fn secure_zero_fill_handles_partial_chunk() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("partial.bin");
+        // 100 bytes — well below the 4 KiB chunk size.
+        let plaintext = vec![0xAAu8; 100];
+        std::fs::write(&path, &plaintext).unwrap();
+        secure_zero_fill(&path).expect("partial-chunk fill succeeds");
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(after.len(), 100);
+        assert!(after.iter().all(|&b| b == 0));
+    }
+
+    /// 4.3 R-c: secure_zero_fill on a file spanning multiple
+    /// chunks (>4 KiB) — exercises the chunk-loop boundary. Must
+    /// still zero the file completely.
+    #[test]
+    fn secure_zero_fill_handles_multi_chunk() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("multi.bin");
+        // 10 KiB — exercises chunk boundary at 4096 + 4096 + 2048.
+        let plaintext = vec![0xBBu8; 10 * 1024];
+        std::fs::write(&path, &plaintext).unwrap();
+        secure_zero_fill(&path).expect("multi-chunk fill succeeds");
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(after.len(), 10 * 1024);
+        assert!(after.iter().all(|&b| b == 0));
+    }
+
+    /// 4.3 R-c constant pinned: chunk size is 4 KiB to match
+    /// SQLite's default page size + the OS page boundary. A future
+    /// refactor that loosens this is caught by the test.
+    #[test]
+    fn secure_zero_fill_chunk_size_is_4kib() {
+        assert_eq!(SECURE_ZERO_FILL_CHUNK_BYTES, 4096);
+    }
+
+    /// 4.3 L4 + L11: dropping the IndexerSession runs
+    /// secure_zero_fill (the actual ordering is verified via the
+    /// test that the temp file is gone after Drop — already
+    /// covered by `dropping_session_unlinks_temp_file_on_normal_exit`
+    /// — plus the assertion that we don't crash on Drop with a
+    /// real session). This test additionally captures the temp
+    /// file's path and confirms the file content was zeroed BEFORE
+    /// the unlink (best-effort — we can't read the unlinked file's
+    /// contents reliably, but we can verify the helper does its
+    /// job standalone above).
+    #[test]
+    fn dropping_session_does_not_panic_with_aead_cipher() {
+        use crate::cipher::AeadCipher;
+        use pangolin_crypto::rng::fill_random;
+        use pangolin_crypto::secret::SecretBytes;
+
+        let cfg = IndexerConfig {
+            rpc_url: "http://localhost:8545".into(),
+            env: ChainEnv::BaseSepolia,
+            idle_timeout_secs: 60,
+        };
+        let mut key = [0u8; 32];
+        fill_random(&mut key);
+        let cipher = AeadCipher::new_arc(SecretBytes::new(key.to_vec()));
+        let path = {
+            let s = IndexerSession::new(cfg, cipher).expect("session");
+            s.temp_db_path().to_path_buf()
+        };
+        // Drop ran; file unlinked.
+        assert!(!path.exists(), "temp file must be unlinked after Drop");
     }
 }

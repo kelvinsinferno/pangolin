@@ -128,9 +128,114 @@ use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
 use hkdf::Hkdf;
 use pangolin_crypto::keys::DeviceKey;
+use pangolin_crypto::secret::SecretBytes;
 use sha2::Sha256;
 
 use crate::error::ChainError;
+
+/// HKDF-SHA256 info string for the MVP-2 issue 4.3 indexer temp-DB
+/// ephemeral key derivation. **Versioned** — any change to this
+/// constant must bump the `-v1` suffix and document the migration.
+///
+/// Domain separation: this string is distinct from
+/// [`DERIVATION_MESSAGE`] / [`HKDF_INFO`] (the EVM-wallet derivation
+/// domain), [`pangolin_crypto::keys::WRAP_KEY_INFO`] (the VDK wrap-key
+/// derivation domain), and any other HKDF use in the codebase. A
+/// future audit can grep for this string to confirm the indexer key
+/// is never reused as any other primitive.
+pub const INDEXER_KEY_DOMAIN: &str = "pangolin-indexer-tempdb-key-v1";
+
+/// Derive an ephemeral 32-byte AEAD key for the MVP-2 issue 4.3
+/// ephemeral local indexer's temp DB.
+///
+/// **What this exists for (MVP-2 issue 4.3 R-a).** The
+/// `pangolin-indexer` crate (D-007 ephemeral local indexer) writes
+/// per-run revision data to a `tempfile::NamedTempFile` `SQLite` DB.
+/// 4.2 shipped the lifecycle skeleton with a no-op cipher; 4.3 ships
+/// real `XChaCha20-Poly1305` page encryption. The key the cipher
+/// uses must be:
+///
+/// 1. Deterministic for a given `(device_key, run_nonce)` pair so
+///    hermetic tests can pin known inputs (4.3 L12).
+/// 2. Cryptographically separated from every other key in the
+///    Pangolin keyring (D-006: same `DeviceKey` signs revisions +
+///    pays gas + here derives a session AEAD key — three distinct
+///    domain-separated uses).
+/// 3. Derived from the device secret per the master plan §5 row
+///    4.3 wording ("encrypted with ephemeral key derived from device
+///    secret").
+///
+/// **How the derivation works.** HKDF-SHA256 (RFC 5869) with:
+///
+/// - **IKM** = `device.secret_seed_bytes()` (the 32-byte Ed25519
+///   secret seed; held inside `Zeroizing<[u8; 32]>` for the duration
+///   of the call).
+/// - **Salt** = `run_nonce` (the caller's per-run 16-byte random
+///   nonce — fresh `OsRng` each session; this is what makes the
+///   derived key per-session rather than per-device).
+/// - **Info** = [`INDEXER_KEY_DOMAIN`] = `"pangolin-indexer-tempdb-key-v1"`
+///   (domain separation against every other HKDF use in the
+///   codebase).
+/// - **Output length** = 32 bytes (matches
+///   [`pangolin_crypto::aead::KEY_LEN`]).
+///
+/// **Domain separation argument.** The same device secret is also
+/// the IKM for `derive_evm_wallet` (which uses
+/// `Sign(seed, DERIVATION_MESSAGE) → HKDF-SHA256(info = HKDF_INFO)`).
+/// Both derivations are HKDF-SHA256 expansions but with **distinct
+/// info strings** (`"pangolin-chain-evm-wallet-v1"` vs
+/// `"pangolin-indexer-tempdb-key-v1"`), so under HKDF-SHA256's PRF
+/// property the two output spaces are computationally independent.
+/// An attacker who recovers one cannot derive the other.
+///
+/// **Why salt = `run_nonce`, not info = `run_nonce`.** HKDF's salt
+/// parameter is part of the extract step's PRF input; info is part
+/// of the expand step. Per RFC 5869 §3.1, salt should be "a non-
+/// secret random value" — exactly what a per-run nonce is. The info
+/// string is the constant domain separator. This matches OWASP /
+/// NIST guidance on HKDF usage.
+///
+/// # Errors
+///
+/// Returns [`ChainError::Wallet`] if HKDF expansion fails. In
+/// practice this is unreachable for the fixed 32-byte output length;
+/// the variant exists only so the signature is total.
+///
+/// # Examples
+///
+/// ```no_run
+/// use pangolin_chain::derive_indexer_key;
+/// use pangolin_crypto::keys::DeviceKey;
+///
+/// let device = DeviceKey::generate();
+/// let mut run_nonce = [0u8; 16];
+/// pangolin_crypto::rng::fill_random(&mut run_nonce);
+/// let key = derive_indexer_key(&device, &run_nonce).expect("derivation succeeds");
+/// assert_eq!(key.expose().len(), 32);
+/// ```
+pub fn derive_indexer_key(
+    device: &DeviceKey,
+    run_nonce: &[u8; 16],
+) -> Result<SecretBytes, ChainError> {
+    // The seed bytes return a `Zeroizing<[u8; 32]>` — held only for
+    // the duration of the HKDF extract; the wrapper zeroes the buffer
+    // on Drop at the end of this function (L3).
+    let seed = device.secret_seed_bytes();
+    let hk = Hkdf::<Sha256>::new(Some(run_nonce), &*seed);
+    let mut okm = [0u8; 32];
+    hk.expand(INDEXER_KEY_DOMAIN.as_bytes(), &mut okm)
+        .map_err(|_| ChainError::Wallet("HKDF-SHA256 expand failed for indexer-key derivation"))?;
+    // Move the OKM bytes into SecretBytes (heap-allocated, zeroes on
+    // Drop). The stack-side `okm` buffer is then zeroized so a stale
+    // stack frame cannot leak the derived key (mirrors the discipline
+    // in `pangolin_crypto::aead::AeadKey::from_bytes`).
+    let key = SecretBytes::new(okm.to_vec());
+    {
+        use zeroize::Zeroize;
+        okm.zeroize();
+    }
+    Ok(key)
+}
 
 /// Fixed message signed by the device's Ed25519 key to produce
 /// derivation IKM. **Versioned** — any change to this constant
@@ -278,7 +383,10 @@ pub fn derive_evm_address(device: &DeviceKey) -> Result<Address, ChainError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_evm_address, derive_evm_wallet, DERIVATION_MESSAGE, HKDF_INFO};
+    use super::{
+        derive_evm_address, derive_evm_wallet, derive_indexer_key, DERIVATION_MESSAGE, HKDF_INFO,
+        INDEXER_KEY_DOMAIN,
+    };
     use alloy::primitives::Address;
     use pangolin_crypto::keys::DeviceKey;
     use pangolin_crypto::sign::SigningKey;
@@ -375,6 +483,106 @@ mod tests {
     fn domain_strings_are_versioned() {
         assert_eq!(DERIVATION_MESSAGE, b"pangolin-chain-evm-wallet-derive-v0");
         assert_eq!(HKDF_INFO, b"pangolin-chain-evm-wallet-v0");
+        // 4.3 indexer-key domain is versioned independently from the
+        // EVM-wallet domain — distinct strings prevent HKDF-output
+        // collisions between the two derivations (R-a + L12).
+        assert_eq!(INDEXER_KEY_DOMAIN, "pangolin-indexer-tempdb-key-v1");
+    }
+
+    // ---------- 4.3 R-a: derive_indexer_key tests ----------
+
+    /// 4.3 R-a + L12: same `(device_key, run_nonce)` pair always
+    /// produces the same 32-byte derived key. Hermetic tests in the
+    /// indexer crate depend on this — they pin a fixed seed + nonce
+    /// and pin the output bytes.
+    #[test]
+    fn derive_indexer_key_is_deterministic() {
+        let seed = [0x9Au8; 32];
+        let nonce = [0x42u8; 16];
+        let d1 = DeviceKey::from_seed(seed);
+        let d2 = DeviceKey::from_seed(seed);
+        let k1 = derive_indexer_key(&d1, &nonce).expect("derive 1");
+        let k2 = derive_indexer_key(&d2, &nonce).expect("derive 2");
+        assert_eq!(
+            k1.expose(),
+            k2.expose(),
+            "same (device_key, run_nonce) must derive same key",
+        );
+    }
+
+    /// 4.3 R-a + L-key-derivation-collision: same device, distinct
+    /// `run_nonce` values produce distinct derived keys. If this
+    /// fails, two indexer runs against the same device would share a
+    /// key, breaking the per-session ephemeral-key property (L3).
+    #[test]
+    fn derive_indexer_key_distinct_per_run_nonce() {
+        let seed = [0x9Au8; 32];
+        let nonce_a = [0x01u8; 16];
+        let nonce_b = [0x02u8; 16];
+        let device = DeviceKey::from_seed(seed);
+        let key_a = derive_indexer_key(&device, &nonce_a).expect("derive a");
+        let key_b = derive_indexer_key(&device, &nonce_b).expect("derive b");
+        assert_ne!(
+            key_a.expose(),
+            key_b.expose(),
+            "distinct run_nonces must derive distinct keys",
+        );
+    }
+
+    /// 4.3 R-a + L-key-derivation-collision: distinct devices, same
+    /// `run_nonce`, produce distinct derived keys. If this fails, a
+    /// stolen `run_nonce` (which is non-secret — it's salt) could be
+    /// reused with an arbitrary device-derived key candidate.
+    #[test]
+    fn derive_indexer_key_distinct_per_device() {
+        let nonce = [0x42u8; 16];
+        let d1 = DeviceKey::from_seed([0x11; 32]);
+        let d2 = DeviceKey::from_seed([0x22; 32]);
+        let k1 = derive_indexer_key(&d1, &nonce).expect("derive 1");
+        let k2 = derive_indexer_key(&d2, &nonce).expect("derive 2");
+        assert_ne!(
+            k1.expose(),
+            k2.expose(),
+            "distinct devices must derive distinct keys for same nonce",
+        );
+    }
+
+    /// 4.3 R-a: the derived key is exactly 32 bytes (matches
+    /// `pangolin_crypto::aead::KEY_LEN`). Pinned so a future
+    /// refactor that asks for a non-32-byte expansion is caught.
+    #[test]
+    fn derive_indexer_key_output_length_is_32() {
+        let device = DeviceKey::from_seed([0x55; 32]);
+        let nonce = [0xCCu8; 16];
+        let key = derive_indexer_key(&device, &nonce).expect("derive");
+        assert_eq!(
+            key.expose().len(),
+            32,
+            "derived key must be 32 bytes (matches AeadKey KEY_LEN)",
+        );
+    }
+
+    /// 4.3 R-a + cryptographic-separation: the indexer-key derivation
+    /// must NOT collide with the EVM-wallet derivation under any
+    /// `run_nonce` — they use different HKDF info strings + different
+    /// IKM constructions. Pin this with a fixed seed + nonce so a
+    /// future refactor that accidentally aligns the two domains is
+    /// caught.
+    #[test]
+    fn derive_indexer_key_does_not_collide_with_evm_wallet() {
+        let seed = [0x77u8; 32];
+        let nonce = [0xAAu8; 16];
+        let device = DeviceKey::from_seed(seed);
+        let indexer_key = derive_indexer_key(&device, &nonce).expect("indexer derive");
+
+        let evm = derive_evm_wallet(&device).expect("evm derive");
+        let evm_scalar: [u8; 32] = evm.signer().to_bytes().into();
+        assert_ne!(
+            indexer_key.expose(),
+            evm_scalar.as_slice(),
+            "indexer-key must be cryptographically separated from \
+             EVM-wallet secret (different HKDF domain)",
+        );
     }
 
     /// MVP-2 issue 3.2 — derivation is deterministic across Drop

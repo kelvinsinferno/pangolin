@@ -76,6 +76,18 @@ test-utilities = []
 # mode).
 pangolin-chain = { path = "../pangolin-chain" }
 
+# 4.3 R-d: pangolin-crypto provides `SecretBytes` (the wrapper for
+# the ephemeral 32-byte indexer AEAD key), the `XChaCha20-Poly1305`
+# AEAD primitive (`AeadKey` + `Nonce` + `AeadError`), and the OS-CSPRNG
+# `rng::fill_random` helper used by `AeadCipher`'s per-page nonce
+# generation and the `secure_zero_fill` random-pass overwrite (R-c).
+# This dep edge widens the indexer's surface to include crypto types,
+# but per 4.3 L6 the only banned direction is `pangolin-indexer →
+# pangolin-store`; pangolin-crypto is a cryptography substrate, not a
+# vault store. CI invariant: `cargo tree -p pangolin-indexer
+# --no-default-features --edges normal | grep -c pangolin-store == 0`.
+pangolin-crypto = { path = "../pangolin-crypto" }
+
 # ---- External deps (each justified below) ----
 
 # alloy 2.0.4 — Address / B256 / U256 primitives reused for the
@@ -121,6 +133,13 @@ thiserror = { workspace = true }
 # enc_payload) into the JSON protocol envelope so the wire format
 # stays cross-platform readable. Workspace pin.
 hex = { workspace = true }
+
+# 4.3: zeroize — wipe the stack-side scratch buffer in the binary
+# entry after moving the bytes into the SecretBytes heap allocation.
+# Already pulled transitively via pangolin-crypto; named here
+# directly so the audit surface is explicit (no transitive-only
+# access). Workspace pin.
+zeroize = { workspace = true }
 
 # tracing + tracing-subscriber — stderr logs for the binary entry.
 # Same `=0.1.41` / `=0.3.20` pins the funder service uses.
