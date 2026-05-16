@@ -42,6 +42,7 @@ pub mod dirty;
 pub mod error;
 pub mod export;
 pub mod pending;
+pub mod publish;
 pub mod revision;
 pub mod session;
 pub mod vault;
@@ -81,6 +82,14 @@ pub use export::{
 // `pangolin-store -> pangolin-chain` dep direction (L8) is preserved.
 pub use pangolin_chain::{ChainEnv, RevisionFieldsV1, SignedRevisionV1};
 pub use pending::{PendingMerge, PENDING_MERGE_NONCE_LEN, PENDING_MERGE_SECRET_LEN};
+// MVP-2 issue 5.1: publish-queue orchestration. `publish_all_for_vault`
+// + `publish_one` were moved out of `apps/cli/src/sync.rs` so the CLI's
+// thin-shell `publish_all` AND 5.1's batched `Vault::flush_publish_queue`
+// share one engine. The batch-flush types live alongside.
+pub use publish::{
+    publish_all_for_vault, publish_one, BatchFlushError, BatchFlushReport, PublishOutcome,
+    PublishOutcomeRow, PublishQueueState, PublishReport,
+};
 pub use revision::{
     ChainAnchor, DeviceId, RevisionGraph, RevisionId, RevisionMeta, REVISION_SCHEMA_VERSION_MAX,
 };

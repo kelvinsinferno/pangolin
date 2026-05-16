@@ -112,7 +112,7 @@ pub mod types;
 #[cfg(any(test, feature = "test-utilities"))]
 pub mod mock;
 
-pub use adapter::ChainAdapter;
+pub use adapter::{BatchBalanceCheck, ChainAdapter};
 pub use balance_check::{
     compute_balance_state, estimate_next_publish_cost, query_evm_balance, GasBalanceState,
     EXPECTED_REVISION_GAS, MIN_BUFFER_REVISIONS,

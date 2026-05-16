@@ -615,6 +615,52 @@ impl ChainAdapter for BaseSepoliaAdapter {
             .await
             .map_err(|e| ChainError::Rpc(format!("eth_blockNumber: {e}")))
     }
+
+    /// **MVP-2 issue 5.1 R-e — pre-flight batch balance gate.**
+    ///
+    /// Uses the existing 3.5 helpers `query_evm_balance_with_provider`
+    /// + `estimate_next_publish_cost_with_provider` against the
+    /// adapter's already-held alloy provider (no new RPC connection).
+    /// Returns `Ok(None)` only on read-only adapter (no signer
+    /// address); production write-capable adapters always return
+    /// `Ok(Some(...))`. `U256`-to-`u128` conversion saturates at
+    /// `u128::MAX` for defense-in-depth (vanishingly impractical for
+    /// either balance or estimate to exceed `u128::MAX` wei).
+    async fn pre_flight_batch_balance(
+        &self,
+        queued_count: usize,
+    ) -> Result<Option<crate::adapter::BatchBalanceCheck>, ChainError> {
+        // Read-only adapter cannot publish at all, so the pre-flight
+        // gate is moot. Returning None lets the flush proceed to
+        // publish_one which will surface ChainError::Wallet per row.
+        let Some(address) = self.signer_address else {
+            return Ok(None);
+        };
+
+        // BaseSepoliaAdapter is unambiguously the BaseSepolia env;
+        // the deployment file's chain_id is asserted at construction
+        // to equal BASE_SEPOLIA_CHAIN_ID.
+        let env = crate::ChainEnv::BaseSepolia;
+
+        let per_revision_estimate =
+            crate::balance_check::estimate_next_publish_cost_with_provider(&self.provider, env)
+                .await?;
+
+        let balance =
+            crate::balance_check::query_evm_balance_with_provider(&self.provider, address, env)
+                .await?;
+
+        let queued_count_u256 = alloy::primitives::U256::from(queued_count as u64);
+        let total_cost = per_revision_estimate.saturating_mul(queued_count_u256);
+
+        let total_estimated_cost_wei: u128 = total_cost.try_into().unwrap_or(u128::MAX);
+        let current_balance_wei: u128 = balance.try_into().unwrap_or(u128::MAX);
+
+        Ok(Some(crate::adapter::BatchBalanceCheck {
+            total_estimated_cost_wei,
+            current_balance_wei,
+        }))
+    }
 }
 
 /// Lowercase-hex encode a fixed-size byte slice without pulling a

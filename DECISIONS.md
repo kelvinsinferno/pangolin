@@ -844,6 +844,47 @@ table.
 
 ---
 
+## MVP-2 issue 5.1 resolved decisions (R-a..R-h) — 2026-05-16
+
+**Date locked:** 2026-05-16 (Kelvin took plan-gate recommendations
+across all eight Q's; the plan agent's two reframings — cross-account
+batching impossible without contract redeploy, and 5.1 being a layer
+on top of P8-2/P8-3 not a fresh queue — both stood)
+
+**Decision:** MVP-2 issue 5.1 (publish queue + batching) layers a
+**30-second same-account coalescing window** on top of the existing
+P8-2 `dirty_accounts` table + P8-3 `publish_all` orchestrator so N
+rapid edits to the same account within a 30s window flush as ONE
+chain transaction (the latest revision; intermediate revisions stay
+in the local lineage but their dirty markers are pruned before flush).
+Per master plan §5 row 5.1 verbatim. Eight resolved decisions:
+
+- **R-a · Window duration.** `pub const BATCH_WINDOW_SECS_DEFAULT: u64 = 30;` + `PANGOLIN_BATCH_WINDOW_SECS` env-var override clamped `1..=300`. Mirrors 4.2 R-c / 4.4 R-a precedent.
+
+- **R-b · Drain triggers.** Mandatory: window elapsed + manual flush + four session-teardown paths (lock / idle-expire / 4h-absolute / `device_locked`). Optional caps: count = 100 dirty markers + byte = 1 MB total `enc_payload`. App-shutdown skipped (dirty markers are SQLite-persisted by P8-2; no in-memory state to lose).
+
+- **R-c · Coalescing scope — per-account verbatim.** Cross-account batching at the chain layer is **impossible** without redeploying D-017 (the `RevisionPublished` event carries one `accountId` per call). Master plan's "multiple edits to same account" wording is the only feasible reading. N different accounts edited in the window = N chain txs (one per account, all submitted in the same flush invocation). No V3 schema_version bump, no payload format change.
+
+- **R-d · Queue persistence — none new.** The existing `dirty_accounts` table IS the queue. 5.1 only adds in-memory window state to `ActiveState`: `window_started_at_unix_ms: Option<i64>`, `window_elapsed_flush_enabled: bool` (default `false` per L11), `last_flush_failed_balance: bool` (diagnostic). On-disk markers survive lock/crash unaltered. No schema change, no `format_version` bump.
+
+- **R-e · Pre-flush balance gate — top-of-flush total-cost check.** Before any chain submit, sum `post_coalescing_count × estimate_next_publish_cost`; if balance < total, return `BatchFlushError::BalanceInsufficientForBatch { needed, available, queued_count }` BEFORE any chain submission. Per-revision gate (3.3 `pre_publish_balance_gate`) still runs as defense-in-depth. Everything-or-nothing semantics; rare multi-account flushes pick predictability over partial progress.
+
+- **R-f · Blocked-queue append.** New edits during balance-block append to the dirty markers normally; the next flush attempt re-runs coalescing across the merged set. Local edits NEVER refused (vault is a local password store first; chain submission is asynchronous to local UX). Caps (R-b) clamp runaway growth.
+
+- **R-g · Test surface — hermetic + 1 live `#[ignore]` test.** ~22 hermetic tests covering window state machine, coalescing rule (including tombstone-wins-tie and clock-skew resistance), drain on teardown via host orchestration, balance gate, caps, concurrency. One `#[ignore]`'d live test against D-017 (same posture as 3.3 / 4.1 / 4.2 / 4.3 R-f). No proptest.
+
+- **R-h · Relationship to P8-2/P8-3 — LAYER + refactor.** Move `apps/cli/src/sync.rs::publish_all` + `publish_one` into a new `pangolin-store::publish` module. Both 5.1's new `Vault::flush_publish_queue` AND the existing CLI `publish_all` call into the same library helper. CLI's `publish_all` becomes a thin shell; behavior preserved verbatim (every CLI sync test passes UNCHANGED after the move).
+
+**Why:** P8-2's `dirty_accounts` table already auto-tracks every edit at the SQL-transaction level; P8-3's `publish_all` already walks the list, dedupes via the A3 check, signs + submits + marks published. 5.1 is the 30s coalescing layer master plan §5 row 5.1 calls for — not a fresh queue. The cross-account batching framing in early plan-gate iteration was incompatible with the deployed contract; the plan agent caught this and Kelvin's "100+ unsynced is only original import" framing from 4.4 transferred directly to "multi-account edits in 30s is rare → everything-or-nothing balance gate is acceptable." 5.1 ships the queue primitive (manual flush + opt-in window-elapsed flush + drain-on-teardown via host orchestration); 5.4 will wire the always-on auto-flush.
+
+**Drain-on-teardown deviation from plan-gate L1 wording:** the plan-gate L1 row read "queue ALWAYS drains on every session-teardown path." 5.1 ships the primitive (`flush_publish_queue`) but does NOT auto-invoke it from inside `Vault::lock()` / `check_session_freshness` / `device_locked()` because those methods are sync and `flush_publish_queue` is async. Forcing them async would ripple through every call site in 1.4 session policy + P2 lock semantics for a benefit the host can already achieve explicitly (calling `flush_publish_queue` before `lock()`). Dirty markers ALWAYS persist through teardown regardless. 5.4 will introduce the host-side orchestration layer that fires pre-lock flush automatically.
+
+**Spec ref:** `PANGOLIN_PLAN.md` §5 row 5.1 ("Coalesce multiple edits to same account within 30s window into a single revision | Cost + UX"); `docs/issue-plans/5.1.md` (resolved decisions table + Q-a..Q-h disposition + L-section).
+
+**Reference (load-bearing):** `crates/pangolin-store/src/publish.rs` (NEW module — extracted from CLI per R-h; hosts `publish_all_for_vault` / `publish_one` / `BatchFlushReport` / `BatchFlushError` / `PublishQueueState`); `crates/pangolin-store/src/vault.rs` (5.1 constants `BATCH_WINDOW_SECS_DEFAULT/MIN/MAX/ENV_VAR` + `PUBLISH_QUEUE_COUNT_CAP/BYTE_CAP_BYTES`; new methods `flush_publish_queue` / `publish_queue_state` / `enable_window_elapsed_flush` / `coalesce_dirty_markers` / `resolve_batch_window_secs`; `ActiveState` extension with the three new fields); `apps/cli/src/sync.rs` (thin-shell over `pangolin_store::publish`); `docs/architecture/publish-queue.md` (R-a..R-h spelled out + drain trigger matrix + API surface); `THREAT_MODEL.md` ("Publish queue + batching (5.1)" deep-dive section).
+
+---
+
 ## PoC retrospective: PoC → MVP mapping
 
 > **Status:** Locked at P12 SIGNOFF (2026-05-08).
