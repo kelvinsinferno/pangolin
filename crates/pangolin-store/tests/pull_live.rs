@@ -129,5 +129,8 @@ async fn live_pull_once_against_d017_advances_checkpoint() {
         mode: SyncMode::Slow,
         sync_report: None,
         pulled_at_unix_ms: 0,
+        newly_frozen_accounts: Vec::new(),
+        newly_forked_accounts: Vec::new(),
+        newly_resolved_accounts: Vec::new(),
     }; // ensure PullReport public construction shape is honored
 }

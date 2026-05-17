@@ -64,7 +64,7 @@ pub use capture_authority::{
     CaptureContextKind, CapturedCaptureAuthority, RegistrationOutcome,
     CAPTURE_AUTHORITY_SCHEMA_VERSION_MAX,
 };
-pub use conflict::ConflictReport;
+pub use conflict::{ConflictBranchSummary, ConflictDelta, ConflictReport, ConflictSnapshot};
 pub use device::{
     DeviceCapabilities, DeviceIdentity, DEVICE_IDENTITY_SCHEMA_VERSION, EVM_ADDRESS_LEN,
 };

@@ -5406,15 +5406,162 @@ impl Vault {
 
         let mut out: Vec<crate::conflict::ConflictReport> = Vec::with_capacity(ids.len());
         for account_id in ids {
-            let heads = self.account_heads(account_id)?;
+            // **MVP-2 issue 5.3 (R-d).** Enrich every head into a
+            // `ConflictBranchSummary`. We reuse `revision_graph`
+            // (cheap — one SQL read per account, builds the in-memory
+            // index from the `revisions` rows) so we get the
+            // `on_canonical_chain` answer from the 1.6 R-c canonical-
+            // head rule without re-implementing it here. The graph's
+            // metadata view of each leaf is the per-row source of
+            // truth for `device_id` / `schema_version` /
+            // `is_tombstone` / `parent_revision_id`. The
+            // `observed_at_block` column is NOT in the graph (it's a
+            // chain-sync-only annotation); we read it via a focused
+            // SQL query per leaf — at most N-heads-per-conflicted-
+            // account reads, typically 2-3.
+            let graph = self.revision_graph(account_id)?;
+            let heads = graph.heads().to_vec();
+            let canonical = graph.canonical_head().copied();
+
+            // Stable iteration order: byte-lexicographic ASC by
+            // revision_id. Matches the deterministic ordering used
+            // everywhere else in the store.
+            let mut sorted_heads = heads;
+            sorted_heads.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+
+            let mut branches: Vec<crate::conflict::ConflictBranchSummary> =
+                Vec::with_capacity(sorted_heads.len());
+            for head_id in &sorted_heads {
+                let meta = graph.get(head_id).ok_or_else(|| {
+                    StoreError::Corrupted("head revision_id missing from graph index".into())
+                })?;
+                // observed_at_block: prefer the chain-sync annotation
+                // (set inside `ingest_pending_chain_revision`);
+                // fall back to `chain_block_number` for rows stamped
+                // via `mark_published` (= local publish round-trip)
+                // so the host UI always has some "when did this
+                // first appear on the chain" anchor.
+                let observed_at_block = self.read_observed_at_block(account_id, *head_id)?;
+                let parent = if meta.parent_revision_id == RevisionId::GENESIS_PARENT {
+                    None
+                } else {
+                    Some(meta.parent_revision_id)
+                };
+                let on_canonical_chain = canonical.is_some_and(|head| {
+                    *head_id == head || graph.ancestors(&head).contains(head_id)
+                });
+                branches.push(crate::conflict::ConflictBranchSummary {
+                    revision_id: *head_id,
+                    parent,
+                    device_id: meta.device_id.0.to_vec(),
+                    observed_at_block,
+                    schema_version: u32::from(meta.schema_version),
+                    is_tombstone: meta.is_tombstone,
+                    on_canonical_chain,
+                });
+            }
+
             let report = crate::conflict::ConflictReport {
                 account_id,
-                heads,
+                branches,
                 frozen: frozen_set.contains(&account_id),
             };
             out.push(report);
         }
         Ok(out)
+    }
+
+    /// **MVP-2 issue 5.3 (R-d).** Per-revision `observed_at_block`
+    /// lookup with fallback. Internal helper for [`Self::list_conflicts`].
+    ///
+    /// Returns the chain-sync `observed_at_block` if populated (set
+    /// by [`Self::ingest_pending_chain_revision`] for rows that came
+    /// in through the 4.1 chain-sync path); otherwise falls back to
+    /// `chain_block_number` from the `mark_published` anchor stamp.
+    /// Returns `None` for purely local rows that haven't yet been
+    /// published or observed on chain.
+    fn read_observed_at_block(
+        &self,
+        account_id: AccountId,
+        revision_id: RevisionId,
+    ) -> Result<Option<u64>> {
+        let row: Option<(Option<i64>, Option<i64>)> = self
+            .conn
+            .query_row(
+                "SELECT observed_at_block, chain_block_number
+                 FROM revisions
+                 WHERE account_id = ?1 AND revision_id = ?2",
+                params![
+                    account_id.as_bytes().as_slice(),
+                    revision_id.as_bytes().as_slice(),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((observed, chain_block)) = row else {
+            return Ok(None);
+        };
+        // Prefer chain-sync's observed_at_block; fall back to the
+        // local mark_published anchor's block_number for the
+        // self-publish-round-trip case.
+        let i64_block = observed.or(chain_block);
+        i64_block.map_or_else(
+            || Ok(None),
+            |b| {
+                u64::try_from(b).map(Some).map_err(|_| {
+                    StoreError::Corrupted(format!("observed_at_block {b} is negative"))
+                })
+            },
+        )
+    }
+
+    /// **MVP-2 issue 5.3 (R-c helper).** One-shot snapshot of the
+    /// account-level conflict set.
+    ///
+    /// Computes the `(frozen, forked)` `HashSet` pair via the two
+    /// existing accessors (`list_frozen_accounts` +
+    /// `all_forked_accounts`). Suitable for passing into
+    /// [`Self::list_conflicts_since`] to diff against a later state.
+    /// Used internally by [`Self::pull_once`] to populate
+    /// `PullReport.newly_frozen_accounts` /
+    /// `newly_forked_accounts` / `newly_resolved_accounts`.
+    ///
+    /// Metadata-only — does NOT require [`VaultState::Active`]. Two
+    /// cheap O(N-conflicted) SQL reads.
+    ///
+    /// # Errors
+    ///
+    /// Inherits [`StoreError::Sqlite`] / [`StoreError::Corrupted`]
+    /// from the underlying `list_frozen_accounts` /
+    /// `all_forked_accounts` calls.
+    pub fn snapshot_conflicts(&self) -> Result<crate::conflict::ConflictSnapshot> {
+        let frozen: std::collections::HashSet<AccountId> =
+            self.list_frozen_accounts()?.into_iter().collect();
+        let forked: std::collections::HashSet<AccountId> =
+            self.all_forked_accounts()?.into_iter().collect();
+        Ok(crate::conflict::ConflictSnapshot { frozen, forked })
+    }
+
+    /// **MVP-2 issue 5.3 (R-c helper).** Diff the current conflict
+    /// set against a prior [`crate::conflict::ConflictSnapshot`].
+    ///
+    /// Returns a [`crate::conflict::ConflictDelta`] populated via
+    /// directional set-difference (see `ConflictDelta` docs for the
+    /// exact semantics). Convenience wrapper around
+    /// [`Self::snapshot_conflicts`] + a pure
+    /// [`diff_conflict_snapshots`] call.
+    ///
+    /// Metadata-only — does NOT require [`VaultState::Active`].
+    ///
+    /// # Errors
+    ///
+    /// Inherits the error set of [`Self::snapshot_conflicts`].
+    pub fn list_conflicts_since(
+        &self,
+        prior: &crate::conflict::ConflictSnapshot,
+    ) -> Result<crate::conflict::ConflictDelta> {
+        let current = self.snapshot_conflicts()?;
+        Ok(diff_conflict_snapshots(prior, &current))
     }
 
     // -----------------------------------------------------------------
@@ -7487,6 +7634,16 @@ impl Vault {
             return Err(crate::pull::PullError::NoActiveSession);
         }
 
+        // (1.5) **MVP-2 issue 5.3 (R-c).** Pre-tick conflict snapshot.
+        // Two cheap O(N-conflicted) SQL reads (`list_frozen_accounts`
+        // + `all_forked_accounts`) into HashSets — the per-cycle diff
+        // is computed against the post-tick snapshot below to
+        // populate `newly_frozen_accounts` / `newly_forked_accounts`
+        // / `newly_resolved_accounts` on the returned `PullReport`.
+        let pre_snapshot = self
+            .snapshot_conflicts()
+            .map_err(crate::pull::PullError::Store)?;
+
         // (2) R-c: re-pick per cycle. Cheap — single SQL read + None
         // check; no RPC under 4.4's first-sync-only heuristic. The
         // `clippy::map_err_ignore` lint would prefer `.map_err(Into::into)?`
@@ -7528,6 +7685,19 @@ impl Vault {
             SyncMode::OfferFast | SyncMode::AlwaysFast => None,
         };
 
+        // (3.5) **MVP-2 issue 5.3 (R-c).** Post-tick conflict
+        // snapshot + per-cycle diff. Set-difference is directional:
+        // already-frozen carry-overs from prior ticks do NOT
+        // re-surface (covers L-PullReport-delta-overcounts-on-
+        // existing-frozen). `removed_frozen` from the diff IS the
+        // `newly_resolved_accounts` channel (covers the self-resolve
+        // loopback case once 5.1 flush stamps the merge anchor and
+        // 5.2 pull ingests via idempotency arm #1).
+        let post_snapshot = self
+            .snapshot_conflicts()
+            .map_err(crate::pull::PullError::Store)?;
+        let delta = diff_conflict_snapshots(&pre_snapshot, &post_snapshot);
+
         // (4) Stamp the diagnostic field on success. We re-check
         // `active` here because the await above released the borrow;
         // a parallel teardown can't happen (we hold &mut self), but
@@ -7541,6 +7711,9 @@ impl Vault {
             mode,
             sync_report,
             pulled_at_unix_ms: now_ms,
+            newly_frozen_accounts: delta.added_frozen,
+            newly_forked_accounts: delta.added_forked,
+            newly_resolved_accounts: delta.removed_frozen,
         })
     }
 
@@ -8068,6 +8241,34 @@ fn decode_head_row(
         return Ok(HeadDecodeOutcome::FutureVersion);
     }
     Ok(outcome)
+}
+
+/// **MVP-2 issue 5.3 (R-c helper).** Pure set-difference between two
+/// [`crate::conflict::ConflictSnapshot`]s producing a
+/// [`crate::conflict::ConflictDelta`].
+///
+/// Two-call sites: [`Vault::pull_once`] computes the per-tick diff
+/// (`pre_snapshot` → `post_snapshot`) to populate
+/// [`crate::pull::PullReport::newly_frozen_accounts`] et al.;
+/// [`Vault::list_conflicts_since`] exposes the same primitive as a
+/// public accessor for the 5.4 indicator state machine. Pure +
+/// deterministic — useful unit-test target.
+fn diff_conflict_snapshots(
+    prior: &crate::conflict::ConflictSnapshot,
+    current: &crate::conflict::ConflictSnapshot,
+) -> crate::conflict::ConflictDelta {
+    let added_frozen: Vec<AccountId> = current.frozen.difference(&prior.frozen).copied().collect();
+    let removed_frozen: Vec<AccountId> =
+        prior.frozen.difference(&current.frozen).copied().collect();
+    let added_forked: Vec<AccountId> = current.forked.difference(&prior.forked).copied().collect();
+    let removed_forked: Vec<AccountId> =
+        prior.forked.difference(&current.forked).copied().collect();
+    crate::conflict::ConflictDelta {
+        added_frozen,
+        removed_frozen,
+        added_forked,
+        removed_forked,
+    }
 }
 
 /// Helper: the head set for `account_id` via the `NOT EXISTS` detector

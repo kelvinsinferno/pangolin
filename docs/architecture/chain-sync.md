@@ -315,6 +315,24 @@ the full L1..L12 defensive surface).
 Full design + canonical host scheduler loop body + threat model in
 [`pull-loop.md`](pull-loop.md).
 
+## Conflict surface (5.3)
+
+**MVP-2 issue 5.3** ships the FFI-side conflict-surfacing plumbing
+that the existing 1.6 + P8 + P9 machinery had built up but never
+exposed: the `vault_list_conflicts` FFI binding, the
+[`ConflictReport`](../../crates/pangolin-store/src/conflict.rs)
+enrichment (per-branch `device_id` / `observed_at_block` /
+`schema_version` / `is_tombstone` / `on_canonical_chain`), the
+[`PullReport`](../../crates/pangolin-store/src/pull.rs) extension
+(`newly_frozen_accounts` / `newly_forked_accounts` /
+`newly_resolved_accounts` per-tick deltas), and the
+`Vault::snapshot_conflicts` + `Vault::list_conflicts_since` accessor
+pair for the 5.4 indicator state machine. ZERO change to
+`ingest_chain_revision` / `refuse_if_frozen` / canonical-head
+election — 5.3 surfaces existing state; it does not re-elect.
+
+Full design in [`conflict-surface.md`](conflict-surface.md).
+
 ## File layout
 
 - `crates/pangolin-chain/src/chain_sync.rs` — module root, constants,
