@@ -7772,6 +7772,112 @@ impl Vault {
     pub fn last_pull_at_unix_ms(&self) -> Option<i64> {
         self.active.as_ref().and_then(|a| a.last_pull_at_unix_ms)
     }
+
+    // -----------------------------------------------------------------
+    // MVP-2 issue 5.4 — bundling accessor + pre-lock drain (R-a + R-e).
+    // -----------------------------------------------------------------
+
+    /// **MVP-2 issue 5.4 (R-a).** Bundle the engine-readable inputs
+    /// for the pure [`crate::sync_status::compute_next_status`]
+    /// transition function.
+    ///
+    /// Reads [`Self::publish_queue_state`] +
+    /// [`Self::list_conflicts_since`] (against the caller's prior
+    /// snapshot) + [`Self::list_frozen_accounts`] +
+    /// [`Self::all_forked_accounts`] (for `conflicts_count`) +
+    /// [`Self::last_pull_at_unix_ms`] and combines them with the
+    /// host-tracked fields (`last_pull_outcome`,
+    /// `last_flush_outcome`, `consecutive_pull_failures`,
+    /// `balance_state`, `now_unix_ms`) into a single
+    /// [`crate::sync_status::SyncStatusInputs`] snapshot.
+    ///
+    /// **Metadata-only** — works on a Locked vault. The pull /
+    /// flush outcome inputs are host-tracked between ticks; the
+    /// engine never persists them.
+    ///
+    /// # Errors
+    ///
+    /// Inherits [`StoreError::Sqlite`] / [`StoreError::Corrupted`]
+    /// from the inner SQL reads.
+    pub fn sync_status_inputs(
+        &self,
+        prior_conflict_snapshot: &crate::conflict::ConflictSnapshot,
+        last_pull_outcome: Option<crate::sync_status::LastPullOutcome>,
+        last_flush_outcome: Option<crate::sync_status::LastFlushOutcome>,
+        consecutive_pull_failures: u32,
+        balance_state: pangolin_chain::GasBalanceState,
+        now_unix_ms: i64,
+    ) -> Result<crate::sync_status::SyncStatusInputs> {
+        let publish_queue = self.publish_queue_state()?;
+        let conflict_delta = self.list_conflicts_since(prior_conflict_snapshot)?;
+        let frozen = self.list_frozen_accounts()?;
+        let forked = self.all_forked_accounts()?;
+        let mut conflict_set: std::collections::HashSet<AccountId> = frozen.into_iter().collect();
+        conflict_set.extend(forked);
+        let conflicts_count = u32::try_from(conflict_set.len()).unwrap_or(u32::MAX);
+        Ok(crate::sync_status::SyncStatusInputs {
+            last_pull_outcome,
+            last_flush_outcome,
+            publish_queue,
+            conflicts_count,
+            conflict_delta,
+            last_pull_at_unix_ms: self.last_pull_at_unix_ms(),
+            consecutive_pull_failures,
+            balance_state,
+            now_unix_ms,
+        })
+    }
+
+    /// **MVP-2 issue 5.4 (R-e).** Pre-lock drain — run
+    /// [`Self::flush_publish_queue`] with `force = true` BEFORE
+    /// transitioning to `Locked`. Best-effort per L3: flush errors
+    /// do NOT block teardown; the error is RETURNED to the caller
+    /// AFTER `lock()` runs.
+    ///
+    /// Closes the 5.1 L1 deviation: the existing sync [`Self::lock`]
+    /// cannot await a flush; this async helper threads an adapter +
+    /// device key through and gives hosts (CLI, Tauri, mobile) a
+    /// single primitive for graceful shutdown.
+    ///
+    /// `lock()` runs regardless of whether the flush succeeded.
+    /// Dirty markers persist in `SQLite` if the flush returned an
+    /// error (network, balance, store) — the next unlock resumes
+    /// the queue (covered by 5.1
+    /// `dirty_markers_persist_through_lock_and_resume_on_next_unlock`).
+    ///
+    /// # Errors
+    ///
+    /// Surfaces the underlying [`crate::publish::BatchFlushError`]
+    /// from the inner flush call AFTER `lock()` runs. Returns
+    /// [`crate::publish::BatchFlushError::NoActiveSession`]
+    /// WITHOUT touching `lock()` if the vault was already locked at
+    /// entry — there is nothing to drain and nothing to tear down.
+    pub async fn lock_with_drain<A: pangolin_chain::ChainAdapter + ?Sized>(
+        &mut self,
+        adapter: &A,
+        device_key: &pangolin_crypto::keys::DeviceKey,
+    ) -> core::result::Result<(), crate::publish::BatchFlushError> {
+        // (1) Guard: locked vault → NoActiveSession early-return.
+        //     Consistent with 5.1 `flush_publish_queue` /
+        //     5.2 `pull_once` posture.
+        if self.active.is_none() {
+            return Err(crate::publish::BatchFlushError::NoActiveSession);
+        }
+        // (2) Attempt drain with force=true so the (future) window
+        //     gate is bypassed — graceful shutdown must drain
+        //     whatever is queued regardless of the 30s window.
+        let flush_result = self.flush_publish_queue(adapter, device_key, true).await;
+        // (3) Lock regardless (L3 — best-effort drain; teardown
+        //     wins). Captures the flush_result and returns it AFTER
+        //     the lock transition so the caller observes the same
+        //     locked-state post-condition no matter what.
+        self.lock();
+        // (4) Surface flush error AFTER lock. Map BatchFlushReport
+        //     to `()` since the caller's interest is "did the drain
+        //     succeed?" — not the per-row outcome counts (host can
+        //     re-query `list_dirty` after the next unlock).
+        flush_result.map(|_| ())
+    }
 }
 
 impl Drop for Vault {
@@ -13360,5 +13466,232 @@ mod tests {
             SyncModePreference::AlwaysFast.to_meta_str(),
             Some("always_fast")
         );
+    }
+
+    // =================================================================
+    // MVP-2 issue 5.4 (R-e) — `Vault::lock_with_drain` tests.
+    // =================================================================
+    //
+    // Cover the pre-lock drain contract: flush runs BEFORE lock; flush
+    // failures do NOT block teardown; locked-vault entry returns the
+    // typed `NoActiveSession` without touching state.
+
+    mod lock_with_drain_tests {
+        use super::*;
+        use crate::publish::BatchFlushError;
+        use async_trait::async_trait;
+        use pangolin_chain::{
+            ChainAdapter, ChainAnchor, ChainError, EventLocation, MockChainAdapter, RevisionEvent,
+            SignedRevision, VaultId,
+        };
+        use pangolin_crypto::keys::DeviceKey;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        /// Helper: fresh, unlocked vault in a tempdir.
+        fn fresh_unlocked() -> (Vault, TempDir) {
+            let dir = TempDir::new().expect("tempdir");
+            let path = vault_path(&dir, "v.pvf");
+            Vault::create(&path, &fresh_password()).expect("create");
+            let mut v = Vault::open(&path).expect("open");
+            v.unlock(&fresh_presence(), &fresh_pin()).expect("unlock");
+            (v, dir)
+        }
+
+        /// Adapter that counts publish calls; otherwise proxies into
+        /// `MockChainAdapter`.
+        struct CountingAdapter {
+            inner: MockChainAdapter,
+            count: StdArc<AtomicUsize>,
+        }
+        impl CountingAdapter {
+            fn new() -> Self {
+                Self {
+                    inner: MockChainAdapter::new(),
+                    count: StdArc::new(AtomicUsize::new(0)),
+                }
+            }
+            fn count(&self) -> usize {
+                self.count.load(Ordering::SeqCst)
+            }
+        }
+        #[async_trait]
+        impl ChainAdapter for CountingAdapter {
+            async fn publish(&self, signed: &SignedRevision) -> Result<ChainAnchor, ChainError> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                self.inner.publish(signed).await
+            }
+            async fn pull_since(
+                &self,
+                vault_id: &VaultId,
+                from_block: u64,
+                until_block: Option<u64>,
+            ) -> Result<Vec<RevisionEvent>, ChainError> {
+                self.inner
+                    .pull_since(vault_id, from_block, until_block)
+                    .await
+            }
+            async fn get_revision(
+                &self,
+                location: &EventLocation,
+            ) -> Result<Option<RevisionEvent>, ChainError> {
+                self.inner.get_revision(location).await
+            }
+            async fn current_block(&self) -> Result<u64, ChainError> {
+                self.inner.current_block().await
+            }
+        }
+
+        /// Adapter that fails the pre-flight balance gate AND would
+        /// fail per-revision publishes if it ever got there.
+        struct BalanceInsufficientAdapter {
+            inner: MockChainAdapter,
+            publish_count: StdArc<AtomicUsize>,
+        }
+        impl BalanceInsufficientAdapter {
+            fn new() -> Self {
+                Self {
+                    inner: MockChainAdapter::new(),
+                    publish_count: StdArc::new(AtomicUsize::new(0)),
+                }
+            }
+        }
+        #[async_trait]
+        impl ChainAdapter for BalanceInsufficientAdapter {
+            async fn publish(&self, _signed: &SignedRevision) -> Result<ChainAnchor, ChainError> {
+                self.publish_count.fetch_add(1, Ordering::SeqCst);
+                Err(ChainError::PrePublishBalanceInsufficient {
+                    balance_wei: 1_000,
+                    estimate_wei: 1_000_000,
+                })
+            }
+            async fn pull_since(
+                &self,
+                vault_id: &VaultId,
+                from_block: u64,
+                until_block: Option<u64>,
+            ) -> Result<Vec<RevisionEvent>, ChainError> {
+                self.inner
+                    .pull_since(vault_id, from_block, until_block)
+                    .await
+            }
+            async fn get_revision(
+                &self,
+                location: &EventLocation,
+            ) -> Result<Option<RevisionEvent>, ChainError> {
+                self.inner.get_revision(location).await
+            }
+            async fn current_block(&self) -> Result<u64, ChainError> {
+                self.inner.current_block().await
+            }
+            async fn pre_flight_batch_balance(
+                &self,
+                queued_count: usize,
+            ) -> Result<Option<pangolin_chain::BatchBalanceCheck>, ChainError> {
+                Ok(Some(pangolin_chain::BatchBalanceCheck {
+                    total_estimated_cost_wei: 1_000_000u128.saturating_mul(queued_count as u128),
+                    current_balance_wei: 1_000,
+                }))
+            }
+        }
+
+        /// **5.4 R-e (load-bearing).** With a pending dirty marker,
+        /// `lock_with_drain` MUST flush the marker BEFORE the vault
+        /// transitions to Locked — verified by: (a) the adapter sees
+        /// the publish call (count == 1), (b) post-call the vault is
+        /// Locked, (c) the dirty queue is empty post-call. The
+        /// "BEFORE" ordering is enforced structurally: flush runs on
+        /// `&mut self.active`'s contents BEFORE `self.lock()` takes
+        /// `active` and drops it.
+        #[tokio::test]
+        async fn lock_with_drain_flushes_pending_queue_before_lock() {
+            let (mut v, _dir) = fresh_unlocked();
+            let device = DeviceKey::generate();
+            let adapter = CountingAdapter::new();
+            // Stage a dirty marker.
+            let _ = v.add_account(fresh_snapshot()).expect("add");
+            assert_eq!(v.list_dirty().expect("list").len(), 1);
+            assert!(matches!(v.state(), VaultState::Active));
+            // Drain + lock.
+            v.lock_with_drain(&adapter, &device)
+                .await
+                .expect("drain ok");
+            // (a) Adapter saw the publish call BEFORE lock — proven by
+            //     the call having occurred while `active` was Some.
+            assert_eq!(adapter.count(), 1, "flush must run before lock");
+            // (b) Vault is Locked post-call.
+            assert!(matches!(v.state(), VaultState::Locked));
+            // (c) Dirty queue empty (the flush succeeded + cleared).
+            //     `list_dirty` works on a locked vault.
+            assert!(
+                v.list_dirty().expect("list post-lock").is_empty(),
+                "drain cleared the dirty marker before lock"
+            );
+        }
+
+        /// **5.4 R-e + L3.** A flush failure does NOT block teardown —
+        /// the vault still transitions to Locked + the error is
+        /// returned to the caller AFTER lock runs.
+        #[tokio::test]
+        async fn lock_with_drain_flush_failure_does_not_block_teardown() {
+            let (mut v, _dir) = fresh_unlocked();
+            let device = DeviceKey::generate();
+            let adapter = BalanceInsufficientAdapter::new();
+            let _ = v.add_account(fresh_snapshot()).expect("add");
+            assert!(matches!(v.state(), VaultState::Active));
+            // Drain attempt fails on the balance gate, but lock still
+            // runs (best-effort per L3).
+            let result = v.lock_with_drain(&adapter, &device).await;
+            // Lock ran regardless.
+            assert!(
+                matches!(v.state(), VaultState::Locked),
+                "lock must transition even on flush failure"
+            );
+            // Error surfaced AFTER lock.
+            let err = result.expect_err("balance gate fires");
+            assert!(
+                matches!(err, BatchFlushError::BalanceInsufficientForBatch { .. }),
+                "expected BalanceInsufficientForBatch, got {err:?}"
+            );
+            // Dirty marker persists for retry after the next unlock —
+            // covered by 5.1's lock/unlock-persistence test on the same
+            // primitive.
+        }
+
+        /// **5.4 R-e edge case.** An empty queue: `lock_with_drain`
+        /// is a no-op-then-lock — zero chain calls, vault Locked.
+        #[tokio::test]
+        async fn lock_with_drain_on_empty_queue_is_noop_then_locks() {
+            let (mut v, _dir) = fresh_unlocked();
+            let device = DeviceKey::generate();
+            let adapter = CountingAdapter::new();
+            assert!(v.list_dirty().expect("list").is_empty());
+            v.lock_with_drain(&adapter, &device).await.expect("ok");
+            assert_eq!(adapter.count(), 0, "no publish on empty queue");
+            assert!(matches!(v.state(), VaultState::Locked));
+        }
+
+        /// **5.4 R-e guard.** Calling `lock_with_drain` on an
+        /// already-locked vault returns `NoActiveSession` WITHOUT
+        /// touching the (already-None) `active` field. No spurious
+        /// double-lock; consistent with 5.1 / 5.2 posture.
+        #[tokio::test]
+        async fn lock_with_drain_on_locked_vault_returns_noactivesession_without_attempting() {
+            let (mut v, _dir) = fresh_unlocked();
+            let device = DeviceKey::generate();
+            let adapter = CountingAdapter::new();
+            v.lock();
+            assert!(matches!(v.state(), VaultState::Locked));
+            let err = v
+                .lock_with_drain(&adapter, &device)
+                .await
+                .expect_err("locked → NoActiveSession");
+            assert!(
+                matches!(err, BatchFlushError::NoActiveSession),
+                "expected NoActiveSession, got {err:?}"
+            );
+            // Adapter was never touched — the guard short-circuited.
+            assert_eq!(adapter.count(), 0);
+        }
     }
 }

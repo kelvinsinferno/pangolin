@@ -139,6 +139,16 @@ name = "conflict_live"
 path = "tests/conflict_live.rs"
 required-features = ["test-utilities"]
 
+# MVP-2 issue 5.4 (R-g): shape-only `#[ignore]`'d live sync-orchestrator
+# test. Drives the canonical host loop body against a live Base Sepolia
+# RPC + uses `MockChainAdapter` (gated behind pangolin-chain's
+# `test-utilities`) for the pre-lock drain primitive. Same posture as
+# `pull_live.rs` + `conflict_live.rs`.
+[[test]]
+name = "sync_status_live"
+path = "tests/sync_status_live.rs"
+required-features = ["test-utilities"]
+
 # MVP-1 issue 1.3: 10k-account search benchmark (hand-rolled
 # `Instant`-timed harness — no `criterion` dependency, so no `deny.toml`
 # / `Cargo.lock` churn). `harness = false` because the body is a plain

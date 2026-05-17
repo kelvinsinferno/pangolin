@@ -46,6 +46,7 @@ pub mod publish;
 pub mod pull;
 pub mod revision;
 pub mod session;
+pub mod sync_status;
 pub mod vault;
 
 pub(crate) mod blob;
@@ -106,6 +107,16 @@ pub use session::{
     AuthError, Clock, IdentityProof, PinIdentityProof, PresenceProof, PressYPresenceProof,
     SessionDuration, SessionState, SystemClock, ABSOLUTE_MAX_DEFAULT, IDLE_TIMEOUT_DEFAULT,
     PRESENCE_FRESHNESS, PROMPT_TIMEOUT, SESSION_IDLE_UNTIL_DEVICE_LOCK,
+};
+// MVP-2 issue 5.4: sync orchestrator state machine. `SyncStatus` enum +
+// pure `compute_next_status` transition function + type-erased outcome
+// shapes for the host's loop. The bundling accessor lives on `Vault`
+// (`Vault::sync_status_inputs`); the pre-lock drain method
+// (`Vault::lock_with_drain`) closes the 5.1 L1 deviation. Per R-a the
+// engine ships ZERO new tokio surface; the host owns the loop.
+pub use sync_status::{
+    compute_next_status, BatchFlushErrorKind, LastFlushOutcome, LastPullOutcome, PullErrorKind,
+    SyncStatus, SyncStatusInputs, OFFLINE_THRESHOLD_FAILURES, SYNCED_STALENESS_THRESHOLD_MS,
 };
 pub use vault::{AccountStatus, SyncMode, SyncModePreference, Vault, VaultState};
 
