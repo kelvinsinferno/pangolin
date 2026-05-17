@@ -231,3 +231,38 @@ See `THREAT_MODEL.md` row "Publish queue + batching (5.1)" for:
 - L-clock-skew-coalesce-wrong-order (mitigated by reading head from `account_identities`, not `MAX(marked_at)`)
 - L-malicious-RPC-fakes-receipt (inherited from 3.3 `tx_hash` cross-check)
 - L-coalescing-skips-foreign-edit (inherited from P8 CRIT-1 `refuse_if_frozen`)
+
+## Sync-orchestrator cross-ref (MVP-2 issue 5.4)
+
+The 5.4 sync orchestrator (`docs/architecture/sync-orchestrator.md`)
+consumes `flush_publish_queue` + `publish_queue_state` in two
+load-bearing ways:
+
+1. The canonical host loop body fires `flush_publish_queue(force=false)`
+   on its 30s tick whenever `publish_queue_state().dirty_count > 0`,
+   then maps the `BatchFlushReport` / `BatchFlushError` into the
+   `LastFlushOutcome` input the transition function consumes. A
+   `BalanceInsufficientForBatch` error becomes
+   `SyncStatus::BlockedOnBalance` on the next tick.
+2. Graceful shutdown uses `Vault::lock_with_drain` (R-e — see
+   below) which runs `flush_publish_queue(force=true)` BEFORE
+   `lock()` runs. This closes the 5.1 L1 deviation (the existing
+   sync `lock()` cannot await a flush).
+
+## Pre-lock drain (MVP-2 issue 5.4 R-e)
+
+`Vault::lock_with_drain(adapter, device_key) -> Result<(), BatchFlushError>`
+is the async primitive that drains the queue BEFORE locking. The
+contract is **best-effort** per L3: flush failures (network,
+balance, store) do NOT block teardown; the error is RETURNED to
+the caller AFTER `lock()` runs. Dirty markers persist in SQLite;
+the next unlock resumes the queue (covered by 5.1's
+`dirty_markers_persist_through_lock_and_resume_on_next_unlock`).
+
+The pre-condition `self.active.is_some()` is enforced via an
+early-return: a locked vault returns `BatchFlushError::NoActiveSession`
+WITHOUT touching `lock()`. This guards against spurious
+double-lock and matches 5.1 / 5.2 posture verbatim.
+
+The existing sync `Vault::lock()` is untouched — emergency /
+`device_locked` paths continue to use it directly.

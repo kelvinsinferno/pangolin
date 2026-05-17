@@ -49,19 +49,21 @@ pub use error::Error;
 // types under `pangolin_core::*`. Q2 (issue 1.1 plan-gate) defers the
 // physical relocation to 1.4; the namespace freezes today.
 pub use pangolin_store::{
-    decode_archive, AccountId, AccountIdentity, AccountIdentityDraft, AccountIdentityPatch,
-    AccountIdentitySummary, AccountSelection, AccountSnapshot, AccountStatus, ArchiveSnapshot,
-    AuthError, CaptureAuthority, CaptureAuthorityEntry, CaptureAuthorityKind, CaptureContext,
-    CaptureContextKind, Clock, ConflictBranchSummary, ConflictDelta, ConflictReport,
-    ConflictSnapshot, DeviceCapabilities, DeviceId, DeviceIdentity, IdentityProof, PasswordEntry,
-    PasswordHistorySummaryEntry, PendingMerge, PinIdentityProof, PlaintextExportConfirmationData,
-    PresenceProof, PressYPresenceProof, RegistrationOutcome, RevisionGraph, RevisionId,
-    RevisionMeta, SessionDuration, SessionState, SystemClock, TotpAlgorithm, TotpParams, Vault,
-    VaultState, ABSOLUTE_MAX_DEFAULT, ACCOUNT_IDENTITY_SCHEMA_VERSION, ARCHIVE_FORMAT_VERSION,
-    ARCHIVE_SNAPSHOT_SCHEMA_VERSION, CAPTURE_AUTHORITY_SCHEMA_VERSION_MAX,
-    DEVICE_IDENTITY_SCHEMA_VERSION, EVM_ADDRESS_LEN, IDLE_TIMEOUT_DEFAULT, PAYLOAD_VERSION_V0,
-    PAYLOAD_VERSION_V1, PAYLOAD_VERSION_V2, PLAINTEXT_EXPORT_BANNER, PRESENCE_FRESHNESS,
-    PROMPT_TIMEOUT, REVISION_SCHEMA_VERSION_MAX, SESSION_IDLE_UNTIL_DEVICE_LOCK,
+    compute_next_status, decode_archive, AccountId, AccountIdentity, AccountIdentityDraft,
+    AccountIdentityPatch, AccountIdentitySummary, AccountSelection, AccountSnapshot, AccountStatus,
+    ArchiveSnapshot, AuthError, BatchFlushErrorKind, CaptureAuthority, CaptureAuthorityEntry,
+    CaptureAuthorityKind, CaptureContext, CaptureContextKind, Clock, ConflictBranchSummary,
+    ConflictDelta, ConflictReport, ConflictSnapshot, DeviceCapabilities, DeviceId, DeviceIdentity,
+    IdentityProof, LastFlushOutcome, LastPullOutcome, PasswordEntry, PasswordHistorySummaryEntry,
+    PendingMerge, PinIdentityProof, PlaintextExportConfirmationData, PresenceProof,
+    PressYPresenceProof, PullErrorKind, RegistrationOutcome, RevisionGraph, RevisionId,
+    RevisionMeta, SessionDuration, SessionState, SyncStatus, SyncStatusInputs, SystemClock,
+    TotpAlgorithm, TotpParams, Vault, VaultState, ABSOLUTE_MAX_DEFAULT,
+    ACCOUNT_IDENTITY_SCHEMA_VERSION, ARCHIVE_FORMAT_VERSION, ARCHIVE_SNAPSHOT_SCHEMA_VERSION,
+    CAPTURE_AUTHORITY_SCHEMA_VERSION_MAX, DEVICE_IDENTITY_SCHEMA_VERSION, EVM_ADDRESS_LEN,
+    IDLE_TIMEOUT_DEFAULT, OFFLINE_THRESHOLD_FAILURES, PAYLOAD_VERSION_V0, PAYLOAD_VERSION_V1,
+    PAYLOAD_VERSION_V2, PLAINTEXT_EXPORT_BANNER, PRESENCE_FRESHNESS, PROMPT_TIMEOUT,
+    REVISION_SCHEMA_VERSION_MAX, SESSION_IDLE_UNTIL_DEVICE_LOCK, SYNCED_STALENESS_THRESHOLD_MS,
 };
 
 /// Returns the crate name. Useful for diagnostics and version reporting.

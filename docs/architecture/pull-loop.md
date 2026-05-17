@@ -284,3 +284,32 @@ change is to introduce a second method that threads it through; the
 - `crates/pangolin-store/tests/pull_live.rs` — R-f `#[ignore]`'d live
   test against D-017 (deferred to fixture-capture follow-up; same
   posture as 4.1 / 4.2 / 4.3 / 5.1 live tests).
+
+## Sync-orchestrator cross-ref (MVP-2 issue 5.4)
+
+The 5.4 sync orchestrator (`docs/architecture/sync-orchestrator.md`)
+consumes `pull_once` + `PullReport` + `PullError` + the
+`last_pull_at_unix_ms` diagnostic stamp as the read-side input to
+its 6-variant `SyncStatus` state machine. The canonical host loop
+body fires `pull_once` on the 60s pull-interval tick and maps:
+
+- `Ok(PullReport { mode, newly_frozen_accounts, newly_resolved_accounts, .. })`
+  into `LastPullOutcome::Success { mode, newly_frozen_count, newly_resolved_count }`
+  + resets the host's consecutive-failure counter to 0 (L4
+  applies — signal-only `OfferFast` / `AlwaysFast` cycles reset
+  too).
+- `Err(PullError::Chain(_))` into
+  `LastPullOutcome::Failure(PullErrorKind::Chain)` + increments
+  the counter; at 3 consecutive failures the transition
+  function returns `SyncStatus::Offline`.
+- `Err(PullError::Store(_))` into
+  `LastPullOutcome::Failure(PullErrorKind::Store)` + the
+  transition function returns `SyncStatus::ActionRequired`.
+- `Err(PullError::NoActiveSession)` is terminal — the host
+  loop breaks.
+
+The `last_pull_at_unix_ms` stamp is the load-bearing staleness
+input: 5 minutes after the last successful pull, the transition
+function downgrades `Synced` to `Syncing { Slow }` (an active
+host running on schedule never trips this; only a wedged
+scheduler does).

@@ -211,3 +211,11 @@ load-bearing L-section risks:
   + `mark_published` inline anchor stamp (R-b reliance).
 - [`revision-lineage.md`](revision-lineage.md) — 1.6 canonical head
   election + `superseded_by` semantics.
+- [`sync-orchestrator.md`](sync-orchestrator.md) — MVP-2 issue 5.4
+  consumes `snapshot_conflicts` + `list_conflicts_since` + the
+  `PullReport.newly_frozen_accounts` / `newly_resolved_accounts`
+  delta to drive the `SyncStatus::ConflictsPending` indicator
+  pill. The 5.4 transition function reads `conflicts_count`
+  directly from the bundling accessor + uses the `removed_frozen`
+  channel for the host's "conflict resolved" banner-dismiss
+  notification.

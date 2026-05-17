@@ -68,6 +68,7 @@ pub mod kdbx;
 pub mod reveal;
 pub mod revision;
 pub mod session;
+pub mod sync_status;
 pub mod totp;
 
 pub use error::FfiError;
@@ -114,6 +115,14 @@ pub use revision::{
 pub use session::{
     PasswordPolicy, PasswordStrength, PlaintextExportConfirmation, PresenceProof, SecretPassword,
     SessionInfo, UnixTimestamp, VaultHandle, PASSWORD_POLICY_SCHEMA_VERSION,
+};
+// MVP-2 issue 5.4: sync orchestrator FFI surface — `vault_sync_status`
+// + `FfiSyncStatus` enum + `FfiSyncMode` mirror + the host-supplied
+// input record + the snapshot record (additive 1.1-surface amendment —
+// see sync_status.rs / ffi-surface.md).
+pub use sync_status::{
+    vault_sync_status, FfiBatchFlushErrorKind, FfiLastFlushOutcome, FfiLastPullOutcome,
+    FfiPullErrorKind, FfiSyncMode, FfiSyncStatus, FfiSyncStatusInputs, FfiSyncStatusSnapshot,
 };
 // MVP-1 issue 1.7: TOTP engine wired — `totp_generate` body +
 // `parse_totp_secret` helper + the `ParsedTotpSecretFfi` /
