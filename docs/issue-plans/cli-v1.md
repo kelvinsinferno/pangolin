@@ -8,21 +8,23 @@
 >
 > **Depends on:** 3.2 R-c `Vault::evm_wallet_address`; 3.5 R-d `BalanceMonitor` + `GasBalanceState`; 3.5 `pangolin-funder-client::initiate_top_up`; 4.4 R-b `SyncModePreference { Ask, AlwaysSlow, AlwaysFast }` + R-c `Vault::select_sync_mode`; 5.1 R-a `Vault::flush_publish_queue` + `publish_queue_state` + `coalesce_dirty_markers` + `enable_window_elapsed_flush`; 5.2 R-a `Vault::pull_once` + `PullReport` + `PULL_INTERVAL_SECS_DEFAULT` + `last_pull_at_unix_ms`; 5.3 R-d `Vault::list_conflicts_since` + `snapshot_conflicts`; 5.4 R-e `Vault::lock_with_drain` + R-h `vault_sync_status` FFI. Current `main` tip `18145f4` (post-5.4 merge).
 
-## Resolved decisions (Kelvin sign-off PENDING)
+## Resolved decisions (Kelvin sign-off 2026-05-17)
 
-> Builder must wait. Plan-gate recommendations live in each Q below.
+> Kelvin took all four surfaced plan-gate recommendations; Q-d (resolve interactive) + Q-e (--json) + Q-f (tests) + Q-h (drain retrofit) + Q-i (test posture) defaulted to plan-gate recommendations. Largest cycle since 5.1; closes 12 FFI gaps + ships 9 new subcommand modules + canonical host scheduler loop body. After CLI-V1, MVP-3 host work has zero engine-side dependencies.
 
 | Decision | Resolution | Notes |
 |---|---|---|
-| **R-a Scope shape** | TBD | Plan-gate recommends Option A (single batch). |
-| **R-b Subcommand discipline** | TBD | Plan-gate recommends Option C (mixed nested). |
-| **R-c sync-loop long-running mode** | TBD | Plan-gate recommends Option C (both one-shot + loop). |
-| **R-d resolve interactive mode** | TBD | Plan-gate recommends Option C (combined; TTY-detected). |
-| **R-e Universal --json flag** | TBD | Plan-gate recommends Option A (every new verb). |
-| **R-f Test surface** | TBD | Plan-gate recommends Option C (smoke + integration + sync_loop). |
-| **R-g FFI gap fills** | TBD | Plan-gate recommends Option A (ship all 9). |
-| **R-h Pre-lock drain retrofit** | TBD | Plan-gate recommends Option C (chain-touching commands). |
-| **R-i Test posture** | TBD | Plan-gate recommends Option A (hermetic + 1 live). |
+| **R-a Scope shape** | **Single CLI-V1 batch.** ~8-14h wall-clock; ~1200 LoC across CLI + FFI. Plan agent scope-assessment validated. | Tightly coupled around `cli.rs` clap tree + `commands/mod.rs`; splitting would just spawn coordination overhead. |
+| **R-b Subcommand discipline** | **Mixed nested.** `pangolin sync flush|queue-status|pull-status|loop` (sync is verb-group) + `pangolin sync-mode show|set` (separate noun) + `pangolin wallet show` + `pangolin balance show` + `pangolin top-up` (flat). | Mirrors how `account` / `vault` / `authority` are nouns and `publish` / `pull` / `resolve` are verbs. |
+| **R-c sync-loop long-running mode** | **Ship both sync-loop AND one-shot verbs.** One-shot verbs (`flush`, `pull`, `queue-status`, `pull-status`) for scripting + disaster recovery; `pangolin sync loop` long-running mode for "keep my vault synced." Uses `lock_with_drain` on SIGINT (L3). | Closes 5.4 R-a's canonical-host-scheduler-loop-body expectation. |
+| **R-d resolve interactive mode** | **Combined.** No-flag invocation runs interactive TTY-detected flow (via `std::io::IsTerminal`); flags-only mode (existing `--account-id` / `--keep` / `--dry-run` / `--yes`) preserved as scripted form. Non-TTY without flags → helpful error. | Best UX + scripting both work. |
+| **R-e Universal --json flag** | **Every new verb honors `--json`.** `queue-status` / `pull-status` / `wallet-show` / `balance-show` / `sync-mode show` emit JSON summaries; `sync loop` emits one JSON-Lines per tick. Per-event lines stay on stderr regardless. | Mirrors existing CLI posture; CI-scriptable. |
+| **R-f Test surface** | **Per-verb smoke + integration + sync_loop file.** ~11 clap-parse smoke tests in `cli_arg_parsing.rs` + 7 integration tests in NEW `cli_v1_smoke.rs` + 3 integration tests in NEW `sync_loop.rs` + 3 in NEW `resolve_interactive.rs` + 13 FFI parity tests across new FFI modules. | Covers each new verb's clap shape + load-bearing end-to-end. |
+| **R-g FFI gap fills** | **Ship all 12 gaps in CLI-V1.** `vault_pull_once` + `vault_last_pull_at_unix_ms` + `vault_flush_publish_queue` + `vault_publish_queue_state` + `vault_enable_window_elapsed_flush` + `vault_coalesce_dirty_markers` + `vault_select_sync_mode` + `vault_sync_mode_preference` + `vault_set_sync_mode_preference` + `vault_lock_with_drain` + `vault_evm_wallet_address` + `vault_initiate_top_up`. ~400 LoC + ~13 parity tests + UniFFI regen. | Closes every standing FFI defer; MVP-3 host work has zero engine-side dependencies left. |
+| **R-h Pre-lock drain retrofit** | **Chain-touching commands only.** `publish` / `pull` / `resolve` / `flush` / `sync loop` / `top-up` swap `Vault::close` → `Vault::lock_with_drain`. Pure-local commands (`account *` / `vault *` / `import` / `authority` / `status` / `queue-status` / `pull-status` / `wallet show` / `balance show` / `sync-mode *`) keep `Vault::close`. | Drain only when chain access exists; mirrors the "5.1 L1 deviation only matters when there's a queue to drain" framing. |
+| **R-i Test posture** | **Hermetic + 1 live `#[ignore]` test.** `live_sync_loop_converges_against_base_sepolia` in NEW `tests/sync_loop_live.rs` (deferred to fixture capture per §4.x/§5.x R-g precedent). No proptest. | Matches §5.x precedent verbatim. env-quirk #14 contract-side-semantics defense via the live test. |
+
+---
 
 ---
 
