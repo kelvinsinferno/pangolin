@@ -65,9 +65,11 @@ pub mod error;
 pub mod identity;
 mod identity_bridge;
 pub mod kdbx;
+pub mod publish_queue;
 pub mod reveal;
 pub mod revision;
 pub mod session;
+pub mod sync_mode;
 pub mod sync_status;
 pub mod totp;
 
@@ -95,12 +97,22 @@ pub use capture_authority::{
 // shapes + entry points (additive 1.1-surface amendment — see
 // balance.rs / ffi-surface.md).
 pub use balance::{
-    balance_monitor_start, balance_monitor_stop, gas_balance_state, GasBalanceStateFfi,
-    MonitorHandle,
+    balance_monitor_start, balance_monitor_stop, gas_balance_state, vault_initiate_top_up,
+    FfiTopUpAttempt, GasBalanceStateFfi, MonitorHandle,
+};
+// CLI-V1 (R-g) — publish-queue FFI surface.
+pub use publish_queue::{
+    vault_coalesce_dirty_markers, vault_enable_window_elapsed_flush, vault_flush_publish_queue,
+    vault_publish_queue_state, FfiBatchFlushReport, FfiPublishQueueState,
+};
+// CLI-V1 (R-g) — sync-mode FFI surface.
+pub use sync_mode::{
+    vault_select_sync_mode, vault_set_sync_mode_preference, vault_sync_mode_preference,
+    FfiSyncModePreference,
 };
 // MVP-1 issue 1.5: device-identity FFI shapes + entry points (additive
 // 1.1-surface amendment — see device.rs / ffi-surface.md).
-pub use device::{DeviceCapabilities, DeviceInfo};
+pub use device::{vault_evm_wallet_address, DeviceCapabilities, DeviceInfo};
 pub use kdbx::KdbxImportReport;
 // MVP-1 issue 1.4: presence-gated reveal-class entry points + the
 // zeroizing `RevealedSecret` wrapper they return (Q4 amendment).
@@ -113,16 +125,18 @@ pub use revision::{
     RevisionMeta,
 };
 pub use session::{
-    PasswordPolicy, PasswordStrength, PlaintextExportConfirmation, PresenceProof, SecretPassword,
-    SessionInfo, UnixTimestamp, VaultHandle, PASSWORD_POLICY_SCHEMA_VERSION,
+    vault_lock_with_drain, PasswordPolicy, PasswordStrength, PlaintextExportConfirmation,
+    PresenceProof, SecretPassword, SessionInfo, UnixTimestamp, VaultHandle,
+    PASSWORD_POLICY_SCHEMA_VERSION,
 };
 // MVP-2 issue 5.4: sync orchestrator FFI surface — `vault_sync_status`
 // + `FfiSyncStatus` enum + `FfiSyncMode` mirror + the host-supplied
 // input record + the snapshot record (additive 1.1-surface amendment —
 // see sync_status.rs / ffi-surface.md).
 pub use sync_status::{
-    vault_sync_status, FfiBatchFlushErrorKind, FfiLastFlushOutcome, FfiLastPullOutcome,
-    FfiPullErrorKind, FfiSyncMode, FfiSyncStatus, FfiSyncStatusInputs, FfiSyncStatusSnapshot,
+    vault_last_pull_at_unix_ms, vault_pull_once, vault_sync_status, FfiBatchFlushErrorKind,
+    FfiLastFlushOutcome, FfiLastPullOutcome, FfiPullErrorKind, FfiPullReport, FfiSyncMode,
+    FfiSyncStatus, FfiSyncStatusInputs, FfiSyncStatusSnapshot,
 };
 // MVP-1 issue 1.7: TOTP engine wired — `totp_generate` body +
 // `parse_totp_secret` helper + the `ParsedTotpSecretFfi` /

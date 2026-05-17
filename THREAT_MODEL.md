@@ -1255,3 +1255,23 @@ the PR.
 
 **Invariant additions:** none new. The 5.4 surface adds no new on-disk state (`SyncStatus` lives in-memory only, in the host's `tokio::sync::watch::Sender` per R-f); no new payload format; no new external crate dep (L6 — `tokio::sync::watch` is a tokio sub-crate already in the tree). The 5.4 FFI binding is metadata-only by construction (L2 — `vault_sync_status` does NOT decrypt, does NOT call `get_account`, does NOT touch `refuse_if_frozen`). The `pangolin-chain` crate is unchanged.
 
+### CLI-V1 wiring (CLI-V1) (`apps/cli/src/commands/{flush,queue_status,pull_status,sync_loop,sync_mode,wallet,balance,top_up,resolve}.rs` + `crates/pangolin-ffi/src/{publish_queue,sync_mode}.rs` + delta to `sync_status.rs` / `device.rs` / `session.rs` / `balance.rs`)
+
+**What it ships:** seven new CLI subcommands + the canonical host scheduler loop body + 12 FFI bindings (8 wired, 4 stubs awaiting MVP-3 chain-adapter FFI). No new on-disk state, no new payload, no new external crate dep. Closes the deferred §3.x / §4.x / §5.x CLI-V1 follow-ups.
+
+**Adversarial threats considered + load-bearing defenses:**
+
+1. **L-cli-flag-injection-via-hex — malicious `--account-id <hex>` value contains SQL-meta / shell-meta / overflow vectors.** Defense: clap's `HexAccountId` value parser rejects non-hex + length-checks (existing P9 surface, unchanged); rusqlite parameterized queries throughout. Adversary leverage: none.
+
+2. **L-resolve-prompt-misclick — R-d interactive `resolve` misreads keystrokes; user kept the wrong branch.** Defense: (a) print the full conflict table on stderr BEFORE the prompt; (b) re-confirm chosen branch with `[y/N]` second prompt showing the chosen revision id; (c) `--dry-run` flag preserved (test `interactive_resolve_re_confirms_chosen_branch`). Adversary leverage: none.
+
+3. **L-sync-loop-leaks-creds-on-long-run — `pangolin sync loop` holds the unlocked vault for hours; SIGTERM late in shutdown could leave cleartext in memory.** Defense: (a) `lock_with_drain` on SIGINT closes the session (L3 — the canonical loop's pre-lock drain runs `Vault::lock()` regardless of flush result); (b) the 1.4 idle-expire / 4 h-absolute session policy fires; the loop catches `PullError::NoActiveSession` / `BatchFlushError::NoActiveSession` and breaks. Adversary leverage: bounded by the session timer — even a crash-mid-loop drops the `Vault` (ZeroizeOnDrop fires on the active-state snapshots).
+
+4. **L-graceful-shutdown-loses-pending-flush — SIGINT during a `sync loop` iteration arrives between arms; pending flush lost.** Defense: `Vault::lock_with_drain` runs on shutdown (R-h retrofit, L3); the drain coalesces + force-flushes any markers before transitioning to Locked (test `sync_loop_sigint_during_loop_drains_pending_publishes`).
+
+5. **L-top-up-rebroadcast-on-retry — `pangolin top-up` invoked twice in quick succession.** Defense: (a) `pangolin_funder_client::initiate_top_up`'s built-in idempotency on `attestation_hash` (3.4 R-d ledger); (b) CLI prompts for `[y/N]` confirmation before submission unless `--yes` is given; (c) `--yes` is REQUIRED on non-TTY contexts (test `cli_v1_top_up_requires_confirmation_flag_or_tty`).
+
+6. **L-sync-mode-set-without-presence — `pangolin sync-mode set always-fast` changes a meta row without a fresh presence proof.** Defense: acceptable per 4.4 R-b — `SyncModePreference` is a UX hint, NOT secret material; the engine re-runs `select_sync_mode` every session, so a tampered preference column degrades UX but not security. The FFI binding `vault_set_sync_mode_preference` still gates on an Active session (refuses Locked vault) so the host UI cannot stamp a preference on a fresh launch before unlock.
+
+**Invariant additions:** none new. R-g's 4 FFI stubs (`vault_flush_publish_queue` / `vault_lock_with_drain` / `vault_pull_once` / `vault_initiate_top_up`) return `FfiError::Internal { message: "... requires <X> FFI (MVP-3)" }` so the surface is locked but the body lands in MVP-3 once the chain-adapter / signer / Credit-attestation FFI handles ship. The §8.1.5 vocabulary discipline extends to every new subcommand's `--help` text (test `cli_v1_help_avoids_forbidden_user_facing_terms`). L1..L11 from `cli-v1.md` are preserved verbatim.
+

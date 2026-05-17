@@ -193,6 +193,52 @@ pub fn device_current(handle: Arc<VaultHandle>) -> Result<DeviceInfo, FfiError> 
     Ok(device_identity_to_ffi(identity))
 }
 
+/// Read the per-device EVM wallet address (20 bytes, hex-encoded).
+///
+/// **CLI-V1 (R-g).** Returns the cached on-disk
+/// `devices.evm_address` column as a `"0x..."` hex string. Works
+/// on a Locked vault (the column is read with metadata-only SQL).
+///
+/// Returns an empty string for a legacy 1.5-era row whose
+/// `evm_address` column is still NULL pre-3.2-era back-fill; the
+/// host renders "not yet derived; unlock once to populate". This
+/// is the same render-only address that
+/// [`DeviceInfo::evm_address`] carries.
+///
+/// # Errors
+///
+/// `FfiError::Session` if the handle has no vault installed;
+/// `FfiError::Store` for a corrupted row.
+#[allow(clippy::significant_drop_tightening, clippy::items_after_statements)]
+#[uniffi::export]
+pub fn vault_evm_wallet_address(handle: Arc<VaultHandle>) -> Result<String, FfiError> {
+    use std::fmt::Write as _;
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    match vault.evm_wallet_address() {
+        Ok(bytes) => {
+            // Lowercase hex, `0x` prefix per the chain-side
+            // convention.
+            let mut s = String::with_capacity(2 + bytes.len() * 2);
+            s.push_str("0x");
+            for b in bytes {
+                let _ = write!(s, "{b:02x}");
+            }
+            Ok(s)
+        }
+        Err(pangolin_store::StoreError::NotUnlocked) => Err(FfiError::Session {
+            message: "vault is not unlocked".into(),
+        }),
+        Err(pangolin_store::StoreError::Validation { kind, .. }) if kind == "evm_address" => {
+            // Empty string for a legacy 1.5-era row with NULL
+            // `evm_address`. Matches the `DeviceInfo.evm_address`
+            // empty-vec convention.
+            Ok(String::new())
+        }
+        Err(e) => Err(store_into_ffi(e)),
+    }
+}
+
 /// Rename a device in the trust list. Validates `label` (non-empty,
 /// ≤ 256 chars, NFC-normalised); persists; survives close/reopen.
 ///
@@ -223,7 +269,9 @@ pub fn device_set_label(
 
 #[cfg(test)]
 mod tests {
-    use super::{device_current, device_list, device_set_label, DeviceCapabilities};
+    use super::{
+        device_current, device_list, device_set_label, vault_evm_wallet_address, DeviceCapabilities,
+    };
     use crate::identity::DeviceId as FfiDeviceId;
     use crate::session::VaultHandle;
     use pangolin_core::{PinIdentityProof, PressYPresenceProof, Vault};
@@ -314,6 +362,35 @@ mod tests {
             listed[0].evm_address, cur.evm_address,
             "list and current must agree on the EVM address"
         );
+    }
+
+    /// **CLI-V1 (R-g).** `vault_evm_wallet_address` returns the
+    /// 20-byte address as `"0x..."` hex for a registered device.
+    #[test]
+    fn vault_evm_wallet_address_returns_hex_string() {
+        use std::fmt::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let h = unlocked_handle(&dir, "evm-addr.pvf");
+        let addr = vault_evm_wallet_address(Arc::clone(&h)).expect("address");
+        assert!(addr.starts_with("0x"), "address must start with 0x: {addr}");
+        assert_eq!(addr.len(), 42, "0x + 20 bytes = 42 chars: {addr}");
+        // Cross-check: device_current reports the same bytes.
+        let cur = device_current(h).unwrap();
+        let mut expected = String::with_capacity(42);
+        expected.push_str("0x");
+        for b in &cur.evm_address {
+            let _ = write!(expected, "{b:02x}");
+        }
+        assert_eq!(addr, expected);
+    }
+
+    /// **CLI-V1 (R-g).** Placeholder handle → `FfiError::Session`
+    /// (session-discipline parity).
+    #[test]
+    fn vault_evm_wallet_address_rejects_placeholder_with_session_error() {
+        let empty = crate::session::VaultHandle::new_placeholder();
+        let err = vault_evm_wallet_address(empty).unwrap_err();
+        assert!(matches!(err, crate::error::FfiError::Session { .. }));
     }
 
     #[test]

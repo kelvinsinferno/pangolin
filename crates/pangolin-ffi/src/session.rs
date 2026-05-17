@@ -508,6 +508,38 @@ pub fn vault_lock(handle: Arc<VaultHandle>) -> Result<(), FfiError> {
     Ok(())
 }
 
+/// Pre-lock drain.
+///
+/// **CLI-V1 (R-g).** Calls
+/// [`pangolin_core::Vault::lock_with_drain`] BEFORE transitioning
+/// to Locked. Closes the 5.1 L1 deviation by draining any dirty
+/// markers (with `force = true` bypassing the 30 s window) before
+/// the lock.
+///
+/// **Stub for CLI-V1.** The full call requires a
+/// [`pangolin_chain::ChainAdapter`] handle + a
+/// [`pangolin_crypto::keys::DeviceKey`] handle, neither of which
+/// has an FFI surface in CLI-V1. The binding is exposed here for
+/// surface-freeze purposes — MVP-3 ships the chain-adapter handle
+/// and wires the body. Returns
+/// `FfiError::Internal { message: "vault_lock_with_drain requires chain-adapter FFI (MVP-3)" }`
+/// at call time.
+///
+/// # Errors
+///
+/// `FfiError::Session` if the handle has no vault installed;
+/// otherwise the CLI-V1 stub returns `FfiError::Internal`.
+#[allow(clippy::significant_drop_tightening)]
+#[uniffi::export]
+pub fn vault_lock_with_drain(handle: Arc<VaultHandle>) -> Result<(), FfiError> {
+    let mut guard = handle.lock_vault();
+    let _vault = guard.as_mut()?;
+    Err(FfiError::Internal {
+        message: "vault_lock_with_drain requires chain-adapter FFI (MVP-3); use the CLI for now"
+            .to_string(),
+    })
+}
+
 /// Close a vault handle — locks it, then releases the `SQLite`
 /// connection (the inner `Vault` is consumed; the handle is left
 /// empty). Idempotent: closing an already-empty handle is a no-op.

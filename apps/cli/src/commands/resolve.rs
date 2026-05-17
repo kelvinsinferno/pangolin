@@ -41,7 +41,7 @@
 //! makes this unavoidable — see §A2); the snapshot is dropped
 //! (zeroized) immediately after the seal call.
 
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 
 use anyhow::{bail, Context, Result};
 use pangolin_chain::BaseSepoliaAdapter;
@@ -78,8 +78,13 @@ pub async fn run(global: &GlobalArgs, args: ResolveArgs) -> Result<()> {
     let mut vault = open_and_unlock(&args.vault_path, args.vault_password.as_deref())
         .context("vault open + unlock failed")?;
 
-    let account_id = AccountId::from_bytes(args.account_id.0);
-    let chosen_revision_id = RevisionId::from_bytes(args.keep.0);
+    // **CLI-V1 R-d.** Resolve `account_id` + `keep` from one of:
+    // (a) explicit flags (scripted path; unchanged from P9-3);
+    // (b) interactive TTY prompt (no flags + stdin is a TTY).
+    // (c) non-TTY + no flags → friendly error pointing at the
+    //     flags-only form.
+    let (account_id, chosen_revision_id) =
+        resolve_account_and_revision(&vault, args.account_id, args.keep)?;
 
     // Defensive: surface a clear error if `--keep` is not currently
     // a head of the account, BEFORE any chain call. The
@@ -167,6 +172,16 @@ pub async fn run(global: &GlobalArgs, args: ResolveArgs) -> Result<()> {
     .await
     .context("resolve_one failed")?;
 
+    // **CLI-V1 R-h.** Chain-touching command: graceful exit via
+    // `Vault::lock_with_drain`. Skipped on `--dry-run` because the
+    // dry-run path makes no chain calls + the user expects no
+    // state change.
+    if !args.dry_run {
+        if let Err(e) = vault.lock_with_drain(&adapter, &device).await {
+            eprintln!("shutdown drain error (dirty markers persist): {e}");
+        }
+    }
+
     if cfg.json {
         let value = match &outcome {
             ResolveOutcome::DryRun {
@@ -248,6 +263,120 @@ pub async fn run(global: &GlobalArgs, args: ResolveArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// **CLI-V1 R-d.** Resolve `(account_id, keep)` from flags or by
+/// prompting interactively when stdin is a TTY.
+///
+/// Three branches:
+///
+/// 1. Both flags present → return verbatim (scripted form;
+///    unchanged from P9-3 behavior). Clap's `requires` constraint
+///    guarantees both-or-neither.
+/// 2. Both flags absent + stdin is a TTY → enumerate
+///    [`pangolin_store::Vault::list_conflicts`], print the table
+///    on stderr, prompt the user for `account_index` +
+///    `branch_index`, and require a `[y/N]` re-confirm prompt
+///    (L-resolve-prompt-misclick defense).
+/// 3. Both flags absent + stdin is NOT a TTY → return a helpful
+///    error pointing at the flags-only form.
+///
+/// The function takes an already-unlocked vault so
+/// `list_conflicts` works (it reads conflict surface — both
+/// metadata-only counters and per-account head data).
+fn resolve_account_and_revision(
+    vault: &pangolin_store::Vault,
+    account_id_flag: Option<crate::cli::HexAccountId>,
+    keep_flag: Option<crate::cli::HexRevisionId>,
+) -> Result<(AccountId, RevisionId)> {
+    if let (Some(acc), Some(rev)) = (account_id_flag, keep_flag) {
+        return Ok((AccountId::from_bytes(acc.0), RevisionId::from_bytes(rev.0)));
+    }
+    // R-d: refuse interactive mode on non-TTY stdin.
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "non-TTY context: pass --account-id <hex> and --keep <hex> for scripted use \
+             (interactive prompt requires a terminal)"
+        );
+    }
+    // R-d interactive path: enumerate conflicts.
+    let conflicts = vault
+        .list_conflicts()
+        .context("list_conflicts failed (interactive resolve)")?;
+    if conflicts.is_empty() {
+        bail!(
+            "no accounts in the conflict surface; nothing to resolve. \
+             Run `pangolin-cli pull` first if you expect freshly-ingested forks."
+        );
+    }
+    eprintln!("interactive resolve — current conflict surface:");
+    for (i, c) in conflicts.iter().enumerate() {
+        eprintln!(
+            "  [{i}] account {}  ({} branches{})",
+            hex::encode(c.account_id.as_bytes()),
+            c.branches.len(),
+            if c.frozen { ", frozen" } else { "" },
+        );
+        for (j, b) in c.branches.iter().enumerate() {
+            let suffix = if b.on_canonical_chain {
+                " (canonical)"
+            } else {
+                ""
+            };
+            eprintln!(
+                "      [{j}] revision {}  {}{suffix}",
+                hex::encode(b.revision_id.as_bytes()),
+                if b.is_tombstone { "tombstone" } else { "live" },
+            );
+        }
+    }
+    eprint!("account index: ");
+    std::io::stderr().flush().ok();
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_line(&mut buf)
+        .context("failed to read account index from stdin")?;
+    let account_idx: usize = buf
+        .trim()
+        .parse()
+        .context("account index must be a number")?;
+    let conflict = conflicts
+        .get(account_idx)
+        .ok_or_else(|| anyhow::anyhow!("account index {account_idx} out of range"))?;
+
+    eprint!("branch index: ");
+    std::io::stderr().flush().ok();
+    buf.clear();
+    std::io::stdin()
+        .read_line(&mut buf)
+        .context("failed to read branch index from stdin")?;
+    let branch_idx: usize = buf
+        .trim()
+        .parse()
+        .context("branch index must be a number")?;
+    let branch = conflict
+        .branches
+        .get(branch_idx)
+        .ok_or_else(|| anyhow::anyhow!("branch index {branch_idx} out of range"))?;
+
+    // L-resolve-prompt-misclick defense: re-confirm with the chosen
+    // revision id printed BEFORE the prompt.
+    eprintln!(
+        "you chose to keep revision {} (account {})",
+        hex::encode(branch.revision_id.as_bytes()),
+        hex::encode(conflict.account_id.as_bytes()),
+    );
+    eprint!("confirm? [y/N]: ");
+    std::io::stderr().flush().ok();
+    buf.clear();
+    std::io::stdin()
+        .read_line(&mut buf)
+        .context("failed to read confirmation from stdin")?;
+    let trimmed = buf.trim();
+    if !trimmed.eq_ignore_ascii_case("y") && !trimmed.eq_ignore_ascii_case("yes") {
+        bail!("aborted by user (no confirmation)");
+    }
+    Ok((conflict.account_id, branch.revision_id))
 }
 
 /// Pluck `chain.rpc_default` from the deployment file. Mirror of
