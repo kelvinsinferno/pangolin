@@ -350,7 +350,7 @@ fn store_into_ffi(err: pangolin_store::StoreError) -> FfiError {
     FfiError::from(pangolin_core::Error::from(err))
 }
 
-fn parse_wei_hex(s: &str) -> Result<u128, FfiError> {
+pub(crate) fn parse_wei_hex(s: &str) -> Result<u128, FfiError> {
     let stripped = s
         .strip_prefix("0x")
         .or_else(|| s.strip_prefix("0X"))
@@ -520,6 +520,92 @@ fn ffi_to_sync_status(s: FfiSyncStatus) -> Result<SyncStatus, FfiError> {
         },
         FfiSyncStatus::ActionRequired { reason } => SyncStatus::ActionRequired { reason },
     })
+}
+
+// ---------------------------------------------------------------------
+// CLI-V1 (R-g): vault_pull_once + vault_last_pull_at_unix_ms
+// ---------------------------------------------------------------------
+
+/// FFI mirror of [`pangolin_store::PullReport`].
+///
+/// Per-cycle outcome carried back from
+/// [`vault_pull_once`]. The mode field tracks the 4.4 picker's
+/// dispatch decision; `newly_*` counters track the 5.3 conflict-
+/// surface delta for the host's notification path.
+///
+/// CLI-V1 (R-g).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiPullReport {
+    /// Schema-version slot.
+    pub schema_version: u16,
+    /// 4.4 picker's dispatch decision for this cycle.
+    pub mode: FfiSyncMode,
+    /// Unix-ms instant at which the dispatch completed.
+    pub pulled_at_unix_ms: i64,
+    /// Count of accounts whose `frozen_pending_resolve` flag
+    /// transitioned from `false` to `true` this cycle.
+    pub newly_frozen_count: u32,
+    /// Count of accounts whose head set went from 1 → 2+ this
+    /// cycle.
+    pub newly_forked_count: u32,
+    /// Count of accounts whose `frozen_pending_resolve` flag
+    /// transitioned from `true` to `false` this cycle.
+    pub newly_resolved_count: u32,
+}
+
+/// Run a single pull cycle.
+///
+/// **CLI-V1 (R-g) stub.** The full call requires an active tokio
+/// runtime + a `Vault` reference held across `.await`. `Vault` is
+/// `!Send` by design (it holds an `RefCell`-bearing `rusqlite::Connection`
+/// + a `dyn Clock`), which makes it incompatible with `UniFFI`'s
+/// `async fn` export shape (which requires the future to be `Send`).
+/// The CLI consumes the engine method directly. MVP-3 may unblock
+/// this via either a single-threaded executor surface or a sync-
+/// path FFI wrapper. Returns
+/// `FfiError::Internal { message: "vault_pull_once requires single-threaded executor FFI (MVP-3)" }`
+/// at call time.
+///
+/// # Errors
+///
+/// Always returns `FfiError::Internal` in CLI-V1 (after the
+/// active-session gate fires).
+#[allow(
+    clippy::significant_drop_tightening,
+    clippy::needless_pass_by_value,
+    unused_variables
+)]
+#[uniffi::export]
+pub fn vault_pull_once(
+    handle: Arc<VaultHandle>,
+    rpc_url: String,
+) -> Result<FfiPullReport, FfiError> {
+    let mut guard = handle.lock_vault();
+    let _vault = guard.as_mut()?;
+    Err(FfiError::Internal {
+        message:
+            "vault_pull_once requires single-threaded executor FFI (MVP-3); use the CLI for now"
+                .to_string(),
+    })
+}
+
+/// Read the unix-ms instant of the most recent successful pull
+/// cycle this session.
+///
+/// Returns `None` on a Locked vault OR if no pull cycle has run
+/// yet on this session.
+///
+/// # Errors
+///
+/// None — the engine accessor returns `None` for both "locked"
+/// and "no pull yet" because the host's UI treatment is
+/// identical.
+#[allow(clippy::significant_drop_tightening)]
+#[uniffi::export]
+pub fn vault_last_pull_at_unix_ms(handle: Arc<VaultHandle>) -> Result<Option<i64>, FfiError> {
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    Ok(vault.last_pull_at_unix_ms())
 }
 
 #[cfg(test)]

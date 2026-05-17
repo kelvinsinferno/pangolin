@@ -238,6 +238,67 @@ pub fn gas_balance_state(
     Ok(GasBalanceStateFfi::from(state))
 }
 
+// ---------------------------------------------------------------------
+// CLI-V1 (R-g) — vault_initiate_top_up stub
+// ---------------------------------------------------------------------
+
+/// FFI mirror of [`pangolin_funder_client::TopUpAttempt`].
+///
+/// CLI-V1 (R-g). Carries the client-generated attempt id (UUID
+/// as a string), the funder's tx hashes, and the unix-second
+/// submission timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiTopUpAttempt {
+    /// Schema-version slot.
+    pub schema_version: u16,
+    /// Client-generated v4 UUID, as a string.
+    pub attempt_id: String,
+    /// Funder's `redeem` tx hash (`0x...` hex).
+    pub redeem_tx_hash: String,
+    /// ETH-transfer tx hash (`0x...` hex). `None` when the
+    /// transfer leg failed (operator reconciliation required).
+    pub eth_transfer_tx_hash: Option<String>,
+    /// Wei transferred, as a `"0x..."` hex string. `"0x0"` when
+    /// the transfer leg failed.
+    pub eth_transferred_wei_hex: String,
+    /// Unix-second timestamp when the POST was issued.
+    pub submitted_at_unix: u64,
+}
+
+/// Request a top-up from the funder service.
+///
+/// **CLI-V1 (R-g) stub.** The full call requires a
+/// [`alloy::signers::local::PrivateKeySigner`] handle and a
+/// [`pangolin_funder_client::Credit`] attestation, neither of
+/// which has an FFI surface in CLI-V1. The binding is exposed
+/// here for surface-freeze purposes — MVP-3 ships the signer
+/// handle (or routes through an active-vault path that signs
+/// engine-side) and wires the body. Returns
+/// `FfiError::Internal { message: "vault_initiate_top_up requires funder-credit FFI (MVP-3)" }`
+/// at call time.
+///
+/// # Errors
+///
+/// `FfiError::Session` if the handle has no vault installed;
+/// otherwise the CLI-V1 stub returns `FfiError::Internal`.
+#[allow(
+    clippy::significant_drop_tightening,
+    clippy::needless_pass_by_value,
+    unused_variables
+)]
+#[uniffi::export]
+pub fn vault_initiate_top_up(
+    handle: Arc<VaultHandle>,
+    funder_url: String,
+) -> Result<FfiTopUpAttempt, FfiError> {
+    let mut guard = handle.lock_vault();
+    let _vault = guard.as_mut()?;
+    Err(FfiError::Internal {
+        message: "vault_initiate_top_up requires funder-credit FFI (MVP-3); use the CLI for now"
+            .to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

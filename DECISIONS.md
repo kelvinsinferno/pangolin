@@ -1325,3 +1325,22 @@ is sealed at P12 SIGNOFF.)
 **Why:** <rationale, with constraints or threats this addresses>
 **Spec ref:** <which spec section this implements/derives from>
 ```
+
+---
+
+## Issue CLI-V1 — CLI + FFI wiring batch (resolved 2026-05-17)
+
+Closes the deferred §3.x / §4.x / §5.x CLI + FFI gaps. R-a..R-i
+locked verbatim from `docs/issue-plans/cli-v1.md`:
+
+| Resolution | Decision |
+|---|---|
+| **R-a** | Single CLI-V1 batch — ~1200 LoC, 7 new subcommands + canonical host scheduler + 12 FFI bindings in one cycle. |
+| **R-b** | Mixed nested subcommand grammar: `sync flush\|queue-status\|pull-status\|loop` (verb-group) + `sync-mode show\|set` + `wallet show` + `balance show` + `top-up` (flat). |
+| **R-c** | Ship both `sync loop` (long-running) AND one-shot verbs (`flush`, `pull`, `queue-status`, `pull-status`). Loop uses `lock_with_drain` on SIGINT. |
+| **R-d** | Combined resolve mode — no-flag interactive TTY (via `std::io::IsTerminal`); flags-only preserved as scripted form. Non-TTY without flags → friendly error. |
+| **R-e** | Universal `--json` on every new verb. Per-event lines stay on stderr; per-tick `sync loop` emits JSON-Lines on stdout when `--json` set. |
+| **R-f** | Per-verb smoke + integration tests + a dedicated `sync_loop.rs` integration file. ~37 new tests across CLI + FFI. |
+| **R-g** | Ship all 12 FFI gap fills: `vault_pull_once`, `vault_last_pull_at_unix_ms`, `vault_flush_publish_queue`, `vault_publish_queue_state`, `vault_enable_window_elapsed_flush`, `vault_coalesce_dirty_markers`, `vault_select_sync_mode`, `vault_sync_mode_preference`, `vault_set_sync_mode_preference`, `vault_lock_with_drain`, `vault_evm_wallet_address`, `vault_initiate_top_up`. **8 of 12 are fully wired in CLI-V1.** The remaining 4 (`vault_flush_publish_queue`, `vault_lock_with_drain`, `vault_pull_once`, `vault_initiate_top_up`) ship as **surface-locked stubs** returning `FfiError::Internal` with operator guidance ("use the CLI for now"); they require chain-adapter / signer / Credit-attestation UniFFI handles that aren't yet on the FFI surface (the `ChainAdapter` trait is async + `Send + Sync` + `BaseSepoliaAdapter::new_with_keystore` threads a `SecretBytes` keystore password — wrapping this for UniFFI is itself a substantial security-boundary cycle estimated at ~5-8h). **Follow-up cycle: `MVP-3-host-FFI-handles`** — to be created when MVP-3 host work begins (Tauri / iOS / Android shells); it wires the 4 stub bodies once the chain-adapter / signer / funder-credit UniFFI Objects ship. The stub signatures + record types (`FfiBatchFlushReport`, `FfiPullReport`, `FfiTopUpAttempt`) are locked so MVP-3 wires bodies without changing the wire shape; each stub has a parity test asserting the stub-as-stub error path. |
+| **R-h** | Pre-lock drain retrofit on chain-touching commands only — `publish` / `pull` / `resolve` / `flush` / `sync loop` / `top-up` use `Vault::lock_with_drain`. Pure-local verbs keep `Vault::close`. |
+| **R-i** | Hermetic test suite + one live `#[ignore]` test (`tests/sync_loop_live.rs`) that skips cleanly on missing env vars. |

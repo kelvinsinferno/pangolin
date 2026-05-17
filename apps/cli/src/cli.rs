@@ -126,6 +126,332 @@ pub enum Command {
     /// form. Read-only in MVP-1; `register` / `clear` arrive with
     /// MVP-2 when the browser extension is the actual consumer.
     Authority(AuthorityArgs),
+
+    /// Sync-orchestrator verbs (CLI-V1, R-b). Group: `flush`,
+    /// `queue-status`, `pull-status`, `loop`. The verb-group is the
+    /// canonical-host scheduler shell — one-shot verbs are for
+    /// scripting + disaster recovery; `loop` is the long-running
+    /// scheduler.
+    Sync(SyncArgs),
+
+    /// Sync-mode preference (CLI-V1, R-b separate noun). Group:
+    /// `show`, `set <ask|always-slow|always-fast>`. The preference
+    /// is a UX hint persisted in the vault meta column.
+    SyncMode(SyncModeArgs),
+
+    /// Show the per-device EVM wallet address (CLI-V1, R-b).
+    /// Group: `show`. Renders the cached on-disk 20-byte address
+    /// in `0x...` hex form.
+    Wallet(WalletArgs),
+
+    /// Show the cached entitlement balance state (CLI-V1, R-b).
+    /// Group: `show`. Starts the `BalanceMonitor` briefly + reads
+    /// the cached `GasBalanceState`.
+    Balance(BalanceArgs),
+
+    /// Request a top-up from the funder service (CLI-V1, R-b
+    /// flat). Calls `pangolin_funder_client::initiate_top_up` and
+    /// records the attempt id + funder response.
+    TopUp(TopUpArgs),
+}
+
+/// `sync` subcommand — wraps the four sync-orchestrator verbs.
+#[derive(Debug, Args)]
+pub struct SyncArgs {
+    #[command(subcommand)]
+    pub command: SyncCommand,
+}
+
+/// The `sync` sub-subcommands.
+#[derive(Debug, Subcommand)]
+pub enum SyncCommand {
+    /// Drain the publish queue once (force-flush bypasses the 30 s
+    /// window gate). Pre-lock drain on graceful exit per R-h.
+    Flush(SyncFlushArgs),
+
+    /// Snapshot the publish queue state: dirty count, byte size,
+    /// window-started-at, blocked-on-balance hint.
+    QueueStatus(SyncQueueStatusArgs),
+
+    /// Show the unix-ms instant of the most recent successful pull
+    /// cycle plus the local checkpoint (read-only).
+    PullStatus(SyncPullStatusArgs),
+
+    /// Run the canonical host scheduler loop (5.4 / R-c). Two
+    /// timers: pull interval + flush window. SIGINT triggers
+    /// `lock_with_drain` per R-h.
+    Loop(SyncLoopArgs),
+}
+
+/// `sync flush` — drain the publish queue once. Pre-lock drain on
+/// graceful exit per R-h.
+#[derive(Debug, Args)]
+pub struct SyncFlushArgs {
+    /// Path to the `.pvf` vault file.
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Vault password (echoes in `ps`; CI use only). If omitted,
+    /// prompted at the terminal without echo.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+
+    /// Foundry keystore name (mirrors `publish`).
+    #[arg(long, conflicts_with = "keystore_path")]
+    pub account: Option<String>,
+
+    /// Override the keystore directory.
+    #[arg(long)]
+    pub keystore_dir: Option<PathBuf>,
+
+    /// Direct path to a Foundry keystore file.
+    #[arg(long, conflicts_with = "account")]
+    pub keystore_path: Option<PathBuf>,
+
+    /// Keystore password (echoes in `ps`; CI use only). If
+    /// omitted, prompted at the terminal without echo.
+    #[arg(long)]
+    pub keystore_password: Option<String>,
+}
+
+/// `sync queue-status` — read-only snapshot of the publish queue.
+#[derive(Debug, Args)]
+pub struct SyncQueueStatusArgs {
+    /// Path to the `.pvf` vault file.
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Vault password — only required if `--unlocked` is set.
+    /// Without it, the metadata-only counters that survive a Locked
+    /// vault are reported.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+}
+
+/// `sync pull-status` — read-only pull cycle timestamps.
+#[derive(Debug, Args)]
+pub struct SyncPullStatusArgs {
+    /// Path to the `.pvf` vault file.
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Vault password. Required to read the in-session
+    /// `last_pull_at_unix_ms` field; without it only the on-disk
+    /// checkpoint is reported.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+}
+
+/// `sync loop` — long-running canonical host scheduler.
+#[derive(Debug, Args)]
+pub struct SyncLoopArgs {
+    /// Path to the `.pvf` vault file.
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Vault password. If omitted, prompted at the terminal
+    /// without echo.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+
+    /// Foundry keystore name (mirrors `publish`).
+    #[arg(long, conflicts_with = "keystore_path")]
+    pub account: Option<String>,
+
+    /// Override the keystore directory.
+    #[arg(long)]
+    pub keystore_dir: Option<PathBuf>,
+
+    /// Direct path to a Foundry keystore file.
+    #[arg(long, conflicts_with = "account")]
+    pub keystore_path: Option<PathBuf>,
+
+    /// Keystore password.
+    #[arg(long)]
+    pub keystore_password: Option<String>,
+
+    /// Run a single iteration of the loop body and exit. Used by
+    /// hermetic tests + scripted single-shot runs.
+    #[arg(long)]
+    pub once: bool,
+
+    /// Override the pull interval in seconds (test-only; clamped
+    /// at the engine layer). Hidden flag — not for user-facing
+    /// docs.
+    #[arg(long, hide = true)]
+    pub pull_interval_secs: Option<u64>,
+
+    /// Override the flush window in seconds (test-only; clamped
+    /// at the engine layer). Hidden flag.
+    #[arg(long, hide = true)]
+    pub flush_window_secs: Option<u64>,
+}
+
+/// `sync-mode` subcommand — wraps the show + set verbs.
+#[derive(Debug, Args)]
+pub struct SyncModeArgs {
+    #[command(subcommand)]
+    pub command: SyncModeCommand,
+}
+
+/// The `sync-mode` sub-subcommands.
+#[derive(Debug, Subcommand)]
+pub enum SyncModeCommand {
+    /// Show the persisted sync-mode preference (ask / always-slow
+    /// / always-fast). Reads `Vault::sync_mode_preference`.
+    Show(SyncModeShowArgs),
+
+    /// Persist a sync-mode preference. Accepts `ask` (the default
+    /// — engine runs the first-sync heuristic), `always-slow`, or
+    /// `always-fast`.
+    Set(SyncModeSetArgs),
+}
+
+/// `sync-mode show` — read the preference.
+#[derive(Debug, Args)]
+pub struct SyncModeShowArgs {
+    /// Path to the `.pvf` vault file.
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Vault password. If omitted, prompted at the terminal
+    /// without echo.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+}
+
+/// `sync-mode set` — persist the preference.
+#[derive(Debug, Args)]
+pub struct SyncModeSetArgs {
+    /// Path to the `.pvf` vault file.
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Vault password. If omitted, prompted at the terminal
+    /// without echo.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+
+    /// The preference value: `ask` (engine runs the first-sync
+    /// heuristic), `always-slow`, or `always-fast`.
+    #[arg(value_parser = clap::value_parser!(SyncModePref))]
+    pub value: SyncModePref,
+}
+
+/// CLI-side preference enum mirroring `pangolin_store::SyncModePreference`.
+/// Three variants; clap value-parses kebab-case literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncModePref {
+    /// `ask` — engine runs the first-sync heuristic (default).
+    Ask,
+    /// `always-slow` — force in-process slow-mode every cycle.
+    AlwaysSlow,
+    /// `always-fast` — pre-elected fast-mode (host spawns the
+    /// indexer without prompting).
+    AlwaysFast,
+}
+
+impl core::str::FromStr for SyncModePref {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ask" => Ok(Self::Ask),
+            "always-slow" => Ok(Self::AlwaysSlow),
+            "always-fast" => Ok(Self::AlwaysFast),
+            other => Err(format!(
+                "expected one of `ask`, `always-slow`, `always-fast`; got `{other}`"
+            )),
+        }
+    }
+}
+
+/// `wallet` subcommand — wraps the show verb.
+#[derive(Debug, Args)]
+pub struct WalletArgs {
+    #[command(subcommand)]
+    pub command: WalletCommand,
+}
+
+/// The `wallet` sub-subcommands.
+#[derive(Debug, Subcommand)]
+pub enum WalletCommand {
+    /// Show the per-device EVM wallet address (read-only).
+    Show(WalletShowArgs),
+}
+
+/// `wallet show` — read the address.
+#[derive(Debug, Args)]
+pub struct WalletShowArgs {
+    /// Path to the `.pvf` vault file.
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Vault password (required to back-fill a legacy 1.5-era row
+    /// the first time; otherwise the on-disk column is read
+    /// directly). If omitted, prompted at the terminal without
+    /// echo.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+}
+
+/// `balance` subcommand — wraps the show verb.
+#[derive(Debug, Args)]
+pub struct BalanceArgs {
+    #[command(subcommand)]
+    pub command: BalanceCommand,
+}
+
+/// The `balance` sub-subcommands.
+#[derive(Debug, Subcommand)]
+pub enum BalanceCommand {
+    /// Show the cached entitlement balance state.
+    Show(BalanceShowArgs),
+}
+
+/// `balance show` — read the cached entitlement state.
+#[derive(Debug, Args)]
+pub struct BalanceShowArgs {
+    /// Path to the `.pvf` vault file.
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Vault password. If omitted, prompted at the terminal
+    /// without echo.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+}
+
+/// `top-up` subcommand args.
+///
+/// Calls `pangolin_funder_client::initiate_top_up`. The Credit
+/// attestation is read from a JSON file path because the user
+/// obtains it from the off-chain billing service before invoking
+/// this verb.
+#[derive(Debug, Args)]
+pub struct TopUpArgs {
+    /// Path to the `.pvf` vault file.
+    #[arg(long)]
+    pub vault_path: PathBuf,
+
+    /// Vault password. If omitted, prompted at the terminal
+    /// without echo.
+    #[arg(long)]
+    pub vault_password: Option<String>,
+
+    /// Funder service URL (e.g., `https://funder.example/`).
+    #[arg(long)]
+    pub funder_url: String,
+
+    /// Path to the Credit attestation JSON file (the
+    /// off-chain-billing-service payload).
+    #[arg(long, value_name = "FILE")]
+    pub credit_file: PathBuf,
+
+    /// Skip the interactive confirmation prompt. Required for
+    /// scripted / CI use. Without this flag, the user must type
+    /// the literal lowercase string `"yes"` at the prompt.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 /// `authority` subcommand — wraps the per-verb sub-subcommands. MVP-1
@@ -762,15 +1088,23 @@ pub struct ResolveArgs {
     pub vault_password: Option<String>,
 
     /// 32-byte account identifier as 64-char lowercase hex.
-    #[arg(long, value_parser = clap::value_parser!(HexAccountId))]
-    pub account_id: HexAccountId,
+    ///
+    /// **CLI-V1 (R-d).** Optional in interactive TTY mode: when
+    /// stdin is a TTY and `--account-id` is omitted, the CLI
+    /// prompts the user to pick from `Vault::list_conflicts`. In
+    /// non-TTY contexts (CI / pipes) the flag is required.
+    #[arg(long, value_parser = clap::value_parser!(HexAccountId), requires = "keep")]
+    pub account_id: Option<HexAccountId>,
 
     /// 32-byte revision identifier as 64-char lowercase hex. The user
     /// is committing to this revision as the new canonical head; the
     /// merge revision the resolve flow publishes will have this
     /// `revision_id` as its `parent_revision`.
-    #[arg(long, value_parser = clap::value_parser!(HexRevisionId))]
-    pub keep: HexRevisionId,
+    ///
+    /// **CLI-V1 (R-d).** Optional in interactive TTY mode (paired
+    /// with `--account-id`). Required in non-TTY contexts.
+    #[arg(long, value_parser = clap::value_parser!(HexRevisionId), requires = "account_id")]
+    pub keep: Option<HexRevisionId>,
 
     /// Foundry keystore name (same resolution as `publish` —
     /// `$FOUNDRY_DIR/keystores/<name>`). Mutually exclusive with
@@ -1009,8 +1343,8 @@ mod tests {
         .expect("resolve with minimum args parses");
         match cli.command {
             Command::Resolve(args) => {
-                assert_eq!(args.account_id.0, [0xAB; 32]);
-                assert_eq!(args.keep.0, [0xAB; 32]);
+                assert_eq!(args.account_id.expect("account_id").0, [0xAB; 32]);
+                assert_eq!(args.keep.expect("keep").0, [0xAB; 32]);
                 assert!(!args.yes);
                 assert!(!args.dry_run);
             }
@@ -1018,9 +1352,12 @@ mod tests {
         }
     }
 
-    /// **P9-3.** `--account-id` is required.
+    /// **P9-3 / CLI-V1 R-d.** `--account-id` requires `--keep` (and
+    /// vice versa). With CLI-V1 R-d, both are individually optional
+    /// (interactive TTY mode populates them at prompt time), but
+    /// supplying one without the other surfaces a clap conflict.
     #[test]
-    fn resolve_requires_account_id() {
+    fn resolve_account_id_requires_keep() {
         let hex = "00".repeat(32);
         let err = Cli::try_parse_from([
             "pangolin-cli",
@@ -1032,15 +1369,18 @@ mod tests {
         ])
         .unwrap_err();
         let msg = err.to_string();
+        // clap surfaces the `requires` violation as MissingRequiredArgument
+        // pointing at the missing dependency.
         assert!(
             msg.contains("--account-id"),
-            "expected missing --account-id, got: {msg}"
+            "expected --account-id dependency error, got: {msg}"
         );
     }
 
-    /// **P9-3.** `--keep` is required.
+    /// **CLI-V1 R-d.** `--account-id` alone (without `--keep`) is
+    /// rejected — the two flags are paired.
     #[test]
-    fn resolve_requires_keep() {
+    fn resolve_keep_required_with_account_id() {
         let hex = "00".repeat(32);
         let err = Cli::try_parse_from([
             "pangolin-cli",
@@ -1054,7 +1394,7 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains("--keep"),
-            "expected missing --keep, got: {msg}"
+            "expected --keep dependency error, got: {msg}"
         );
     }
 
@@ -1143,6 +1483,7 @@ mod tests {
         match cli.command {
             Command::Resolve(args) => {
                 assert!(args.dry_run);
+                assert!(args.account_id.is_some());
             }
             _ => panic!("expected Resolve"),
         }

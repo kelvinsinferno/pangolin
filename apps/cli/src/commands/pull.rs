@@ -45,6 +45,22 @@ pub async fn run(global: &GlobalArgs, args: PullArgs) -> Result<()> {
         .await
         .context("pull_all failed")?;
 
+    // **CLI-V1 R-h.** Chain-touching command: graceful exit via
+    // `Vault::lock_with_drain`. `pull` doesn't publish, but the
+    // user may have queued markers from a concurrent CLI session;
+    // the drain is best-effort and the lock transitions
+    // regardless. We need an ephemeral DeviceKey for the
+    // lock_with_drain signature; the same signing posture as
+    // `publish_all` (PoC two-key model). Drop the wallet view we
+    // had via `adapter` (read-only) — `lock_with_drain` reads the
+    // adapter via `flush_publish_queue`; an adapter without a
+    // signer + an empty publish queue is fine (no publishes
+    // attempted).
+    let device = pangolin_crypto::keys::DeviceKey::generate();
+    if let Err(e) = vault.lock_with_drain(&adapter, &device).await {
+        eprintln!("shutdown drain error (dirty markers persist): {e}");
+    }
+
     if cfg.json {
         let summary = serde_json::json!({
             "applied": report.applied,

@@ -53,6 +53,9 @@ pangolin-totp   = { path = "../../crates/pangolin-totp" }
 # and this CLI (per docs/issue-plans/1.9.md L2). Never reaches
 # `pangolin-store` / `pangolin-core` / `pangolin-crypto`'s trees.
 pangolin-kdbx   = { path = "../../crates/pangolin-kdbx" }
+# CLI-V1: `pangolin top-up` invokes `pangolin_funder_client::initiate_top_up`.
+# Leaf crate (only depends on alloy + reqwest + serde + thiserror + uuid).
+pangolin-funder-client = { path = "../../crates/pangolin-funder-client" }
 
 # alloy is needed for the deployment-file loader Path resolution + the
 # Foundry-keystore loader. Same workspace pin chaincli uses; the audit

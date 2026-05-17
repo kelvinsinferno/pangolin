@@ -3093,6 +3093,7 @@ dependencies = [
  "pangolin-chain",
  "pangolin-core",
  "pangolin-crypto",
+ "pangolin-funder-client",
  "pangolin-kdbx",
  "pangolin-store",
  "pangolin-totp",

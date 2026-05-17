@@ -67,6 +67,29 @@ fn main() -> Result<()> {
             cli::Command::Vault(sub) => commands::vault::run(&args.global, sub).await,
             cli::Command::Import(sub) => commands::import::run(&args.global, sub).await,
             cli::Command::Authority(sub) => commands::authority::run(&args.global, sub).await,
+            cli::Command::Sync(sub) => match sub.command {
+                cli::SyncCommand::Flush(a) => commands::flush::run(&args.global, a).await,
+                cli::SyncCommand::QueueStatus(a) => {
+                    commands::queue_status::run(&args.global, a).await
+                }
+                cli::SyncCommand::PullStatus(a) => {
+                    commands::pull_status::run(&args.global, a).await
+                }
+                cli::SyncCommand::Loop(a) => commands::sync_loop::run(&args.global, a).await,
+            },
+            cli::Command::SyncMode(sub) => match sub.command {
+                cli::SyncModeCommand::Show(a) => {
+                    commands::sync_mode::run_show(&args.global, a).await
+                }
+                cli::SyncModeCommand::Set(a) => commands::sync_mode::run_set(&args.global, a).await,
+            },
+            cli::Command::Wallet(sub) => match sub.command {
+                cli::WalletCommand::Show(a) => commands::wallet::run_show(&args.global, a).await,
+            },
+            cli::Command::Balance(sub) => match sub.command {
+                cli::BalanceCommand::Show(a) => commands::balance::run_show(&args.global, a).await,
+            },
+            cli::Command::TopUp(sub) => commands::top_up::run(&args.global, sub).await,
         }
     })
 }
