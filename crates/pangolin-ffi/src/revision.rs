@@ -227,6 +227,120 @@ pub fn account_status(handle: Arc<VaultHandle>, id: AccountId) -> Result<Account
     })
 }
 
+// ---------------------------------------------------------------------
+// MVP-2 issue 5.3 (R-e) — vault_list_conflicts FFI binding.
+//
+// The host's conflict-resolution screen calls `vault_list_conflicts`
+// once on unlock and after every pull tick that surfaced a
+// `newly_frozen` / `newly_forked` account via `PullReport`. Per L2
+// the call does NOT decrypt, does NOT call `get_account`, does NOT
+// touch the freeze-read-guard — it is metadata-only by construction
+// (mirrors the `pangolin-store::Vault::list_conflicts` posture).
+// ---------------------------------------------------------------------
+
+/// **MVP-2 issue 5.3 (R-d).** Per-branch metadata for one leaf of a
+/// conflicted account's revision graph.
+///
+/// UniFFI-flattened mirror of
+/// [`pangolin_store::ConflictBranchSummary`] — 32-byte `RevisionId`
+/// blobs flattened to `Vec<u8>` per existing FFI convention.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiConflictBranchSummary {
+    /// Schema-version slot (matches the `ACCOUNT_IDENTITY_SCHEMA_VERSION`
+    /// + the `RevisionId.schema_version` ambient).
+    pub schema_version: u16,
+    /// 32-byte leaf revision id.
+    pub revision_id: Vec<u8>,
+    /// 32-byte parent revision id; `None` if this leaf is itself the
+    /// genesis revision (parent == all-zeros sentinel).
+    pub parent: Option<Vec<u8>>,
+    /// 32-byte authoring device id.
+    pub device_id: Vec<u8>,
+    /// Block height at which the chain-sync ingest first observed
+    /// this revision (chain-sync rows only). `None` for purely-local
+    /// rows that haven't been published yet.
+    pub observed_at_block: Option<u64>,
+    /// AEAD payload schema version on this leaf row.
+    pub schema_version_payload: u32,
+    /// `true` iff the leaf is a tombstone (deletion sentinel).
+    pub is_tombstone: bool,
+    /// `true` iff this leaf is on the canonical chain (= equals the
+    /// canonical head OR is an ancestor of it) per the 1.6 R-c
+    /// byte-lexicographic-largest-`revision_id` rule.
+    pub on_canonical_chain: bool,
+}
+
+/// **MVP-2 issue 5.3 (R-d).** Per-account conflict report —
+/// UniFFI-flattened mirror of [`pangolin_store::ConflictReport`].
+///
+/// One record per account that is forked OR frozen (or both). The
+/// `branches` vector carries one [`FfiConflictBranchSummary`] per
+/// current head; iteration order is `revision_id` byte-order ASC.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiConflictReport {
+    /// Schema-version slot.
+    pub schema_version: u16,
+    /// 32-byte affected account id.
+    pub account_id: Vec<u8>,
+    /// One entry per current head of `account_id`'s revision graph.
+    /// `len == 1 && frozen == true` is the fresh-foreign-account
+    /// case; `len > 1` is forked (with or without `frozen`).
+    pub branches: Vec<FfiConflictBranchSummary>,
+    /// `true` iff `account_identities.frozen_pending_resolve = 1`.
+    pub frozen: bool,
+}
+
+/// **MVP-2 issue 5.3 (R-e).** Enumerate every account currently in
+/// the conflict-needing-resolution surface (forked OR frozen) with
+/// per-branch metadata pre-joined.
+///
+/// Read-only by construction. Per L2 the call:
+///
+/// - does NOT decrypt any payload bytes,
+/// - does NOT call `Vault::get_account` / `reveal_password`,
+/// - does NOT touch the `refuse_if_frozen` guard (which is on the
+///   write paths only; this is a pure read accessor).
+///
+/// The host calls this on unlock and after every `pull_once` cycle
+/// that surfaced a `newly_frozen` / `newly_forked` account on
+/// [`pangolin_store::PullReport`] to refresh its conflict-resolution
+/// screen in a single round-trip.
+///
+/// # Errors
+///
+/// `FfiError::Session` if the handle has no vault; `FfiError::Store`
+/// on a storage failure.
+#[allow(clippy::significant_drop_tightening)]
+#[uniffi::export]
+pub fn vault_list_conflicts(handle: Arc<VaultHandle>) -> Result<Vec<FfiConflictReport>, FfiError> {
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    let reports = vault.list_conflicts().map_err(store_into_ffi)?;
+    let out = reports
+        .into_iter()
+        .map(|r| FfiConflictReport {
+            schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
+            account_id: r.account_id.as_bytes().to_vec(),
+            branches: r
+                .branches
+                .into_iter()
+                .map(|b| FfiConflictBranchSummary {
+                    schema_version: pangolin_core::ACCOUNT_IDENTITY_SCHEMA_VERSION,
+                    revision_id: b.revision_id.as_bytes().to_vec(),
+                    parent: b.parent.map(|p| p.as_bytes().to_vec()),
+                    device_id: b.device_id,
+                    observed_at_block: b.observed_at_block,
+                    schema_version_payload: b.schema_version,
+                    is_tombstone: b.is_tombstone,
+                    on_canonical_chain: b.on_canonical_chain,
+                })
+                .collect(),
+            frozen: r.frozen,
+        })
+        .collect();
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{account_fork_branches, account_is_forked, account_resolve_fork, account_status};

@@ -107,7 +107,10 @@ pub use reveal::RevealedSecret;
 // MVP-1 issue 1.6: revision-lineage finalisation — enriched RevisionMeta
 // + the fork/resolve/status FFI shapes (additive 1.1-surface amendment;
 // see revision.rs / ffi-surface.md).
-pub use revision::{AccountStatus, ForkBranch, RevisionId, RevisionMeta};
+pub use revision::{
+    AccountStatus, FfiConflictBranchSummary, FfiConflictReport, ForkBranch, RevisionId,
+    RevisionMeta,
+};
 pub use session::{
     PasswordPolicy, PasswordStrength, PlaintextExportConfirmation, PresenceProof, SecretPassword,
     SessionInfo, UnixTimestamp, VaultHandle, PASSWORD_POLICY_SCHEMA_VERSION,
