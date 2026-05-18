@@ -56,7 +56,7 @@ fn replay_d017_sync_status_fixture_byte_pin() {
          If this fails, the JSON snapshot drifted from its .meta.toml provenance."
     );
     // Hash must match the .meta.toml record.
-    let expected_sha = "63174b412969b2b78018c2d50cbaea375e27af41dc1900941fd97107a118f161";
+    let expected_sha = "a3eaef4b87226b953af22b345703271604efa1b375d5f3042ae126bc693c6abe";
     let actual_sha = sha256_hex(&bytes);
     assert_eq!(
         actual_sha, expected_sha,

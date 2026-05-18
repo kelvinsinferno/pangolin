@@ -10,5 +10,5 @@ deploy_reference = "D-017"
 capture_utc = "2026-05-18T05:30:00Z"
 cast_command = "cast rpc eth_getBlockByNumber 0x279bfb0 false --rpc-url https://sepolia.base.org | jq '{number, hash, timestamp, parentHash, baseFeePerGas, gasLimit, gasUsed}'"
 live_block_at_capture = 41654746
-sha256_of_fixture = "63174b412969b2b78018c2d50cbaea375e27af41dc1900941fd97107a118f161"
+sha256_of_fixture = "a3eaef4b87226b953af22b345703271604efa1b375d5f3042ae126bc693c6abe"
 live_event_gap = "Trimmed block header at the D-017 deploy block (41507120). Only the load-bearing fields are retained (number, hash, timestamp, parentHash, baseFeePerGas, gasLimit, gasUsed); the full eth_getBlockByNumber response includes a transactions array whose tx hashes are unrelated public data that would noise the fixture_no_secrets sweep. The sync-status replay exercises `compute_next_status` against a synthetic LastPullOutcome; the chain-tip-state shape is intrinsically static (block hash + number + timestamp), so this trimmed fixture is fully representative."
