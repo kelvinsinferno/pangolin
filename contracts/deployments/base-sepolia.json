@@ -165,7 +165,7 @@
         "Pangolin-chain adapter integration (-v1 domain prefix bump in `crates/pangolin-chain/src/signing.rs` + new secp256k1_signing.rs module) is a separate MVP-2 issue (3.1)."
       ]
     },
-    "EntitlementRegistry": {
+    "EntitlementRegistry_D018_smoke_test_superseded": {
       "address": "0x08F8c394EB0c04ba0A4FBA1e64507b88F4b59D8d",
       "deployer": "0x89e720238A3913688CB0E025ef03a64539575c54",
       "deploy_tx": "0x914f5d97dc4b7c78e85ef3ab0d33d0e5c0fa741e3aaa407fc83461e028e94cd0",
@@ -175,6 +175,9 @@
       "gas_used": 593592,
       "gas_price_gwei": 0.006,
       "deploy_cost_eth": 0.000003561552,
+      "superseded_by": "EntitlementRegistry (D-019, split-key production-grade redeploy at 0xdDa04e427e95e50Cfd22703A76CAE2E1Da4F5fCD)",
+      "superseded_at": "2026-05-17",
+      "superseded_reason": "Smoke-test placeholder with collapsed authorities (PAYMENT == REDEMPTION == pangolin-dev). MVP-2 issue 3.4 R-d required split-key production-grade redeploy; D-019 is the canonical EntitlementRegistry going forward. D-018 remains on chain (immutable; no admin / pause / selfdestruct) but is no longer referenced by any pangolin-chain constants.",
       "compiler": {
         "name": "solc",
         "version": "0.8.24",
@@ -225,9 +228,89 @@
       },
       "notes": [
         "Recorded under D-018 in DECISIONS.md.",
+        "SUPERSEDED by D-019 on 2026-05-17 (split-key production-grade redeploy).",
         "Per-user paid-balance ledger contract — funder-push split-signer (payment + redemption authorities) with strict-equality nonce + per-credit expiresAt. Same chain as RevisionLogV1 per D-008.",
         "Constructor immutables locked at deploy: PAYMENT_AUTHORITY, REDEMPTION_AUTHORITY (both pangolin-dev on testnet per R-b), initial schemaVersion=1. No setSigner / setAuthority / rotateKeys — a compromised key would require a v2 redeploy per 2.2 R-d.",
-        "THIS IS THE SMOKE-TEST INSTANCE. Production deployment with real payment-processor + funder-service split keys ships with MVP-2 issue 3.4 at a fresh address; this testnet contract is NOT wired to production."
+        "THIS WAS THE SMOKE-TEST INSTANCE. Production deployment with real payment-processor + funder-service split keys shipped 2026-05-17 as D-019 at 0xdDa04e427e95e50Cfd22703A76CAE2E1Da4F5fCD; the canonical EntitlementRegistry entry in this file is now D-019."
+      ]
+    },
+    "EntitlementRegistry": {
+      "address": "0xdDa04e427e95e50Cfd22703A76CAE2E1Da4F5fCD",
+      "deployer": "0x89e720238A3913688CB0E025ef03a64539575c54",
+      "deploy_tx": "0x06ab93d4b121a80283b1b6b035c4cc004f5e9859126e3039d7984d03981ba4b1",
+      "deploy_block": 41645807,
+      "deploy_timestamp_unix": 1779061949,
+      "deploy_timestamp_iso": "2026-05-17T23:52:29Z",
+      "gas_used": 593592,
+      "gas_price_gwei": 0.006,
+      "deploy_cost_eth": 0.000003561552,
+      "compiler": {
+        "name": "solc",
+        "version": "0.8.24",
+        "evm_version": "shanghai",
+        "optimizer": true,
+        "optimizer_runs": 200,
+        "bytecode_hash": "none"
+      },
+      "bytecode": {
+        "runtime_size_bytes": 2464,
+        "deployed_runtime_keccak256": "0xca252c6eaa70553a3fb040b9493c2b9db2a34fb7abc782a3ddeb74b1b35dd1f7",
+        "matches_audited_artifact": true,
+        "audited_at": "2.2 SIGNOFF (commit 26b7af1; identical bytecode to D-018 since contract source is unchanged)",
+        "comment": "Same bytecode as D-018 (identical EntitlementRegistry.sol source; the deploy difference is purely constructor args). Keccak hash is Ethereum Keccak-256 verified via `cast keccak $(cast code 0xdDa04e427e95e50Cfd22703A76CAE2E1Da4F5fCD --rpc-url https://sepolia.base.org)`."
+      },
+      "constructor_args": {
+        "payment_authority": "0x89e720238A3913688CB0E025ef03a64539575c54",
+        "redemption_authority": "0xaeE7E9bf859d938CB087D1e567221cffba9455AC",
+        "initial_schema_version": 1,
+        "abi_encoded": "00000000000000000000000089e720238a3913688cb0e025ef03a64539575c54000000000000000000000000aee7e9bf859d938cb087d1e567221cffba9455ac0000000000000000000000000000000000000000000000000000000000000001",
+        "comment": "D-019 split-key production-grade redeploy. PAYMENT_AUTHORITY = pangolin-dev (issues Credit purchase attestations; same wallet that signed D-018 + D-017). REDEMPTION_AUTHORITY = pangolin-funder-dev (NEW keystore created 2026-05-17 for the funder service's signing key; signs redemption authorizations dispensed alongside ETH top-ups per 3.4 funder lifecycle). Production-grade key separation per 2.2 R-a + 3.4 R-d; closes the D-018 collapsed-authority smoke-test posture."
+      },
+      "abi": "../abi/EntitlementRegistry.json",
+      "source": "../src/EntitlementRegistry.sol",
+      "domain_separator": {
+        "value": "0xb33d25188e5fc32cf5021ce63f28ee4ffb13d1d9a4ca720c46272f4c87c42fd0",
+        "captured_via": "cast call 0xdDa04e427e95e50Cfd22703A76CAE2E1Da4F5fCD \"DOMAIN_SEPARATOR()(bytes32)\" --rpc-url https://sepolia.base.org",
+        "captured_at": "2026-05-17T23:55Z",
+        "comment": "Pinned at source in crates/pangolin-chain/src/secp256k1_signing.rs as ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1. The redemption_domain_separator_matches_pinned_constant test catches drift at CI time."
+      },
+      "verified_on_explorer": false,
+      "verification": {
+        "status": "deferred",
+        "method": "Basescan Standard-JSON-Input upload via web UI (operational follow-up; same workaround D-017 + D-018 used)",
+        "manual_command": "forge verify-contract --chain-id 84532 --etherscan-api-key $BASESCAN_API_KEY 0xdDa04e427e95e50Cfd22703A76CAE2E1Da4F5fCD src/EntitlementRegistry.sol:EntitlementRegistry --constructor-args 0x00000000000000000000000089e720238a3913688cb0e025ef03a64539575c54000000000000000000000000aee7e9bf859d938cb087d1e567221cffba9455ac0000000000000000000000000000000000000000000000000000000000000001",
+        "comment": "Auto-verify failed in the wrapper (BASESCAN_API_KEY env var was not set at deploy time). Get a free Basescan API key at https://basescan.org/myapikey then run the manual command above OR upload via Basescan's web UI. Verification is cosmetic; the deployed contract works regardless."
+      },
+      "smoke_tests": {
+        "test_1_payment_authority": {
+          "command": "cast call 0xdDa04e427e95e50Cfd22703A76CAE2E1Da4F5fCD \"PAYMENT_AUTHORITY()(address)\" --rpc-url https://sepolia.base.org",
+          "expected": "0x89e720238A3913688CB0E025ef03a64539575c54",
+          "passed": true,
+          "passed_at": "2026-05-17T23:55Z"
+        },
+        "test_2_redemption_authority": {
+          "command": "cast call 0xdDa04e427e95e50Cfd22703A76CAE2E1Da4F5fCD \"REDEMPTION_AUTHORITY()(address)\" --rpc-url https://sepolia.base.org",
+          "expected": "0xaeE7E9bf859d938CB087D1e567221cffba9455AC",
+          "passed": true,
+          "passed_at": "2026-05-17T23:55Z"
+        },
+        "test_3_domain_separator": {
+          "command": "cast call 0xdDa04e427e95e50Cfd22703A76CAE2E1Da4F5fCD \"DOMAIN_SEPARATOR()(bytes32)\" --rpc-url https://sepolia.base.org",
+          "expected": "0xb33d25188e5fc32cf5021ce63f28ee4ffb13d1d9a4ca720c46272f4c87c42fd0",
+          "passed": true,
+          "passed_at": "2026-05-17T23:55Z"
+        }
+      },
+      "explorer_links": {
+        "contract": "https://sepolia.basescan.org/address/0xdDa04e427e95e50Cfd22703A76CAE2E1Da4F5fCD",
+        "deploy_tx": "https://sepolia.basescan.org/tx/0x06ab93d4b121a80283b1b6b035c4cc004f5e9859126e3039d7984d03981ba4b1"
+      },
+      "notes": [
+        "Recorded under D-019 in DECISIONS.md.",
+        "D-019 split-key production-grade redeploy (2026-05-17) — SUPERSEDES D-018 (the smoke-test instance with collapsed authorities).",
+        "Constructor immutables locked at deploy: PAYMENT_AUTHORITY = pangolin-dev (0x89e7...5c54), REDEMPTION_AUTHORITY = pangolin-funder-dev (0xaeE7...55AC, NEW keystore created 2026-05-17 funded with 0.03 ETH from pangolin-dev via tx 0xe8ec3b5632...). initial schemaVersion = 1. No setSigner / setAuthority / rotateKeys — a compromised key would require a v2 redeploy per 2.2 R-d.",
+        "Per-user paid-balance ledger contract — funder-push split-signer (payment + redemption authorities) with strict-equality nonce + per-credit expiresAt. Same chain as RevisionLogV1 per D-008.",
+        "Production-grade split-key separation closes the D-018 smoke-test posture per 3.4 R-d; pangolin-chain constants (EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA + ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1) updated in the same commit that records this entry."
       ]
     }
   }

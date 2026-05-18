@@ -1038,27 +1038,32 @@ pub const REDEMPTION_TYPEHASH_V1: [u8; 32] =
 /// (R-d), the new D-019 contract will have a DIFFERENT
 /// `verifyingContract` field (the new contract address) and therefore
 /// a DIFFERENT `DOMAIN_SEPARATOR`. The pinned constant here is for
-/// D-018 (the smoke-test instance currently at
-/// `0x08F8c394EB0c04ba0A4FBA1e64507b88F4b59D8d`). The follow-up
-/// operational commit that updates `contracts/deployments/base-sepolia.json`
-/// to point at D-019 MUST also update this constant + the
-/// `EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA` constant
-/// below to match the new deployment's `DOMAIN_SEPARATOR()` view
-/// fn output. The `domain_separator_matches_pinned_constant` test
-/// catches drift at CI time.
+/// D-019 (the split-key production-grade redeploy currently at
+/// `0xdDa04e427e95e50Cfd22703A76CAE2E1Da4F5fCD`). Captured 2026-05-17
+/// via `cast call <D-019> "DOMAIN_SEPARATOR()(bytes32)"` post-deploy.
+/// Supersedes D-018's collapsed-authority smoke-test instance per
+/// 3.4 R-d production-grade key separation. The
+/// `redemption_domain_separator_matches_pinned_constant` test catches
+/// drift at CI time; any future redeploy MUST update this constant +
+/// the `EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA` constant
+/// below to match the new deployment's `DOMAIN_SEPARATOR()` view fn
+/// output.
 pub const ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1: [u8; 32] =
-    hex!("3c8b930fcd97a1d2fc760f841fa1cee652130f42af7eaedd143e37aba3e552b3");
+    hex!("b33d25188e5fc32cf5021ce63f28ee4ffb13d1d9a4ca720c46272f4c87c42fd0");
 
 /// Pinned-at-source expected deployment address for the
 /// `EntitlementRegistry` on Base Sepolia (mirror of
 /// [`EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA`] for `RevisionLogV1`).
 ///
-/// Today this is D-018 (`0x08F8...8d`); after the D-019 operational
-/// redeploy this constant updates to the new address. The
-/// [`build_signed_redemption_v1`] entry point cross-checks the
+/// D-019 split-key production-grade redeploy (2026-05-17):
+/// `PAYMENT_AUTHORITY` = pangolin-dev (`0x89e7...5c54`),
+/// `REDEMPTION_AUTHORITY` = pangolin-funder-dev (`0xaeE7...55AC`).
+/// Supersedes D-018's collapsed-authority smoke-test instance
+/// (`0x08F8...8d`) per 3.4 R-d production-grade key separation.
+/// The [`build_signed_redemption_v1`] entry point cross-checks the
 /// deployment-file address against this constant before signing.
 pub const EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA: Address =
-    address!("0x08F8c394EB0c04ba0A4FBA1e64507b88F4b59D8d");
+    address!("0xdDa04e427e95e50Cfd22703A76CAE2E1Da4F5fCD");
 
 /// EIP-712 domain string for the `EntitlementRegistry` `name` field.
 /// Taken VERBATIM from `EntitlementRegistry.sol:240` — a future
