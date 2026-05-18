@@ -2,7 +2,7 @@
 
 > **One-line scope:** inventory every `#[ignore]`-gated test that depends on Base Sepolia (D-017 RevisionLogV1 + D-019 EntitlementRegistry); categorize each as (A) keep-`#[ignore]`-but-document-and-update-pinned-state, (B) hermeticize with a captured-from-live-chain fixture, or (C) move to a one-shot pre-release runner; capture the small set of real-chain fixtures needed for (B); update every pinned chain-state constant that has rotted relative to D-017/D-019 current state; ship one operator-facing runner that exercises the residue.
 >
-> **Status:** Plan-gate DRAFT 2026-05-18 awaiting Kelvin sign-off on Q-a..Q-f.
+> **Status:** Plan-gate LOCKED 2026-05-18. Kelvin chose most-secure on every Q (= plan-gate recommendations across the board). Builder dispatch GO.
 >
 > **Security-critical: MEDIUM.** Does NOT close a known cryptographic gap. DOES alter the trust-edge between hermetic mocks and live verification — the discipline this cycle locks down is what catches the next env-quirk-#14-class bug (4.3 audit: calldata-vs-contract semantics mismatch invisible to hermetic tests, fatal on first live publish). One sub-decision (Q-d below) is AUDIT-CLASS severity because it surfaces a real rotted constant already in `main`.
 >
@@ -17,16 +17,16 @@
 > - Anvil-fork CI job (Q-a Option B — possible future cycle).
 > - Migrating fixtures to a dedicated `pangolin-test-fixtures` crate (Q-b Option γ — refactor when duplication justifies).
 
-## Resolved decisions (Kelvin sign-off PENDING)
+## Resolved decisions (LOCKED 2026-05-18)
 
-| Decision | Resolution | Notes |
+| Decision | Resolution | Rationale |
 |---|---|---|
-| **R-a Gating model** | TBD | Plan-gate recommends Option D (hybrid: hermetic-with-fixture for parsing surface; live `#[ignore]` residue for contract-execution surface). |
-| **R-b Fixture storage** | TBD | Plan-gate recommends Option α (per-crate `tests/fixtures/`) + raw bytes. |
-| **R-c Recapture cadence** | TBD | Plan-gate recommends Option ζ (recapture per-deploy). |
-| **R-d Rotted deploy-block** | TBD | Plan-gate recommends Option III (re-query live chain to pin authoritative value; expects Option I outcome — JSON is right, Rust `23_640_113` is wrong). **AUDIT-CLASS severity.** |
-| **R-e CI coverage** | TBD | Plan-gate recommends Option K (hermetic replay tests run on every PR) + Option M (no live-secrets CI job). |
-| **R-f Runner shape** | TBD | Plan-gate recommends Option P (`scripts/run-live-tests.sh` + `.ps1`). |
+| **R-a Gating model** | **Option D — Hybrid** | Hermetic-with-fixture for the bytes-parsing surface (decode-side of tests #1, #5, #6, #7, #8); live `#[ignore]` residue for the contract-execution surface (#4 publish, #5/#6/#7 contract-state assertions, #9 mock conflict, balance query). Most-secure tradeoff: every PR exercises the parser; contract-semantics drift caught by pre-release runner. |
+| **R-b Fixture storage** | **Option α — Per-crate `tests/fixtures/` + raw bytes** | Locality; cross-crate refactor stays backward-compatible. Raw bytes (exact JSON-RPC response / log hex) replays through same parsers production uses — that's the env-quirk-#14 surface. |
+| **R-c Recapture cadence** | **Option ζ — Recapture per-deploy** | Every new D-XXX triggers fixture-recapture in the deploy cycle's PR. `.meta.toml` diff is the audit signal. Captures the moment chain state changed without noise-every-release of Option η. |
+| **R-d Rotted deploy-block** | **Option III — Re-query live chain via `cast`** | Expects Option I outcome (JSON value `41_639_216` is right; Rust `23_640_113` is rot). Builder MUST run `cast` against the live D-017 to confirm authoritative value before updating constants. Audit-class severity: same constant-rot class on mainnet would mean missed events on fresh-vault first-sync. |
+| **R-e CI coverage** | **Option K + Option M** | Hermetic replay tests drop `#[ignore]` and run on every PR (K — that IS the env-quirk-#14 defense). NO separate live-chain-smoke CI job (M — keep CI secrets-free; pre-release runner covers residue). |
+| **R-f Runner shape** | **Option P — `scripts/run-live-tests.sh` + `.ps1`** | Two short shell scripts. No new crate, no new `xtask` infra. Refactor to `cargo xtask` if a second xtask-class chore appears later. |
 
 ---
 
