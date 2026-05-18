@@ -1,46 +1,43 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! 4.2 R-f `#[ignore]`'d live parity test.
+//! 4.2 R-f `#[ignore]`'d live parity test (Option D residue per issue #98).
 //!
 //! Verifies L4: the indexer's output against D-017 is byte-identical
-//! to slow-mode 4.1's output for the same chain state.
+//! to slow-mode 4.1's output for the same chain state, exercising
+//! contract-execution + checkpoint-state assertions that the hermetic
+//! sibling (`tests/replay_d017_fixture_parity.rs`) genuinely cannot
+//! cover.
 //!
-//! ## Why `#[ignore]`'d
+//! ## Why `#[ignore]`'d (operator-visible failure mode)
 //!
-//! Same posture 4.1 R-f took: the production verifier covers the
-//! symmetric byte-pinning end of env-quirk #14 via the hermetic
-//! suite, but the contract-semantic-drift end requires a captured
-//! `RevisionPublished` event payload from D-017's actual history.
-//! No such event exists yet (D-017 was deployed on 2026-05-14; no
-//! `publishRevision` smoke transaction has been recorded). The
-//! 4.1 builder also deferred this test pending fixture capture.
+//! This test sits on the contract-execution side of env-quirk #14:
+//! the hermetic replay (which DOES run on every PR) exercises the
+//! bytes-parsing surface using the captured D-014 V0 event fixture,
+//! but the live tip-of-chain query against D-017 must remain manual
+//! because (a) D-017 currently has zero `RevisionPublished` events
+//! emitted (no smoke publish has been recorded since deploy on
+//! 2026-05-14, see `chain_submit.rs::publish_v1_live_d017_smoke`),
+//! and (b) even when events exist, the rolling chain tip is not
+//! deterministic at PR time.
 //!
-//! ## How to run + capture a fixture
+//! **Operator-visible failure mode:** if this test fails when run via
+//! `scripts/run-live-tests.{sh,ps1}` it indicates either (i) the live
+//! D-017 RPC has drifted from `EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA`
+//! / `d017_deploy_block(BaseSepolia)`, or (ii) the indexer's
+//! StartIndex⇒Pull cycle returned a different event sequence than
+//! `Vault::sync_from_chain` for the same window. The hermetic replay
+//! (which DID pass at PR time) localizes the regression to live-only
+//! state — usually a contract redeploy at a new address without an
+//! accompanying constant bump.
+//!
+//! ## How to run
 //!
 //! ```text
-//! # 1. Capture any historical RevisionPublished event from D-017:
-//! cast logs --address 0x179362Ad7fb7dA664312aEFDdaa53431eb748E42 \
-//!     --from-block 23640113 \
-//!     --to-block latest \
-//!     --rpc-url $BASE_SEPOLIA_RPC_URL
-//!
-//! # 2. Pin the resulting (vault_id, block, tx_hash) tuple as a
-//! #    const at the top of this module.
-//!
-//! # 3. Run the test:
 //! BASE_SEPOLIA_RPC_URL=https://sepolia.base.org \
-//!     cargo test -p pangolin-indexer --test parity \
-//!     --features integration-tests -- --ignored
+//!     PANGOLIN_INDEXER_VAULT_ID=<64-char hex, no 0x prefix> \
+//!     cargo test -p pangolin-indexer --test parity -- --ignored
 //! ```
 //!
-//! ## Builder note (4.2)
-//!
-//! No D-017 event hex has been captured yet. The test below is
-//! shape-correct: it spawns an indexer against a configured
-//! `BASE_SEPOLIA_RPC_URL` and a configured `PANGOLIN_INDEXER_VAULT_ID`,
-//! then asserts the temp DB returns a non-zero event count for the
-//! configured block range. The byte-identical comparison versus
-//! slow-mode is deferred to the operational follow-up that captures
-//! the event fixture (same follow-up 4.1 left open).
+//! Or, easier: `bash scripts/run-live-tests.sh` (sources `.env.live`).
 
 #![forbid(unsafe_code)]
 
@@ -52,7 +49,9 @@ use pangolin_indexer::{
 };
 
 /// D-017's deploy block on Base Sepolia (per `pangolin_chain::d017_deploy_block`).
-const D017_DEPLOY_BLOCK: u64 = 23_640_113;
+/// Issue #98 (2026-05-18): re-pinned via cast verification — see
+/// `pangolin_chain::d017_deploy_block` docstring for the rot-fix history.
+const D017_DEPLOY_BLOCK: u64 = 41_507_120;
 
 /// Run the live parity test against D-017. Requires:
 ///

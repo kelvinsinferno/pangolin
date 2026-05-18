@@ -359,26 +359,46 @@ pub async fn fetch_and_verify_chunk(
 
 /// Resolve D-017's deploy block — the genesis cursor for first-time
 /// syncs. Currently hard-pinned to the live deploy block of D-017 on
-/// Base Sepolia (`23_640_113`); for `BaseMainnet` / `Dev` the helper
+/// Base Sepolia (`41_507_120`); for `BaseMainnet` / `Dev` the helper
 /// returns `0` so a fresh deployment's first sync replays from chain
 /// genesis (acceptable for those envs since Base Sepolia is the only
 /// pinned env in MVP-2).
 ///
 /// **Why a constant.** Reading `eth_getCode` history to find a contract's
 /// deploy block requires an archival RPC; pinning the value avoids the
-/// extra RPC + works against pruned RPCs. The constant is captured at
-/// 4.1 plan-gate time (2026-05-15) and verified via:
+/// extra RPC + works against pruned RPCs.
+///
+/// **Issue #98 (2026-05-18) — env-quirk #14 audit-class rot fix.**
+/// Two prior values were both wrong:
+///
+/// - `23_640_113` (Rust, originally captured at 4.1 plan-gate) predates
+///   Base Sepolia genesis by months and was an outright clerical error.
+/// - `41_639_216` (`contracts/deployments/base-sepolia.json`,
+///   `RevisionLogV1.deploy_block`) was the recorded deploy-pipeline
+///   value but ALSO did not match the live chain.
+///
+/// The authoritative value `41_507_120` was re-derived by binary-search
+/// over `cast code` against the live D-017 contract: at block
+/// `41_507_119` `eth_getCode` returns `0x` (no contract); at
+/// `41_507_120` it returns the deployed runtime bytecode. Confirmed via
+/// `cast tx 0x22e464123c7fc1c71a161350d521ed7946975b0a9a3b9fd232d8846327cacd19`
+/// which records `blockNumber = 41507120`. Same commit re-pinned the
+/// JSON record + added the [`deployment_json_pins_match_rust_constants`]
+/// CI test so the next rot fails at PR time, not in production.
+///
+/// Verification commands (run any time the constant is changed):
 ///
 /// ```text
-/// cast block-number --rpc-url $BASE_SEPOLIA_RPC_URL  # current tip
-/// cast logs --address 0x179362Ad7fb7dA664312aEFDdaa53431eb748E42 \
-///     --from-block 0 \
-///     --rpc-url $BASE_SEPOLIA_RPC_URL                 # first emit
+/// cast block-number --rpc-url $BASE_SEPOLIA_RPC_URL    # current tip
+/// cast code 0x179362Ad7fb7dA664312aEFDdaa53431eb748E42 \
+///     --block 41507120 --rpc-url $BASE_SEPOLIA_RPC_URL  # NON-empty
+/// cast code 0x179362Ad7fb7dA664312aEFDdaa53431eb748E42 \
+///     --block 41507119 --rpc-url $BASE_SEPOLIA_RPC_URL  # 0x (empty)
 /// ```
 #[must_use]
 pub const fn d017_deploy_block(env: ChainEnv) -> u64 {
     match env {
-        ChainEnv::BaseSepolia => 23_640_113,
+        ChainEnv::BaseSepolia => 41_507_120,
         _ => 0,
     }
 }

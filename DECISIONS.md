@@ -1349,3 +1349,63 @@ bumping the wire schema (the decoder rejects unknown keys via the
 strict canonical-shape check, but a coordinated additive field
 bump would relax the second-key check via the standard plan-gate
 cadence).
+
+## Issue 98-live-ignore-fixture-captures — hybrid hermetic+live discipline across §4.x / §5.x / CLI-V1 (resolved 2026-05-18)
+
+Closes the standing fixture-capture follow-up that 4.1 / 4.2 / 4.3
+/ 5.1 / 5.2 / 5.3 / 5.4 / CLI-V1 all referenced. Surfaces and
+closes an audit-class chain-state-pin rot finding (Q-d). Locked
+decisions:
+
+| Resolution | Decision |
+|---|---|
+| **R-a Gating model** | **Option D — Hybrid.** Hermetic-with-fixture for the bytes-parsing surface (decode-side of `parity`, `per_column_wrap`, `pull_live`, `sync_status_live`); live `#[ignore]` residue for the contract-execution surface (`publish_v1_live_d017_smoke`, `live_balance_query`, `live_two_device_*`, conflict, sync status, parity contract-state assertions). Most-secure tradeoff: every PR exercises the parser; contract-semantics drift caught by pre-release runner. |
+| **R-b Fixture storage** | **Option α — Per-crate `tests/fixtures/` + raw bytes.** Locality wins; cross-crate refactor stays backward-compatible. Raw bytes (exact JSON-RPC response / log hex / block header JSON) replays through the SAME parsers production uses — that's the env-quirk-#14 surface. |
+| **R-c Recapture cadence** | **Option ζ — Recapture per-deploy.** Every new D-XXX triggers fixture-recapture in the deploy cycle's PR. `.meta.toml` diff is the audit signal. Records `source_contract_address`, `deploy_reference`, `capture_utc`, `cast_command`, `live_block_at_capture`, `sha256_of_fixture` per fixture. |
+| **R-d Rotted deploy-block constant** | **Option III — Re-query live chain via `cast`.** Both the Rust constant `d017_deploy_block(BaseSepolia) = 23_640_113` AND the JSON `RevisionLogV1.deploy_block = 41_639_216` were rot. The authoritative value `41_507_120` was re-derived via `cast tx 0x22e464123c7fc1c71a161350d521ed7946975b0a9a3b9fd232d8846327cacd19` (records `blockNumber = 41507120`) + cast-code binary-search confirmation (block 41507119 returns 0x; block 41507120 returns runtime bytecode). Rust constant + JSON record + 6 downstream pins ALL updated in this commit. NEW hermetic CI test `deployment_json_pins_match_rust_constants` ensures future drift fails at PR time. |
+| **R-e CI coverage** | **Option K + Option M.** Hermetic replay tests drop `#[ignore]` and run on every PR (K — env-quirk-#14 bytes-parsing defense). NO separate live-chain-smoke CI job (M — keep CI secrets-free; pre-release runner covers residue). |
+| **R-f Runner shape** | **Option P — `scripts/run-live-tests.sh` + `scripts/run-live-tests.ps1`.** Two short shell scripts. No new crate, no new `xtask` infra. Sources gitignored `.env.live`. |
+
+**Closed audit-class finding (Q-d):**
+
+- **L-rotted-constant-class:** the rotted `d017_deploy_block(BaseSepolia)` constant (`23_640_113`) predated Base Sepolia genesis by months; the JSON record was also wrong (`41_639_216`). On Base Sepolia testnet the consequence was bounded — a fresh-vault first sync would scan from a non-existent block (or from an unindexed-by-RPC range) and either (a) error out with a chain-side rejection, or (b) silently skip a real-history window. **On mainnet** the same class of rot would mean missed events on fresh-vault first-sync, which IS a security regression class. The NEW hermetic test `deployment_json_pins_match_rust_constants` makes this regression-class impossible to ship past PR.
+
+**Closed L-empty-test-body class:**
+
+- `cross_check_against_live_d017` + `redemption_cross_check_against_live_d018` in `secp256k1_signing.rs` had empty `#[test]` bodies that "passed" doing nothing. Removed; intent migrated to `crates/pangolin-chain/RUNBOOK.md` §1 + §2. NEW hermetic sweep `no_empty_ignored_tests` walks every `.rs` file in the workspace + asserts no `#[test]` fn body is `{}` / comment-only (the one allowed exception, `initiate_top_up_live_d019_placeholder`, is named explicitly in the test's ALLOWED_EMPTY list).
+
+**Closed L-fixture-rot / L-fake-fixture / L-secrets-in-fixtures classes:**
+
+- NEW hermetic sweep `fixture_provenance`: walks every `.meta.toml` under `crates/*/tests/fixtures/**` + asserts `cast_command` starts with literal `cast ` (L-fake-fixture defense; rejects in-tree-adapter captures), `sha256_of_fixture` matches the sibling fixture file's actual SHA-256 (L-fixture-rot defense; rejects post-capture edits).
+- NEW hermetic sweep `fixture_no_secrets`: scans every fixture file for 64-char hex tokens; matches outside the known-public-address / known-public-hash allowlist fire the test (L-secrets-in-fixtures defense).
+
+**Shipped fixtures (4):**
+
+- `crates/pangolin-indexer/tests/fixtures/parity/d017_revisionpublished_batch.json` — captured `eth_getLogs` for D-014 V0 first event (block 41133109). D-017 has no events yet; `.meta.toml` `live_event_gap` field documents the stand-in.
+- `crates/pangolin-indexer/tests/fixtures/per_column_wrap/d017_real_revisionpublished_payload.json` — same D-014 V0 bytes, used by the disk-leak replay.
+- `crates/pangolin-store/tests/fixtures/pull/d017_pull_batch_logs.json` — same D-014 V0 bytes, used by the checkpoint-advance replay.
+- `crates/pangolin-store/tests/fixtures/sync_status/d017_sync_state_snapshot.json` — D-017 deploy-block header (block 41507120). Used by the sync-status state-machine replay.
+
+**Shipped hermetic replay tests (4):**
+
+- `replay_d017_fixture_parity` (pangolin-indexer) — alloy `RpcLog` round-trip + load-bearing field pinning.
+- `replay_d017_revision_no_plaintext_per_column` (pangolin-indexer) — fixture ⇒ `VerifiedRevisionEvent` ⇒ `test_inject_chunk` ⇒ raw-disk-no-plaintext scan.
+- `replay_d017_pull_batch_advances_checkpoint` (pangolin-store) — fixture ⇒ `update_last_synced_block_v1` ⇒ checkpoint monotonicity property.
+- `replay_d017_sync_status_transitions` (pangolin-store) — fixture byte-pin + `compute_next_status` state machine through Syncing ⇒ Synced ⇒ ConflictsPending ⇒ Synced.
+
+**Shipped hermetic invariant sweeps (4):**
+
+- `deployment_json_pins_match_rust_constants` (pangolin-chain) — L-rotted-constant-class.
+- `no_empty_ignored_tests` (pangolin-chain) — L-empty-test-body.
+- `fixture_provenance` (pangolin-chain) — L-fake-fixture-from-wrong-test-build + L-fixture-rot.
+- `fixture_no_secrets` (pangolin-chain) — L-secrets-in-fixtures.
+
+**Pre-release runner (R-f):**
+
+- `scripts/run-live-tests.sh` (Bash) + `scripts/run-live-tests.ps1` (PowerShell 7+).
+- Sources gitignored `.env.live` (template documented in the script header comment).
+- Runs `cargo test --workspace --all-targets -- --ignored --nocapture`.
+
+**Runbook addition:** NEW `crates/pangolin-chain/RUNBOOK.md` with operator-facing sections for the two removed empty-body tests + D-017 deploy-block cast cross-check + fixture-provenance audit shape.
+
+**Forward-compat note for MVP-3 + future deploys.** The R-c Option ζ "recapture per deploy" cadence means a future D-020 (or any future D-XXX) deploy cycle's PR MUST regenerate the four fixtures + update the four `.meta.toml` records; `fixture_provenance` enforces the freshness invariant at PR time. Once D-017 emits its first `RevisionPublished` event (via `publish_v1_live_d017_smoke` or a real first user publish), the parity / per_column / pull fixtures should be recaptured against D-017 V1 bytes to retire the `live_event_gap` notes — that work is mechanical and triggers automatically under R-c Option ζ.

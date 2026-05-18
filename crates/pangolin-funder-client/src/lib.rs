@@ -785,13 +785,43 @@ mod tests {
         }
     }
 
-    /// Live-funder placeholder: we can't really test against D-019
-    /// without a paid Credit attestation. Marker `#[ignore]` so the
-    /// slot exists in CI output but does not gate green.
+    /// Live-funder placeholder (`#[ignore]`'d, Option D residue per
+    /// issue #98): we can't really test against D-019 without a paid
+    /// Credit attestation.
+    ///
+    /// **What this test (eventually) covers.** A real end-to-end
+    /// initiate-top-up against the live funder service backed by
+    /// D-019 (the production-grade `EntitlementRegistry` at
+    /// `0xdDa04e427e95e50Cfd22703A76CAE2E1Da4F5fCD`, with
+    /// `REDEMPTION_AUTHORITY` = `0xaeE7E9bf859d938CB087D1e567221cffba9455AC`).
+    /// Until a paid Credit attestation exists for testing, the slot
+    /// stays empty so the contract is reserved in CI output. The
+    /// hermetic tests in this same module (mock funder via wiremock)
+    /// cover the protocol shape verbatim; this slot only fires once
+    /// a real Credit is available.
+    ///
+    /// **Operator-visible failure mode.** Not applicable — the body
+    /// is currently empty by design. Per L6, the empty body is
+    /// acceptable here ONLY because the test docstring is
+    /// load-bearing (anchoring the slot for the future real
+    /// exercise); a future PR that puts a real assertion in this
+    /// body will retire the L-empty-test-body exception for this
+    /// test.
+    ///
+    /// To run (when activated):
+    ///
+    /// ```text
+    /// bash scripts/run-live-tests.sh
+    /// # OR manually:
+    /// cargo test -p pangolin-funder-client \
+    ///     initiate_top_up_live_d019_placeholder -- --ignored
+    /// ```
     #[tokio::test]
     #[ignore = "live-funder test; requires real D-019 service + paid Credit"]
     async fn initiate_top_up_live_d019_placeholder() {
-        // Future: wire a real Credit + real funder URL. For now, the
+        // Future: wire a real Credit + real funder URL against the
+        // D-019 EntitlementRegistry redemption-authority
+        // 0xaeE7E9bf859d938CB087D1e567221cffba9455AC. For now, the
         // test is a stub so the slot is reserved.
     }
 

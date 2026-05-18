@@ -2388,13 +2388,37 @@ mod tests {
     // Network-gated live test (R-f Option B). #[ignore]'d.
     // -----------------------------------------------------------------
 
-    /// Live smoke test against D-017 (`#[ignore]`'d). To run:
+    /// Live smoke test against D-017 (`#[ignore]`'d, Option D
+    /// residue per issue #98).
+    ///
+    /// **What this test covers (live residue).** The full
+    /// publish-revision-v1 round trip: signed-revision construction
+    /// ⇒ EIP-1559 broadcast ⇒ receipt poll ⇒ `RevisionPublished`
+    /// event decode ⇒ `signer` recovery cross-check. This is the
+    /// fundamental env-quirk-#14-class test: hermetic mocks cover
+    /// calldata + signature + receipt parsing in isolation, but
+    /// only the live broadcast catches a contract-execution-side
+    /// mismatch (e.g., the 3.3 audit-HIGH preimage-vs-hash mismatch
+    /// that was invisible to hermetic tests).
+    ///
+    /// **Operator-visible failure mode.** If this test fails when
+    /// run via `scripts/run-live-tests.{sh,ps1}`, either (i) the
+    /// signed payload no longer matches what the contract verifies
+    /// (recovery: re-read 3.3 audit-HIGH preimage discipline), or
+    /// (ii) the fixed wallet ran out of gas (recovery: top up via
+    /// faucet), or (iii) D-017 was redeployed at a new address
+    /// (recovery: update `EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA`).
+    ///
+    /// To run:
     ///
     /// ```text
     /// BASE_SEPOLIA_RPC_URL=https://sepolia.base.org \
     ///   cargo test -p pangolin-chain --features integration-tests \
     ///   publish_v1_live_d017_smoke -- --ignored --nocapture
     /// ```
+    ///
+    /// Or, easier: `bash scripts/run-live-tests.sh` (sources
+    /// `.env.live`).
     ///
     /// Requires a funded device wallet OR a fresh `vault_id` (the
     /// self-bootstrap path of R-b lets the first publish for any

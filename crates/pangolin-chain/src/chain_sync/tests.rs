@@ -644,7 +644,12 @@ fn push_block_with_hash(asserter: &Asserter, block_number: u64, block_hash: B256
 
 #[test]
 fn d017_deploy_block_is_pinned_for_base_sepolia() {
-    assert_eq!(super::d017_deploy_block(ChainEnv::BaseSepolia), 23_640_113);
+    // Issue #98 (2026-05-18): chain-verified value. Both prior pins
+    // (`23_640_113` in Rust + `41_639_216` in JSON) were rot; the
+    // authoritative deploy block was re-derived via `cast code` binary
+    // search against the live D-017 contract — see
+    // [`super::d017_deploy_block`] docstring for verification commands.
+    assert_eq!(super::d017_deploy_block(ChainEnv::BaseSepolia), 41_507_120);
     // Non-pinned envs return 0 so a first sync replays from chain
     // genesis on a fresh deployment.
     assert_eq!(super::d017_deploy_block(ChainEnv::Dev), 0);

@@ -957,32 +957,15 @@ mod tests {
         assert!(!is_canonical_s(&just_over));
     }
 
-    /// R-e: network-cross-check against the live D-017 contract.
-    /// `#[ignore]`'d — does NOT run in default CI; documented in this
-    /// docstring so the builder can run it locally before merge.
-    ///
-    /// To run: `cargo test -p pangolin-chain
-    /// --features integration-tests cross_check_against_live_d017 --
-    /// --ignored`.
-    /// Requires `BASE_SEPOLIA_RPC_URL` env var (defaults to the
-    /// public endpoint).
-    #[test]
-    #[ignore = "live-RPC test; requires BASE_SEPOLIA_RPC_URL"]
-    #[cfg(feature = "integration-tests")]
-    fn cross_check_against_live_d017() {
-        // Live-RPC test left as a runbook entry rather than a full
-        // alloy provider implementation here — the equivalent
-        // pinned-constant test (`domain_separator_matches_pinned_constant`)
-        // is the hermetic cross-check the audit relies on. Builder
-        // should run:
-        //
-        //   cast call 0x179362Ad7fb7dA664312aEFDdaa53431eb748E42 \
-        //     "domainSeparator()(bytes32)" \
-        //     --rpc-url $BASE_SEPOLIA_RPC_URL
-        //
-        // and confirm output equals
-        // `DOMAIN_SEPARATOR_BASE_SEPOLIA_V1` (the hex! constant).
-    }
+    // Issue #98 (2026-05-18) — REMOVED: `cross_check_against_live_d017`
+    // was an empty `#[test]` body that "passed" doing nothing
+    // (L-empty-test-body class). Its runbook content migrated to
+    // `crates/pangolin-chain/RUNBOOK.md` § "RevisionLogV1 domain
+    // separator cross-check". The hermetic
+    // `domain_separator_matches_pinned_constant` test above remains
+    // the load-bearing CI-side check; the operator-facing live cast
+    // call lives in the runbook so operators see real guidance
+    // instead of a green tick on no work.
 }
 
 // =====================================================================
@@ -1424,27 +1407,15 @@ mod redemption_tests {
         assert_ne!(recovered, signer.address(), "expires_at tamper");
     }
 
-    /// env-quirk #14 live cross-check, `#[ignore]`'d so it doesn't
-    /// run in default CI. The pinned-constant hermetic test above is
-    /// the load-bearing CI-side check; this one is the manual
-    /// pre-merge smoke against the live D-018 contract.
-    ///
-    /// To run:
-    /// ```text
-    /// cast call 0x08F8c394EB0c04ba0A4FBA1e64507b88F4b59D8d \
-    ///     "DOMAIN_SEPARATOR()(bytes32)" \
-    ///     --rpc-url https://sepolia.base.org
-    /// ```
-    /// and confirm output equals
-    /// `ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1`. Re-pin when
-    /// D-019 lands (the new address changes the verifyingContract
-    /// component of the domain → new `DOMAIN_SEPARATOR`).
-    #[test]
-    #[ignore = "manual live-RPC cross-check; documented in docstring"]
-    fn redemption_cross_check_against_live_d018() {
-        // Documented as a runbook check rather than an embedded RPC
-        // call to keep the test crate net-isolated by default.
-    }
+    // Issue #98 (2026-05-18) — REMOVED: `redemption_cross_check_against_live_d018`
+    // was an empty `#[test]` body (L-empty-test-body class) + the
+    // name still referenced D-018 (the smoke-test instance superseded
+    // by D-019 on 2026-05-17). Its runbook content migrated to
+    // `crates/pangolin-chain/RUNBOOK.md` § "EntitlementRegistry
+    // domain separator cross-check (D-019)" — references the
+    // current D-019 redemption-authority `0xaeE7E9bf859d938CB087D1e567221cffba9455AC`.
+    // The hermetic `redemption_domain_separator_matches_pinned_constant`
+    // test above remains the load-bearing CI-side check.
 
     /// MVP-2 issue 3.6 (R-c distributed-impl touchpoint).
     ///
