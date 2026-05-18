@@ -375,6 +375,245 @@ fn cross_session_replay_aad_mismatch_via_cipher() {
 /// The hermetic in-source unit test
 /// `aead_cipher_42_byte_aad_round_trips` in `cipher.rs::tests`
 /// pins the 42-byte width.
+/// L-aad-integer-truncation defense (Finding 1 from audit fix-pass):
+/// attacker with mid-run file-level write access duplicates row 0's
+/// wrapped BLOBs into a NEW row whose plaintext `page_seq = -1`. The
+/// `cached_revisions.page_seq` column has a UNIQUE constraint, but
+/// `-1 ≠ 0` so the insert succeeds. Pre-fix the read side silently
+/// mapped `page_seq = -1` → `page_seq = 0` via `unwrap_or(0)`,
+/// reconstructed AAD as if `page_seq = 0`, and successfully decrypted
+/// the duplicated BLOBs as a phantom additional row carrying row 0's
+/// plaintext. Post-fix the read path rejects with `CipherTamper`.
+#[test]
+fn cross_page_phantom_via_negative_page_seq_surfaces_cipher_tamper() {
+    use pangolin_indexer::IndexerError;
+    use rusqlite::Connection;
+
+    // 1. Open a session and persist 3 rows normally.
+    let mut session = fresh_aead_session();
+    let mut chunk = Vec::new();
+    for i in 0..3u64 {
+        let mut ev = sentinel_event();
+        ev.event.sequence = i;
+        chunk.push(ev);
+    }
+    session
+        .test_inject_chunk(SENTINEL_VAULT_ID, &chunk)
+        .expect("inject");
+
+    // 2. Open a SECOND rusqlite connection directly to the temp DB
+    //    file path. Read row 0's wrapped BLOBs, then INSERT a new
+    //    row carrying the SAME BLOBs but with `page_seq = -1`.
+    {
+        let path = session.temp_db_path();
+        let conn = Connection::open(path).expect("second connection");
+        let mut stmt = conn
+            .prepare(
+                "SELECT vault_id, account_id, parent_revision, device_id, \
+                        schema_version, sequence, enc_payload, signer, \
+                        block_number, block_hash, tx_hash, log_index \
+                 FROM cached_revisions WHERE page_seq = 0",
+            )
+            .expect("prepare select row 0");
+        let mut rows = stmt.query([]).expect("query");
+        let row = rows
+            .next()
+            .expect("step")
+            .expect("row 0 must exist after persist");
+        let v_ct: Vec<u8> = row.get(0).unwrap();
+        let a_ct: Vec<u8> = row.get(1).unwrap();
+        let p_ct: Vec<u8> = row.get(2).unwrap();
+        let d_ct: Vec<u8> = row.get(3).unwrap();
+        let schema_version: i64 = row.get(4).unwrap();
+        let sequence: i64 = row.get(5).unwrap();
+        let pay_ct: Vec<u8> = row.get(6).unwrap();
+        let sig_ct: Vec<u8> = row.get(7).unwrap();
+        let block_number: i64 = row.get(8).unwrap();
+        let bh_ct: Vec<u8> = row.get(9).unwrap();
+        let th_ct: Vec<u8> = row.get(10).unwrap();
+        let log_index: i64 = row.get(11).unwrap();
+        drop(rows);
+        drop(stmt);
+
+        // 3. INSERT a new row with `page_seq = -1` and the wrapped
+        //    BLOBs copied from row 0.
+        conn.execute(
+            "INSERT INTO cached_revisions (\
+                 page_seq, vault_id, account_id, parent_revision, device_id, \
+                 schema_version, sequence, enc_payload, signer, \
+                 block_number, block_hash, tx_hash, log_index\
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                -1i64,
+                v_ct,
+                a_ct,
+                p_ct,
+                d_ct,
+                schema_version,
+                sequence,
+                pay_ct,
+                sig_ct,
+                block_number,
+                bh_ct,
+                th_ct,
+                log_index,
+            ],
+        )
+        .expect("inject forged page_seq=-1 row");
+    }
+
+    // 4. Drive a Pull and assert CipherTamper surfaces.
+    let resp = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(session.handle_request(IndexerRequest::Pull { batch_size: 16 }));
+    let err = resp.expect_err("must reject forged negative page_seq row");
+    assert!(
+        matches!(err, IndexerError::CipherTamper { .. }),
+        "expected CipherTamper for page_seq=-1, got {err:?}",
+    );
+}
+
+/// L-aad-integer-truncation defense — `schema_version` arm (Finding
+/// 1 from audit fix-pass): same shape as the negative-`page_seq`
+/// attack but flipping `schema_version` instead. The pre-fix
+/// `u16::try_from(i64).unwrap_or(u16::MAX)` silently mapped any
+/// out-of-range value to `u16::MAX`, letting an attacker forge a row
+/// whose seal-time AAD doesn't match the read-time AAD without the
+/// read path catching the mismatch via integer rejection.
+#[test]
+fn schema_version_out_of_u16_range_surfaces_cipher_tamper() {
+    use pangolin_indexer::IndexerError;
+    use rusqlite::Connection;
+
+    let mut session = fresh_aead_session();
+    session
+        .test_inject_chunk(SENTINEL_VAULT_ID, &[sentinel_event()])
+        .expect("inject");
+
+    // Mutate row 0's plaintext `schema_version` to a value that
+    // doesn't fit in u16. The wrapped BLOBs are unchanged so the
+    // tamper is pure-integer-column.
+    {
+        let path = session.temp_db_path();
+        let conn = Connection::open(path).expect("second connection");
+        conn.execute(
+            "UPDATE cached_revisions SET schema_version = ? WHERE page_seq = 0",
+            rusqlite::params![i64::MAX],
+        )
+        .expect("set schema_version=i64::MAX");
+    }
+
+    let resp = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(session.handle_request(IndexerRequest::Pull { batch_size: 16 }));
+    let err = resp.expect_err("must reject schema_version out of u16 range");
+    assert!(
+        matches!(err, IndexerError::CipherTamper { .. }),
+        "expected CipherTamper for schema_version=i64::MAX, got {err:?}",
+    );
+
+    // Symmetric arm: negative schema_version (also outside u16).
+    let mut session2 = fresh_aead_session();
+    session2
+        .test_inject_chunk(SENTINEL_VAULT_ID, &[sentinel_event()])
+        .expect("inject");
+    {
+        let path = session2.temp_db_path();
+        let conn = Connection::open(path).expect("second connection (neg)");
+        conn.execute(
+            "UPDATE cached_revisions SET schema_version = ? WHERE page_seq = 0",
+            rusqlite::params![-1i64],
+        )
+        .expect("set schema_version=-1");
+    }
+    let resp = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(session2.handle_request(IndexerRequest::Pull { batch_size: 16 }));
+    let err = resp.expect_err("must reject negative schema_version");
+    assert!(
+        matches!(err, IndexerError::CipherTamper { .. }),
+        "expected CipherTamper for schema_version=-1, got {err:?}",
+    );
+}
+
+/// L2 / L3 session-level nonce-distinctness sweep (Finding 6 from
+/// audit fix-pass): the cipher-level test
+/// `aead_cipher_nonce_distinct_across_8000_calls` exercises the
+/// cipher in isolation, but cannot catch a future refactor that
+/// reuses a nonce across the 8 columns of the same row (e.g., a
+/// premature-optimisation that generates one nonce per row instead
+/// of per column). This session-level test persists 1000 rows via
+/// the real `persist_chunk` path, opens the temp DB directly, and
+/// asserts all 8 * 1000 = 8000 nonce prefixes are pairwise distinct.
+#[test]
+fn session_nonces_distinct_across_persist_chunk_8_columns_x_1000_rows() {
+    use rusqlite::Connection;
+
+    // The cipher's wire framing is `nonce(24) ‖ ct_with_tag(>=16)`.
+    // The session writes that frame into each wrapped BLOB column.
+    const NONCE_LEN: usize = 24;
+    const N_ROWS: usize = 1000;
+    const N_WRAPPED_COLS: usize = 8;
+    const N_EXPECTED_NONCES: usize = N_ROWS * N_WRAPPED_COLS;
+
+    let mut session = fresh_aead_session();
+    let mut chunk = Vec::with_capacity(N_ROWS);
+    for i in 0..N_ROWS {
+        let mut ev = sentinel_event();
+        ev.event.sequence = i as u64;
+        ev.event.anchor.sequence = i as u64;
+        chunk.push(ev);
+    }
+    session
+        .test_inject_chunk(SENTINEL_VAULT_ID, &chunk)
+        .expect("inject 1000 rows");
+
+    // Open a second connection to read every wrapped BLOB column.
+    let path = session.temp_db_path().to_path_buf();
+    let conn = Connection::open(&path).expect("second connection");
+    let mut stmt = conn
+        .prepare(
+            "SELECT vault_id, account_id, parent_revision, device_id, \
+                    enc_payload, signer, block_hash, tx_hash \
+             FROM cached_revisions ORDER BY page_seq ASC",
+        )
+        .expect("prepare select");
+    let mut rows = stmt.query([]).expect("query");
+    let mut nonces: std::collections::HashSet<[u8; NONCE_LEN]> =
+        std::collections::HashSet::with_capacity(N_EXPECTED_NONCES);
+    let mut total: usize = 0;
+    while let Some(row) = rows.next().expect("step") {
+        for col_idx in 0..N_WRAPPED_COLS {
+            let ct: Vec<u8> = row.get(col_idx).expect("col read");
+            assert!(
+                ct.len() >= NONCE_LEN,
+                "column {col_idx} ciphertext shorter than NONCE_LEN ({}) — framing regressed",
+                ct.len(),
+            );
+            let mut n = [0u8; NONCE_LEN];
+            n.copy_from_slice(&ct[..NONCE_LEN]);
+            assert!(
+                nonces.insert(n),
+                "session-level nonce collision detected after {total} insertions \
+                 (col_idx = {col_idx}, page_seq row index = {}); \
+                 XChaCha20 catastrophe — both plaintexts leak under the colliding pair. \
+                 This likely means a future refactor reused a nonce across the 8 columns \
+                 of the same row, or used a deterministic nonce derivation.",
+                total / N_WRAPPED_COLS,
+            );
+            total += 1;
+        }
+    }
+    assert_eq!(total, N_EXPECTED_NONCES);
+    assert_eq!(nonces.len(), N_EXPECTED_NONCES);
+}
+
 #[test]
 fn per_row_aad_pins_42_byte_width_and_byte_order() {
     // Pin the constant.

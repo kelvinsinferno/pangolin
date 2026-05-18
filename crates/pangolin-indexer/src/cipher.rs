@@ -486,27 +486,41 @@ mod tests {
 
     // ---------- 4.3 R-e + L2: nonce-distinctness across many calls ----------
 
+    /// L2 (the load-bearing crypto property): per-page random 24-byte
+    /// nonces must never collide. `NONCE_DISTINCT_CALLS` encryptions of
+    /// the same plaintext under the same key MUST produce that many
+    /// distinct ciphertext frames (the nonce prefix is fresh every
+    /// call). If this fails, XChaCha20 leaks both plaintexts on the
+    /// colliding pair — catastrophic.
+    ///
+    /// The 8000 count mirrors the §4.3 plan-gate L3 narrative
+    /// (`10_000 rows × 8 columns = 80_000 distinct nonces`); we cap at
+    /// 8000 to keep CI wall-clock bounded while still sweeping an
+    /// order of magnitude above the previous 1000-call check. The
+    /// session-level companion test
+    /// `session_nonces_distinct_across_persist_chunk_8_columns_x_1000_rows`
+    /// (in `tests/raw_disk_no_plaintext_per_column.rs`) exercises the
+    /// full 8 cols × 1000 rows = 8000 nonces through the real persist
+    /// path so a future refactor that reuses a nonce across columns of
+    /// the same row also fails.
+    const NONCE_DISTINCT_CALLS: usize = 8000;
+
     #[test]
-    fn aead_cipher_nonce_distinct_across_1000_calls() {
-        // L2 (the load-bearing crypto property): per-page random
-        // 24-byte nonces must never collide. 1000 encryptions of
-        // the same plaintext under the same key MUST produce 1000
-        // distinct ciphertext frames (the nonce prefix is fresh
-        // every call). If this fails, XChaCha20 leaks both
-        // plaintexts on the colliding pair — catastrophic.
+    fn aead_cipher_nonce_distinct_across_8000_calls() {
         let c = fresh_cipher();
-        let pt = b"identical plaintext across all 1000 calls";
-        let mut nonces = std::collections::HashSet::with_capacity(1000);
-        for _ in 0..1000 {
+        let pt = b"identical plaintext across all 8000 calls";
+        let mut nonces = std::collections::HashSet::with_capacity(NONCE_DISTINCT_CALLS);
+        for _ in 0..NONCE_DISTINCT_CALLS {
             let frame = c.encrypt_page(pt, TEST_AAD);
             let mut nonce = [0u8; NONCE_LEN];
             nonce.copy_from_slice(&frame[..NONCE_LEN]);
             assert!(
                 nonces.insert(nonce),
-                "nonce collision detected across 1000 calls — XChaCha20 catastrophe",
+                "nonce collision detected across {NONCE_DISTINCT_CALLS} calls — \
+                 XChaCha20 catastrophe",
             );
         }
-        assert_eq!(nonces.len(), 1000);
+        assert_eq!(nonces.len(), NONCE_DISTINCT_CALLS);
     }
 
     // ---------- 4.3 R-e + L-tampered-ciphertext: adversarial decode ----------

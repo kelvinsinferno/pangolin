@@ -652,8 +652,35 @@ impl IndexerSession {
             // rebuilt AAD MUST be byte-identical to the AAD used at
             // seal time; if not, every per-column decrypt fails
             // with TagMismatch.
-            let page_seq = u64::try_from(page_seq_i64).unwrap_or(0);
-            let schema_version = u16::try_from(schema_version_i64).unwrap_or(u16::MAX);
+            //
+            // ## L-aad-integer-truncation defense
+            //
+            // SQLite stores `page_seq` + `schema_version` as `i64`
+            // because rusqlite doesn't have a native `u64` column type.
+            // A naive `u64::try_from(i64).unwrap_or(0)` lets an
+            // attacker with mid-run file-level write access duplicate
+            // row 0's wrapped BLOBs into a NEW row with plaintext
+            // `page_seq = -1` (the UNIQUE constraint allows it because
+            // -1 ≠ 0) — the silent fallback would then map -1 → 0,
+            // reconstruct AAD as if `page_seq = 0`, decrypt
+            // successfully, and surface row 0's plaintext as a phantom
+            // additional row. Same class of attack exists for
+            // `schema_version`. Reject out-of-range integers with
+            // `CipherTamper` so a malicious filesystem cannot make the
+            // session swallow a forged row silently.
+            let page_seq = u64::try_from(page_seq_i64).map_err(|_| IndexerError::CipherTamper {
+                context: format!(
+                    "page_seq out of u64 range (raw i64 = {page_seq_i64}); \
+                         likely on-disk tamper of an unwrapped column"
+                ),
+            })?;
+            let schema_version =
+                u16::try_from(schema_version_i64).map_err(|_| IndexerError::CipherTamper {
+                    context: format!(
+                        "schema_version out of u16 range (raw i64 = {schema_version_i64}); \
+                         likely on-disk tamper of an unwrapped column"
+                    ),
+                })?;
             let aad = build_aad(&bound, page_seq, schema_version);
 
             // Unwrap each of the 8 BLOB columns. ANY tamper-mismatch

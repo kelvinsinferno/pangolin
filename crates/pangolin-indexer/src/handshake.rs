@@ -443,6 +443,33 @@ fn decode_body(body: &[u8]) -> Result<IndexerHandshake, HandshakeError> {
     }
     let mut run_nonce = [0u8; HANDSHAKE_RUN_NONCE_LEN];
     run_nonce.copy_from_slice(&v2);
+    // Wipe the heap-side staging vec now that we've copied into the
+    // fixed array. Mirrors the v1 (derived_key) discipline above
+    // byte-for-byte. The `run_nonce` is non-secret per L3 (it's HKDF
+    // salt, not IKM), but the hygiene is consistent so an audit can
+    // grep "Zeroize::zeroize" on every `pull_bytes` callsite.
+    {
+        let mut v2_owner = v2;
+        Zeroize::zeroize(v2_owner.as_mut_slice());
+        drop(v2_owner);
+    }
+
+    // Strict end-of-input: a canonical `map(2)` body with two
+    // length-pinned byte-string values MUST be exhausted at this
+    // point. Trailing CBOR (e.g., a forged third spurious key-value
+    // pair that fits within the capped body buffer) is rejected as
+    // tampering — a benign host has no reason to send extra bytes.
+    // We use the ciborium-ll decoder's `pull()` to test for "anything
+    // more to consume": if it returns `Ok(_)`, the body has extra
+    // structure beyond the documented `map(2)` shape; if it returns
+    // an error (typically the underlying reader at EOF), we accept
+    // that as the success case (no further items to decode).
+    if dec.pull().is_ok() {
+        // Re-zero the derived_key on rejection — same discipline as
+        // the wrong-key-order branch above.
+        derived_key.zeroize();
+        return Err(HandshakeError::Cbor("trailing CBOR after map(2)".into()));
+    }
 
     Ok(IndexerHandshake {
         derived_key,
@@ -664,6 +691,76 @@ mod tests {
         assert_eq!(HANDSHAKE_KEY_LEN, 32);
         assert_eq!(HANDSHAKE_RUN_NONCE_LEN, 16);
         assert_eq!(MAX_HANDSHAKE_BYTES, 256);
+    }
+
+    /// L-trailing-cbor-after-map-2: a body that decodes as a valid
+    /// `map(2)` with the two expected fields but carries EXTRA CBOR
+    /// bytes after the run_nonce value (e.g., a forged third
+    /// spurious key-value pair) MUST be rejected. Without strict
+    /// end-of-input enforcement an attacker can smuggle additional
+    /// CBOR structure inside the body cap.
+    #[test]
+    fn decode_body_rejects_trailing_cbor_after_map2() {
+        // Build a well-formed map(2) body, then append a third key-
+        // value pair using the same encoder. The leading map header
+        // still claims arity 2, so a CBOR decoder that only consumes
+        // the announced 2 pairs and stops will silently leave the
+        // trailing pair behind. We assert that the strict-EOF check
+        // rejects this.
+        let mut body = Vec::new();
+        {
+            let mut enc = Encoder::from(&mut body);
+            enc.push(Header::Map(Some(2))).unwrap();
+            push_text(&mut enc, KEY_DERIVED_KEY).unwrap();
+            push_bytes(&mut enc, &[0x42u8; HANDSHAKE_KEY_LEN]).unwrap();
+            push_text(&mut enc, KEY_RUN_NONCE).unwrap();
+            push_bytes(&mut enc, &[0x55u8; HANDSHAKE_RUN_NONCE_LEN]).unwrap();
+            // Trailing spurious pair — fits within MAX_HANDSHAKE_BYTES.
+            push_text(&mut enc, "extra_field").unwrap();
+            push_bytes(&mut enc, &[0u8; 4]).unwrap();
+        }
+        // Sanity: the trailing bytes do fit within the cap (otherwise
+        // OversizeFrame would catch them earlier, masking the EOF
+        // check).
+        assert!(
+            body.len() <= MAX_HANDSHAKE_BYTES,
+            "test body {} bytes exceeds cap {} — adjust test",
+            body.len(),
+            MAX_HANDSHAKE_BYTES,
+        );
+        let err = decode_body(&body).expect_err("must reject trailing CBOR");
+        match err {
+            HandshakeError::Cbor(msg) => assert!(
+                msg.contains("trailing"),
+                "expected 'trailing CBOR after map(2)' error, got: {msg}",
+            ),
+            other => panic!("expected HandshakeError::Cbor, got {other:?}"),
+        }
+    }
+
+    /// L-trailing-cbor-after-map-2 (framed-path): the same attack
+    /// shape via the full `read_handshake` framing path — the
+    /// length-prefix declares a body length that includes the
+    /// trailing bytes, and the decoder still rejects.
+    #[test]
+    fn read_handshake_rejects_trailing_cbor_in_framed_body() {
+        let mut body = Vec::new();
+        {
+            let mut enc = Encoder::from(&mut body);
+            enc.push(Header::Map(Some(2))).unwrap();
+            push_text(&mut enc, KEY_DERIVED_KEY).unwrap();
+            push_bytes(&mut enc, &[0x42u8; HANDSHAKE_KEY_LEN]).unwrap();
+            push_text(&mut enc, KEY_RUN_NONCE).unwrap();
+            push_bytes(&mut enc, &[0x55u8; HANDSHAKE_RUN_NONCE_LEN]).unwrap();
+            push_text(&mut enc, "extra_field").unwrap();
+            push_bytes(&mut enc, &[0u8; 4]).unwrap();
+        }
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&u32::to_be_bytes(u32::try_from(body.len()).unwrap()));
+        framed.extend_from_slice(&body);
+        let err = read_handshake(&mut std::io::Cursor::new(framed))
+            .expect_err("must reject trailing CBOR in framed body");
+        assert!(matches!(err, HandshakeError::Cbor(_)));
     }
 
     #[test]
