@@ -3196,11 +3196,14 @@ name = "pangolin-indexer"
 version = "0.0.0"
 dependencies = [
  "alloy",
+ "ciborium-io",
+ "ciborium-ll",
  "clap",
  "hex",
  "pangolin-chain",
  "pangolin-crypto",
  "pangolin-indexer",
+ "proptest",
  "rusqlite",
  "serde",
  "serde_json",

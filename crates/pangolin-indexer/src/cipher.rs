@@ -22,6 +22,27 @@
 //! framing): tampering MUST surface as a typed error, never silently
 //! accepted.
 //!
+//! ## 4.3 per-column AEAD cycle — `aad` parameter
+//!
+//! The §4.3 per-column-AEAD cycle (Resolved decisions table)
+//! introduces an additional `aad: &[u8]` parameter on both
+//! [`TempDbCipher::encrypt_page`] and [`TempDbCipher::decrypt_page`].
+//! The AAD is the fixed-width 42-byte concatenation
+//! `vault_id (32) ‖ page_id_BE_u64 (8) ‖ schema_version_BE_u16 (2)`,
+//! computed by the session per row at persist + read time. Binding
+//! the AAD into the AEAD cryptographically prevents three additional
+//! threat surfaces beyond plain AEAD authentication:
+//!
+//! - **L-cross-page-cut-and-paste:** swapping two rows' ciphertexts
+//!   on disk causes a decryption failure because the `page_id` field
+//!   in the recomputed AAD no longer matches the seal-time AAD.
+//! - **L-cross-session-replay:** replaying ciphertext captured under
+//!   one session's `vault_id` against a second session bound to a
+//!   different vault fails because `vault_id` differs.
+//! - **L-future-schema-version-poison:** ciphertext produced under
+//!   `schema_version = N` cannot be re-played as `schema_version =
+//!   N+1` payload because `schema_version` is bound into the AAD.
+//!
 //! [`NoOpCipher`] — the test-only passthrough — is updated to match
 //! the new signature (its `decrypt_page` always returns
 //! `Ok(ciphertext.to_vec())`). Production builds construct
@@ -129,14 +150,25 @@ impl From<AeadError> for CipherError {
 /// `Ok(ciphertext.to_vec())`).
 pub trait TempDbCipher: Send + Sync + std::fmt::Debug {
     /// Transform a plaintext page into the ciphertext to write on
-    /// disk. The production [`AeadCipher`] returns
+    /// disk, binding `aad`.
+    ///
+    /// The production [`AeadCipher`] returns
     /// `nonce ‖ ciphertext_with_tag` (length =
     /// `NONCE_LEN + plaintext.len() + TAG_LEN`); the test-only
-    /// [`NoOpCipher`] returns `plaintext.to_vec()`.
-    fn encrypt_page(&self, plaintext: &[u8]) -> Vec<u8>;
+    /// [`NoOpCipher`] returns `plaintext.to_vec()` and IGNORES the
+    /// AAD (the NoOp passthrough has no authentication to bind).
+    ///
+    /// The `aad` is the 42-byte concat
+    /// `vault_id (32) ‖ page_id_BE_u64 (8) ‖ schema_version_BE_u16 (2)`
+    /// per the §4.3 per-column-AEAD plan-gate Resolved decisions
+    /// table. Callers (`session.rs::persist_chunk`) build the AAD
+    /// per row using the session's bound `vault_id`, the row's
+    /// `page_seq`, and the row's `schema_version`.
+    fn encrypt_page(&self, plaintext: &[u8], aad: &[u8]) -> Vec<u8>;
 
     /// Transform a ciphertext page read off disk back into
-    /// plaintext.
+    /// plaintext, requiring `aad` to match what was used during
+    /// sealing.
     ///
     /// # Errors
     ///
@@ -146,7 +178,7 @@ pub trait TempDbCipher: Send + Sync + std::fmt::Debug {
     /// - [`CipherError::FramingTooShort`] when the input is shorter
     ///   than `NONCE_LEN + TAG_LEN` (impossible for any output of
     ///   `encrypt_page`).
-    fn decrypt_page(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CipherError>;
+    fn decrypt_page(&self, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, CipherError>;
 }
 
 // ---------------------------------------------------------------------
@@ -232,22 +264,23 @@ impl std::fmt::Debug for AeadCipher {
 }
 
 impl TempDbCipher for AeadCipher {
-    fn encrypt_page(&self, plaintext: &[u8]) -> Vec<u8> {
+    fn encrypt_page(&self, plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
         // L2: fresh random 24-byte nonce per call. The 192-bit
         // XChaCha20 nonce makes collision negligible.
         let mut nonce_bytes = [0u8; NONCE_LEN];
         fill_random(&mut nonce_bytes);
         let nonce = Nonce::from_storage_bytes(nonce_bytes);
 
-        // Seal under the held key with empty AAD. (The temp DB has
-        // no per-page binding context; future hardening could mix
-        // page_id + vault_id into AAD per L-tampered-ciphertext (c)
-        // but 4.3 ships the minimal seal as the load-bearing step;
-        // the AAD discipline is per-call hardening that can be added
-        // additively without a wire-format break.)
+        // §4.3 per-column AEAD: bind the caller-supplied AAD into
+        // the AEAD seal. The AAD is the 42-byte concat
+        // `vault_id (32) ‖ page_id_BE_u64 (8) ‖ schema_version_BE_u16 (2)`
+        // built by `session::build_aad`. Cross-page-cut-and-paste,
+        // cross-session-replay, and future-schema-version-poison
+        // are all mitigated by binding `(vault_id, page_id,
+        // schema_version)` into every seal.
         let key = self.aead_key();
         let ct = key
-            .seal(&nonce, plaintext, &[])
+            .seal(&nonce, plaintext, aad)
             .expect("XChaCha20-Poly1305 seal cannot fail for a 32-byte key + 24-byte nonce");
         let ct_bytes = ct.into_vec();
 
@@ -258,7 +291,7 @@ impl TempDbCipher for AeadCipher {
         out
     }
 
-    fn decrypt_page(&self, input: &[u8]) -> Result<Vec<u8>, CipherError> {
+    fn decrypt_page(&self, input: &[u8], aad: &[u8]) -> Result<Vec<u8>, CipherError> {
         // Framing check: any input shorter than NONCE_LEN + TAG_LEN
         // cannot possibly authenticate. Caught deterministically
         // before the AEAD primitive is invoked.
@@ -273,8 +306,12 @@ impl TempDbCipher for AeadCipher {
         let key = self.aead_key();
         // Any AeadError -> CipherError::TagMismatch via the From
         // impl. The opaque single-variant shape on tamper failures
-        // is the L-tampered-ciphertext discipline.
-        Ok(key.open(&nonce, &ct, &[])?)
+        // is the L-tampered-ciphertext discipline. If the caller-
+        // supplied `aad` differs from the seal-time AAD (e.g.,
+        // cross-page-cut-and-paste, cross-session-replay), this
+        // surfaces as `TagMismatch` indistinguishably from a
+        // tag-flip.
+        Ok(key.open(&nonce, &ct, aad)?)
     }
 }
 
@@ -306,13 +343,17 @@ impl NoOpCipher {
 
 #[cfg(any(test, feature = "test-utilities"))]
 impl TempDbCipher for NoOpCipher {
-    fn encrypt_page(&self, plaintext: &[u8]) -> Vec<u8> {
+    fn encrypt_page(&self, plaintext: &[u8], _aad: &[u8]) -> Vec<u8> {
+        // §4.3 per-column AEAD: NoOp ignores AAD — it provides no
+        // authentication anyway. Production builds construct
+        // `AeadCipher`; this stub exists only for `#[cfg(test)]`
+        // and the `test-utilities` feature.
         plaintext.to_vec()
     }
 
-    fn decrypt_page(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CipherError> {
+    fn decrypt_page(&self, ciphertext: &[u8], _aad: &[u8]) -> Result<Vec<u8>, CipherError> {
         // Passthrough — never fails. Round-trip identity for the
-        // 4.2 lifecycle probe + scaffolding tests.
+        // 4.2 lifecycle probe + scaffolding tests. AAD is ignored.
         Ok(ciphertext.to_vec())
     }
 }
@@ -322,26 +363,32 @@ mod tests {
     use super::*;
     use pangolin_crypto::aead::{NONCE_LEN, TAG_LEN};
 
+    /// §4.3 per-column AEAD: handy fixed AAD for tests that don't
+    /// care about the AAD-binding semantics. The session builds AAD
+    /// per row in production; tests that exercise pure AEAD round-
+    /// trips can pass any consistent bytes here.
+    const TEST_AAD: &[u8] = b"test-aad-42";
+
     // ---------- 4.2 NoOpCipher regression tests ----------
 
     #[test]
     fn noop_encrypt_is_identity_on_empty_input() {
         let c = NoOpCipher;
-        assert_eq!(c.encrypt_page(&[]), Vec::<u8>::new());
+        assert_eq!(c.encrypt_page(&[], TEST_AAD), Vec::<u8>::new());
     }
 
     #[test]
     fn noop_encrypt_is_identity_on_arbitrary_input() {
         let c = NoOpCipher;
         let plaintext = b"the temp DB is full of pancakes";
-        assert_eq!(c.encrypt_page(plaintext), plaintext.to_vec());
+        assert_eq!(c.encrypt_page(plaintext, TEST_AAD), plaintext.to_vec());
     }
 
     #[test]
     fn noop_decrypt_is_identity() {
         let c = NoOpCipher;
         let ciphertext = vec![1, 2, 3, 4, 5];
-        assert_eq!(c.decrypt_page(&ciphertext).unwrap(), ciphertext);
+        assert_eq!(c.decrypt_page(&ciphertext, TEST_AAD).unwrap(), ciphertext);
     }
 
     #[test]
@@ -352,8 +399,8 @@ mod tests {
         let c = NoOpCipher;
         for n in [0usize, 1, 16, 4096, 1 << 16] {
             let buf: Vec<u8> = (0..n).map(|i| u8::try_from(i & 0xFF).unwrap()).collect();
-            let enc = c.encrypt_page(&buf);
-            let dec = c.decrypt_page(&enc).unwrap();
+            let enc = c.encrypt_page(&buf, TEST_AAD);
+            let dec = c.decrypt_page(&enc, TEST_AAD).unwrap();
             assert_eq!(buf, dec, "round-trip failed for n = {n}");
         }
     }
@@ -364,8 +411,8 @@ mod tests {
         assert_send_sync::<NoOpCipher>();
         // The Arc<dyn TempDbCipher> shape the session uses.
         let arc: Arc<dyn TempDbCipher> = NoOpCipher::new_arc();
-        assert_eq!(arc.encrypt_page(b"x"), b"x".to_vec());
-        assert_eq!(arc.decrypt_page(b"x").unwrap(), b"x".to_vec());
+        assert_eq!(arc.encrypt_page(b"x", TEST_AAD), b"x".to_vec());
+        assert_eq!(arc.decrypt_page(b"x", TEST_AAD).unwrap(), b"x".to_vec());
     }
 
     // ---------- 4.3 R-e: AeadCipher round-trip across input sizes ----------
@@ -384,10 +431,10 @@ mod tests {
     fn aead_cipher_round_trip_zero_bytes() {
         let c = fresh_cipher();
         let pt: &[u8] = &[];
-        let ct = c.encrypt_page(pt);
+        let ct = c.encrypt_page(pt, TEST_AAD);
         // Frame layout: nonce (24) ‖ tag (16) for empty plaintext.
         assert_eq!(ct.len(), NONCE_LEN + TAG_LEN);
-        let recovered = c.decrypt_page(&ct).unwrap();
+        let recovered = c.decrypt_page(&ct, TEST_AAD).unwrap();
         assert_eq!(recovered, pt);
     }
 
@@ -395,9 +442,9 @@ mod tests {
     fn aead_cipher_round_trip_one_byte() {
         let c = fresh_cipher();
         let pt = b"X";
-        let ct = c.encrypt_page(pt);
+        let ct = c.encrypt_page(pt, TEST_AAD);
         assert_eq!(ct.len(), NONCE_LEN + 1 + TAG_LEN);
-        let recovered = c.decrypt_page(&ct).unwrap();
+        let recovered = c.decrypt_page(&ct, TEST_AAD).unwrap();
         assert_eq!(recovered, pt.to_vec());
     }
 
@@ -405,9 +452,9 @@ mod tests {
     fn aead_cipher_round_trip_100_bytes() {
         let c = fresh_cipher();
         let pt: Vec<u8> = (0u8..100).collect();
-        let ct = c.encrypt_page(&pt);
+        let ct = c.encrypt_page(&pt, TEST_AAD);
         assert_eq!(ct.len(), NONCE_LEN + pt.len() + TAG_LEN);
-        let recovered = c.decrypt_page(&ct).unwrap();
+        let recovered = c.decrypt_page(&ct, TEST_AAD).unwrap();
         assert_eq!(recovered, pt);
     }
 
@@ -417,9 +464,9 @@ mod tests {
         // overhead doesn't regress for the most common payload.
         let c = fresh_cipher();
         let pt: Vec<u8> = (0..4096).map(|i| u8::try_from(i & 0xFF).unwrap()).collect();
-        let ct = c.encrypt_page(&pt);
+        let ct = c.encrypt_page(&pt, TEST_AAD);
         assert_eq!(ct.len(), NONCE_LEN + pt.len() + TAG_LEN);
-        let recovered = c.decrypt_page(&ct).unwrap();
+        let recovered = c.decrypt_page(&ct, TEST_AAD).unwrap();
         assert_eq!(recovered, pt);
     }
 
@@ -431,9 +478,9 @@ mod tests {
         let pt: Vec<u8> = (0..65_536)
             .map(|i| u8::try_from(i & 0xFF).unwrap())
             .collect();
-        let ct = c.encrypt_page(&pt);
+        let ct = c.encrypt_page(&pt, TEST_AAD);
         assert_eq!(ct.len(), NONCE_LEN + pt.len() + TAG_LEN);
-        let recovered = c.decrypt_page(&ct).unwrap();
+        let recovered = c.decrypt_page(&ct, TEST_AAD).unwrap();
         assert_eq!(recovered, pt);
     }
 
@@ -451,7 +498,7 @@ mod tests {
         let pt = b"identical plaintext across all 1000 calls";
         let mut nonces = std::collections::HashSet::with_capacity(1000);
         for _ in 0..1000 {
-            let frame = c.encrypt_page(pt);
+            let frame = c.encrypt_page(pt, TEST_AAD);
             let mut nonce = [0u8; NONCE_LEN];
             nonce.copy_from_slice(&frame[..NONCE_LEN]);
             assert!(
@@ -470,10 +517,10 @@ mod tests {
         // must surface as TagMismatch.
         let c = fresh_cipher();
         let pt = b"plaintext to seal";
-        let mut ct = c.encrypt_page(pt);
+        let mut ct = c.encrypt_page(pt, TEST_AAD);
         let last = ct.len() - 1;
         ct[last] ^= 0x01;
-        let result = c.decrypt_page(&ct);
+        let result = c.decrypt_page(&ct, TEST_AAD);
         assert_eq!(
             result.unwrap_err(),
             CipherError::TagMismatch,
@@ -488,9 +535,9 @@ mod tests {
         // computation, so any flip propagates to the tag).
         let c = fresh_cipher();
         let pt = b"plaintext to seal";
-        let mut ct = c.encrypt_page(pt);
+        let mut ct = c.encrypt_page(pt, TEST_AAD);
         ct[0] ^= 0x01;
-        let result = c.decrypt_page(&ct);
+        let result = c.decrypt_page(&ct, TEST_AAD);
         assert_eq!(
             result.unwrap_err(),
             CipherError::TagMismatch,
@@ -504,10 +551,10 @@ mod tests {
         // nonce, before tag) — must surface as TagMismatch.
         let c = fresh_cipher();
         let pt: Vec<u8> = (0u8..64).collect();
-        let mut ct = c.encrypt_page(&pt);
+        let mut ct = c.encrypt_page(&pt, TEST_AAD);
         let middle = NONCE_LEN + 8; // 8 bytes into the body
         ct[middle] ^= 0x01;
-        let result = c.decrypt_page(&ct);
+        let result = c.decrypt_page(&ct, TEST_AAD);
         assert_eq!(
             result.unwrap_err(),
             CipherError::TagMismatch,
@@ -523,7 +570,7 @@ mod tests {
         let c = fresh_cipher();
         for short_len in 0..(NONCE_LEN + TAG_LEN) {
             let buf = vec![0u8; short_len];
-            let result = c.decrypt_page(&buf);
+            let result = c.decrypt_page(&buf, TEST_AAD);
             assert_eq!(
                 result.unwrap_err(),
                 CipherError::FramingTooShort,
@@ -538,13 +585,66 @@ mod tests {
         let c1 = fresh_cipher();
         let c2 = fresh_cipher();
         let pt = b"sensitive metadata";
-        let ct = c1.encrypt_page(pt);
-        let result = c2.decrypt_page(&ct);
+        let ct = c1.encrypt_page(pt, TEST_AAD);
+        let result = c2.decrypt_page(&ct, TEST_AAD);
         assert_eq!(
             result.unwrap_err(),
             CipherError::TagMismatch,
             "wrong-key decrypt must surface as TagMismatch",
         );
+    }
+
+    // ---------- §4.3 per-column AEAD: AAD-binding semantics ----------
+
+    #[test]
+    fn aead_cipher_wrong_aad_rejects() {
+        // Seal with AAD-A; open with AAD-B — must surface as
+        // TagMismatch. This is the load-bearing per-column AEAD
+        // property: cross-page-cut-and-paste / cross-session-replay
+        // / future-schema-version-poison all manifest as an AAD
+        // mismatch at decrypt time.
+        let c = fresh_cipher();
+        let pt = b"cross-row plaintext";
+        let aad_a = b"page-id=1";
+        let aad_b = b"page-id=2";
+        let ct = c.encrypt_page(pt, aad_a);
+        let result = c.decrypt_page(&ct, aad_b);
+        assert_eq!(
+            result.unwrap_err(),
+            CipherError::TagMismatch,
+            "wrong-AAD open must surface as TagMismatch",
+        );
+        // Sanity: same AAD round-trips.
+        let recovered = c.decrypt_page(&ct, aad_a).unwrap();
+        assert_eq!(recovered, pt.to_vec());
+    }
+
+    #[test]
+    fn aead_cipher_empty_aad_round_trips() {
+        // Empty AAD is a valid input — the AEAD primitive accepts
+        // zero-length AAD just like zero-length plaintext.
+        let c = fresh_cipher();
+        let pt = b"empty-aad case";
+        let ct = c.encrypt_page(pt, &[]);
+        let recovered = c.decrypt_page(&ct, &[]).unwrap();
+        assert_eq!(recovered, pt.to_vec());
+    }
+
+    #[test]
+    fn aead_cipher_42_byte_aad_round_trips() {
+        // The session builds a fixed-width 42-byte AAD per row
+        // (vault_id 32 ‖ page_id_be 8 ‖ schema_version_be 2). Pin
+        // a round-trip at that exact width so any future regression
+        // on the AAD shape surfaces here.
+        let c = fresh_cipher();
+        let mut aad = [0u8; 42];
+        aad[..32].fill(0xAB);
+        aad[32..40].copy_from_slice(&123_u64.to_be_bytes());
+        aad[40..42].copy_from_slice(&1u16.to_be_bytes());
+        let pt = b"42-byte AAD round-trip";
+        let ct = c.encrypt_page(pt, &aad);
+        let recovered = c.decrypt_page(&ct, &aad).unwrap();
+        assert_eq!(recovered, pt.to_vec());
     }
 
     #[test]
@@ -566,8 +666,8 @@ mod tests {
         fill_random(&mut k);
         let arc: Arc<dyn TempDbCipher> = AeadCipher::new_arc(SecretBytes::new(k.to_vec()));
         let pt = b"sample";
-        let ct = arc.encrypt_page(pt);
-        let recovered = arc.decrypt_page(&ct).unwrap();
+        let ct = arc.encrypt_page(pt, TEST_AAD);
+        let recovered = arc.decrypt_page(&ct, TEST_AAD).unwrap();
         assert_eq!(recovered, pt);
     }
 

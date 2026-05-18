@@ -7,17 +7,37 @@
 //! 1. Parse argv (`--rpc-url`, `--env`).
 //! 2. Initialise `tracing_subscriber` to stderr (R-b: stdout is
 //!    reserved for the JSON protocol).
-//! 3. Resolve `PANGOLIN_INDEXER_IDLE_TIMEOUT_SECS` via the library
+//! 3. **§4.3 per-column AEAD (ARCH-1): consume the binary handshake**
+//!    on stdin BEFORE the chain-RPC config and the protocol loop.
+//!    The host (CLI / Tauri / mobile FFI wrapper) derives the
+//!    ephemeral AEAD key from the device secret via
+//!    `pangolin_chain::derive_indexer_key` and writes the
+//!    length-prefixed CBOR-framed `IndexerHandshake` to the binary's
+//!    stdin. The binary deserialises, zeroizes the staging buffer,
+//!    and constructs `AeadCipher` from the received key. The
+//!    `OsRng::fill_bytes`/`fill_random` random-key path the §4.3
+//!    baseline used is GONE — the binary no longer generates its
+//!    own key.
+//! 4. Resolve `PANGOLIN_INDEXER_IDLE_TIMEOUT_SECS` via the library
 //!    helper.
-//! 4. Construct an `IndexerSession` with `NoOpCipher` (4.3 swaps
-//!    this in).
-//! 5. Run the stdio loop:
+//! 5. Construct an `IndexerSession` with the per-column `AeadCipher`.
+//! 6. Run the stdio loop:
 //!    `BufReader<stdin>::lines()` → `serde_json::from_str` →
 //!    `session.handle_request(req).await` → `serde_json::to_string`
 //!    + write line to stdout.
-//! 6. Exit cleanly on a `Stop` request, an idle-timeout fire, or
+//! 7. Exit cleanly on a `Stop` request, an idle-timeout fire, or
 //!    a ctrl_c / SIGTERM (per L11 — both Drop + signal handler
 //!    fire on shutdown).
+//!
+//! ## Host caller contract (MVP-3 host-FFI cycle)
+//!
+//! See [`pangolin_indexer::handshake`] for the full spawn-and-write
+//! sequence. The binary expects the handshake bytes BEFORE any line-
+//! delimited JSON; if the handshake fails (truncated, malformed CBOR,
+//! wrong field shape), the binary exits with a fatal stderr message
+//! and a non-zero exit code WITHOUT writing anything to stdout (so
+//! the host's JSON protocol parser is never confused by a partial
+//! response).
 
 #![forbid(unsafe_code)]
 #![allow(clippy::doc_markdown)]
@@ -31,12 +51,12 @@ use tokio::time::{sleep_until, Instant};
 use tracing_subscriber::EnvFilter;
 
 use pangolin_chain::ChainEnv;
-use pangolin_crypto::rng::fill_random;
 use pangolin_crypto::secret::SecretBytes;
 use pangolin_indexer::{
-    AeadCipher, IndexerConfig, IndexerError, IndexerRequest, IndexerResponse, IndexerSession,
-    MAX_REQUEST_LINE_BYTES,
+    read_handshake, AeadCipher, IndexerConfig, IndexerError, IndexerRequest, IndexerResponse,
+    IndexerSession, MAX_REQUEST_LINE_BYTES,
 };
+use zeroize::Zeroize;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -100,28 +120,52 @@ async fn run() -> Result<(), IndexerError> {
         "starting indexer session"
     );
 
-    // ---- Session ----
-    // 4.3 R-b + L10: production builds construct `AeadCipher` with
-    // a fresh random 32-byte key per run. The key never persists to
-    // disk; on Drop the SecretBytes wrapper zeroes it.
+    // ---- §4.3 per-column AEAD (ARCH-1): consume binary handshake ----
     //
-    // For host integrations that want a deterministic key derived
-    // from the device secret (e.g., the desktop CLI wrapper that
-    // already holds an unlocked Vault), the in-process API
-    // `pangolin_chain::derive_indexer_key` produces an equivalent
-    // 32-byte SecretBytes. The standalone `pangolin-indexer` binary
-    // does NOT receive the device secret — it generates a fresh key
-    // here so the binary's blast radius stays minimal (4.3 plan-gate
-    // L-indexer-grows-pangolin-crypto-secret-material-reach).
-    let mut key_bytes = [0u8; 32];
-    fill_random(&mut key_bytes);
-    let cipher = AeadCipher::new_arc(SecretBytes::new(key_bytes.to_vec()));
-    // Wipe the stack-side copy now that the bytes are inside the
-    // SecretBytes heap allocation.
-    {
-        use zeroize::Zeroize;
+    // The host (CLI / Tauri / mobile FFI wrapper) MUST have written
+    // a length-prefixed CBOR `IndexerHandshake` to our stdin BEFORE
+    // the first protocol request. We read it synchronously via
+    // `std::io::stdin().lock()` BEFORE switching to tokio's async
+    // stdin for the line-delimited protocol loop. Mixing the two is
+    // safe here because we consume exactly the handshake bytes
+    // (4-byte length prefix + body) up-front; everything that
+    // follows on the same FD is a clean newline-terminated JSON
+    // stream that tokio's BufReader picks up.
+    //
+    // R-e (ARCH-1) rationale: the standalone binary NEVER imports
+    // `DeviceKey` (`L-indexer-grows-pangolin-crypto-secret-
+    // material-reach` defense); the host derives via
+    // `pangolin_chain::derive_indexer_key(device_key, run_nonce)`
+    // and pipes the 32-byte derived key to us through this
+    // handshake. The pre-§4.3-per-column-AEAD path used
+    // `OsRng::fill_bytes` to mint an ad-hoc per-run key — that
+    // satisfied the "ephemeral" property but failed the "derived
+    // from device secret" property of master plan §5 row 4.3. The
+    // handshake closes that gap.
+    let handshake = {
+        let mut stdin_sync = std::io::stdin().lock();
+        read_handshake(&mut stdin_sync).map_err(|e| IndexerError::Config {
+            message: format!("indexer handshake failed: {e}"),
+        })?
+    };
+    // Move the derived key into a heap-allocated `SecretBytes` (the
+    // zeroize-on-drop wrapper) and IMMEDIATELY zeroize the local
+    // `IndexerHandshake.derived_key` stack-side array. The
+    // `IndexerHandshake::Drop` impl also runs zeroize on Drop, so
+    // this is belt-and-suspenders — but the explicit zeroize here
+    // makes the discipline grep-able for the audit.
+    let cipher = {
+        let mut key_bytes = handshake.derived_key;
+        let cipher_arc = AeadCipher::new_arc(SecretBytes::new(key_bytes.to_vec()));
         key_bytes.zeroize();
-    }
+        cipher_arc
+    };
+    // The run_nonce is non-secret (it's HKDF salt). We don't carry
+    // it forward into the session for 4.3; future cycles may mix it
+    // into the AAD or surface it in diagnostics. The handshake's
+    // Drop impl handles cleanup.
+    drop(handshake);
+
     let mut session = IndexerSession::new(config, cipher)?;
 
     // ---- Stdio loop ----

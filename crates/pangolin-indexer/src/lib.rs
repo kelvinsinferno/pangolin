@@ -52,6 +52,7 @@
 
 pub mod cipher;
 pub mod error;
+pub mod handshake;
 pub mod protocol;
 pub mod session;
 
@@ -59,6 +60,10 @@ pub mod session;
 pub use cipher::NoOpCipher;
 pub use cipher::{AeadCipher, CipherError, TempDbCipher, AEAD_KEY_LEN};
 pub use error::IndexerError;
+pub use handshake::{
+    read_handshake, write_handshake, HandshakeError, IndexerHandshake, HANDSHAKE_KEY_LEN,
+    HANDSHAKE_RUN_NONCE_LEN, MAX_HANDSHAKE_BYTES,
+};
 pub use protocol::{
     IndexedEvent, IndexerEvent, IndexerRequest, IndexerResponse, MAX_REQUEST_LINE_BYTES,
     PROTOCOL_VERSION,
@@ -66,7 +71,7 @@ pub use protocol::{
 pub use session::{
     resolve_idle_timeout, resolve_idle_timeout_from, IndexerConfig, IndexerSession,
     IDLE_TIMEOUT_DEFAULT_SECS, IDLE_TIMEOUT_ENV_VAR, IDLE_TIMEOUT_MAX_SECS, IDLE_TIMEOUT_MIN_SECS,
-    PULL_BATCH_SIZE_MAX,
+    PER_COLUMN_AAD_LEN, PULL_BATCH_SIZE_MAX, WRAPPED_BLOB_COLUMN_COUNT,
 };
 
 /// Returns the crate name. Useful for diagnostics and version
