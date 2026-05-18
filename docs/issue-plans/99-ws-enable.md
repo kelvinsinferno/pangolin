@@ -2,7 +2,7 @@
 
 > **One-line scope:** flip alloy's `ws` feature on in the workspace `Cargo.toml`, replace `chain_sync::ws::open_subscription`'s `WsOpenError::Unavailable` stub with a real `ProviderBuilder` + `eth_subscribe("logs", filter)` subscription, wire `Vault::sync_from_chain` to honor the existing `SyncOptions.prefer_websocket = true` default by attempting WS first and falling back to the already-shipped HTTP-polling loop on WS-open-fail / mid-session-drop. Closes the L8 deferral the 4.1 plan-gate explicitly forecast as "MVP-3 4.1.x feature-flag flip." Most of the structural surface is ALREADY in tree at `be7fe30` — this cycle adds the live transport + orchestrator branch that consumes it.
 >
-> **Status:** Plan-gate DRAFT 2026-05-18 awaiting Kelvin sign-off on Q-a..Q-h.
+> **Status:** Plan-gate LOCKED 2026-05-18. Kelvin chose most-secure on every Q (= plan-gate recommendations across the board). Builder dispatch GO — pending pre-flight `cargo tree -i ring` verification.
 >
 > **Security-critical: MEDIUM.** Does NOT close a known cryptographic gap. DOES (a) introduce new transport surface for malicious-RPC injection (same risk class as HTTP — L-rpc-spoof-events from 4.1 — but re-asserted across new code path), (b) add new transitive crates to the workspace dep tree (env-quirk #15 + HIGH-1 audit + `ring`-ban tripwire), (c) introduce stateful reconnect loop whose silent-disconnect failure mode is the load-bearing risk.
 >
@@ -16,18 +16,18 @@
 > - Indexer's chain-touching surface (consumes alloy primitives only; no provider construction).
 > - Per-event WS replay-protection beyond existing idempotency (4.1 L12 — canonical-hash + chain-anchor match handles duplicates).
 
-## Resolved decisions (Kelvin sign-off PENDING)
+## Resolved decisions (LOCKED 2026-05-18)
 
-| Decision | Resolution | Notes |
+| Decision | Resolution | Rationale |
 |---|---|---|
-| **R-a Transport posture** | TBD | Plan-gate recommends Option A (WS-only-for-tip-following; HTTP for historical backfill). |
-| **R-b Reconnect strategy** | TBD | Plan-gate recommends Option β (exponential backoff cap 30s + circuit breaker N=5). |
-| **R-c WS endpoint URL** | TBD | Plan-gate recommends Option I+III hybrid (pin `chain.ws_default` in deployment JSON; derive from HTTP URL as fallback). |
-| **R-d Test posture** | TBD | Plan-gate recommends Option K (hermetic mock-server + 1 live `#[ignore]`). |
-| **R-e Feature gating** | TBD | Plan-gate recommends Option P (always-on; runtime decides via `prefer_websocket`). |
-| **R-f WS event ingest** | TBD | Plan-gate recommends Option T (per-event advance + ingest; no HTTP re-confirm). |
-| **R-g WS replay-protection** | TBD | Plan-gate recommends Option Σ (trust 4.1 L12 idempotency). |
-| **R-h WS reorg detection** | TBD | Plan-gate recommends Option Ω (timer-based at 12-block finality cadence). |
+| **R-a Transport posture** | **Option A — WS-tip-following + HTTP-backfill** | HTTP chunk loop backfills `cursor → head` (existing path); WS subscription opened at tip for new events. Subscription cannot replay history; this is the only topology that wins on both fresh-vault and incremental sync. |
+| **R-b Reconnect strategy** | **Option β — Exponential backoff + circuit breaker N=5** | Bounded recovery time before HTTP fallback. Surfaces `SyncReport.ws_drops` for UX telemetry. Resets on next `sync_from_chain` call. |
+| **R-c WS endpoint URL** | **Option I+III hybrid** | Pin `chain.ws_default = "wss://sepolia.base.org"` in `base-sepolia.json` (source-of-truth per #98 L1); derive from HTTP URL as runtime fallback for dev/unpinned envs. |
+| **R-d Test posture** | **Option K — Hermetic mock-server + 1 live `#[ignore]`** | Mirrors #98 R-a posture. Mock uses local `tokio-tungstenite` server (~150-250 LoC `#[cfg(test)]`). Live residue against `wss://sepolia.base.org` for env-quirk #14 defense. |
+| **R-e Feature gating** | **Option P — Always-on** | alloy `ws` feature unconditional in workspace `Cargo.toml`; runtime decides via `SyncOptions.prefer_websocket`. CI exercises every code path. ~600 KB binary-size cost acceptable. |
+| **R-f WS event ingest** | **Option T — Per-event advance + ingest** | Existing defenses (filter + chain-id pin + ecrecover) apply identically to WS-delivered events. No defense-in-depth gained by Option U HTTP re-confirm. |
+| **R-g WS replay-protection** | **Option Σ — Trust 4.1 L12 idempotency** | `ingest_chain_revision` canonical-hash + chain-anchor match handles duplicates as storage-layer no-ops. No new dedupe layer. |
+| **R-h WS reorg detection** | **Option Ω — Timer at 12-block finality cadence** | Matches `CONFIRMATION_DEPTH_FOR_FINALIZATION`. RPC budget bounded; finality semantics preserved. |
 
 ---
 
