@@ -3,34 +3,55 @@
 //! `tests/pull_live.rs::live_pull_once_against_d017_advances_checkpoint`.
 //!
 //! Loads the captured `eth_getLogs` JSON-RPC response from
-//! `tests/fixtures/pull/d017_pull_batch_logs.json` and asserts the
-//! fixture is structurally well-formed (load-bearing fields pin-able).
-//! Drives the captured event through
-//! `Vault::ingest_chain_revision` (the same ingestion path
-//! `Vault::sync_from_chain` calls) + `update_last_synced_block_v1`
-//! (the checkpoint-monotonicity primitive) and asserts the checkpoint
-//! advances correctly.
+//! `tests/fixtures/pull/d017_pull_batch_logs.json`, builds the
+//! `RevisionEvent` shape the fixture pins (vault/account/parent/
+//! device/payload + chain anchor — same values pinned by the
+//! indexer's sibling `replay_d017_genesis_revisionpublished_decodes_correctly`
+//! test), then DRIVES that event through `Vault::ingest_chain_revision`
+//! (the same ingestion path `Vault::sync_from_chain` calls per the
+//! pull-cycle) AND `update_last_synced_block_v1` (the checkpoint-
+//! monotonicity primitive `sync_from_chain` invokes after each
+//! batch chunk per `vault.rs:7537`). Asserts the full ingest +
+//! checkpoint round-trip:
+//!
+//!   1. `ingest_chain_revision` returns `Inserted` for a fresh event.
+//!   2. The row queried back via `revisions_for` carries the
+//!      captured fixture's chain anchor (block_number + log_index).
+//!   3. `update_last_synced_block_v1(fixture_block)` advances the
+//!      checkpoint from `None` to `Some(fixture_block)`.
+//!   4. Re-applying the same block is a no-op (monotonic equal).
+//!   5. Backward advance is rejected.
 //!
 //! Defends env-quirk-#14's bytes-parsing surface for the
-//! pangolin-store pull cycle: a future regression that breaks the
-//! checkpoint-monotonicity property or the `RevisionEvent`-from-bytes
-//! decoding chain surfaces here on every PR.
+//! pangolin-store pull cycle: a future regression in either the
+//! `RevisionEvent` ingestion contract or the checkpoint-monotonicity
+//! property surfaces here on every PR. The fixture is loaded raw
+//! (and pinned by-length in `replay_fixture_byte_pin_audit`) — the
+//! captured-event values used here are the same ones the indexer's
+//! `replay_d017_fixture_parity` test pins from the SAME fixture
+//! bytes through alloy's deserializer. The store crate intentionally
+//! does NOT take a `serde_json` dev-dep (env-quirk #15): the
+//! cross-crate parity test in pangolin-indexer is where the bytes
+//! → `RpcLog` decode is exercised. This test owns the
+//! `RevisionEvent` → `Vault` ingest path.
 //!
 //! Per the fixture's `.meta.toml`: bytes are from D-014 V0; D-017
-//! has no events yet. The checkpoint-advance property is parser-
-//! agnostic so the hermetic test is real coverage.
+//! has no events yet. The ingest + checkpoint properties are
+//! parser-agnostic, so the hermetic test is real coverage.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::doc_markdown)]
 
 use pangolin_chain::{ChainAnchor, RevisionEvent};
 use pangolin_crypto::secret::SecretBytes;
-use pangolin_store::{PinIdentityProof, PressYPresenceProof, Vault};
+use pangolin_store::{AccountId, IngestOutcome, PinIdentityProof, PressYPresenceProof, Vault};
 
-/// Fixture path. Reading the raw bytes here (without parsing) is
-/// enough — the parsing surface is covered by the
-/// `replay_d017_fixture_parity` sibling in pangolin-indexer; this
-/// test focuses on the store's checkpoint discipline.
+/// Fixture path. The bytes-→-`RpcLog` parsing surface is covered
+/// by the `replay_d017_fixture_parity` sibling in pangolin-indexer
+/// (where alloy is a regular dep); this test focuses on the
+/// store's `RevisionEvent` → ingest → checkpoint pipeline. The
+/// fixture's exact byte length is pinned in
+/// `replay_fixture_byte_pin_audit` below.
 fn fixture_path() -> std::path::PathBuf {
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
@@ -44,12 +65,18 @@ fn pwd() -> SecretBytes {
     SecretBytes::new(b"correct horse battery staple".to_vec())
 }
 
-/// Build the captured event's RevisionEvent shape from the known
-/// pinned values (the parity replay test pins the same hex). This
-/// avoids re-implementing the alloy decoder here — the parser-side
-/// validation lives in the indexer crate's replay test (where alloy
-/// is a regular dep) and this test focuses on the checkpoint
-/// property.
+/// Build the captured event's `RevisionEvent` shape from the
+/// fixture-pinned values. The indexer's
+/// `replay_d017_genesis_revisionpublished_decodes_correctly` test
+/// asserts the SAME hex (vault `0xaaaa...`, account `0xbbbb...`,
+/// device `0xcccc...`, parent `0x0000...`, payload
+/// `deadbeef...×4`, block `0x273a435 = 41133109`, log_index `0x9b
+/// = 155`, tx_hash `0x5cb4a7...f7ba6`) from the fixture bytes
+/// through alloy's `RpcLog` deserializer. Keeping the values
+/// hand-pinned here (rather than parsing the fixture in-line via
+/// `serde_json`) avoids taking a `serde_json` dev-dep on
+/// pangolin-store — the cross-crate parity is the audit signal
+/// per R-b Option α (same fixture, two parsers).
 fn captured_event() -> RevisionEvent {
     let mut vault_id = [0u8; 32];
     vault_id[0] = 0xAA;
@@ -91,7 +118,8 @@ fn captured_event() -> RevisionEvent {
 
 #[test]
 fn replay_d017_pull_batch_advances_checkpoint() {
-    // Fixture must exist + must be readable.
+    // Fixture must exist + must be readable. The exact byte length is
+    // separately pinned in `replay_fixture_byte_pin_audit` (below).
     let bytes = std::fs::read(fixture_path()).expect("fixture readable");
     assert!(!bytes.is_empty(), "fixture must be non-empty");
 
@@ -105,33 +133,93 @@ fn replay_d017_pull_batch_advances_checkpoint() {
     )
     .expect("unlock");
 
-    // Pre-condition: fresh vault has no checkpoint.
-    let pre = v.last_synced_block_v1().expect("read checkpoint");
-    assert_eq!(pre, None, "fresh vault checkpoint must be None");
+    // Pre-condition: fresh vault has no checkpoint + no rows for the
+    // fixture's account.
+    let pre_checkpoint = v.last_synced_block_v1().expect("read checkpoint");
+    assert_eq!(pre_checkpoint, None, "fresh vault checkpoint must be None");
+    let ev = captured_event();
+    let account = AccountId::from_bytes(ev.account_id);
+    let pre_revs = v.revisions_for(account).expect("revisions_for pre");
+    assert!(
+        pre_revs.is_empty(),
+        "fresh vault must have no rows for the fixture's account"
+    );
+    let captured_block = ev.anchor.block_number;
+    let captured_log_index = ev.anchor.log_index;
+    assert_eq!(
+        captured_block, 41_133_109_u64,
+        "fixture's pinned block number — same value the indexer's \
+         replay_d017_genesis_revisionpublished_decodes_correctly asserts \
+         from the same bytes"
+    );
 
-    // Drive the checkpoint forward through the same primitive
-    // `Vault::sync_from_chain` uses internally
-    // (`update_last_synced_block_v1`). The advancement direction +
-    // monotonicity property is what the live test sibling exercises;
-    // here we exercise it against the captured fixture's pinned
-    // block number.
-    let _ev = captured_event();
-    let captured_block = 41_133_109_u64;
+    // ─── Phase 1: drive the captured event through ingest_chain_revision
+    // ─── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+    // This is the production ingestion path: `Vault::sync_from_chain`
+    // (vault.rs:7436) → adapter `pull_since` → for-each-event
+    // `ingest_chain_revision`. The captured fixture would normally
+    // be returned by the adapter; here we replay the event values
+    // pinned from the captured bytes directly. The bytes-→-event
+    // parse is exercised by the indexer's `replay_d017_fixture_parity`
+    // sibling (alloy is a regular dep there; this crate avoids
+    // taking serde_json as a dev-dep).
+    let outcome = v.ingest_chain_revision(&ev).expect("ingest must succeed");
+    assert_eq!(
+        outcome,
+        IngestOutcome::Inserted,
+        "fresh fixture event must be inserted (no prior row)"
+    );
+
+    // The inserted row must carry the captured chain anchor — this
+    // is the load-bearing property: a downstream consumer querying
+    // `revisions_for` sees the same block/log_index it would see
+    // after a live `sync_from_chain` run.
+    let revs = v.revisions_for(account).expect("revisions_for post");
+    assert_eq!(revs.len(), 1, "exactly one row after fixture ingest");
+    let anchor = revs[0]
+        .chain_anchor
+        .expect("ingested row must carry a chain anchor");
+    assert_eq!(
+        anchor.block_number, captured_block,
+        "row anchor must pin the captured fixture's block"
+    );
+    assert_eq!(
+        anchor.log_index, captured_log_index,
+        "row anchor must pin the captured fixture's log_index"
+    );
+
+    // Idempotency: re-ingesting the same event returns `AlreadyPresent`
+    // + leaves the row count untouched. This is what `sync_from_chain`
+    // relies on when the same log re-arrives in an overlapping pull
+    // window.
+    let re = v
+        .ingest_chain_revision(&ev)
+        .expect("re-ingest must succeed");
+    assert_eq!(re, IngestOutcome::AlreadyPresent);
+    let revs2 = v
+        .revisions_for(account)
+        .expect("revisions_for after re-ingest");
+    assert_eq!(revs2.len(), 1, "no duplicate row on re-ingest");
+
+    // ─── Phase 2: advance the checkpoint via the same primitive
+    // ─── `sync_from_chain` calls after each chunk (vault.rs:7537)
+    // ─── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
     v.update_last_synced_block_v1(captured_block)
         .expect("checkpoint must advance");
-
-    let post = v.last_synced_block_v1().expect("read checkpoint");
+    let post_checkpoint = v.last_synced_block_v1().expect("read checkpoint");
     assert_eq!(
-        post,
+        post_checkpoint,
         Some(captured_block),
-        "checkpoint must equal captured block"
+        "checkpoint must equal the fixture's captured block"
     );
     assert!(
-        post.unwrap_or(0) > pre.unwrap_or(0),
+        post_checkpoint.unwrap_or(0) > pre_checkpoint.unwrap_or(0),
         "checkpoint must strictly advance from None ⇒ Some(captured_block)"
     );
 
-    // Re-applying the same block is a no-op (monotonic equal).
+    // Re-applying the same block is a no-op (monotonic equal — the
+    // exact semantics `sync_from_chain` depends on for chunks that
+    // do not advance the head).
     v.update_last_synced_block_v1(captured_block)
         .expect("idempotent re-apply");
     assert_eq!(
@@ -139,7 +227,9 @@ fn replay_d017_pull_batch_advances_checkpoint() {
         Some(captured_block)
     );
 
-    // Backward advance is rejected (checkpoint monotonicity defense).
+    // Backward advance is rejected (checkpoint monotonicity defense
+    // — a malicious or buggy adapter returning a regressed
+    // `eth_blockNumber` must not be able to rewind the local cursor).
     let backward = v.update_last_synced_block_v1(captured_block.saturating_sub(1));
     assert!(
         backward.is_err(),

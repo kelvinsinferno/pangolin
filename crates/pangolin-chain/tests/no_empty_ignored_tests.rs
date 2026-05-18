@@ -117,6 +117,14 @@ fn body_is_empty_or_comment_only(body: &str) -> bool {
 
 /// Finds `#[test]` or `#[tokio::test]` attrs followed by an `async
 /// fn` or `fn` declaration; returns `(fn_name, body)` pairs.
+///
+/// The function is over the clippy `too_many_lines` threshold (100)
+/// because the raw-string-aware brace counter is intentionally
+/// open-coded in-line rather than split out — fragmenting it across
+/// helper fns obscures the linear scanner state machine that's
+/// load-bearing for the F-3 fix. The block is comprehensively
+/// commented + covered by 4 unit tests.
+#[allow(clippy::too_many_lines)]
 fn find_test_fns(content: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut idx = 0usize;
@@ -180,17 +188,86 @@ fn find_test_fns(content: &str) -> Vec<(String, String)> {
                 continue;
             }
         };
-        // Find matching `}` with depth counting.
+        // Find matching `}` with depth counting. The scanner skips
+        // contents of regular string literals (`"..."`) and raw
+        // string literals (`r"..."`, `r#"..."#`, `r##"..."##`, ...,
+        // also `br...` byte raw strings) so that braces appearing
+        // INSIDE strings don't perturb the depth count. Raw strings
+        // are load-bearing because their content cannot use `\` to
+        // escape a `"`, and JSON / contract-bytecode literals
+        // commonly embedded in tests do contain `{` / `}` chars
+        // (issue #98 F-3 audit finding).
         let mut depth = 1i32;
         let mut i = brace_open + 1;
         let bytes2 = content.as_bytes();
         while i < bytes2.len() && depth > 0 {
+            // Raw string detection: `r"...`, `r#"..."#`, `br"...`,
+            // `br#"..."#`, etc. The `r` (or `br`) must be at a
+            // token-start position — i.e., the preceding byte must
+            // not be an ASCII identifier-continuation byte (letter,
+            // digit, or underscore). Conservative: false-negative
+            // (treating `var` followed by `"` as a regular string
+            // boundary) is safe; false-positive (treating an
+            // identifier ending in `r` as a raw-string start) is
+            // the hazard, so the prev-byte check forbids it.
+            let is_token_start = i == brace_open + 1
+                || !matches!(bytes2[i - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_');
+            if is_token_start {
+                // Optional `b` prefix for byte raw strings.
+                let mut probe = i;
+                if probe < bytes2.len() && bytes2[probe] == b'b' {
+                    probe += 1;
+                }
+                if probe < bytes2.len() && bytes2[probe] == b'r' {
+                    probe += 1;
+                    // Count `#` chars.
+                    let hash_start = probe;
+                    while probe < bytes2.len() && bytes2[probe] == b'#' {
+                        probe += 1;
+                    }
+                    let n_hashes = probe - hash_start;
+                    if probe < bytes2.len() && bytes2[probe] == b'"' {
+                        // Confirmed raw-string open. Skip to matching
+                        // `"` followed by exactly `n_hashes` `#`.
+                        // (`r"..."` with `n_hashes == 0` closes on
+                        // the next `"`.)
+                        let mut j = probe + 1;
+                        loop {
+                            if j >= bytes2.len() {
+                                // Unterminated raw string — fall
+                                // through and let the outer loop
+                                // resolve. Best-effort.
+                                break;
+                            }
+                            if bytes2[j] == b'"' {
+                                // Check trailing `#` run.
+                                let mut k = 0;
+                                while k < n_hashes
+                                    && j + 1 + k < bytes2.len()
+                                    && bytes2[j + 1 + k] == b'#'
+                                {
+                                    k += 1;
+                                }
+                                if k == n_hashes {
+                                    j += 1 + n_hashes; // past the closing `"` + hashes
+                                    break;
+                                }
+                            }
+                            j += 1;
+                        }
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+
             match bytes2[i] {
                 b'{' => depth += 1,
                 b'}' => depth -= 1,
                 b'"' => {
-                    // Skip string literals (simple — no escape
-                    // handling needed for typical test bodies).
+                    // Skip regular string literals (simple — no
+                    // escape handling needed for typical test
+                    // bodies; `\"` is the only relevant escape).
                     i += 1;
                     while i < bytes2.len() && bytes2[i] != b'"' {
                         if bytes2[i] == b'\\' && i + 1 < bytes2.len() {
@@ -251,5 +328,129 @@ fn no_empty_test_bodies_workspace_wide() {
          function name to ALLOWED_EMPTY in this test if its empty \
          body is genuinely load-bearing (e.g., the funder-client D-019 \
          placeholder)."
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Issue #98 F-3 fix-pass: raw-string awareness in the brace-counter.
+//
+// Before F-3 the scanner skipped regular `"..."` literals only;
+// raw strings (`r#"..."#`, `br#"..."#`, etc.) were scanned
+// byte-by-byte, so any `{` or `}` inside the raw-string content
+// perturbed the depth counter. If a test fn body contained a raw
+// string with unbalanced braces (very common in tests that pin
+// JSON or contract-bytecode fragments), the scanner could either
+// miss an empty body (depth never reaches 0 inside the fn) or —
+// worse — false-positive a non-empty body by terminating early at
+// a stray `}` inside the raw string and treating the rest of the
+// fn as outside.
+//
+// The two tests below feed synthetic Rust source through
+// `find_test_fns` and assert it correctly identifies the fn name
+// + body for raw strings whose content contains unbalanced braces.
+// ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn raw_string_with_unbalanced_braces_does_not_corrupt_scanner() {
+    // A test fn whose body contains a raw string with three opening
+    // `{` and no closing `}`, followed by `panic!()`. Before F-3 the
+    // depth counter would over-count and the scanner would over-run
+    // (or under-shoot) the fn body. After F-3 the raw-string
+    // content is skipped entirely and the body is correctly
+    // identified.
+    let src = "\
+#[test]
+fn raw_unbalanced() {
+    let s = r#\"{{{ unbalanced {{ braces\"#;
+    panic!(\"body is non-empty\");
+}
+";
+    let fns = find_test_fns(src);
+    assert_eq!(fns.len(), 1, "scanner must find exactly one test fn");
+    let (name, body) = &fns[0];
+    assert_eq!(name, "raw_unbalanced");
+    assert!(
+        body.contains("panic!"),
+        "scanner must capture the post-raw-string body content; got: {body:?}"
+    );
+    assert!(
+        !body_is_empty_or_comment_only(body),
+        "body must register as NON-empty"
+    );
+}
+
+#[test]
+fn byte_raw_string_handled_correctly() {
+    // Same shape but with a byte raw string `br#"..."#`. The
+    // `b` prefix MUST be recognized — otherwise a test pinning
+    // binary fixture bytes inline would corrupt the scanner.
+    let src = "\
+#[test]
+fn byte_raw_unbalanced() {
+    let s: &[u8] = br#\"}}} more {{ unbalanced\"#;
+    assert!(!s.is_empty());
+}
+";
+    let fns = find_test_fns(src);
+    assert_eq!(fns.len(), 1);
+    let (name, body) = &fns[0];
+    assert_eq!(name, "byte_raw_unbalanced");
+    assert!(
+        body.contains("assert!"),
+        "scanner must capture the post-byte-raw-string body; got: {body:?}"
+    );
+    assert!(
+        !body_is_empty_or_comment_only(body),
+        "body must register as NON-empty"
+    );
+}
+
+#[test]
+fn raw_string_with_multiple_hashes_handled() {
+    // Defense for `r##"..."##` (two hashes) — the matching close
+    // must consume exactly two `#`, not one. If the scanner closed
+    // on the first `"#`, content past that point would be
+    // re-scanned (and any embedded `}` would close the fn early).
+    let src = "\
+#[test]
+fn multi_hash_raw() {
+    let s = r##\"close-only-with-double-hash \"# still inside }}}\"##;
+    let _ = s;
+    assert_eq!(1 + 1, 2);
+}
+";
+    let fns = find_test_fns(src);
+    assert_eq!(fns.len(), 1);
+    let (name, body) = &fns[0];
+    assert_eq!(name, "multi_hash_raw");
+    assert!(
+        body.contains("assert_eq!"),
+        "scanner must reach the post-raw-string assert; got: {body:?}"
+    );
+}
+
+#[test]
+fn identifier_ending_in_r_not_treated_as_raw_string() {
+    // Conservative-correctness check: `var"..."` — where `var` is
+    // an identifier ending in `r` — must NOT be misread as a
+    // raw-string open. (Real Rust forbids this construct entirely;
+    // the scanner's job is to not generate a false-positive that
+    // would over-skip content.) The previous-byte-is-id-continuation
+    // check guards this case.
+    let src = "\
+#[test]
+fn ident_then_string() {
+    let var = \"hello\";
+    let _ = var;
+    assert!(true);
+}
+";
+    let fns = find_test_fns(src);
+    assert_eq!(fns.len(), 1);
+    let (name, body) = &fns[0];
+    assert_eq!(name, "ident_then_string");
+    assert!(
+        body.contains("assert!"),
+        "body must include the post-string assert; got: {body:?}"
     );
 }
