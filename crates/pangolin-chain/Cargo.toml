@@ -101,3 +101,19 @@ pangolin-store     = { path = "../pangolin-store", features = ["test-utilities"]
 # external feature flag. Mirrors the pattern in
 # `crates/pangolin-store/Cargo.toml` for `test-utilities`.
 pangolin-chain     = { path = ".", features = ["test-utilities"] }
+# MVP-2 issue #99 hermetic WS test harness (`tests/ws_mock_server.rs`
+# + `tests/hermetic_ws.rs`). Both crates are already in the production
+# dep tree via `alloy::providers::ws` (-> `alloy-transport-ws` ->
+# `tokio-tungstenite` + `futures-util`), so naming them here as
+# dev-deps introduces NO new external crate. Pinned `=X.Y.Z` to the
+# exact versions resolved in `Cargo.lock` so a future alloy bump
+# doesn't quietly drift the mock-server's tree. tokio-tungstenite's
+# `connect` feature is not needed (the mock is server-only); the
+# default features cover `accept_async` + `WebSocketStream`.
+tokio-tungstenite  = { version = "=0.28.0", default-features = false }
+futures-util       = { version = "=0.3.32", default-features = false, features = ["std", "sink"] }
+# JSON-RPC framing on the mock server side. The mock parses incoming
+# eth_subscribe requests + emits eth_subscription notifications by
+# hand to keep its scope tiny; same workspace pin already used by
+# `pangolin-chain`'s production deployment-file loader.
+serde_json         = { workspace = true }

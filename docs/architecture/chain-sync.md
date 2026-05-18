@@ -27,7 +27,7 @@ Concrete consequences in-tree:
 | Resolution | Implementation |
 |---|---|
 | **R-a** (`.pvf` checkpoint) | `chain_sync_v1_state` table (single-row, CHECK id = 0); `Vault::last_synced_block_v1()` / `update_last_synced_block_v1()` accessors. `SyncOptions { from_genesis: true }` for the user-facing re-sync escape. |
-| **R-b** (WS preferred + HTTP fallback) | `ChainEventSource` enum tracks active backend; `chain_sync::ws::open_subscription` returns `WsOpenError::Unavailable` in MVP-2 (alloy WS feature deferred per L8); HTTP polling fallback runs unconditionally. Reconnect backoff + state machine are present so the MVP-3 feature-flag flip is a one-line change. |
+| **R-b** (WS preferred + HTTP fallback) | Issue #99 (2026-05-18) flipped alloy's `provider-ws` + `pubsub` features and shipped the WS-preferred branch. `chain_sync::ws::open_subscription` opens a real `eth_subscribe("logs", filter)` WS subscription; `Vault::sync_from_chain` runs HTTP backfill first (cursor → head), then enters a WS recv loop at tip per Q-a Option A. WS open-fail / mid-session-drop never aborts the sync (L10); circuit breaker at `WS_CIRCUIT_BREAKER_THRESHOLD = 5` consecutive failures falls through to HTTP polling. `SyncReport.event_source` is honest (L9); `SyncReport.ws_drops` carries the reconnect telemetry. |
 | **R-c** (two-stage rollback) | `RevisionStatus::Pending { observed_at_block, block_hash }` → `Finalized` at depth ≥ 12. Three additive `revisions` columns (`revision_status`, `observed_at_block`, `observed_block_hash`). `ReorgDetector` caches observed hashes; `Vault::rollback_pending_revisions_in_range` + `promote_finalized_revisions` drive the state-machine. |
 | **R-d** (permissive auto-register) | `device::auto_register_device_from_chain_sync` inserts a row keyed on the EVM address (left-padded `device_id`); two additive `devices` columns (`discovered_via_chain_sync`, `discovered_at_block`). Idempotent via `INSERT OR IGNORE`. |
 | **R-e** (async on `pangolin-store::Vault`) | `Vault::sync_from_chain(&mut self, rpc_url, env, vault_id, options) -> Result<SyncReport, StoreError>` lives on the Vault side (NOT on `pangolin-chain`) — preserves L7. Primitives (signer recovery, event-decode, reorg detector) live on `pangolin-chain`. |
@@ -97,22 +97,63 @@ sync_from_chain(rpc_url, env, vault_id, options)
     └── update_last_synced_block_v1(chunk_end)               # R-a + L12 atomic fence
 ```
 
-### WS deferral note (L8)
+### WS-preferred branch (issue #99 — 2026-05-18)
 
-The R-b "WebSocket preferred" branch is structurally present in
-`crates/pangolin-chain/src/chain_sync/ws.rs` — `ChainEventSource`
-enum, `WsHandle` struct, `open_subscription` entry, reconnect-backoff
-helper, payload adapter — but the actual WS-open returns
-`WsOpenError::Unavailable` in MVP-2 because alloy's `ws` feature is
-not enabled (per L8: no new external crate dep in 4.1). The
-orchestrator's fallback branch handles this gracefully; the
-`SyncReport.event_source` reports `ChainEventSource::HttpPolling`
-unconditionally in this build.
+The R-b "WebSocket preferred" branch is fully shipped. The workspace
+`Cargo.toml` selects alloy's `provider-ws` + `pubsub` features (which
+transitively bring `tokio-tungstenite` + `tungstenite` + `alloy-pubsub`
++ `rustls` with `aws-lc-rs` — `ring` remains BANNED via `deny.toml`
+and verified zero in the dep tree by `scripts/check-no-ring.sh`).
 
-MVP-3 4.1.x feature-flag flip is two lines: (a) add `features =
-["ws", ...]` to the `alloy` workspace dep; (b) replace the
-`Unavailable` branch in `open_subscription` with a real
-`ProviderBuilder::new().on_ws(...)` call.
+The orchestrator topology (Q-a Option A, locked 2026-05-18):
+
+```text
+sync_from_chain(rpc_url, env, vault_id, options)
+    │
+    ├── Stage 1 — HTTP backfill (always runs)
+    │     ├── Chunked eth_getLogs at LOG_BLOCK_CHUNK = 9_000
+    │     ├── verify_alloy_log per event (L2 byte-identical to WS)
+    │     ├── ingest_pending_chain_revision + reorg check
+    │     └── advance last_synced_block_v1 atomically
+    │
+    └── Stage 2 — WS tip-follow (when prefer_websocket && until_block.is_none())
+          │
+          ├── resolve_ws_url(rpc_url, env, ws_default)
+          │     ├── if pinned: use chain.ws_default from base-sepolia.json
+          │     └── else: derive from HTTP URL (https→wss / http→ws)
+          │
+          ├── check_ws_scheme — L-ws-tls-downgrade defence
+          │     ├── BaseSepolia/BaseMainnet refuse ws:// (only wss://)
+          │     └── Dev permits ws:// (hermetic mock + anvil)
+          │
+          ├── open_subscription(ws_url, env, vault_id, contract_address)
+          │     ├── ProviderBuilder + connect_ws (WsConnect)
+          │     │     └── keepalive = WS_KEEPALIVE_INTERVAL_SECS = 30s
+          │     └── subscribe_logs(filter:
+          │             address=D-017
+          │             topic0=RevisionPublished
+          │             topic1=vault_id)
+          │
+          └── recv loop (bounded by WS_TIP_FOLLOW_WINDOW_SECS = 30s)
+                ├── per-event: verify_alloy_log → ingest →
+                │     advance checkpoint
+                └── on SubscriptionClosed:
+                      ├── ws_drops++
+                      ├── exponential backoff via
+                      │     next_reconnect_backoff_ms
+                      └── retry up to WS_CIRCUIT_BREAKER_THRESHOLD = 5
+                          consecutive failures, then fall through to
+                          HTTP polling at HTTP_POLL_INTERVAL_SECS
+                          cadence for the rest of the session
+```
+
+L10: WS open-fail / mid-session-drop NEVER fails the sync. Only
+HARD failures (chain-id mismatch, contract-address mismatch,
+unrecoverable RPC) abort.
+
+L9: `SyncReport.event_source` is set to `WebSocket` only if at least
+one WS-delivered event was successfully ingested; otherwise stays at
+`HttpPolling` (the path actually taken at exit).
 
 ## Two-stage rollback state machine (R-c)
 
@@ -344,8 +385,10 @@ Full design in [`conflict-surface.md`](conflict-surface.md).
 - `crates/pangolin-chain/src/chain_sync/poll.rs` — `fetch_chunk` (HTTP
   per-chunk fetcher), `verify_signed_event` (synthetic-event verifier
   for the test path).
-- `crates/pangolin-chain/src/chain_sync/ws.rs` — WS state-machine
-  placeholder (L8 deferral), `WsHandle`, `WsOpenError`,
+- `crates/pangolin-chain/src/chain_sync/ws.rs` — WS state machine
+  (issue #99): `open_subscription`, `WsHandle`, `WsOpenError`,
+  `WsRecvOutcome`, `recv_next_event`, `resolve_ws_url`,
+  `check_ws_scheme`, `build_ws_read_provider`,
   `next_reconnect_backoff_ms`.
 - `crates/pangolin-chain/src/chain_sync/reorg.rs` — `ReorgDetector`,
   `ReorgInfo`.

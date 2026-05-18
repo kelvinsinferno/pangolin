@@ -347,7 +347,7 @@ jobs:
   # existing dev-dep on `pangolin-store/test-utilities` is filtered out
   # by `--edges normal` so it does NOT false-positive.
   invariants:
-    name: invariants (no-serde-in-crypto + no-uniffi-in-core + chain-no-store)
+    name: invariants (no-serde-in-crypto + no-uniffi-in-core + chain-no-store + no-ring)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -367,6 +367,15 @@ jobs:
       # the script handles the `grep -c 0` exit-1 trap via `|| true`.
       - name: Verify pangolin-chain production tree has zero pangolin-store references
         run: bash scripts/check-chain-no-store.sh
+      # MVP-2 issue #99 (L5 + L-ws-feature-leak-pulls-ring): the
+      # workspace dep tree MUST NOT contain `ring`. The WS feature
+      # flip selected `aws-lc-rs` via alloy 2.0.4's `transport-ws`
+      # feature, but a future alloy/rustls/reqwest bump could
+      # transitively re-route the TLS backend; this guard catches it
+      # at PR time. `deny.toml`'s ring ban is the secondary defence;
+      # this script is the cargo-tree first-line check.
+      - name: Verify workspace tree has zero ring references
+        run: bash scripts/check-no-ring.sh
 
   # MVP-1 issue 1.1 §Test plan: `ffi-bindings` job. Builds the FFI
   # crate, asserts `staticlib`/`cdylib` artefacts exist, runs

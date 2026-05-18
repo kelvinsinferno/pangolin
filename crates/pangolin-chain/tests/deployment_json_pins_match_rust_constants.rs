@@ -112,3 +112,25 @@ fn hex_encode(bytes: &[u8]) -> String {
     }
     out
 }
+
+/// Issue #99 §2f + L-ws-tls-downgrade. The deployment JSON's
+/// `chain.ws_default` field MUST start with `wss://` for the BaseSepolia
+/// production env. The Rust `check_ws_scheme(env, url)` helper rejects
+/// `ws://` for production envs at runtime; this test enforces that the
+/// source-of-truth pin in the JSON is also TLS so a misconfigured
+/// runtime override is the only way to land cleartext WS.
+#[test]
+fn deployment_json_ws_default_uses_wss_scheme_for_base_sepolia() {
+    let json = load_json();
+    let ws_default = json["chain"]["ws_default"]
+        .as_str()
+        .expect("chain.ws_default is a string");
+    assert!(
+        ws_default.starts_with("wss://"),
+        "L-ws-tls-downgrade: chain.ws_default = {ws_default:?} must start with wss:// \
+         (production env BaseSepolia requires TLS-encrypted WebSocket; cleartext ws:// \
+         leaks the requested vault_id topic + subscription metadata on-wire). \
+         If a future provider migration forces a different scheme, the Rust \
+         `check_ws_scheme` helper must be updated in lockstep."
+    );
+}

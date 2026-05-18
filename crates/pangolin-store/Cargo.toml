@@ -76,6 +76,20 @@ unicode-normalization = { version = "=0.1.25", default-features = false, feature
 # (`Send` is asserted; `Sync` is asserted NOT to be implemented).
 static_assertions = { workspace = true }
 
+# MVP-2 issue #99 (2026-05-18): `sync_from_chain`'s WS tip-follow
+# branch uses `tokio::time::timeout` + `tokio::time::Instant` to
+# bound the recv loop (Q-b circuit breaker + L10 graceful-exit on
+# silent disconnect). Tokio was already in `[dev-dependencies]` of
+# this crate (the 4.4 / 5.1 hermetic tests needed it) and is
+# transitively in `pangolin-store`'s dep tree via `pangolin-chain`,
+# so the move from dev-deps to non-dev deps introduces NO new
+# external crate. Pinned via workspace = uses the same
+# `=1.52.2` line + feature set (`time` is the only feature used
+# here; pulled in by the workspace pin). HIGH-1 + L7 invariants
+# preserved: `pangolin-crypto` and `pangolin-indexer` are upstream
+# of `pangolin-store` so the move doesn't affect their trees.
+tokio    = { workspace = true }
+
 # P11B fix-pass M-1: safe wrapper around POSIX `umask(2)` so
 # `Vault::create` can install a `0o077` umask BEFORE the `.pvf` file
 # is created on disk, structurally eliminating the world-readable
@@ -98,13 +112,6 @@ nix = { version = "=0.29.0", default-features = false, features = ["fs"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 hex      = { workspace = true }
-# MVP-2 issue 4.4: the sync-mode selector `Vault::select_sync_mode` is
-# `async fn` (its API signature reserves the option to call a chain
-# RPC from future heuristics; today the body never awaits). Tests
-# need an async test harness; tokio is already a workspace dep and
-# is transitively in pangolin-store's dep tree via pangolin-chain,
-# so the addition is dev-only and introduces no new external crate.
-tokio    = { workspace = true }
 # MVP-2 issue 5.1: hermetic flush-queue tests in `publish.rs` impl
 # the `ChainAdapter` async-trait against test-only fakes
 # (BalanceInsufficientAdapter, CountingAdapter). The chain crate's

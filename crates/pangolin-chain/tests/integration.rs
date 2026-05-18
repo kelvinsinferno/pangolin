@@ -204,3 +204,60 @@ async fn pull_since_returns_smoke_revision() {
         "smoke revision payload must match the deployment record"
     );
 }
+
+/// **MVP-2 issue #99 (Q-d Option K — live residue against the
+/// production WS endpoint).** Opens a real WebSocket subscription
+/// against `wss://sepolia.base.org`, filtered to D-017 +
+/// `RevisionPublished` topic0 + an arbitrary indexed vault id.
+/// Asserts that `open_subscription` returns a handle within a sane
+/// time budget — the subscription does NOT need to receive an event
+/// (D-017 has no production events at MVP-2 time per the #98
+/// fixture-capture inventory). The test confirms:
+///
+/// 1. The TLS handshake against `wss://sepolia.base.org` completes.
+/// 2. The `eth_subscribe("logs", filter)` JSON-RPC request succeeds.
+/// 3. The chain-side filter is honored (server accepts the
+///    contract-address + topic0 + topic1 shape pangolin-chain emits).
+///
+/// Closes the env-quirk-#14 audit-class for the WS path: a future
+/// regression in alloy's WS provider, a TLS-stack drift, or a public
+/// RPC behaviour change surfaces here on demand (run via
+/// `scripts/run-live-tests.{sh,ps1}`).
+///
+/// Marked `#[ignore]` so default CI does not reach the network;
+/// manually invoke with:
+///
+/// ```text
+/// cargo test -p pangolin-chain --features integration-tests \
+///   live_ws_subscribe_against_d017 -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "live-RPC test; opens real WS against wss://sepolia.base.org"]
+async fn live_ws_subscribe_against_d017() {
+    use pangolin_chain::chain_sync::ws::open_subscription;
+    use pangolin_chain::ChainEnv;
+
+    let ws_url = std::env::var("BASE_SEPOLIA_WS_URL")
+        .unwrap_or_else(|_| "wss://sepolia.base.org".to_owned());
+    // D-017 contract address from the deployment file
+    // (`0x179362Ad7fb7dA664312aEFDdaa53431eb748E42`). Hard-coded
+    // here to keep the dep set minimal (no JSON parse in this test).
+    let contract_addr: alloy::primitives::Address = "0x179362Ad7fb7dA664312aEFDdaa53431eb748E42"
+        .parse()
+        .expect("D-017 address parses");
+    // Arbitrary vault id; we don't expect any events (the assertion
+    // is that the subscription HANDLE is established).
+    let vault_id: [u8; 32] = [0x42u8; 32];
+
+    let handle = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        open_subscription(&ws_url, ChainEnv::BaseSepolia, &vault_id, contract_addr),
+    )
+    .await
+    .expect("WS open within 30s budget")
+    .expect("open_subscription succeeds against live WS endpoint");
+
+    // The handle's Debug impl confirms the subscription is live.
+    eprintln!("live WS handle established: {handle:?}");
+    drop(handle);
+}

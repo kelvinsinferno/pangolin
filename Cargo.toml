@@ -84,7 +84,7 @@ tempfile          = "=3.13.0"
 #     chaincli does NOT deserialize attacker-controlled bytes (the on-chain
 #     `encPayload` is printed raw as hex/base64; never parsed structurally).
 #   - `anyhow = "=1.0.95"` — error propagation in this binary-only crate.
-alloy             = { version = "=2.0.4", features = ["json", "rpc-types", "signer-local", "signers"] }
+alloy             = { version = "=2.0.4", features = ["json", "rpc-types", "signer-local", "signers", "provider-ws", "pubsub"] }
 alloy-signer-local = { version = "=2.0.4", default-features = false, features = ["keystore"] }
 tokio             = { version = "=1.52.2", default-features = false, features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 clap              = { version = "=4.5.21", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }

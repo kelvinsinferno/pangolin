@@ -20,16 +20,23 @@
 //!   subsequent syncs. Force-from-genesis escape hatch via
 //!   [`SyncOptions::from_genesis`].
 //!
-//! - **R-b:** WebSocket-preferred with HTTP-poll fallback. The
-//!   [`ChainEventSource`] enum tracks which mode is active; the
-//!   orchestrator opens WS first, falls back to HTTP-poll on WS-open
-//!   failure or mid-session drop. NOTE: alloy's WS feature
-//!   (`alloy::providers::ws`) is not currently enabled in the workspace
-//!   `Cargo.toml` (see L8 — no new external crate dep). The WS-open
-//!   path in [`mod@ws`] returns `WsUnavailable` immediately, forcing
-//!   the HTTP-fallback branch in production; the orchestration shape +
-//!   tests cover both branches so the WS upgrade is a future
-//!   feature-flag flip + dep addition rather than a structural rewrite.
+//! - **R-b (issue #99, 2026-05-18):** WebSocket-preferred with HTTP-poll
+//!   fallback. The [`ChainEventSource`] enum tracks which mode is
+//!   active; the orchestrator FIRST runs the HTTP chunk loop to
+//!   backfill `cursor → head` (WS subscriptions cannot replay
+//!   history), THEN if `SyncOptions.prefer_websocket` is true it
+//!   attempts [`ws::open_subscription`] and enters a recv loop at
+//!   tip. WS open-fail / mid-session-drop NEVER fails the sync (L10);
+//!   the orchestrator backs off via [`ws::next_reconnect_backoff_ms`]
+//!   up to [`WS_CIRCUIT_BREAKER_THRESHOLD`] consecutive failures, then
+//!   falls through to HTTP polling at [`HTTP_POLL_INTERVAL_SECS`]
+//!   cadence for the rest of the session. `SyncReport.event_source`
+//!   is written honestly per the path actually taken at exit (L9).
+//!   `SyncReport.ws_drops` counts reconnect attempts for UX telemetry.
+//!   The workspace `Cargo.toml` selects alloy's `provider-ws` +
+//!   `pubsub` features (transitively bringing `tokio-tungstenite` +
+//!   `rustls + aws-lc-rs`; `ring` remains BANNED via `deny.toml` and
+//!   verified zero in the dep tree per L5 + L-ws-feature-leak-pulls-ring).
 //!
 //! - **R-c:** Two-stage rollback. [`RevisionStatus::Pending`] at 1-conf;
 //!   promote to [`RevisionStatus::Finalized`] at depth ≥
@@ -76,8 +83,12 @@
 //! - L6: bounded fetch — [`LOG_BLOCK_CHUNK = 9_000`](LOG_BLOCK_CHUNK).
 //! - L7: `pangolin-store -> pangolin-chain` direction preserved (no
 //!   reverse dep).
-//! - L8: NO new external crate dep beyond what's already in tree.
-//!   See R-b note above for the WS-feature deferral consequence.
+//! - L8 (4.1 ORIGINAL): NO new external crate dep beyond what's
+//!   already in tree. CLOSED by issue #99 (2026-05-18): the alloy
+//!   `provider-ws` + `pubsub` features were enabled to ship the
+//!   WS-preferred branch. Transitives audited via `cargo tree -i ring`
+//!   (0 rows), `cargo audit`, `cargo deny check`. See issue #99
+//!   plan-gate L5 + L-ws-feature-leak-pulls-ring.
 //! - L11: ZERO on-chain broadcast in 4.1. READ-only.
 //! - L12: replay protection via existing MVP-1
 //!   `Vault::ingest_chain_revision` idempotency (canonical-hash +
@@ -133,6 +144,25 @@ pub const MAX_KNOWN_CLIENT_SCHEMA_VERSION: u16 = 1;
 /// override is supplied.
 pub const HTTP_POLL_INTERVAL_SECS: u64 = 30;
 
+/// Interval between WS keepalive pings (RFC 6455 ping/pong). Sets the
+/// alloy `WsConnect::with_keepalive_interval` value. On the server's
+/// silent-disconnect path (TCP RST swallowed), the missing pong
+/// surfaces inside this window so the recv loop reconnects via Q-b.
+///
+/// Issue #99 L-ws-silent-disconnect.
+pub const WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
+
+/// Maximum number of consecutive WS reconnect failures within a single
+/// `sync_from_chain` invocation before the orchestrator gives up on WS
+/// and falls through to HTTP polling for the rest of the session.
+/// Resets on the next `sync_from_chain` call.
+///
+/// Issue #99 Q-b Option β + L12. Bounded recovery time prevents a
+/// dead-RPC from becoming a CPU-spinning hot loop while preserving
+/// the latency win of WS when the server recovers within a few
+/// retries.
+pub const WS_CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
+
 // ---------------------------------------------------------------------
 // SyncReport
 // ---------------------------------------------------------------------
@@ -168,6 +198,11 @@ pub struct SyncReport {
     /// either the WS path was never attempted (feature off) or it
     /// failed and the orchestrator fell back.
     pub event_source: ChainEventSource,
+    /// Count of WS reconnect attempts (open-fails + mid-session
+    /// drops) during this sync. Issue #99 L12 + Q-b telemetry. Resets
+    /// to 0 on every `sync_from_chain` call; trips into HTTP fallback
+    /// when this hits [`WS_CIRCUIT_BREAKER_THRESHOLD`].
+    pub ws_drops: u32,
 }
 
 // ---------------------------------------------------------------------
@@ -181,11 +216,14 @@ pub struct SyncReport {
 /// Useful for UX telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChainEventSource {
-    /// WebSocket subscription via `eth_subscribe("logs")`.
+    /// WebSocket subscription via `eth_subscribe("logs")`. Set when
+    /// the WS recv loop processed at least one tip-following event
+    /// before the sync exited (issue #99 L9).
     WebSocket,
     /// HTTP polling via chunked `eth_getLogs`. The default fallback;
-    /// also the default in builds where alloy WS support is not yet
-    /// enabled (see R-b note in module docstring).
+    /// also set when `SyncOptions.prefer_websocket == false`, when the
+    /// WS open failed, or when the circuit breaker tripped to HTTP
+    /// for the rest of the session.
     #[default]
     HttpPolling,
 }

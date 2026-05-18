@@ -4,7 +4,9 @@
     "name": "base-sepolia",
     "chain_id": 84532,
     "explorer": "https://sepolia.basescan.org",
-    "rpc_default": "https://sepolia.base.org"
+    "rpc_default": "https://sepolia.base.org",
+    "ws_default": "wss://sepolia.base.org",
+    "ws_default_comment": "Issue #99 Q-c Option III (2026-05-18). Source-of-truth pin for the WebSocket subscription endpoint, mirroring rpc_default. L-ws-tls-downgrade: MUST start with wss:// for any production env (BaseSepolia, future BaseMainnet); cleartext ws:// is permitted only against dev/anvil. The deployment_json_pins_match_rust_constants hermetic test (crates/pangolin-chain/tests/) enforces the wss:// prefix at CI time. Public Base Sepolia RPC exposes the WS endpoint at the same host:port as HTTPS; private RPC providers may diverge — update this pin when switching providers."
   },
   "contracts": {
     "RevisionLogV0": {
