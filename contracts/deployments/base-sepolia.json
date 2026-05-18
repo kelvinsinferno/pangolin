@@ -274,12 +274,12 @@
         "captured_at": "2026-05-17T23:55Z",
         "comment": "Pinned at source in crates/pangolin-chain/src/secp256k1_signing.rs as ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1. The redemption_domain_separator_matches_pinned_constant test catches drift at CI time."
       },
-      "verified_on_explorer": false,
+      "verified_on_explorer": true,
       "verification": {
-        "status": "deferred",
-        "method": "Basescan Standard-JSON-Input upload via web UI (operational follow-up; same workaround D-017 + D-018 used)",
-        "manual_command": "forge verify-contract --chain-id 84532 --etherscan-api-key $BASESCAN_API_KEY 0xdDa04e427e95e50Cfd22703A76CAE2E1Da4F5fCD src/EntitlementRegistry.sol:EntitlementRegistry --constructor-args 0x00000000000000000000000089e720238a3913688cb0e025ef03a64539575c54000000000000000000000000aee7e9bf859d938cb087d1e567221cffba9455ac0000000000000000000000000000000000000000000000000000000000000001",
-        "comment": "Auto-verify failed in the wrapper (BASESCAN_API_KEY env var was not set at deploy time). Get a free Basescan API key at https://basescan.org/myapikey then run the manual command above OR upload via Basescan's web UI. Verification is cosmetic; the deployed contract works regardless."
+        "status": "verified",
+        "method": "Basescan auto-attribution via bytecode similarity match (2026-05-17)",
+        "matched_contract": "0x08F8c394EB0c04ba0A4FBA1e64507b88F4b59D8d (D-018)",
+        "comment": "D-019 has byte-identical runtime bytecode to D-018 (same EntitlementRegistry.sol source; only constructor args differ). Basescan's verifier recognized the matching runtime keccak (0xca252c6eaa70553a3fb040b9493c2b9db2a34fb7abc782a3ddeb74b1b35dd1f7) and auto-attributed D-018's already-verified source to D-019 without an explicit upload. The contract page displays the full source + ABI + functional Read Contract / Write Contract tabs. No manual web UI upload was required, contrary to the D-017 + D-018 paths (those were the FIRST verifications of their respective bytecodes; D-019 benefits from D-018's prior work). Confirmed by Kelvin at https://sepolia.basescan.org/address/0xdDa04e427e95e50Cfd22703A76CAE2E1Da4F5fCD#code — page shows green verified checkmark + 'Similar Match: 0x08F8c394...8F4b59D8d' attribution line."
       },
       "smoke_tests": {
         "test_1_payment_authority": {
