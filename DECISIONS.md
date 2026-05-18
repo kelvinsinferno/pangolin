@@ -113,42 +113,15 @@
 **Why:** Per master plan §5 row 2.3 + D-008 (entitlement registry locked as the MVP-2 per-user paid-balance ledger). 2.2 ships the contract; 2.3 ships the deploy pipeline; D-018 records the resulting testnet smoke-test instance. Production-split-authority redeployment happens with MVP-2 issue 3.4; D-018 is not the production address.
 **Spec ref:** Master plan §5 (MVP-2 rows 2.2 + 2.3); D-008 (entitlement registry); 2.2 R-a/R-b/R-e; full metadata in `contracts/deployments/base-sepolia.json` under the `EntitlementRegistry` key.
 
-## D-019 · EntitlementRegistry redeploy with split authorities (Base Sepolia) — TEMPLATE
+## D-019 · EntitlementRegistry redeploy with split authorities (Base Sepolia)
 
-> **Status:** TEMPLATE — placeholder for the operational follow-up
-> commit. Code merged in MVP-2 issue 3.4 (funder service) at 2026-05-15;
-> Kelvin runs the redeploy after merge and fills in the actual values
-> (address / tx / block / runtime keccak / authority addresses).
+**Date locked:** 2026-05-17
 
-**Date locked:** 2026-MM-DD
+**Decision:** `EntitlementRegistry` redeployed at `0xdDa04e427e95e50Cfd22703A76CAE2E1Da4F5fCD` on Base Sepolia (chain id `84532`). Deploy tx `0x06ab93d4b121a80283b1b6b035c4cc004f5e9859126e3039d7984d03981ba4b1` in block `41645807` (timestamp `2026-05-17T23:52:29Z`). Deployer: same `pangolin-dev` wallet (`0x89e720238A3913688CB0E025ef03a64539575c54`) as D-014/D-015/D-017/D-018. Runtime keccak256: `0xca252c6eaa70553a3fb040b9493c2b9db2a34fb7abc782a3ddeb74b1b35dd1f7` (identical to D-018 since contract source is unchanged — only constructor args differ). Runtime bytecode 2,464 B. Gas used 593,592 at 0.006 gwei = 0.0000036 ETH. Constructor arguments (ABI-encoded, three 32-byte words): `PAYMENT_AUTHORITY = 0x89e720238A3913688CB0E025ef03a64539575c54` (pangolin-dev wallet — issues Credit purchase attestations; same wallet that signed D-018), `REDEMPTION_AUTHORITY = 0xaeE7E9bf859d938CB087D1e567221cffba9455AC` (pangolin-funder-dev wallet — NEW keystore created 2026-05-17 via `cast wallet new $HOME/.foundry/keystores` then renamed; funded with 0.03 ETH from pangolin-dev via tx `0xe8ec3b563239b3b20ff44173dec7e33af8c799ec97c5698eca3068fdff354dbb`; signs redemption authorizations dispensed alongside ETH top-ups per 3.4 funder lifecycle), `initial schemaVersion = 1`. Domain separator pinned post-deploy: `0xb33d25188e5fc32cf5021ce63f28ee4ffb13d1d9a4ca720c46272f4c87c42fd0` (captured via `cast call <D-019> "DOMAIN_SEPARATOR()(bytes32)"`). **Production-grade key separation** per 2.2 R-a + 3.4 R-d: REDEMPTION_AUTHORITY compromise no longer enables balance inflation via `credit` (PAYMENT_AUTHORITY is a separate signer). Source `crates/pangolin-chain/src/secp256k1_signing.rs` constants `EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA` + `ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1` updated in this commit to match. `contracts/deploy/.env.sepolia` updated to use the split-key addresses. `contracts/deployments/base-sepolia.json` adds the canonical `EntitlementRegistry` entry (D-019); the D-018 entry renamed to `EntitlementRegistry_D018_smoke_test_superseded` with cross-references. **D-018 (`0x08F8c394EB0c04ba0A4FBA1e64507b88F4b59D8d`) remains on chain** — immutable; no admin / pause / selfdestruct — as historical record but is NO LONGER referenced by any production code path. Smoke-tested live: `PAYMENT_AUTHORITY()` returns pangolin-dev; `REDEMPTION_AUTHORITY()` returns pangolin-funder-dev; `DOMAIN_SEPARATOR()` returns the pinned hex. Verification status DEFERRED (Basescan API key not set at deploy time; deploy script logged the manual verify-contract fallback command in `contracts/deployments/base-sepolia.json` under the `verification` field).
 
-**Decision:** `EntitlementRegistry` redeployed at `0x<TBD>` on Base
-Sepolia (chain id `84532`). Deploy tx `0x<TBD>` in block `<TBD>`.
-Constructor args: `PAYMENT_AUTHORITY = 0x89e720238A3913688CB0E025ef03a64539575c54`
-(pangolin-dev wallet, testnet billing); `REDEMPTION_AUTHORITY = 0x<funder-TBD>`
-(pangolin-funder-dev wallet — the funder service's REAL signing key,
-distinct from pangolin-dev per 3.4 R-d). D-018 stays untouched as the
-collapsed-authority smoke-test instance; D-019 is the production
-split-key contract the funder service binds to. After deploy: the
-funder service reads D-019's address via the deployment-file loader
-(no source change); the `EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA`
-+ `ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1` constants in
-`crates/pangolin-chain/src/secp256k1_signing.rs` MUST be updated to
-match the new deployment (the `redemption_domain_separator_matches_pinned_constant`
-hermetic test catches drift).
+**Why:** Per master plan §4 row 3.4 + R-d of `docs/issue-plans/3.4.md`. 2.2's split-trust property (R-a) is load-bearing for the funder threat model (L-funder-wallet-key-leak): the REDEMPTION_AUTHORITY compromise must not also enable balance inflation via `credit`. D-018 collapsed authorities for the 2.3 smoke-test pass; D-019 ships real split keys under the same contract source. After CLI-V1 closed all functional MVP-2 deferrals (a458675), this is the first item in the pre-MVP-3 cleanup batch.
 
-**Why:** Per master plan §4 row 3.4 + R-d of `docs/issue-plans/3.4.md`.
-2.2's split-trust property (R-a) is load-bearing for the funder threat
-model (L-funder-wallet-key-leak): the REDEMPTION_AUTHORITY compromise
-must not also enable balance inflation via `credit`. D-018 collapsed
-authorities for the 2.3 smoke-test pass; D-019 ships real split keys
-under the same contract source.
-
-**Spec ref:** Master plan §4 row 3.4; `docs/issue-plans/3.4.md` R-d;
-`docs/RELEASE-CONTRACTS.md` D-019 section; full deploy procedure +
-post-deploy invariant updates documented there. Will reference
-`contracts/deployments/base-sepolia.json` under the `EntitlementRegistry`
-key (replaces / shadows the D-018 entry).
+**Spec ref:** Master plan §4 row 3.4; `docs/issue-plans/3.4.md` R-d; full deploy procedure logged in `contracts/deployments/base-sepolia.json` under the canonical `EntitlementRegistry` key (D-019 supersedes the prior D-018 entry which is renamed to `EntitlementRegistry_D018_smoke_test_superseded`).
 
 ---
 
