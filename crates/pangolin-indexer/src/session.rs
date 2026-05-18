@@ -39,6 +39,7 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -80,6 +81,47 @@ pub const IDLE_TIMEOUT_ENV_VAR: &str = "PANGOLIN_INDEXER_IDLE_TIMEOUT_SECS";
 /// host that requests an unreasonably large batch (memory pressure
 /// in the session task).
 pub const PULL_BATCH_SIZE_MAX: u32 = 1_024;
+
+/// §4.3 per-column AEAD: width of the fixed-format AAD bound into
+/// every per-column seal/open. Layout (big-endian where applicable):
+///
+/// ```text
+/// [vault_id (32)] [page_id_BE_u64 (8)] [schema_version_BE_u16 (2)]
+/// ```
+///
+/// Total = `32 + 8 + 2 = 42` bytes. Pinned as a `const` so any
+/// future regression on the AAD shape surfaces as a compile error
+/// at the test sites that consume this constant.
+pub const PER_COLUMN_AAD_LEN: usize = 42;
+
+/// §4.3 per-column AEAD: number of BLOB columns wrapped by the
+/// per-column cipher discipline. Pinned for the
+/// `nonces_distinct_across_persist` and raw-disk-no-plaintext
+/// tests. Columns (in stable order): `vault_id, account_id,
+/// parent_revision, device_id, enc_payload, signer, block_hash,
+/// tx_hash`. Schema columns NOT wrapped: `page_seq, schema_version,
+/// sequence, block_number, log_index` (integers, used as
+/// AAD/index/sequencing material).
+pub const WRAPPED_BLOB_COLUMN_COUNT: usize = 8;
+
+/// §4.3 per-column AEAD: build the fixed-format 42-byte AAD bound
+/// into every per-row seal/open. The AAD layout is
+/// `vault_id (32) ‖ page_id_BE_u64 (8) ‖ schema_version_BE_u16 (2)`.
+///
+/// This function is `pub(crate)` rather than `pub` because the AAD
+/// is an internal contract between `persist_chunk` (writer) and
+/// `handle_pull` (reader); no external caller should construct an
+/// AAD directly. The integration tests in `tests/*.rs` reach this
+/// indirectly via `persist_chunk` outputs and ciphertext inspection
+/// — they MUST NOT reconstruct the AAD themselves.
+#[must_use]
+pub(crate) fn build_aad(vault_id: &[u8; 32], page_id: u64, schema_version: u16) -> [u8; 42] {
+    let mut aad = [0u8; PER_COLUMN_AAD_LEN];
+    aad[..32].copy_from_slice(vault_id);
+    aad[32..40].copy_from_slice(&page_id.to_be_bytes());
+    aad[40..42].copy_from_slice(&schema_version.to_be_bytes());
+    aad
+}
 
 // ---------------------------------------------------------------------
 // IndexerConfig
@@ -173,6 +215,18 @@ pub struct IndexerSession {
     /// Total blocks the session expects to process — used for the
     /// `Progress` response.
     total_blocks: u64,
+    /// §4.3 per-column AEAD (Option δ): monotonic per-session
+    /// counter that allocates the `page_seq` value for each row
+    /// inserted by `persist_chunk`. The counter starts at 0 and
+    /// increments by 1 per row. The value is also bound into every
+    /// per-column AEAD AAD via [`build_aad`] so two rows in the same
+    /// session always carry distinct AAD even if they share
+    /// `(vault_id, schema_version)` (which they will — same vault +
+    /// same schema across the session). Held as an `AtomicU64` so
+    /// the chunk-loop body could be parallelised in a future cycle
+    /// without losing the monotonic-increment invariant; 4.3 itself
+    /// drives this sequentially from `persist_chunk`.
+    page_seq_counter: AtomicU64,
 }
 
 impl std::fmt::Debug for IndexerSession {
@@ -223,15 +277,18 @@ impl IndexerSession {
         // any constructor/key issue surfaces at session creation
         // (NOT at first persist). With 4.3's `AeadCipher` this
         // exercises the full seal/open path; with the test-only
-        // `NoOpCipher` it stays a passthrough.
+        // `NoOpCipher` it stays a passthrough. The probe uses a
+        // fixed sentinel AAD so the per-column AEAD path is
+        // exercised end-to-end even before the session is bound to
+        // a vault.
         let probe_plain: &[u8] = b"4.3-cipher-probe";
-        let probe_sealed = cipher.encrypt_page(probe_plain);
-        let probe_recovered =
-            cipher
-                .decrypt_page(&probe_sealed)
-                .map_err(|e| IndexerError::TempDbInit {
-                    message: format!("cipher constructor probe failed: {e}"),
-                })?;
+        let probe_aad: &[u8] = b"4.3-cipher-probe-aad";
+        let probe_sealed = cipher.encrypt_page(probe_plain, probe_aad);
+        let probe_recovered = cipher.decrypt_page(&probe_sealed, probe_aad).map_err(|e| {
+            IndexerError::TempDbInit {
+                message: format!("cipher constructor probe failed: {e}"),
+            }
+        })?;
         debug_assert_eq!(probe_recovered.as_slice(), probe_plain);
         Ok(Self {
             config,
@@ -244,6 +301,7 @@ impl IndexerSession {
             end_block: 0,
             last_processed_block: 0,
             total_blocks: 0,
+            page_seq_counter: AtomicU64::new(0),
         })
     }
 
@@ -252,10 +310,30 @@ impl IndexerSession {
     /// indexer doesn't compute) so the host's ingest path can
     /// translate 1:1.
     fn run_migration(conn: &Connection) -> Result<(), IndexerError> {
+        // §4.3 per-column AEAD migration (ephemeral DB — no .pvf
+        // schema change; no migration ladder needed because the
+        // temp DB is created fresh per-session):
+        //
+        // 1. The 8 BLOB columns (`vault_id, account_id,
+        //    parent_revision, device_id, enc_payload, signer,
+        //    block_hash, tx_hash`) now hold **per-column AEAD
+        //    ciphertext** (`nonce ‖ ct ‖ tag`) rather than
+        //    plaintext. The column types remain `BLOB`; only the
+        //    semantics change.
+        // 2. New `page_seq` column holds the monotonic per-session
+        //    sequence number allocated from
+        //    `IndexerSession::page_seq_counter`. Bound into every
+        //    per-column AAD (Option δ from the §4.3 per-column
+        //    plan-gate).
+        // 3. Integer columns (`schema_version, sequence,
+        //    block_number, log_index, page_seq`) stay plaintext —
+        //    they are not secret material and are needed as AAD /
+        //    sort keys / index hooks.
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS cached_revisions (
                 rowid             INTEGER PRIMARY KEY AUTOINCREMENT,
+                page_seq          INTEGER NOT NULL UNIQUE,
                 vault_id          BLOB    NOT NULL,
                 account_id        BLOB    NOT NULL,
                 parent_revision   BLOB    NOT NULL,
@@ -271,6 +349,8 @@ impl IndexerSession {
             );
             CREATE INDEX IF NOT EXISTS idx_cached_revisions_block
                 ON cached_revisions(block_number);
+            CREATE INDEX IF NOT EXISTS idx_cached_revisions_page_seq
+                ON cached_revisions(page_seq);
             CREATE TABLE IF NOT EXISTS indexer_meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -420,16 +500,21 @@ impl IndexerSession {
         events: &[VerifiedRevisionEvent],
         bound_vault: &[u8; 32],
     ) -> Result<(), IndexerError> {
+        // §4.3 per-column AEAD: every BLOB column is wrapped with
+        // the cipher before INSERT. AAD per row is the fixed-format
+        // 42-byte concat `vault_id ‖ page_id_BE ‖ schema_version_BE`
+        // built by [`build_aad`]. The `page_id` source is the
+        // monotonic per-session `page_seq_counter` (Option δ).
         let mut stmt = self
             .conn
             .as_ref()
             .expect("conn is Some for the entire session lifetime")
             .prepare(
                 "INSERT INTO cached_revisions (
-                    vault_id, account_id, parent_revision, device_id,
+                    page_seq, vault_id, account_id, parent_revision, device_id,
                     schema_version, sequence, enc_payload, signer,
                     block_number, block_hash, tx_hash, log_index
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .map_err(|e| IndexerError::TempDbIo {
                 message: format!("prepare insert: {e}"),
@@ -444,20 +529,50 @@ impl IndexerSession {
             if v.event.vault_id != *bound_vault {
                 continue;
             }
+            // Allocate a fresh page_seq for this row. The fetch-add
+            // returns the previous value; the very first row gets
+            // page_seq = 0. Sequential across the session.
+            let page_seq = self.page_seq_counter.fetch_add(1, Ordering::SeqCst);
+            let aad = build_aad(bound_vault, page_seq, v.schema_version);
+
             let block_hash_bytes: [u8; 32] = v.block_hash.into();
             let signer_bytes = v.signer.as_slice();
+
+            // Wrap each of the 8 BLOB columns with the cipher under
+            // the SAME (per-row) AAD. The AAD discipline binds
+            // (vault_id, page_id, schema_version) into every column
+            // — cross-page-cut-and-paste, cross-session-replay, and
+            // future-schema-version-poison all manifest as decrypt
+            // failure under [`build_aad`]-recomputed AAD at read
+            // time.
+            let vault_ct = self.cipher.encrypt_page(v.event.vault_id.as_ref(), &aad);
+            let account_ct = self.cipher.encrypt_page(v.event.account_id.as_ref(), &aad);
+            let parent_ct = self
+                .cipher
+                .encrypt_page(v.event.parent_revision.as_ref(), &aad);
+            let device_ct = self.cipher.encrypt_page(v.event.device_id.as_ref(), &aad);
+            let payload_ct = self
+                .cipher
+                .encrypt_page(v.event.enc_payload.as_slice(), &aad);
+            let signer_ct = self.cipher.encrypt_page(signer_bytes, &aad);
+            let block_hash_ct = self.cipher.encrypt_page(block_hash_bytes.as_ref(), &aad);
+            let tx_hash_ct = self
+                .cipher
+                .encrypt_page(v.event.anchor.tx_hash.as_ref(), &aad);
+
             stmt.execute(rusqlite::params![
-                v.event.vault_id.as_ref() as &[u8],
-                v.event.account_id.as_ref() as &[u8],
-                v.event.parent_revision.as_ref() as &[u8],
-                v.event.device_id.as_ref() as &[u8],
+                i64::try_from(page_seq).unwrap_or(i64::MAX),
+                vault_ct,
+                account_ct,
+                parent_ct,
+                device_ct,
                 i64::from(v.schema_version),
                 i64::try_from(v.event.sequence).unwrap_or(i64::MAX),
-                v.event.enc_payload.as_slice(),
-                signer_bytes,
+                payload_ct,
+                signer_ct,
                 i64::try_from(v.event.anchor.block_number).unwrap_or(i64::MAX),
-                block_hash_bytes.as_ref() as &[u8],
-                v.event.anchor.tx_hash.as_ref() as &[u8],
+                block_hash_ct,
+                tx_hash_ct,
                 i64::try_from(v.event.anchor.log_index).unwrap_or(i64::MAX),
             ])
             .map_err(|e| IndexerError::TempDbIo {
@@ -467,6 +582,12 @@ impl IndexerSession {
         Ok(())
     }
 
+    // The per-column AAD path pairs every column's ciphertext (`*_ct`)
+    // with its decrypted plaintext (`*_pt`). The `_ct`/`_pt` suffix
+    // discipline is intentional + readable in this context; the
+    // clippy::similar_names lint flags the close suffix-pair as
+    // hazardous, but here it is load-bearing for the audit.
+    #[allow(clippy::similar_names)]
     fn handle_pull(&mut self, batch_size: u32) -> Result<IndexerResponse, IndexerError> {
         let n = batch_size.min(PULL_BATCH_SIZE_MAX);
         // 0-batch pulls drain nothing but still tick the
@@ -479,12 +600,17 @@ impl IndexerSession {
                 message: "Pull issued before StartIndex".into(),
             });
         };
+        // §4.3 per-column AEAD: SELECT now includes `page_seq` so we
+        // can rebuild the per-row AAD at decrypt time. The schema
+        // INTEGER columns (`page_seq, schema_version, sequence,
+        // block_number, log_index`) are plaintext; the 8 BLOB
+        // columns are per-column ciphertext (`nonce ‖ ct ‖ tag`).
         let mut stmt = self
             .conn
             .as_ref()
             .expect("conn is Some for the entire session lifetime")
             .prepare(
-                "SELECT vault_id, account_id, parent_revision, device_id,
+                "SELECT page_seq, vault_id, account_id, parent_revision, device_id,
                         schema_version, sequence, enc_payload, signer,
                         block_number, block_hash, tx_hash, log_index
                  FROM cached_revisions
@@ -507,52 +633,100 @@ impl IndexerSession {
         while let Some(row) = rows.next().map_err(|e| IndexerError::TempDbIo {
             message: format!("step pull: {e}"),
         })? {
-            let vault_blob: Vec<u8> = row.get(0).map_err(|ref e| map_io(e))?;
+            let page_seq_i64: i64 = row.get(0).map_err(|ref e| map_io(e))?;
+            let vault_ct: Vec<u8> = row.get(1).map_err(|ref e| map_io(e))?;
+            let account_ct: Vec<u8> = row.get(2).map_err(|ref e| map_io(e))?;
+            let parent_ct: Vec<u8> = row.get(3).map_err(|ref e| map_io(e))?;
+            let device_ct: Vec<u8> = row.get(4).map_err(|ref e| map_io(e))?;
+            let schema_version_i64: i64 = row.get(5).map_err(|ref e| map_io(e))?;
+            let sequence: i64 = row.get(6).map_err(|ref e| map_io(e))?;
+            let enc_payload_ct: Vec<u8> = row.get(7).map_err(|ref e| map_io(e))?;
+            let signer_ct: Vec<u8> = row.get(8).map_err(|ref e| map_io(e))?;
+            let block_number: i64 = row.get(9).map_err(|ref e| map_io(e))?;
+            let block_hash_ct: Vec<u8> = row.get(10).map_err(|ref e| map_io(e))?;
+            let tx_hash_ct: Vec<u8> = row.get(11).map_err(|ref e| map_io(e))?;
+            let log_index: i64 = row.get(12).map_err(|ref e| map_io(e))?;
+
+            // Reconstruct the AAD for this row from the plaintext
+            // integer columns + the session's bound vault_id. The
+            // rebuilt AAD MUST be byte-identical to the AAD used at
+            // seal time; if not, every per-column decrypt fails
+            // with TagMismatch.
+            //
+            // ## L-aad-integer-truncation defense
+            //
+            // SQLite stores `page_seq` + `schema_version` as `i64`
+            // because rusqlite doesn't have a native `u64` column type.
+            // A naive `u64::try_from(i64).unwrap_or(0)` lets an
+            // attacker with mid-run file-level write access duplicate
+            // row 0's wrapped BLOBs into a NEW row with plaintext
+            // `page_seq = -1` (the UNIQUE constraint allows it because
+            // -1 ≠ 0) — the silent fallback would then map -1 → 0,
+            // reconstruct AAD as if `page_seq = 0`, decrypt
+            // successfully, and surface row 0's plaintext as a phantom
+            // additional row. Same class of attack exists for
+            // `schema_version`. Reject out-of-range integers with
+            // `CipherTamper` so a malicious filesystem cannot make the
+            // session swallow a forged row silently.
+            let page_seq = u64::try_from(page_seq_i64).map_err(|_| IndexerError::CipherTamper {
+                context: format!(
+                    "page_seq out of u64 range (raw i64 = {page_seq_i64}); \
+                         likely on-disk tamper of an unwrapped column"
+                ),
+            })?;
+            let schema_version =
+                u16::try_from(schema_version_i64).map_err(|_| IndexerError::CipherTamper {
+                    context: format!(
+                        "schema_version out of u16 range (raw i64 = {schema_version_i64}); \
+                         likely on-disk tamper of an unwrapped column"
+                    ),
+                })?;
+            let aad = build_aad(&bound, page_seq, schema_version);
+
+            // Unwrap each of the 8 BLOB columns. ANY tamper-mismatch
+            // (cross-row paste, cross-session-replay, key-mismatch,
+            // tag/body/nonce flip, AAD-recompute mismatch) surfaces
+            // as a typed `CipherTamper`. The discipline is "fail
+            // closed on the entire batch" rather than skip-and-
+            // continue, so a malicious filesystem cannot make the
+            // session silently swallow tampered rows.
+            let vault_pt = unwrap_column(&*self.cipher, "vault_id", &vault_ct, &aad)?;
             // L2 defense-in-depth on the read side too — if a row
             // somehow leaked a foreign vault id past the insert
             // filter (it can't, but the layered defense is cheap),
             // skip it.
-            if vault_blob != bound {
+            if vault_pt != bound {
                 continue;
             }
-            let account_id: Vec<u8> = row.get(1).map_err(|ref e| map_io(e))?;
-            let parent_revision: Vec<u8> = row.get(2).map_err(|ref e| map_io(e))?;
-            let device_id: Vec<u8> = row.get(3).map_err(|ref e| map_io(e))?;
-            let schema_version: i64 = row.get(4).map_err(|ref e| map_io(e))?;
-            let sequence: i64 = row.get(5).map_err(|ref e| map_io(e))?;
-            let enc_payload: Vec<u8> = row.get(6).map_err(|ref e| map_io(e))?;
-            let signer: Vec<u8> = row.get(7).map_err(|ref e| map_io(e))?;
-            let block_number: i64 = row.get(8).map_err(|ref e| map_io(e))?;
-            let block_hash: Vec<u8> = row.get(9).map_err(|ref e| map_io(e))?;
-            let tx_hash: Vec<u8> = row.get(10).map_err(|ref e| map_io(e))?;
-            let log_index: i64 = row.get(11).map_err(|ref e| map_io(e))?;
+            let account_pt = unwrap_column(&*self.cipher, "account_id", &account_ct, &aad)?;
+            let parent_pt = unwrap_column(&*self.cipher, "parent_revision", &parent_ct, &aad)?;
+            let device_pt = unwrap_column(&*self.cipher, "device_id", &device_ct, &aad)?;
+            let enc_payload_pt =
+                unwrap_column(&*self.cipher, "enc_payload", &enc_payload_ct, &aad)?;
+            let signer_pt = unwrap_column(&*self.cipher, "signer", &signer_ct, &aad)?;
+            let block_hash_pt = unwrap_column(&*self.cipher, "block_hash", &block_hash_ct, &aad)?;
+            let tx_hash_pt = unwrap_column(&*self.cipher, "tx_hash", &tx_hash_ct, &aad)?;
+
             // Track the highest rowid we've seen so the next pull
-            // resumes after it.
-            //
-            // SQLite's AUTOINCREMENT guarantees `rowid` is
-            // monotonically increasing in INSERT order, so the
-            // `ORDER BY rowid ASC` query is the natural FIFO.
-            //
-            // The rowid is not on the SELECT list; we read it via a
-            // second statement-bound query. For 4.2 we just track
-            // the offset by counting returned rows (rowid is the
-            // primary key generated AUTOINCREMENT-style; rowid n
-            // implies n rows fit before it). Since we don't expose
-            // the rowid column, we count rows here and advance the
-            // offset accordingly.
+            // resumes after it. SQLite's AUTOINCREMENT guarantees
+            // `rowid` is monotonically increasing in INSERT order,
+            // so the `ORDER BY rowid ASC` query is the natural FIFO.
+            // Since we don't expose the rowid column on the SELECT,
+            // we count returned rows here and advance the offset
+            // accordingly.
             highest_rowid = highest_rowid.saturating_add(1);
             out.push(IndexedEvent {
-                vault_id: hex::encode(&vault_blob),
-                account_id: hex::encode(&account_id),
-                parent_revision: hex::encode(&parent_revision),
-                device_id: hex::encode(&device_id),
-                schema_version: u16::try_from(schema_version).unwrap_or(u16::MAX),
+                vault_id: hex::encode(&vault_pt),
+                account_id: hex::encode(&account_pt),
+                parent_revision: hex::encode(&parent_pt),
+                device_id: hex::encode(&device_pt),
+                schema_version,
                 sequence: u64::try_from(sequence).unwrap_or(0),
-                enc_payload: hex::encode(&enc_payload),
-                signer: hex::encode(&signer),
+                enc_payload: hex::encode(&enc_payload_pt),
+                signer: hex::encode(&signer_pt),
                 block_number: u64::try_from(block_number).unwrap_or(0),
-                block_hash: hex::encode(&block_hash),
-                tx_hash: hex::encode(&tx_hash),
+                block_hash: hex::encode(&block_hash_pt),
+                tx_hash: hex::encode(&tx_hash_pt),
                 log_index: u64::try_from(log_index).unwrap_or(0),
             });
         }
@@ -591,12 +765,71 @@ impl IndexerSession {
     pub fn is_complete(&self) -> bool {
         self.bound_vault.is_some() && self.last_processed_block >= self.end_block
     }
+
+    // ---- §4.3 per-column AEAD: test-only injection surface ----
+
+    /// **Test-only.** Directly bind a `vault_id` and persist a slice
+    /// of pre-built [`VerifiedRevisionEvent`]s through the session's
+    /// per-column-AEAD write path.
+    ///
+    /// Used by `tests/raw_disk_no_plaintext_per_column.rs` and
+    /// related integration tests that need to exercise
+    /// `persist_chunk` without spinning up a live RPC. Gated behind
+    /// the existing `test-utilities` feature so production builds
+    /// can NEVER reach this method (4.2 L1 hygiene preserved).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`IndexerError::TempDbIo`] from the underlying
+    /// `persist_chunk` SQL path.
+    #[cfg(any(test, feature = "test-utilities"))]
+    pub fn test_inject_chunk(
+        &mut self,
+        vault_id: [u8; 32],
+        events: &[VerifiedRevisionEvent],
+    ) -> Result<(), IndexerError> {
+        if self.bound_vault.is_none() {
+            self.bound_vault = Some(vault_id);
+        }
+        self.persist_chunk(events, &vault_id)
+    }
+
+    /// **Test-only.** Snapshot the current `page_seq` counter without
+    /// modifying it. Tests that pin the counter's monotonic-increment
+    /// behaviour read this to assert N rows ⇒ counter = N.
+    #[cfg(any(test, feature = "test-utilities"))]
+    #[must_use]
+    pub fn test_page_seq_counter(&self) -> u64 {
+        self.page_seq_counter.load(Ordering::SeqCst)
+    }
 }
 
 fn map_io(e: &rusqlite::Error) -> IndexerError {
     IndexerError::TempDbIo {
         message: format!("row read: {e}"),
     }
+}
+
+/// §4.3 per-column AEAD: decrypt a single BLOB column under the
+/// row's reconstructed AAD. Any AEAD authentication failure (tag,
+/// nonce, body, AAD, key mismatch) surfaces as a typed
+/// [`IndexerError::CipherTamper`] carrying the column name as
+/// context. The `name` argument is the SQL column label (`"vault_id"`,
+/// `"signer"`, etc.) — used in operator-facing error messages to
+/// pinpoint which column tripped the tamper detector. It does NOT
+/// leak the column's plaintext content (the AEAD primitive's open
+/// path returns the typed error BEFORE the plaintext is materialised).
+fn unwrap_column(
+    cipher: &dyn crate::cipher::TempDbCipher,
+    name: &'static str,
+    ciphertext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, IndexerError> {
+    cipher
+        .decrypt_page(ciphertext, aad)
+        .map_err(|e| IndexerError::CipherTamper {
+            context: format!("column={name}: {e}"),
+        })
 }
 
 // ---------------------------------------------------------------------

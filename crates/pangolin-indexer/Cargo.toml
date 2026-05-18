@@ -141,6 +141,18 @@ hex = { workspace = true }
 # access). Workspace pin.
 zeroize = { workspace = true }
 
+# §4.3 per-column AEAD (ARCH-1) handshake: ciborium-ll + ciborium-io
+# are the workspace's existing low-level CBOR encoder/decoder pair
+# (same crates pangolin-store already uses for the vault blob
+# format). Low-level on purpose — the higher-level `ciborium` crate
+# would pull `serde`, which would widen pangolin-indexer's audit
+# surface (and risks creeping into pangolin-crypto's audit boundary
+# via transitive deps). Workspace pins (`=0.2.2`, `default-features
+# = false`). NO new lockfile entry — pangolin-store already pulls
+# both crates.
+ciborium-ll = { workspace = true }
+ciborium-io = { workspace = true }
+
 # tracing + tracing-subscriber — stderr logs for the binary entry.
 # Same `=0.1.41` / `=0.3.20` pins the funder service uses.
 # Stderr-only per the R-b protocol contract: stdout is reserved for
@@ -167,3 +179,15 @@ hex = { workspace = true }
 # pattern `pangolin-chain` / `pangolin-store` use for their own
 # test-utilities flags.
 pangolin-indexer = { path = ".", features = ["test-utilities"] }
+# §4.3 per-column AEAD: proptest dev-dep for the AAD perturbation
+# property tests + handshake CBOR-shape fuzz. Workspace pin
+# (`=1.7.0`) per quirk #15. proptest does NOT reach pangolin-crypto
+# (it's a dev-dep on pangolin-indexer only); HIGH-1 invariant
+# `cargo tree -p pangolin-crypto | grep -c serde == 0` stays clean.
+proptest = { workspace = true }
+# §4.3 per-column AEAD: pangolin-chain dev-dep with the
+# `test-utilities` feature is NOT required — pangolin-chain is
+# already a non-test runtime dep above. We pull `pangolin-crypto`
+# directly above for `SecretBytes` / `AeadKey`; the chain crate's
+# `derive_indexer_key` is reachable via the existing
+# `pangolin-chain` runtime dep.

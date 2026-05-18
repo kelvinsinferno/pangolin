@@ -255,13 +255,14 @@ async fn pull_before_start_index_returns_protocol_error() {
 #[test]
 fn noop_cipher_round_trips_arbitrary_input() {
     let c = NoOpCipher;
+    let aad: &[u8] = b"hermetic-noop-aad";
     for n in [0usize, 1, 16, 4096, 1 << 16] {
         let buf: Vec<u8> = (0..n).map(|i| u8::try_from(i & 0xFF).unwrap()).collect();
-        let enc = c.encrypt_page(&buf);
-        // 4.3: TempDbCipher::decrypt_page returns
-        // `Result<Vec<u8>, CipherError>`. NoOpCipher always
-        // returns Ok.
-        let dec = c.decrypt_page(&enc).expect("noop decrypt always Ok");
+        let enc = c.encrypt_page(&buf, aad);
+        // §4.3 per-column AEAD: TempDbCipher::decrypt_page returns
+        // `Result<Vec<u8>, CipherError>` and takes an AAD param.
+        // NoOpCipher always returns Ok and ignores AAD.
+        let dec = c.decrypt_page(&enc, aad).expect("noop decrypt always Ok");
         assert_eq!(buf, dec);
     }
 }
@@ -270,8 +271,9 @@ fn noop_cipher_round_trips_arbitrary_input() {
 fn noop_cipher_is_an_arc_dyn_temp_db_cipher() {
     let arc: Arc<dyn TempDbCipher> = NoOpCipher::new_arc();
     let plaintext = b"hermetic test payload";
+    let aad: &[u8] = b"hermetic-arc-aad";
     let round = arc
-        .decrypt_page(&arc.encrypt_page(plaintext))
+        .decrypt_page(&arc.encrypt_page(plaintext, aad), aad)
         .expect("noop decrypt always Ok");
     assert_eq!(round, plaintext.to_vec());
 }

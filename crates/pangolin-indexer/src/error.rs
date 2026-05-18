@@ -68,6 +68,20 @@ pub enum IndexerError {
     /// but out of range — clamped, not rejected — see R-c).
     #[error("invalid configuration: {message}")]
     Config { message: String },
+
+    /// §4.3 per-column AEAD: a per-column ciphertext failed to
+    /// authenticate at `handle_pull` read time. Distinguishes
+    /// AEAD-level tampering (tag-mismatch / AAD-mismatch / wrong
+    /// key) from SQLite I/O failures so the host can react
+    /// differently — a `CipherTamper` strongly suggests filesystem
+    /// or memory corruption (or a defective host that hot-swapped
+    /// the temp DB), whereas `TempDbIo` is typical I/O. All AEAD
+    /// authentication failures collapse to a single `CipherTamper`
+    /// shape so callers cannot construct a distinguishing oracle
+    /// on the failure mode (same discipline `AeadError::Tampered`
+    /// uses — see [`crate::cipher::CipherError`]).
+    #[error("temp DB cipher authentication failed: {context}")]
+    CipherTamper { context: String },
 }
 
 impl IndexerError {

@@ -1317,3 +1317,35 @@ locked verbatim from `docs/issue-plans/cli-v1.md`:
 | **R-g** | Ship all 12 FFI gap fills: `vault_pull_once`, `vault_last_pull_at_unix_ms`, `vault_flush_publish_queue`, `vault_publish_queue_state`, `vault_enable_window_elapsed_flush`, `vault_coalesce_dirty_markers`, `vault_select_sync_mode`, `vault_sync_mode_preference`, `vault_set_sync_mode_preference`, `vault_lock_with_drain`, `vault_evm_wallet_address`, `vault_initiate_top_up`. **8 of 12 are fully wired in CLI-V1.** The remaining 4 (`vault_flush_publish_queue`, `vault_lock_with_drain`, `vault_pull_once`, `vault_initiate_top_up`) ship as **surface-locked stubs** returning `FfiError::Internal` with operator guidance ("use the CLI for now"); they require chain-adapter / signer / Credit-attestation UniFFI handles that aren't yet on the FFI surface (the `ChainAdapter` trait is async + `Send + Sync` + `BaseSepoliaAdapter::new_with_keystore` threads a `SecretBytes` keystore password — wrapping this for UniFFI is itself a substantial security-boundary cycle estimated at ~5-8h). **Follow-up cycle: `MVP-3-host-FFI-handles`** — to be created when MVP-3 host work begins (Tauri / iOS / Android shells); it wires the 4 stub bodies once the chain-adapter / signer / funder-credit UniFFI Objects ship. The stub signatures + record types (`FfiBatchFlushReport`, `FfiPullReport`, `FfiTopUpAttempt`) are locked so MVP-3 wires bodies without changing the wire shape; each stub has a parity test asserting the stub-as-stub error path. |
 | **R-h** | Pre-lock drain retrofit on chain-touching commands only — `publish` / `pull` / `resolve` / `flush` / `sync loop` / `top-up` use `Vault::lock_with_drain`. Pure-local verbs keep `Vault::close`. |
 | **R-i** | Hermetic test suite + one live `#[ignore]` test (`tests/sync_loop_live.rs`) that skips cleanly on missing env vars. |
+
+---
+
+## Issue 4.3-per-column-aead — closes §4.3-baseline audit deferrals (resolved 2026-05-17)
+
+Closes the three documented audit deferrals from the §4.3-baseline
+cycle (per-column wrapping, AAD binding, binary
+key-derivation-not-pinned). R-a..R-e locked verbatim:
+
+| Resolution | Decision |
+|---|---|
+| **R-a** | **Per-column wrapping.** `TempDbCipher::{encrypt_page, decrypt_page}` gain an `aad: &[u8]` parameter. `persist_chunk` wraps each of the 8 BLOB columns (`vault_id, account_id, parent_revision, device_id, enc_payload, signer, block_hash, tx_hash`) via the cipher before INSERT; `handle_pull` unwraps each via the cipher after SELECT. Integer columns (`page_seq, schema_version, sequence, block_number, log_index`) stay plaintext on disk (they're index / AAD / sort material, not secret). |
+| **R-b** | **AAD format.** Fixed-width 42-byte concat: `vault_id (32) ‖ page_id_BE_u64 (8) ‖ schema_version_BE_u16 (2)`. Pinned by the new `PER_COLUMN_AAD_LEN: usize = 42` const + byte-pin test (`aad_byte_pin_for_known_triple` in `proptest_aad_perturbations.rs`). |
+| **R-c** | **`page_seq` source = AtomicU64 (Option δ).** New `IndexerSession::page_seq_counter: AtomicU64` starts at 0 and increments by 1 per row inserted via `persist_chunk` (via `fetch_add(1, Ordering::SeqCst)`). The value is also persisted in a new `page_seq INTEGER NOT NULL UNIQUE` column in `cached_revisions` so `handle_pull` can reconstruct the AAD from the row's stored sequence (rather than counting rows). The UNIQUE constraint is defense-in-depth (a duplicate page_seq would surface as an INSERT failure rather than silently overwriting AAD-dependent data). Schema migration is in-place (ephemeral DB; no `.pvf` change). |
+| **R-d** | **Test surface (Option C).** Hermetic in-source + 1 live `#[ignore]` + proptest module. ~38 new tests: 5 AAD-binding tests in `cipher.rs::tests`; 7 in `tests/raw_disk_no_plaintext_per_column.rs` (incl. `temp_db_file_contains_no_plaintext_after_persist`, `cross_page_cut_and_paste_surfaces_cipher_tamper`, `pull_after_persist_recovers_plaintexts_under_per_column_aad`, `page_seq_counter_increments_monotonically_across_persist_chunks`); 9 proptest cases in `tests/proptest_aad_perturbations.rs` (cross-page paste, cross-session replay, cross-schema paste, same-AAD round-trip, single-byte ciphertext perturbation, single-byte AAD perturbation × 1024 iterations each + byte-pin asserts + handshake CBOR round-trip); 4 in `tests/handshake_ipc.rs` (subprocess-spawn round-trip + truncated/oversize prefix rejection + `binary_random_key_path_removed` source-scan regression); 1 `#[ignore]` in `tests/live_per_column_wrap.rs`. |
+| **R-e (ARCH-1)** | **Binary handshake — host derives + sends.** The standalone `pangolin-indexer` binary's `OsRng::fill_bytes` random-key path is REMOVED. Replaced with stdin handshake reading a length-prefixed CBOR `IndexerHandshake { derived_key: [u8; 32], run_nonce: [u8; 16] }` BEFORE the chain-RPC config and the protocol loop. Host caller (CLI / Tauri / mobile FFI) holds the `DeviceKey`, derives via `pangolin_chain::derive_indexer_key(device_key, run_nonce)`, and writes the handshake. Binary zeroizes the stdin buffer post-deserialise. New `crates/pangolin-indexer/src/handshake.rs` module ships the typed message + `ciborium-ll` CBOR codec + length-prefix framing + zeroize helper. Rejected alternatives: ARCH-0 (binary mints random key; defect: doesn't satisfy master plan §5 "derived from device secret"); ARCH-2 (binary imports DeviceKey directly; rejected on `L-indexer-grows-pangolin-crypto-secret-material-reach`); ARCH-3 (binary reads key file from argv; rejected as more complex without security benefit). |
+
+**Closed audit deferrals:**
+- **Deferral #1 (per-column wrapping):** CLOSED via R-a. Raw-disk-no-plaintext property is now mechanically enforced for the 8 BLOB columns; per-column-AEAD-wrapping integration tests run on every PR.
+- **Deferral #2 (binary key derivation):** CLOSED via R-e ARCH-1. Master plan §5 row 4.3 "derived from device secret" property is now fulfilled by the host-side `derive_indexer_key` path; the binary's secret-material reach stays minimal (never imports `DeviceKey`).
+- **Deferral #3 (AAD binding):** CLOSED via R-b + R-c. Cross-page-cut-and-paste, cross-session-replay, and future-schema-version-poison all manifest as `CipherTamper` at decrypt time.
+
+**Forward-compat note for MVP-3-host-FFI-handles cycle:** the
+`pangolin-cli` does not currently spawn the `pangolin-indexer`
+binary; the host-caller contract is documented in the
+`IndexerHandshake` docstring so MVP-3 host work wires the
+spawn-and-write sequence mechanically. The handshake wire format
+is FORWARD-COMPATIBLE — additive CBOR fields can land without
+bumping the wire schema (the decoder rejects unknown keys via the
+strict canonical-shape check, but a coordinated additive field
+bump would relax the second-key check via the standard plan-gate
+cadence).
