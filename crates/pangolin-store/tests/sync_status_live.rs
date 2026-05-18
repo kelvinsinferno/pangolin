@@ -1,5 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! 5.4 R-g `#[ignore]`'d live sync-orchestrator test against D-017.
+//! 5.4 R-g `#[ignore]`'d live sync-orchestrator test against D-017
+//! (Option D residue per issue #98).
+//!
+//! Sibling of the hermetic
+//! `tests/replay_d017_sync_status_transitions.rs` (which exercises
+//! the `compute_next_status` state machine against the captured
+//! fixture's chain-state snapshot on every PR). This live residue
+//! covers (i) the real `Vault::pull_once` integration against a
+//! live RPC tick, and (ii) the actual checkpoint stamping
+//! (`last_pull_at_unix_ms`) that the hermetic mock can't observe.
+//!
+//! **Operator-visible failure mode.** If this test fails when run
+//! via `scripts/run-live-tests.{sh,ps1}`, the live sync loop's
+//! input mapping (`v.sync_status_inputs(...)`) returned a status
+//! the `compute_next_status` transition rejected — i.e., the
+//! orchestrator's input contract drifted from the state machine's
+//! input contract. Recovery: re-read
+//! `docs/architecture/sync-orchestrator.md` for the locked
+//! transition table.
 //!
 //! Drives the canonical host loop body documented in
 //! `docs/architecture/sync-orchestrator.md` against a live Base

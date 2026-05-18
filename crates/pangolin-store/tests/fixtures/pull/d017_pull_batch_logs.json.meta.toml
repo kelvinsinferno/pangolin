@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Issue #98 R-b Option α + R-c Option ζ fixture provenance record.
+# Audited by the hermetic `fixture_provenance` test on every PR.
+
+source_contract_address = "0x8566D3de653ee55775783bD7918Fe91b66373896"
+deploy_reference = "D-014"
+capture_utc = "2026-05-18T05:30:00Z"
+cast_command = "cast rpc eth_getLogs '{\"address\":\"0x8566D3de653ee55775783bD7918Fe91b66373896\",\"fromBlock\":\"0x273a435\",\"toBlock\":\"0x273a435\"}' --rpc-url https://sepolia.base.org"
+live_block_at_capture = 41654746
+sha256_of_fixture = "7f6bfff9c32eae661e8d5a3af17bcd191cec21fcc1aafd01431fb545dc662b7e"
+live_event_gap = "Same posture as parity/d017_revisionpublished_batch.json. Used by `replay_d017_pull_batch_advances_checkpoint` hermetic test (mock chain adapter returns this fixture; pull_once asserts checkpoint advances)."

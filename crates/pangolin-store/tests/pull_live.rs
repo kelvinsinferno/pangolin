@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! 5.2 R-f `#[ignore]`'d live pull-loop test against D-017.
+//! 5.2 R-f `#[ignore]`'d live pull-loop test against D-017 (Option D
+//! residue per issue #98).
 //!
 //! Verifies the end-to-end pull cycle against the live D-017
 //! `RevisionPublished` event stream on Base Sepolia: the picker
@@ -7,36 +8,42 @@
 //! `Vault::sync_from_chain` (L4), and the monotonic checkpoint
 //! advances on success.
 //!
-//! ## Why `#[ignore]`'d
+//! ## Why `#[ignore]`'d (operator-visible failure mode)
 //!
-//! Same posture 4.1 R-g / 4.2 R-f / 4.3 R-f / 5.1 R-g took: the
-//! production primitive (`Vault::pull_once`) is covered by ~14
-//! hermetic tests in `crates/pangolin-store/src/pull.rs::tests`,
-//! but the env-quirk #14 contract-semantics-drift defense requires
-//! a captured `RevisionPublished` event payload from D-017's actual
-//! history. Until the fixture-capture follow-up lands (an
-//! operational item shared with 4.1 / 4.2 / 4.3 / 5.1's
-//! `#[ignore]`'d tests), this test runs shape-only against a
-//! configured RPC + vault id.
+//! Sibling of the hermetic
+//! `tests/replay_d017_pull_batch_advances_checkpoint.rs` (which runs
+//! on every PR using the captured D-014 V0 event fixture + a mock
+//! chain adapter). This live residue exercises (i) the slow-mode
+//! `Vault::pull_once` path against the rolling D-017 chain tip, and
+//! (ii) the checkpoint-monotonicity property under a real RPC's
+//! finalization semantics.
 //!
-//! ## How to run + capture a fixture
+//! **Operator-visible failure mode:** if the test fails when run via
+//! `scripts/run-live-tests.{sh,ps1}`, either (i) the live D-017
+//! contract address or domain separator drifted (recovery: re-pin
+//! `EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA` and the JSON record), or
+//! (ii) the slow-mode checkpoint regressed below its prior value
+//! (recovery: investigate `Vault::last_synced_block_v1` storage path).
+//!
+//! ## How to run
 //!
 //! ```text
-//! # 1. Capture any historical RevisionPublished event from D-017:
-//! cast logs --address 0x179362Ad7fb7dA664312aEFDdaa53431eb748E42 \
-//!     --from-block 23640113 \
-//!     --to-block latest \
-//!     --rpc-url $BASE_SEPOLIA_RPC_URL
-//!
-//! # 2. Pin the resulting (vault_id, block, tx_hash) tuple as a
-//! #    const at the top of this module.
-//!
-//! # 3. Run the test:
 //! BASE_SEPOLIA_RPC_URL=https://sepolia.base.org \
 //!     PANGOLIN_PULL_LIVE_VAULT_ID=<64-char hex, no 0x prefix> \
 //!     cargo test -p pangolin-store --test pull_live \
 //!     -- --ignored
 //! ```
+//!
+//! Or, easier: `bash scripts/run-live-tests.sh` (sources `.env.live`).
+//!
+//! ## Issue #98 fix-comment
+//!
+//! The previously-pinned D-017 deploy-block comment below referenced
+//! `23640113` (the rotted Rust constant value). The authoritative
+//! deploy block is `41_507_120` (cast-verified via `cast tx
+//! 0x22e464123c7fc1c71a161350d521ed7946975b0a9a3b9fd232d8846327cacd19`).
+//! See `pangolin_chain::d017_deploy_block` docstring for the rot-fix
+//! history.
 
 #![forbid(unsafe_code)]
 

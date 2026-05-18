@@ -49,6 +49,10 @@ Thumbs.db
 !contracts/deploy/.env.sepolia
 !contracts/deploy/.env.mainnet.template
 contracts/deploy/.env.mainnet
+# Issue #98 (L5): the pre-release live-test runner sources this for
+# RPC URL + keystore path + wallet address. Already covered by the
+# wildcard above; named explicitly so future readers know what it is.
+.env.live
 *.pem
 *.key
 secrets/

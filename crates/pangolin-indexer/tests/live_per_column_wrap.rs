@@ -1,32 +1,30 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! §4.3 per-column AEAD: live `#[ignore]`-gated parity test against
-//! D-017.
+//! D-017 (Option D residue per issue #98).
 //!
-//! Same posture as `parity.rs` (the §4.3-baseline live parity test):
-//! requires `BASE_SEPOLIA_RPC_URL` + `PANGOLIN_INDEXER_VAULT_ID` env
-//! vars + a captured `RevisionPublished` event fixture from D-017.
-//! Without those env vars set, the test is a no-op return; the
-//! `#[ignore]` keeps CI from running it by default.
+//! Sibling of the hermetic
+//! `tests/replay_d017_revision_no_plaintext_per_column.rs` (which
+//! drives the same disk-sweep against the captured D-014 V0 event
+//! fixture on every PR). This live residue covers the rolling-tip
+//! contract-execution side of env-quirk #14: real D-017 byte
+//! patterns drive the indexer through its persistence path, then the
+//! raw temp DB is scanned for plaintext leakage.
 //!
-//! ## What this test adds beyond `parity.rs`
+//! ## What this test adds beyond the hermetic replay
 //!
-//! `parity.rs` exercises the high-level Start ⇒ Pull cycle but
-//! pre-§4.3-per-column-AEAD it did NOT verify the on-disk file
-//! contains zero plaintext. This test:
+//! The hermetic replay catches the AEAD-wiring property by exercising
+//! `IndexerSession::test_inject_chunk` against the captured fixture's
+//! decoded events — covering the indexer's persist path verbatim. The
+//! live test additionally exercises (i) the end-to-end RPC ⇒ decoder ⇒
+//! persist chain against arbitrary current D-017 chain state, and (ii)
+//! contract-side semantics-drift catches (e.g., the verifier silently
+//! widening the schema_version ladder mid-flight).
 //!
-//! 1. Starts a real session against D-017 with real bytes.
-//! 2. Pulls events.
-//! 3. Reads the temp DB file via `std::fs::read` BEFORE the session
-//!    is dropped.
-//! 4. Asserts no event's `vault_id`, `enc_payload`, `signer`,
-//!    `tx_hash`, or `block_hash` BLOB content appears in the raw
-//!    file (= cipher wrap landed for the real chain payload).
-//!
-//! Per the §4.3 per-column-AEAD plan-gate Builder note: hermetic
-//! tests catch the cipher-wiring property; the live test exercises
-//! the REAL byte patterns of D-017 events so a contract-side
-//! semantics regression (e.g., the verifier silently widening the
-//! schema_version ladder) doesn't sneak past us.
+//! **Operator-visible failure mode:** if the test fails when run via
+//! `scripts/run-live-tests.{sh,ps1}`, the raw temp DB file leaked a
+//! plaintext field from a real D-017 event payload. That means the
+//! `AeadCipher` wrap silently bypassed at least one column. The
+//! per-column failure assertion names which column leaked.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::doc_markdown)]
@@ -40,7 +38,9 @@ use pangolin_indexer::{
     AeadCipher, IndexerConfig, IndexerRequest, IndexerResponse, IndexerSession, TempDbCipher,
 };
 
-const D017_DEPLOY_BLOCK: u64 = 23_640_113;
+/// Issue #98 (2026-05-18): re-pinned via cast verification — see
+/// `pangolin_chain::d017_deploy_block` docstring.
+const D017_DEPLOY_BLOCK: u64 = 41_507_120;
 
 #[tokio::test]
 #[ignore = "requires BASE_SEPOLIA_RPC_URL + PANGOLIN_INDEXER_VAULT_ID + captured event fixture"]

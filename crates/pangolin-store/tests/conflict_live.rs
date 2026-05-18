@@ -44,11 +44,30 @@ fn snap(name: &str) -> AccountSnapshot {
     )
 }
 
-/// **MVP-2 issue 5.3 (R-g — `#[ignore]`'d).** Two-device concurrent
-/// edit creates a fork; `Vault::list_conflicts` surfaces it through
-/// the enriched per-branch summary; `Vault::resolve_fork` chooses
-/// one branch and the next conflict snapshot shows the account
-/// removed.
+/// **MVP-2 issue 5.3 (R-g — `#[ignore]`'d, Option D residue per
+/// issue #98).** Two-device concurrent edit creates a fork;
+/// `Vault::list_conflicts` surfaces it through the enriched
+/// per-branch summary; `Vault::resolve_fork` chooses one branch and
+/// the next conflict snapshot shows the account removed.
+///
+/// **What this test covers (live residue).** The shape-only mock
+/// path through `__test_synthesize_sibling_revision` — the inner
+/// body never reaches the network. The hermetic conflict tests in
+/// `crates/pangolin-store/src/conflict.rs::tests` cover the full
+/// conflict surfacing logic; this `#[ignore]`'d slot is reserved
+/// for the future end-to-end exercise where two real Foundry
+/// signers concurrently publish to D-017 and a live pull cycle
+/// observes the fork. Until that fixture-capture work lands (out
+/// of scope for issue #98 — synth-sibling exercise stays as
+/// shape-only), the test runs with `BASE_SEPOLIA_RPC_URL`
+/// requirement as a gating signal only.
+///
+/// **Operator-visible failure mode.** If this test fails when run
+/// via `scripts/run-live-tests.{sh,ps1}`, the shape-only mock path
+/// regressed (`__test_synthesize_sibling_revision`,
+/// `list_conflicts`, or `resolve_fork`). Since the body doesn't
+/// reach the live chain, a regression here is local to the
+/// `pangolin-store` conflict-surfacing module.
 ///
 /// Without a configured `BASE_SEPOLIA_RPC_URL` env var the test is a
 /// no-op return; the `#[ignore]` keeps CI off it by default.

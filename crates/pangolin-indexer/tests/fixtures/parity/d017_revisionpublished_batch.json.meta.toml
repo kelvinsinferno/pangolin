@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Issue #98 R-b Option α + R-c Option ζ fixture provenance record.
+# Audited by the hermetic `fixture_provenance` test on every PR.
+
+# Canonical contract address whose chain state this fixture captures.
+# Note: this fixture is intentionally NAMED after D-017 (the
+# RevisionLogV1 target of the parity replay) but the actual bytes are
+# captured from D-014 (RevisionLogV0). See "live_event_gap" below.
+source_contract_address = "0x8566D3de653ee55775783bD7918Fe91b66373896"
+
+# Deploy reference for the source contract above.
+deploy_reference = "D-014"
+
+# Wall-clock UTC at capture time.
+capture_utc = "2026-05-18T05:30:00Z"
+
+# Verbatim cast command used to produce the fixture bytes.
+# `fixture_provenance` test asserts this starts with `cast `.
+cast_command = "cast rpc eth_getLogs '{\"address\":\"0x8566D3de653ee55775783bD7918Fe91b66373896\",\"fromBlock\":\"0x273a435\",\"toBlock\":\"0x273a435\"}' --rpc-url https://sepolia.base.org"
+
+# Live tip block number at capture time (for staleness audit).
+live_block_at_capture = 41654746
+
+# SHA-256 of the fixture file's bytes (audit cross-check).
+sha256_of_fixture = "7f6bfff9c32eae661e8d5a3af17bcd191cec21fcc1aafd01431fb545dc662b7e"
+
+# Issue #98 honesty: D-017 has zero RevisionPublished events on chain
+# as of capture time (deployed 2026-05-14, no smoke publish yet).
+# The replay sibling exercises the D-014 V0 RevisionPublished bytes
+# through the SAME parsers the V0 path uses in production
+# (`base_sepolia.rs::pull_since`). Once D-017 emits its first event
+# (via `publish_v1_live_d017_smoke`), this fixture is recaptured
+# against D-017's V1 binding (`chain_submit.rs`); the R-c Option ζ
+# protocol triggers the recapture automatically (next deploy cycle
+# regenerates fixtures).
+live_event_gap = "D-017 RevisionLogV1 has no RevisionPublished events as of 2026-05-18; fixture uses D-014 V0 event bytes as a stand-in for the parser-exercise property. Replay sibling is restricted to V0 parser surface until D-017 emits."

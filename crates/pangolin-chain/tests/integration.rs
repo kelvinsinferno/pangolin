@@ -103,14 +103,31 @@ async fn runtime_keccak_cross_check_passes_on_live_chain() {
         .expect("post-cross-check provider call works");
 }
 
-/// **MVP-2 issue 3.5 (env-quirk #14 live test).** Query the EVM
-/// balance of a known-funded testnet wallet against Base Sepolia.
+/// **MVP-2 issue 3.5 (env-quirk #14 live test, Option D residue per
+/// issue #98).** Query the EVM balance of a known-funded testnet
+/// wallet against Base Sepolia.
 ///
 /// `BASE_SEPOLIA_DEV_WALLET` env var carries the 20-byte hex address
 /// of a funded `pangolin-dev` wallet (the same one chaincli's `--keystore`
 /// path uses for live publish smoke tests). Asserts the U256 is
 /// non-zero and prints the wei value at info-level so a human running
 /// the test can sanity-check.
+///
+/// **What this test covers (live residue).** The actual
+/// `eth_getBalance` RPC roundtrip + alloy U256 decoding +
+/// non-zero balance assertion. This is intrinsically NOT
+/// hermetic-able: the assertion is "the live wallet has funds,"
+/// and that's a property of the live chain at test time. The
+/// existing hermetic mock tests (`query_evm_balance` with
+/// `MockChainAdapter`) cover the decoding path; this one closes
+/// the env-quirk-#14 contract-execution surface for the
+/// pre-publish balance gate.
+///
+/// **Operator-visible failure mode.** If this test fails when run
+/// via `scripts/run-live-tests.{sh,ps1}`, either the configured
+/// `BASE_SEPOLIA_DEV_WALLET` ran out of testnet ETH (recovery:
+/// top up via the Base Sepolia faucet) or the RPC URL is wrong /
+/// unreachable.
 ///
 /// Marked `#[ignore]` so default CI doesn't reach the network.
 /// Manually run with:
@@ -120,6 +137,8 @@ async fn runtime_keccak_cross_check_passes_on_live_chain() {
 ///   cargo test -p pangolin-chain --features integration-tests \
 ///   live_balance_query_against_d017_wallet -- --ignored --nocapture
 /// ```
+///
+/// Or, easier: `bash scripts/run-live-tests.sh` (sources `.env.live`).
 #[tokio::test]
 #[ignore = "live-RPC test; requires BASE_SEPOLIA_DEV_WALLET + network"]
 async fn live_balance_query_against_d017_wallet() {
