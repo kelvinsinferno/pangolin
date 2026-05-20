@@ -3215,14 +3215,17 @@ dependencies = [
  "pangolin-chain",
  "pangolin-core",
  "pangolin-crypto",
+ "pangolin-funder-client",
  "pangolin-kdbx",
  "pangolin-store",
  "pangolin-totp",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "uniffi",
  "uniffi_build",
+ "wiremock",
  "zeroize",
 ]
 

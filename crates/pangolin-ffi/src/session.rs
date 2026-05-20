@@ -510,34 +510,60 @@ pub fn vault_lock(handle: Arc<VaultHandle>) -> Result<(), FfiError> {
 
 /// Pre-lock drain.
 ///
-/// **CLI-V1 (R-g).** Calls
-/// [`pangolin_core::Vault::lock_with_drain`] BEFORE transitioning
-/// to Locked. Closes the 5.1 L1 deviation by draining any dirty
-/// markers (with `force = true` bypassing the 30 s window) before
-/// the lock.
+/// Calls [`pangolin_core::Vault::lock_with_drain`] BEFORE
+/// transitioning to Locked. Closes the 5.1 L1 deviation by draining
+/// any dirty markers (with `force = true` bypassing the 30 s window)
+/// before the lock.
 ///
-/// **Stub for CLI-V1.** The full call requires a
-/// [`pangolin_chain::ChainAdapter`] handle + a
-/// [`pangolin_crypto::keys::DeviceKey`] handle, neither of which
-/// has an FFI surface in CLI-V1. The binding is exposed here for
-/// surface-freeze purposes — MVP-3 ships the chain-adapter handle
-/// and wires the body. Returns
-/// `FfiError::Internal { message: "vault_lock_with_drain requires chain-adapter FFI (MVP-3)" }`
-/// at call time.
+/// **MVP-3 issue #100.** Builds a `BaseSepoliaAdapter` engine-side
+/// from the unlocked vault's per-device gas wallet (the signer is
+/// read via `Vault::evm_wallet().signer()` and cloned engine-side —
+/// **no secret material crosses FFI**, L1) plus the host-supplied
+/// non-secret `config`, then drives the `!Send`
+/// `Vault::lock_with_drain` future to completion on a local
+/// current-thread runtime.
 ///
 /// # Errors
 ///
-/// `FfiError::Session` if the handle has no vault installed;
-/// otherwise the CLI-V1 stub returns `FfiError::Internal`.
-#[allow(clippy::significant_drop_tightening)]
+/// `FfiError::Session` for a locked / placeholder handle (the L4
+/// session gate, before any chain primitive); `FfiError::Store` /
+/// `FfiError::Chain` for adapter-construction or drain failures.
+/// Note: the vault transitions to Locked regardless of the drain
+/// outcome (best-effort drain; teardown wins) — a returned error
+/// reports the drain result, not a still-unlocked state.
+#[allow(clippy::significant_drop_tightening, clippy::needless_pass_by_value)]
 #[uniffi::export]
-pub fn vault_lock_with_drain(handle: Arc<VaultHandle>) -> Result<(), FfiError> {
+pub fn vault_lock_with_drain(
+    handle: Arc<VaultHandle>,
+    config: crate::chain_config::FfiChainConfig,
+) -> Result<(), FfiError> {
+    use pangolin_chain::BaseSepoliaAdapter;
+    use pangolin_crypto::keys::DeviceKey;
+
+    // Active-session gate at the FFI boundary (L4), BEFORE any chain
+    // primitive.
     let mut guard = handle.lock_vault();
-    let _vault = guard.as_mut()?;
-    Err(FfiError::Internal {
-        message: "vault_lock_with_drain requires chain-adapter FFI (MVP-3); use the CLI for now"
-            .to_string(),
-    })
+    let vault = guard.as_mut()?;
+    // L1: read the gas-paying signer engine-side from the unlocked
+    // vault and clone it. Never crosses FFI.
+    let signer = vault.evm_wallet().map_err(store_into_ffi)?.signer().clone();
+    // Throwaway device key (the gas wallet is internal to the adapter,
+    // two-key PoC model); SEPARATE from the gas wallet sourced above.
+    // NOT a host input.
+    let throwaway_device_key = DeviceKey::generate();
+    crate::chain_config::block_on_local(async {
+        let adapter = BaseSepoliaAdapter::new_with_signer(
+            &config.rpc_url,
+            std::path::Path::new(&config.deployment_path),
+            signer,
+        )
+        .await
+        .map_err(crate::chain_config::chain_into_ffi)?;
+        vault
+            .lock_with_drain(&adapter, &throwaway_device_key)
+            .await
+            .map_err(crate::chain_config::batch_flush_into_ffi)
+    })?
 }
 
 /// Close a vault handle — locks it, then releases the `SQLite`
@@ -942,4 +968,82 @@ pub fn vault_restore_from_archive(
         account_count,
         device_count,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain_config::FfiChainConfig;
+    use pangolin_core::{PinIdentityProof, PressYPresenceProof, Vault};
+    use pangolin_crypto::secret::SecretBytes;
+
+    fn pwd() -> SecretBytes {
+        SecretBytes::new(b"correct horse battery staple".to_vec())
+    }
+
+    fn unlocked_handle(dir: &tempfile::TempDir, name: &str) -> Arc<VaultHandle> {
+        let path = dir.path().join(name);
+        Vault::create(&path, &pwd()).unwrap();
+        let mut v = Vault::open(&path).unwrap();
+        v.unlock(
+            &PressYPresenceProof::confirmed(),
+            &PinIdentityProof::new(pwd()),
+        )
+        .unwrap();
+        VaultHandle::from_vault(v)
+    }
+
+    fn bogus_config() -> FfiChainConfig {
+        FfiChainConfig {
+            schema_version: 1,
+            rpc_url: "http://127.0.0.1:1".into(),
+            deployment_path: "/no/such/path/base-sepolia.json".into(),
+            prefer_websocket: false,
+        }
+    }
+
+    /// **MVP-3 #100 (R-f) — REAL-path stub-parity flip.** With an
+    /// empty publish queue + a bogus chain config, the REAL
+    /// lock-with-drain path runs: it sources the gas signer
+    /// engine-side and attempts adapter construction, which fails fast
+    /// on the missing deployment file → `FfiError::Chain` (NOT the old
+    /// `Internal` stub).
+    #[test]
+    fn lock_with_drain_real_path_maps_adapter_error_to_chain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "v.pvf");
+        let err = vault_lock_with_drain(h, bogus_config()).unwrap_err();
+        assert!(
+            matches!(err, FfiError::Chain { .. }),
+            "expected FfiError::Chain from adapter construction, got {err:?}"
+        );
+    }
+
+    /// **MVP-3 #100 (R-f) — per-binding session gate (L4).** A locked
+    /// vault errors `FfiError::Session` BEFORE any chain primitive.
+    #[test]
+    fn lock_with_drain_rejects_locked_vault_before_chain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "v.pvf");
+        {
+            let mut g = h.lock_vault();
+            g.as_mut().unwrap().lock();
+        }
+        let err = vault_lock_with_drain(h, bogus_config()).unwrap_err();
+        assert!(
+            matches!(err, FfiError::Session { .. }),
+            "expected FfiError::Session (L4 gate before chain), got {err:?}"
+        );
+    }
+
+    /// **MVP-3 #100 (R-f) — per-binding session gate (placeholder).**
+    #[test]
+    fn lock_with_drain_rejects_placeholder() {
+        let empty = VaultHandle::new_placeholder();
+        let err = vault_lock_with_drain(empty, bogus_config()).unwrap_err();
+        assert!(
+            matches!(err, FfiError::Session { .. }),
+            "expected FfiError::Session, got {err:?}"
+        );
+    }
 }
