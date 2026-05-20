@@ -32,9 +32,7 @@ use std::sync::Arc;
 use pangolin_chain::BaseSepoliaAdapter;
 use pangolin_crypto::keys::DeviceKey;
 
-use crate::chain_config::{
-    batch_flush_into_ffi, block_on_local, chain_into_ffi, FfiChainConfig,
-};
+use crate::chain_config::{batch_flush_into_ffi, block_on_local, chain_into_ffi, FfiChainConfig};
 use crate::error::FfiError;
 use crate::session::VaultHandle;
 

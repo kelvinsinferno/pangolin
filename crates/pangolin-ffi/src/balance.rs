@@ -365,13 +365,12 @@ fn ffi_credit_to_credit(c: &FfiCredit) -> Result<pangolin_funder_client::Credit,
         .strip_prefix("0x")
         .or_else(|| c.amount_hex.strip_prefix("0X"))
         .unwrap_or(&c.amount_hex);
-    let amount =
-        alloy::primitives::U256::from_str_radix(amount_stripped, 16).map_err(|e| {
-            FfiError::Validation {
-                kind: "credit".into(),
-                message: format!("credit field `amount` is not a valid hex U256: {e}"),
-            }
-        })?;
+    let amount = alloy::primitives::U256::from_str_radix(amount_stripped, 16).map_err(|e| {
+        FfiError::Validation {
+            kind: "credit".into(),
+            message: format!("credit field `amount` is not a valid hex U256: {e}"),
+        }
+    })?;
     Ok(pangolin_funder_client::Credit {
         user_id,
         amount,
@@ -415,11 +414,7 @@ pub fn vault_initiate_top_up(
     let signer = {
         let mut guard = handle.lock_vault();
         let vault = guard.as_mut()?;
-        vault
-            .evm_wallet()
-            .map_err(store_into_ffi)?
-            .signer()
-            .clone()
+        vault.evm_wallet().map_err(store_into_ffi)?.signer().clone()
     };
     // `initiate_top_up`'s future IS `Send` (no `!Send` vault held
     // across the await), but the host calls this binding synchronously
@@ -649,12 +644,9 @@ mod tests {
     #[test]
     fn initiate_top_up_rejects_placeholder_before_funder_call() {
         let empty = VaultHandle::new_placeholder();
-        let err = vault_initiate_top_up(
-            empty,
-            "http://127.0.0.1:1".to_string(),
-            valid_ffi_credit(),
-        )
-        .unwrap_err();
+        let err =
+            vault_initiate_top_up(empty, "http://127.0.0.1:1".to_string(), valid_ffi_credit())
+                .unwrap_err();
         assert!(
             matches!(err, FfiError::Session { .. }),
             "expected FfiError::Session, got {err:?}"
@@ -669,8 +661,7 @@ mod tests {
         let h = unlocked_handle(&dir, "v.pvf");
         let mut bad = valid_ffi_credit();
         bad.signature_hex = "0x00".into(); // wrong length
-        let err =
-            vault_initiate_top_up(h, "http://127.0.0.1:1".to_string(), bad).unwrap_err();
+        let err = vault_initiate_top_up(h, "http://127.0.0.1:1".to_string(), bad).unwrap_err();
         assert!(
             matches!(&err, FfiError::Validation { kind, .. } if kind == "credit"),
             "expected FfiError::Validation(credit), got {err:?}"
@@ -705,12 +696,11 @@ mod tests {
 
         let dir = tempfile::TempDir::new().unwrap();
         let h = unlocked_handle(&dir, "v.pvf");
-        let attempt = tokio::task::spawn_blocking(move || {
-            vault_initiate_top_up(h, uri, valid_ffi_credit())
-        })
-        .await
-        .unwrap()
-        .expect("top-up should succeed against mock funder");
+        let attempt =
+            tokio::task::spawn_blocking(move || vault_initiate_top_up(h, uri, valid_ffi_credit()))
+                .await
+                .unwrap()
+                .expect("top-up should succeed against mock funder");
         assert_eq!(attempt.schema_version, 1);
         assert_eq!(
             attempt.redeem_tx_hash,
