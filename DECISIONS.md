@@ -1409,3 +1409,126 @@ decisions:
 **Runbook addition:** NEW `crates/pangolin-chain/RUNBOOK.md` with operator-facing sections for the two removed empty-body tests + D-017 deploy-block cast cross-check + fixture-provenance audit shape.
 
 **Forward-compat note for MVP-3 + future deploys.** The R-c Option ζ "recapture per deploy" cadence means a future D-020 (or any future D-XXX) deploy cycle's PR MUST regenerate the four fixtures + update the four `.meta.toml` records; `fixture_provenance` enforces the freshness invariant at PR time. Once D-017 emits its first `RevisionPublished` event (via `publish_v1_live_d017_smoke` or a real first user publish), the parity / per_column / pull fixtures should be recaptured against D-017 V1 bytes to retire the `live_event_gap` notes — that work is mechanical and triggers automatically under R-c Option ζ.
+
+## Issue 99-ws-enable — alloy WS feature flip + WS-preferred branch (resolved 2026-05-18)
+
+Closes the L8 deferral that 4.1 explicitly forecast as "MVP-3 4.1.x feature-flag flip" (R-b WS state-machine scaffolding shipped at 4.1; this cycle wires the live transport). Kelvin signed off on **most-secure across all 8 Qs** = plan-gate recommendations verbatim.
+
+| Decision (R) | Resolution | Rationale |
+|---|---|---|
+| **R-a Transport posture** | **Option A — WS tip-following + HTTP backfill.** | Chunked `eth_getLogs` backfills `cursor → head` first (WS subscriptions cannot replay history); WS subscription opened at tip for new events. Only topology that wins on both fresh-vault + incremental sync. |
+| **R-b Reconnect strategy** | **Option β — Exponential backoff + circuit breaker N=5.** | Bounded recovery time before HTTP fallback. `WS_CIRCUIT_BREAKER_THRESHOLD = 5` consecutive failures within a single `sync_from_chain` invocation. Resets on next call. Telemetry via `SyncReport.ws_drops`. |
+| **R-c WS endpoint URL** | **Option I+III hybrid.** | Pin `chain.ws_default = "wss://sepolia.base.org"` in `base-sepolia.json` (Option III source-of-truth per #98 L1); derive from HTTP URL as runtime fallback for dev/unpinned envs (Option I). `resolve_ws_url` helper in `chain_sync::ws`. |
+| **R-d Test posture** | **Option K — Hermetic mock + 1 live `#[ignore]`.** | Mirrors #98 R-a Option D. Local `tokio-tungstenite` mock server in `tests/ws_mock_server.rs` (~330 LoC, `#[cfg(test)]`-gated); 24 hermetic tests in `tests/hermetic_ws.rs`; 1 live residue `live_ws_subscribe_against_d017` in `tests/integration.rs`. |
+| **R-e Feature gating** | **Option P — Always-on.** | alloy `provider-ws` + `pubsub` features unconditional in workspace `Cargo.toml`; runtime decides via `SyncOptions.prefer_websocket`. One binary across all environments; CI exercises every code path. |
+| **R-f WS event ingest** | **Option T — Per-event advance + ingest.** | WS events treated as authoritative for tip-following. Existing defences (L4 contract-address pin + L3 chain-id pin + contract-side `ecrecover`) apply identically via the shared `verify_alloy_log` helper. |
+| **R-g WS replay-protection** | **Option Σ — Trust 4.1 L12 idempotency.** | `Vault::ingest_pending_chain_revision` is idempotent (canonical-hash + chain-anchor match); duplicate WS events across reconnect are storage-layer no-ops. No new dedupe layer. |
+| **R-h WS reorg detection** | **Option Ω — Timer at 12-block finality cadence.** | Matches `CONFIRMATION_DEPTH_FOR_FINALIZATION`. Same `detect_reorg_via_rpc` helper. WS recv loop is bounded by `WS_TIP_FOLLOW_WINDOW_SECS = 30s` per call; host's pull-loop drives the next call to refresh the WS session. |
+
+**Pre-flight ring-check (load-bearing risk gate per plan-gate L5 + L-ws-feature-leak-pulls-ring):**
+
+- `cargo tree -i ring` post-flip → **0 rows** (`warning: nothing to print`).
+- `cargo tree -i aws-lc-rs` → confirms `aws-lc-rs → rustls → alloy-transport-ws → alloy` (TLS backend is `aws-lc-rs`, NOT `ring`). L5 invariant satisfied.
+- NEW CI gate `scripts/check-no-ring.sh` wired into `.github/workflows/ci.yml` `invariants` job alongside the existing `check-no-serde-in-crypto.sh` / `check-no-uniffi-in-core.sh` / `check-chain-no-store.sh`. `deny.toml`'s `ring` ban is the secondary defence; the script is the cargo-tree first-line check.
+
+**Workspace flip + new constants:**
+
+- `Cargo.toml` line 87: added `"provider-ws"` + `"pubsub"` to alloy features.
+- `WS_KEEPALIVE_INTERVAL_SECS = 30` (RFC 6455 ping cadence; L-ws-silent-disconnect defence).
+- `WS_CIRCUIT_BREAKER_THRESHOLD = 5` (Q-b Option β; L12).
+- `SyncReport.ws_drops: u32` (new field; telemetry).
+- `WsRecvOutcome` + `WsHandle { provider, subscription }` (provider held for lifetime so the subscription's broadcast channel stays open).
+- `chain_sync::poll::VerifyOutcome` + `verify_alloy_log` (extracted; reused by HTTP + WS).
+- `chain_sync::ws::open_subscription`, `resolve_ws_url`, `check_ws_scheme`, `build_ws_read_provider`, `recv_next_event`.
+- `chain_sync::sync_from_chain_with_ws_url` (test-facing variant; production `sync_from_chain` API surface unchanged).
+
+**L1..L12 invariants (from plan-gate):**
+
+- L1: 4.1 R-b scaffolding preserved (renames out of scope).
+- L2: WS verification byte-identical to HTTP (shared `verify_alloy_log`).
+- L3: NO WS path on the publish surface (R-b WS branch is READ-only).
+- L4: HIGH-1 (pangolin-crypto zero-serde) preserved via dep direction.
+- L5: NO `ring` in tree; verified by `cargo tree -i ring` + new CI script.
+- L6: Reorg detection at finality-depth cadence (every 12 blocks, ~24s); uses `detect_reorg_via_rpc`.
+- L7: Idempotency at ingest defends WS-duplicate-events-across-reconnect.
+- L8 (4.1 ORIGINAL): closed — alloy `provider-ws` + `pubsub` features added per plan-gate sign-off.
+- L8 (NEW): `sync_from_chain` is the single entry point; WS recv loop lives inside it.
+- L9: `SyncReport.event_source` honest per the path actually taken at exit.
+- L10: WS open-fail / mid-session-drop NEVER fails the sync.
+- L11: `forbid(unsafe_code)` + AGPL-3.0-or-later SPDX preserved.
+- L12: Circuit breaker at 5 consecutive failures resets per `sync_from_chain` call.
+
+**L-section adversarial framing (6 new threat-model rows):**
+
+- L-ws-silent-disconnect — alloy keepalive ping/pong (30s) + circuit breaker handles silent TCP drops.
+- L-ws-reconnect-storm — exponential backoff (250ms → 30s cap) + circuit breaker bounds CPU spin.
+- L-ws-event-replay — L7 storage-layer idempotency defends; verifier is stateless.
+- L-ws-out-of-order — storage key is `(vault_id, sequence)` not insert order; `BTreeMap` sorts on read.
+- L-ws-tls-downgrade — `check_ws_scheme` refuses `ws://` for `BaseSepolia` + `BaseMainnet`; deployment JSON pin enforces `wss://`.
+- L-ws-feature-leak-pulls-ring — `cargo tree -i ring` returns 0; new CI gate `scripts/check-no-ring.sh`; `deny.toml` ban as secondary defence.
+
+**Test deltas:**
+
+- 24 hermetic tests (`tests/hermetic_ws.rs`) + 2 mock-server self-tests (`tests/ws_mock_server.rs`).
+- 1 live residue `live_ws_subscribe_against_d017` (`#[ignore]` in `tests/integration.rs`).
+- Extended `deployment_json_pins_match_rust_constants` with `chain.ws_default` `wss://`-prefix assertion.
+- 8 `chain_sync::ws::tests` unit tests covering `next_reconnect_backoff_ms`, `resolve_ws_url`, `check_ws_scheme`.
+- Existing `chain_sync::tests` (37 tests) pass unchanged after `fetch_chunk` refactor to use `verify_alloy_log`.
+
+**Closed audit-class findings:**
+
+- **L8 deferral (4.1):** the WS-state-machine scaffolding stub returning `WsOpenError::Unavailable` is replaced with a real `eth_subscribe("logs", filter)` implementation. The 4.1 L1 invariant (R-b scaffolding stays as contract) is preserved — every type + constant from 4.1 R-b remains in tree; this cycle only added the implementation body + new constants per the plan-gate Qs.
+- **TLS-downgrade class:** `check_ws_scheme` + `deployment_json_pins_match_rust_constants::deployment_json_ws_default_uses_wss_scheme_for_base_sepolia` close the surface at both runtime + at source-of-truth.
+
+**Forward-compat note for MVP-3.** Issue #100 (MVP-3-host-FFI-handles) is the next cycle in this pre-MVP-3 cleanup batch; the host-side toggle of `SyncOptions.prefer_websocket = false` is the host-FFI knob covered there. The Q-c Option III "pin source-of-truth" arm — pulling `chain.ws_default` from `contracts/deployments/base-sepolia.json` at runtime — is currently not wired into `sync_from_chain` (the resolver falls back to Option I derivation when no override is passed); wiring the JSON-file loader through pangolin-store is a small follow-up that doesn't change the security posture (the L-ws-tls-downgrade defence fires inside `open_subscription` regardless of how the URL was obtained).
+
+### Audit fix-pass — F-1 + F-2 + F-3 (2026-05-19)
+
+First audit returned **REQUEST CHANGES** with three findings against the builder commit:
+
+- **F-1 (LOW, test-naming honesty):** `hermetic_ws_malicious_wrong_chain_id_at_open_fails_closed` was named for chain-id-mismatch coverage but exercised `fail_subscribe`. Renamed to `hermetic_ws_subscribe_jsonrpc_error_fails_closed`.
+- **F-2 (MEDIUM, circuit-breaker bypass on accept-then-drop):** WS reconnect loop reset `consecutive_failures` to 0 on every open-success regardless of whether any event landed. Fix: `event_ingested_this_open` flag + recv-loop-exit gate that resets only when a verified event landed. New mock mode `accept_then_drop_subscribe`.
+- **F-3 (LOW, L3 gap on asymmetric topology):** `open_subscription` did not run `check_chain_id_matches` against the WS provider. Fix: new `WsOpenError::ChainIdMismatch` variant + `eth_chainId` check BEFORE `eth_subscribe`. Orchestrator's fallback branch treats this as a regular open-fail → counts toward breaker, degrades to HTTP per L10.
+
+### Re-audit fix-pass — F-4 + alloy empirical finding (2026-05-19)
+
+Re-audit returned **REQUEST CHANGES** with one new LOW finding plus a doc-drift note:
+
+- **F-4 (LOW, F-2 regression test does not exercise the F-2 fix's code path):** the test renamed `hermetic_ws_accept_then_drop_storm_pattern_counts_toward_breaker` asserts an iteration counter the test itself increments; it never invokes `Vault::sync_from_chain_with_ws_url` and never observes `event_ingested_this_open` or `consecutive_failures`. Would still pass if vault.rs's F-2 fix were reverted.
+
+**Empirical finding driving the scope decision.** When implementing the orchestrator-level regression test for F-4, an inline HTTP+WS mock harness + `Vault::sync_from_chain_with_ws_url` end-to-end drive surfaced that **alloy 2.0.4's `alloy-pubsub` layer transparently reconnects on accept-then-drop and does NOT surface this to the orchestrator's `recv_next_event`**:
+
+- Probe: `recv_next_event` against the `accept_then_drop_subscribe` mock blocked for 10 seconds; the mock accepted **1809 TCP connections** in that window (~180 reconnects/sec).
+- Root cause: `alloy-pubsub-2.0.4/src/service.rs::reconnect_with_retries` increments `max_retries` ONLY on FAILED reconnects. Every accept-then-drop cycle "succeeds" at WS-handshake + `eth_subscribe` (the subscribe response arrives before the close), so the retry counter never trips.
+- `WsConnect::with_max_retries(0)` confirmed (empirically + by source inspection) NOT to help — the underlying counter still observes "success" on each cycle.
+
+**Implication for the F-2 fix.** The vault.rs `event_ingested_this_open` gate is **mechanically correct** but defends against a scenario alloy effectively hides from the orchestrator. The gate fires only in the SLOW failure mode (alloy gives up reconnecting after `max_retries × backoff ≈ minutes`); the FAST accept-then-drop storm is absorbed silently by alloy. The orchestrator's L10 circuit-breaker is **bounded by what alloy chooses to surface** — not by the orchestrator's own threshold.
+
+**Scope decision (Kelvin sign-off 2026-05-19):**
+
+| Option weighed | Decision |
+|---|---|
+| Heuristic timing-based wrapper (vulnerable to adversarial threading of the keepalive signal) | **REJECTED** |
+| Direct WS transport (`tokio-tungstenite` + hand-written JSON-RPC framing — bypass `alloy-pubsub` for the WS path; keep alloy for HTTP) | **DEFERRED to a separate follow-up issue.** Most secure architecturally per the project's hand-roll-security-critical pattern (KDBX parser, TOTP engine, encrypted-export format, ciborium-ll handshake); too large for this fix-pass. |
+| Fork `alloy-pubsub` | **REJECTED** (drift + upstream-relations + audit surface barely shrinks) |
+| **Defer wrapper + document the limitation honestly** | **CHOSEN.** Net behaviour is acceptable: HTTP Stage 1 backfill catches up every `sync_from_chain` call, L3 chain-id pin still HARD-aborts on the HTTP path, the user's catch-up cadence degrades silently from real-time WS push to ~60s HTTP polling (the `pull_once` interval). No event loss — only UX degradation. |
+
+**Fix-pass shape:**
+
+- F-2 vault.rs gate **retained as defense-in-depth** for the SLOW failure mode; updated comment to honestly enumerate what scenarios it does and does not catch.
+- F-2 building-block test renamed `hermetic_ws_accept_then_drop_storm_pattern_counts_toward_breaker → hermetic_ws_accept_then_drop_subscribe_mock_mode_shape_pin` + docstring rewritten to drop the orchestrator-level claim; updated comments explicitly state the alloy limitation + point to the documented follow-up.
+- Doc-drift on `chain-sync.md` (chain-id mismatch as a "HARD abort" — actually a soft-fail on the WS path per F-3) corrected. New section "Documented limitation — alloy's pubsub transparent reconnect" added.
+- New `L-ws-alloy-pubsub-masks-fast-drops` row added to `THREAT_MODEL.md` (row 10 in `pangolin-store::Vault::sync_from_chain` enumeration, immediately after L-ws-silent-disconnect for topical adjacency; rows that were 10-14 renumbered to 11-15 to keep markdown numbering contiguous). L-ws-silent-disconnect (row 9) gets a "see L-ws-alloy-pubsub-masks-fast-drops" caveat. L-ws-reconnect-storm (row 11) gets a post-handshake-variant caveat pointing at row 10.
+- **Architectural follow-up tracked in the backlog (DEFERRED):** direct WS transport bypassing `alloy-pubsub`. Surfaces every drop in real time. Project hand-roll pattern. Future cycle.
+
+### Second re-audit (F-5 + F-6 + F-7, 2026-05-19)
+
+Second re-audit returned **REQUEST CHANGES** with three findings against the F-4 defer-and-document fix-pass:
+
+- **F-5 (LOW, mock-server docstring drift):** the `MockBehaviour::accept_then_drop_subscribe` docstring at `crates/pangolin-chain/tests/ws_mock_server.rs:82-88` referenced a test name that never existed (`hermetic_ws_accept_then_drop_storm_trips_circuit_breaker`) and claimed the mode "verify[s] the breaker counts accept-then-drop cycles instead of resetting on each open-success" — precisely the orchestrator-level claim the F-4 fix-pass retracted, so the mock's own documentation contradicted the documented limitation. Fix-pass: rewrote the docstring to reference the actual test name (`hermetic_ws_accept_then_drop_subscribe_mock_mode_shape_pin`) and describe honestly what the mode pins (the close-without-emitting-events shape that alloy's pubsub transparently absorbs at the orchestrator-recv layer; see L-ws-alloy-pubsub-masks-fast-drops in THREAT_MODEL.md).
+- **F-6 (MEDIUM, markdown numbered-list ordering):** the new alloy-masks-fast-drops row was hand-numbered `15.` in source but inserted at file position 10 (immediately after row 9). Markdown renders numbered lists by source position, not by literal number — so the file would display 9, 10, 11, 12, 13, 14, 15 with the row labeled `15.` rendering as visual item 10, breaking cross-references. Fix-pass: renumbered the new row to `10.` (preserving topical adjacency to row 9) and shifted the existing rows 10-14 to 11-15. DECISIONS.md updated to cite the new row number.
+- **F-7 (LOW, L-ws-reconnect-storm caveat):** row 10 (now row 11) `L-ws-reconnect-storm` defense narrative invokes the same circuit-breaker mechanism that the new row 10 demonstrates is bypassed under post-handshake accept-then-drop. The row's literal scenario (TCP-refuse → `WsOpenError::ConnectFailed`) is still defended, but a closely-related post-handshake-rate-limit variant falls under the new row 10 instead. Fix-pass: appended a one-sentence caveat at the end of row 11's Adversary leverage paragraph pointing at row 10.
+
+**Files touched (second re-audit fix-pass only):** `crates/pangolin-chain/tests/ws_mock_server.rs` (F-5 docstring rewrite), `THREAT_MODEL.md` (F-6 row renumbering + F-7 row 11 caveat), `DECISIONS.md` (this subsection + row-number update in the F-4 narrative above).
+
+**Files touched (full audit cycle, cumulative across both rounds):** `crates/pangolin-chain/tests/hermetic_ws.rs` (test rename + docstring rewrite), `crates/pangolin-chain/tests/ws_mock_server.rs` (F-5 docstring + earlier accept_then_drop_subscribe mock mode), `crates/pangolin-chain/src/chain_sync/ws.rs` (F-3 chain-id check), `crates/pangolin-store/src/vault.rs` (F-2 gate + scope-honesty comment), `docs/architecture/chain-sync.md` (chain-id doc drift fix + new limitation section), `THREAT_MODEL.md` (new L-ws-alloy-pubsub-masks-fast-drops row 10 + L-ws-silent-disconnect caveat + L-ws-reconnect-storm caveat), `DECISIONS.md` (this section). F-1 rename carries through unchanged from the first audit fix-pass.

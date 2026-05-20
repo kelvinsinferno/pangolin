@@ -7440,12 +7440,50 @@ impl Vault {
         vault_id: &[u8; 32],
         options: pangolin_chain::SyncOptions,
     ) -> Result<pangolin_chain::SyncReport> {
+        self.sync_from_chain_with_ws_url(rpc_url, None, env, vault_id, options)
+            .await
+    }
+
+    /// Test-facing variant of [`Self::sync_from_chain`] that accepts an
+    /// explicit `ws_url_override` for hermetic WS tests against a
+    /// local mock server. Production callers use
+    /// [`Self::sync_from_chain`] which derives the WS URL via the
+    /// Q-c resolver (`resolve_ws_url`).
+    ///
+    /// Issue #99 §2d orchestrator branch lives here so the public
+    /// `sync_from_chain` surface stays unchanged.
+    #[allow(clippy::too_many_lines)]
+    pub async fn sync_from_chain_with_ws_url(
+        &mut self,
+        rpc_url: &str,
+        ws_url_override: Option<&str>,
+        env: pangolin_chain::ChainEnv,
+        vault_id: &[u8; 32],
+        options: pangolin_chain::SyncOptions,
+    ) -> Result<pangolin_chain::SyncReport> {
+        use pangolin_chain::chain_sync::poll::{verify_alloy_log, VerifyOutcome};
+        use pangolin_chain::chain_sync::ws::{
+            open_subscription, recv_next_event, resolve_ws_url, WsRecvOutcome,
+        };
         use pangolin_chain::chain_sync::{detect_reorg_via_rpc, fetch_and_verify_chunk};
         use pangolin_chain::{
             d017_deploy_block, fetch_current_block_number, ChainEventSource, SyncReport,
+            WS_CIRCUIT_BREAKER_THRESHOLD,
         };
+        use std::time::Duration;
 
         const CHUNK: u64 = pangolin_chain::CHAIN_SYNC_LOG_BLOCK_CHUNK;
+        // Issue #99 §2d. Wall-clock window the WS recv loop holds
+        // inside ONE `sync_from_chain` call before returning. Bounds
+        // the call duration; the host's pull-loop drives the next
+        // call to keep the WS path alive across many ticks.
+        const WS_TIP_FOLLOW_WINDOW_SECS: u64 = 30;
+        // Per-recv idle timeout. If no event arrives in this window,
+        // the recv loop returns control to the caller (= exits this
+        // `sync_from_chain` invocation gracefully). Shorter than
+        // `WS_TIP_FOLLOW_WINDOW_SECS` so a quiet WS connection
+        // doesn't block the host's pull-loop cadence.
+        const WS_RECV_IDLE_TIMEOUT_MS: u64 = 250;
 
         // R-a: resolve the starting cursor.
         let persisted = self.last_synced_block_v1()?;
@@ -7479,6 +7517,11 @@ impl Vault {
         };
         let mut detector = pangolin_chain::chain_sync::reorg::ReorgDetector::default();
 
+        // -----------------------------------------------------------
+        // Stage 1 — HTTP backfill (Q-a Option A).
+        // WS subscriptions cannot replay history; the chunked
+        // `eth_getLogs` loop catches up `cursor -> head` first.
+        // -----------------------------------------------------------
         while cursor < head {
             let chunk_start = cursor.saturating_add(1);
             let chunk_end = chunk_start
@@ -7546,8 +7589,248 @@ impl Vault {
         let promoted = self.promote_finalized_revisions(head)?;
         report.revisions_finalized = report.revisions_finalized.saturating_add(promoted);
         report.last_block_synced = head;
-        // R-b: in MVP-2 the WS path defers to HTTP polling.
-        report.event_source = ChainEventSource::HttpPolling;
+
+        // -----------------------------------------------------------
+        // Stage 2 — WS tip-follow (Q-a Option A second phase).
+        // Issue #99 §2d. After backfill catches up to head, attempt
+        // a WS subscription for new events at tip. On open-fail or
+        // mid-session-drop, increment `ws_drops` and back off up to
+        // `WS_CIRCUIT_BREAKER_THRESHOLD` consecutive failures, then
+        // fall through to HTTP polling for the rest of the session.
+        //
+        // L10: WS open-fail / drop NEVER fails the sync. The path
+        // taken at exit is reflected honestly in
+        // `report.event_source` per L9.
+        //
+        // The recv loop holds the connection for up to
+        // `WS_TIP_FOLLOW_WINDOW_SECS` of wall-clock; the host's
+        // pull-loop calls `sync_from_chain` again on its cadence to
+        // re-establish the WS session for the next window.
+        // -----------------------------------------------------------
+        // Skip WS entirely when an explicit `until_block` was passed
+        // (caller is doing a bounded historical sync, not tip-follow).
+        let tip_follow_eligible = options.prefer_websocket && options.until_block.is_none();
+        if !tip_follow_eligible {
+            return Ok(report);
+        }
+
+        // The HTTP backfill above already ran the same resolver
+        // successfully, so the Err branch is unreachable in
+        // practice. Defensive: fall through to HTTP if it ever
+        // fires.
+        let Ok(contract_address) = pangolin_chain::chain_sync::resolve_and_check_contract(env)
+        else {
+            return Ok(report);
+        };
+
+        // Q-c URL resolver. For hermetic tests, `ws_url_override`
+        // bypasses the JSON pin + scheme derivation; production
+        // callers pass None and the resolver derives from
+        // `rpc_url` (Option I) or picks up a JSON pin (Option III,
+        // wired by the host's deployment-file loader).
+        let ws_url = if let Some(forced) = ws_url_override {
+            forced.to_owned()
+        } else {
+            // No JSON-pin loader is wired into `sync_from_chain`
+            // yet (it would require pangolin-store to depend on
+            // the deployment-file loader); the resolver derives
+            // from the HTTP URL until that wiring lands. This is
+            // a deviation from Q-c Option III's "pin source-of-
+            // truth" arm — closed by the future wiring task; the
+            // L-ws-tls-downgrade defense still fires inside
+            // `open_subscription` regardless.
+            match resolve_ws_url(rpc_url, env, None) {
+                Ok(s) => s,
+                Err(_) => return Ok(report),
+            }
+        };
+
+        // Stage 2 recv loop: bounded by `WS_TIP_FOLLOW_WINDOW_SECS`
+        // wall-clock + circuit-breaker count.
+        let stage2_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(WS_TIP_FOLLOW_WINDOW_SECS);
+
+        let mut consecutive_failures: u32 = 0;
+        let mut backoff_ms: u64 = 0;
+        // Track whether we processed at least one WS event so
+        // `report.event_source` reflects the path actually taken
+        // (L9). Set to `WebSocket` only after the first
+        // successfully-ingested event.
+        let mut ws_path_used = false;
+
+        'ws_session: while tokio::time::Instant::now() < stage2_deadline
+            && consecutive_failures < WS_CIRCUIT_BREAKER_THRESHOLD
+        {
+            // Backoff before opening (skipped for the first attempt
+            // since backoff_ms = 0).
+            if backoff_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+            // L10: WS open-fail never aborts; bump ws_drops,
+            // advance backoff, retry up to the circuit-breaker cap.
+            let Ok(mut handle) = open_subscription(&ws_url, env, vault_id, contract_address).await
+            else {
+                report.ws_drops = report.ws_drops.saturating_add(1);
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                backoff_ms = pangolin_chain::chain_sync::ws::next_reconnect_backoff_ms(backoff_ms);
+                continue 'ws_session;
+            };
+
+            // Issue #99 F-2 fix-pass — recv-loop-exit gate.
+            //
+            // Track whether at least one verified event landed during
+            // this open's recv loop. The breaker counter is reset to
+            // 0 ONLY when this flag is true at recv-loop exit;
+            // otherwise the recv-loop exit accumulates the counter
+            // toward `WS_CIRCUIT_BREAKER_THRESHOLD`.
+            //
+            // **Scope honesty (F-4 re-audit empirical finding).** This
+            // gate fires only when `recv_next_event` returns
+            // `WsRecvOutcome::SubscriptionClosed` — which alloy's
+            // `alloy-pubsub` 2.0.4 layer only surfaces when its
+            // internal `reconnect_with_retries` loop gives up (max
+            // ~10 FAILED-reconnects × exponential-backoff ≈ minutes).
+            // On the accept-then-drop FAST-failure mode (RPC accepts
+            // the WS + replies to eth_subscribe + immediately drops),
+            // every reconnect cycle is a "fresh success" from
+            // alloy's POV, so `max_retries` never increments and the
+            // pubsub layer absorbs the storm silently below the
+            // orchestrator's recv layer. The orchestrator therefore
+            // does NOT receive the close signal in that scenario, and
+            // this gate is unreachable. See
+            // `docs/architecture/chain-sync.md` for the documented
+            // limitation + the deferred wrapper architectural
+            // follow-up (direct WS transport that bypasses
+            // alloy-pubsub and surfaces drops to the orchestrator).
+            //
+            // This gate remains valuable for the SLOW-failure mode
+            // (alloy gives up entirely; rare but real) — it then
+            // correctly distinguishes "open succeeded but no event
+            // landed during this session" from "session was healthy"
+            // for breaker accounting.
+            let mut event_ingested_this_open = false;
+
+            // Drain events with a short idle timeout so a quiet
+            // tip returns the caller quickly. Any event whose
+            // verification succeeds advances the local revision
+            // graph + the v1 checkpoint.
+            'recv_loop: loop {
+                if tokio::time::Instant::now() >= stage2_deadline {
+                    // Wall-clock deadline: treat as a successful
+                    // recv-loop exit only if at least one event
+                    // landed (so the breaker resets only on
+                    // healthy sessions). The post-loop reset
+                    // gate below handles the bookkeeping.
+                    break 'ws_session;
+                }
+                let recv_fut = recv_next_event(&mut handle);
+                // Timeout — no events available; gracefully
+                // exit the WS session for this call. Honest
+                // event_source reporting requires at least one
+                // successfully-ingested WS event for the
+                // `WebSocket` label; if no events arrived,
+                // the sync reports HttpPolling per L9.
+                let Ok(outcome) =
+                    tokio::time::timeout(Duration::from_millis(WS_RECV_IDLE_TIMEOUT_MS), recv_fut)
+                        .await
+                else {
+                    break 'ws_session;
+                };
+                match outcome {
+                    WsRecvOutcome::Event(log) => {
+                        match verify_alloy_log(&log, vault_id, &contract_address, env) {
+                            VerifyOutcome::Verified(ev) => {
+                                report.revisions_pulled = report.revisions_pulled.saturating_add(1);
+                                let signer_bytes = ev.signer.into_array();
+                                let now_ms = current_unix_ms();
+                                let inserted_new = device::auto_register_device_from_chain_sync(
+                                    &self.conn,
+                                    signer_bytes,
+                                    ev.event.anchor.block_number,
+                                    now_ms,
+                                )?;
+                                if inserted_new {
+                                    report.new_devices_registered =
+                                        report.new_devices_registered.saturating_add(1);
+                                }
+                                self.ingest_pending_chain_revision(
+                                    &ev.event,
+                                    ev.event.anchor.block_number,
+                                    ev.block_hash.0,
+                                )?;
+                                detector.record(ev.event.anchor.block_number, ev.block_hash);
+                                report.revisions_applied =
+                                    report.revisions_applied.saturating_add(1);
+                                // L9: WS path used iff at least one
+                                // event landed via WS.
+                                ws_path_used = true;
+                                // F-2: mark this open's recv loop
+                                // as healthy. Only verified +
+                                // ingested events count — a wire
+                                // event that fails verification
+                                // (foreign address, future schema,
+                                // etc.) doesn't prove the channel
+                                // is real, just that we received
+                                // bytes.
+                                event_ingested_this_open = true;
+                                // Advance the v1 checkpoint to the
+                                // event's block. The block-number
+                                // monotone-advance guard inside
+                                // `update_last_synced_block_v1`
+                                // rejects out-of-order WS events
+                                // gracefully (the L7 idempotency
+                                // path already handles the
+                                // duplicate-row case).
+                                let new_cursor = ev.event.anchor.block_number;
+                                if new_cursor > cursor {
+                                    self.update_last_synced_block_v1(new_cursor)?;
+                                    cursor = new_cursor;
+                                }
+                            }
+                            VerifyOutcome::Rejected => {
+                                report.revisions_rejected =
+                                    report.revisions_rejected.saturating_add(1);
+                            }
+                        }
+                    }
+                    WsRecvOutcome::SubscriptionClosed => {
+                        // L-ws-silent-disconnect: server closed
+                        // the channel (or broadcast lagged).
+                        // Increment ws_drops + back off. The
+                        // breaker-counter bookkeeping happens at
+                        // the recv-loop-exit gate below so the
+                        // accept-then-drop storm is captured.
+                        report.ws_drops = report.ws_drops.saturating_add(1);
+                        backoff_ms =
+                            pangolin_chain::chain_sync::ws::next_reconnect_backoff_ms(backoff_ms);
+                        break 'recv_loop;
+                    }
+                }
+            }
+
+            // F-2 recv-loop-exit gate. Reset the breaker counter
+            // ONLY if at least one verified event landed during
+            // this open. Otherwise treat the open-then-drop as a
+            // continuation of the storm and let the counter
+            // accumulate toward WS_CIRCUIT_BREAKER_THRESHOLD.
+            if event_ingested_this_open {
+                consecutive_failures = 0;
+                backoff_ms = 0;
+            } else {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+            }
+        }
+
+        if ws_path_used {
+            report.event_source = ChainEventSource::WebSocket;
+            // Run another finalization pass since the WS path may
+            // have added new pending rows that crossed the
+            // finalization threshold.
+            let promoted = self.promote_finalized_revisions(head)?;
+            report.revisions_finalized = report.revisions_finalized.saturating_add(promoted);
+        }
+        // L9 default: report.event_source already initialised to
+        // HttpPolling. Set here for clarity if WS never took the path.
         Ok(report)
     }
 

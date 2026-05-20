@@ -148,7 +148,8 @@ pub use chain_sync::{
     RevisionStatus, SyncOptions, SyncReport, VerifiedRevisionEvent,
     CONFIRMATION_DEPTH_FOR_FINALIZATION, HTTP_POLL_INTERVAL_SECS,
     LOG_BLOCK_CHUNK as CHAIN_SYNC_LOG_BLOCK_CHUNK, MAX_KNOWN_CLIENT_SCHEMA_VERSION,
-    WS_RECONNECT_INITIAL_BACKOFF_MS, WS_RECONNECT_MAX_BACKOFF_MS,
+    WS_CIRCUIT_BREAKER_THRESHOLD, WS_KEEPALIVE_INTERVAL_SECS, WS_RECONNECT_INITIAL_BACKOFF_MS,
+    WS_RECONNECT_MAX_BACKOFF_MS,
 };
 pub use secp256k1_signing::{
     build_signed_redemption_v1, build_signed_revision_v1, is_canonical_s, recover_signer_v1,

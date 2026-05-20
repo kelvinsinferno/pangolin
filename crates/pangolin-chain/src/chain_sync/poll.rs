@@ -7,7 +7,7 @@
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
-use alloy::rpc::types::Filter;
+use alloy::rpc::types::{Filter, Log as RpcLog};
 use alloy::sol_types::SolEvent;
 
 use crate::chain_submit::revision_log_v1_binding::RevisionLogV1;
@@ -22,6 +22,155 @@ use super::{
     MAX_KNOWN_CLIENT_SCHEMA_VERSION,
 };
 
+/// Outcome of [`verify_alloy_log`] — either the event was successfully
+/// decoded + passed every L2 defense, or it was rejected with a typed
+/// reason. The HTTP polling path and the WS recv loop BOTH consume
+/// this helper so verification is byte-identical across both
+/// transports (issue #99 L2).
+///
+/// The `Rejected` variant carries no error — rejections at this layer
+/// are silent (the orchestrator's `revisions_rejected` counter
+/// increments, but the sync continues). Hard failures (e.g. an RPC
+/// transport error) surface via `Result<…, ChainError>` from the
+/// caller's I/O layer; this helper is pure decode + check.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum VerifyOutcome {
+    /// Log decoded + passed every defense. Ingest into the local
+    /// revision graph.
+    Verified(VerifiedRevisionEvent),
+    /// Log was structurally invalid, or failed a defense-in-depth
+    /// check (foreign address, wrong `vaultId` topic, future
+    /// schemaVersion, missing block metadata, sequence overflow).
+    /// Caller increments the rejection counter and moves on.
+    Rejected,
+}
+
+/// L2 verification helper — decode + check a single alloy `Log` against
+/// every defense the HTTP polling path applies, returning a
+/// `VerifiedRevisionEvent` on success.
+///
+/// **Issue #99 L2.** Shared by `poll::fetch_chunk` (HTTP) and the WS
+/// recv loop (`chain_sync::ws`) so verification is byte-identical
+/// across both transports. The contract emits the same event shape
+/// regardless of how we observe it; this helper enforces:
+///
+/// 1. **L4 + MED-4:** `log.address() == contract_address` (defense
+///    against a misbehaving RPC splicing foreign logs into the
+///    response).
+/// 2. **L2 typed-binding decode:** via
+///    `RevisionLogV1::RevisionPublished::decode_log`.
+/// 3. **L-malicious-vault-id-substitution:** `decoded.vaultId ==
+///    requested vault_id`.
+/// 4. **L-schemaVersion-future-poison:** `decoded.schemaVersion <=
+///    MAX_KNOWN_CLIENT_SCHEMA_VERSION`.
+/// 5. **Anchor materialisation:** `log.block_number`,
+///    `log.log_index`, `log.transaction_hash`, `log.block_hash` are
+///    all Some (a log lacking any of these is a malformed RPC
+///    response and is rejected).
+/// 6. **Sequence range:** `u64::try_from(decoded.sequence)` succeeds.
+///
+/// The recovered-signer + signer-field cross-check (L5) is structurally
+/// preserved via the [`super::verify_signer_or_reject`] helper but is
+/// not invoked here because the v1 contract event surface does not
+/// carry the inline signature bytes (the contract performs
+/// `ecrecover` server-side at publish time and surfaces only the
+/// recovered `signer` address). See the long comment block on the
+/// `claimed_signer` line below + `docs/architecture/chain-sync.md` for
+/// the L4+L3+contract-side-verification chain that makes this safe.
+///
+/// `env` is accepted for forward-compatibility with the L5 path that
+/// will fire once a v1.1 event re-emits the signature bytes.
+#[must_use]
+pub fn verify_alloy_log(
+    log: &RpcLog,
+    vault_id: &VaultId,
+    contract_address: &Address,
+    _env: ChainEnv,
+) -> VerifyOutcome {
+    // (1) L4 + MED-4: filter is already address-pinned, but a
+    // misbehaving RPC could splice in foreign logs. Drop silently.
+    if log.address() != *contract_address {
+        return VerifyOutcome::Rejected;
+    }
+
+    // (2) L2: typed-binding decode.
+    let Ok(decoded) = RevisionLogV1::RevisionPublished::decode_log(&log.inner) else {
+        return VerifyOutcome::Rejected;
+    };
+
+    // (3) L-malicious-vault-id-substitution: cross-check `vaultId`
+    // topic against the requested vault. Server-side filter is the
+    // first defense; this is defense-in-depth.
+    let decoded_vault: [u8; 32] = decoded.vaultId.into();
+    if decoded_vault != *vault_id {
+        return VerifyOutcome::Rejected;
+    }
+
+    // (4) L-schemaVersion-future-poison: reject events with a
+    // not-yet-known schema version.
+    if decoded.schemaVersion > MAX_KNOWN_CLIENT_SCHEMA_VERSION {
+        return VerifyOutcome::Rejected;
+    }
+
+    // The contract emits `signer` as the recovered address from its
+    // server-side ecrecover; the event does not carry inline
+    // signature bytes for v1. The L5 client-side verifier
+    // (`verify_signer_or_reject`) is reachable via test fixtures
+    // that synthesise the signature; production decode trusts the
+    // L3 chain-id pin + L4 contract-address pin + contract-side
+    // verification chain. See `fetch_chunk` for the canonical
+    // long-form discussion.
+    let claimed_signer = decoded.signer;
+
+    // (5) Anchor materialisation.
+    let Some(block_number) = log.block_number else {
+        return VerifyOutcome::Rejected;
+    };
+    let Some(log_index) = log.log_index else {
+        return VerifyOutcome::Rejected;
+    };
+    let Some(tx_hash) = log.transaction_hash else {
+        return VerifyOutcome::Rejected;
+    };
+    let Some(block_hash) = log.block_hash else {
+        return VerifyOutcome::Rejected;
+    };
+
+    // (6) Sequence range.
+    let Ok(sequence) = u64::try_from(decoded.sequence) else {
+        return VerifyOutcome::Rejected;
+    };
+
+    let device_id_bytes: [u8; 32] = decoded.deviceId.into();
+    let account_id: [u8; 32] = decoded.accountId.into();
+    let parent_revision: [u8; 32] = decoded.parentRevision.into();
+    let enc_payload = decoded.encPayload.to_vec();
+
+    let anchor = ChainAnchor {
+        tx_hash: tx_hash.0,
+        block_number,
+        log_index,
+        sequence,
+    };
+    let event = event_to_revision_event(
+        *vault_id,
+        account_id,
+        parent_revision,
+        device_id_bytes,
+        decoded.schemaVersion,
+        sequence,
+        enc_payload,
+        anchor,
+    );
+    VerifyOutcome::Verified(VerifiedRevisionEvent {
+        event,
+        signer: claimed_signer,
+        block_hash,
+        schema_version: decoded.schemaVersion,
+    })
+}
+
 /// Issue a single `eth_getLogs` for the range `[from_block, to_block]`
 /// filtered by D-017 + `RevisionPublished` topic0 + indexed `vaultId`
 /// topic1, decode + verify each log, return the
@@ -32,7 +181,7 @@ use super::{
 /// fn knowing about chunk boundaries).
 pub async fn fetch_chunk<P: Provider>(
     provider: &P,
-    _env: ChainEnv,
+    env: ChainEnv,
     contract_address: Address,
     vault_id: &VaultId,
     from_block: u64,
@@ -53,122 +202,15 @@ pub async fn fetch_chunk<P: Provider>(
 
     let mut verified = Vec::with_capacity(logs.len());
     let mut rejected: u32 = 0;
-    for log in logs {
-        // L4 + MED-4 defensive emitter check: server-side filter is
-        // already address-pinned, but a misbehaving RPC could splice
-        // in foreign logs. Drop without surfacing.
-        if log.address() != contract_address {
-            rejected = rejected.saturating_add(1);
-            continue;
+    // Issue #99 L2: WS recv loop calls the SAME `verify_alloy_log`
+    // helper so verification is byte-identical across both transports.
+    for log in &logs {
+        match verify_alloy_log(log, vault_id, &contract_address, env) {
+            VerifyOutcome::Verified(ev) => verified.push(ev),
+            VerifyOutcome::Rejected => {
+                rejected = rejected.saturating_add(1);
+            }
         }
-
-        // L2: decode via the reused alloy `sol!` binding.
-        let Ok(decoded) = RevisionLogV1::RevisionPublished::decode_log(&log.inner) else {
-            rejected = rejected.saturating_add(1);
-            continue;
-        };
-
-        // L-malicious-vault-id-substitution: cross-check `vaultId`
-        // topic against the requested vault. Server-side filter is
-        // first defense; this is defense-in-depth.
-        let decoded_vault: [u8; 32] = decoded.vaultId.into();
-        if decoded_vault != *vault_id {
-            rejected = rejected.saturating_add(1);
-            continue;
-        }
-
-        // L-schemaVersion-future-poison: reject events with a
-        // not-yet-known schema version.
-        if decoded.schemaVersion > MAX_KNOWN_CLIENT_SCHEMA_VERSION {
-            rejected = rejected.saturating_add(1);
-            continue;
-        }
-
-        // The contract emits `signature` as the same 65-byte rsv the
-        // signer produced. The v1 ABI now carries this as an unindexed
-        // `bytes` parameter. **NB:** the binding in
-        // `revision_log_v1_binding` does NOT currently declare a
-        // `signature` field on the event (the contract emits 8 fields:
-        // sequence, vaultId, accountId, parentRevision, deviceId,
-        // schemaVersion, encPayload, signer). The verifier therefore
-        // has no signature bytes on the event itself; the contract has
-        // already verified the signature server-side at publish time
-        // and surfaces only the recovered signer. We trust the
-        // contract's verification + the contract address + chain-id
-        // cross-check (L3 + L4) — the verifier here is structurally
-        // present (recover_signer_v1_raw) but invoked only when the
-        // event carries explicit signature bytes (e.g. via a
-        // hypothetical v1.1 event that re-emits the signature). For
-        // the current contract, the L5 client-side defense reduces to
-        // "trust the signer field after L3 + L4 succeed".
-        //
-        // Per plan-gate L5 explicit text: client-side verifier is
-        // load-bearing for L-rpc-spoof-events. The defense lives in
-        // L4 (contract address pinned + filter) + L3 (chain id pinned)
-        // + the contract's own `ecrecover` at publish time. A
-        // misbehaving RPC cannot synthesize a chain that emits a
-        // valid contract address with a forged `signer` field because
-        // the contract's `RevisionPublished` event is only emitted
-        // from inside `publishRevision` AFTER signature verification.
-        //
-        // Future-proofing: if the v1.1 contract adds an unindexed
-        // `signature` field to the event, the call below will fire
-        // and the L5 verifier will run end-to-end. Today the helper
-        // [`verify_signer_or_reject`] is reachable from the test
-        // suite via synthetic events that carry the signature; the
-        // production decode path defers to the contract's own
-        // verification.
-        let claimed_signer = decoded.signer;
-
-        let Some(block_number) = log.block_number else {
-            rejected = rejected.saturating_add(1);
-            continue;
-        };
-        let Some(log_index) = log.log_index else {
-            rejected = rejected.saturating_add(1);
-            continue;
-        };
-        let Some(tx_hash) = log.transaction_hash else {
-            rejected = rejected.saturating_add(1);
-            continue;
-        };
-        let Some(block_hash) = log.block_hash else {
-            rejected = rejected.saturating_add(1);
-            continue;
-        };
-
-        let Ok(sequence) = u64::try_from(decoded.sequence) else {
-            rejected = rejected.saturating_add(1);
-            continue;
-        };
-
-        let device_id_bytes: [u8; 32] = decoded.deviceId.into();
-        let account_id: [u8; 32] = decoded.accountId.into();
-        let parent_revision: [u8; 32] = decoded.parentRevision.into();
-        let enc_payload = decoded.encPayload.to_vec();
-
-        let anchor = ChainAnchor {
-            tx_hash: tx_hash.0,
-            block_number,
-            log_index,
-            sequence,
-        };
-        let event = event_to_revision_event(
-            *vault_id,
-            account_id,
-            parent_revision,
-            device_id_bytes,
-            decoded.schemaVersion,
-            sequence,
-            enc_payload,
-            anchor,
-        );
-        verified.push(VerifiedRevisionEvent {
-            event,
-            signer: claimed_signer,
-            block_hash,
-            schema_version: decoded.schemaVersion,
-        });
     }
     Ok((verified, rejected))
 }
