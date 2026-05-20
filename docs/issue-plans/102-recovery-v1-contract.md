@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 # Issue #102 — Recovery v1 contract (`RecoveryV1.sol`) — plan-gate DRAFT
 
-**Status: DRAFT — awaiting Kelvin's resolved decisions (Q-a..Q-h below). HIGHEST-RISK EPIC; external-audit-gated before mainnet; every change requires explicit Kelvin approval (§16.3).**
+**Status: LOCKED — Kelvin sign-off 2026-05-20. Resolved decisions R-a..R-h in DECISIONS.md (Issue #102). HIGHEST-RISK EPIC; external-audit-gated before mainnet; every change requires explicit Kelvin approval (§16.3).**
 **Base tip: `b93c101` (main; MVP-3 started with #101 anvil harness). Implements master plan §6 row `2.2 Recovery contract v1` (Whitepaper §D2).**
 
 ## Scope — contract-only (recommended, confirmed)
