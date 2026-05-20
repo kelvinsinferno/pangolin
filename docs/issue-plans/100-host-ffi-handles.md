@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 # Issue #100 — MVP-3-host-FFI-handles (plan-gate DRAFT)
 
-**Status: DRAFT — awaiting Kelvin's resolved decisions (Q-a..Q-f below).**
+**Status: LOCKED — Kelvin sign-off 2026-05-20. Resolved decisions R-a..R-f recorded in DECISIONS.md (Issue #100 section).**
 **Base tip: `7aa04cc` (#99 merged, CI green). Last item in the pre-MVP-3 cleanup batch (5/5).**
 
 ## Headline finding (reframes the cycle)
