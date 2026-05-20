@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod aead;
+pub mod escrow;
 pub mod kdf;
 pub mod keys;
 pub mod rng;
