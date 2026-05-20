@@ -265,38 +265,194 @@ pub struct FfiTopUpAttempt {
     pub submitted_at_unix: u64,
 }
 
+/// FFI mirror of [`pangolin_funder_client::Credit`] (MVP-3 issue
+/// #100 R-c).
+///
+/// The Credit attestation the host obtains from the off-chain payment
+/// service. Byte fields cross as hex strings (`0x`-prefixed accepted)
+/// per the established convention; `nonce` / `schema_version` /
+/// `expires_at` cross as integers. The [`FfiCredit`]→`Credit` reshape
+/// is a single TOTAL function with strict hex-decode + length
+/// validation (see [`ffi_credit_to_credit`]); malformed input → a
+/// clear `FfiError::Validation`. The reshape is fail-safe: the Credit
+/// signature binds the semantic fields and is verified downstream by
+/// the funder + on-chain `ecrecover`, so any corruption → signature
+/// mismatch → REJECTED, never a silent mis-bind.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiCredit {
+    /// Schema-version slot (the FFI-wire transport version, distinct
+    /// from the Credit's own `schema_version` event field below).
+    pub schema_version: u16,
+    /// Opaque user identifier — 32-byte hex string (`0x`-prefixed
+    /// accepted).
+    pub user_id_hex: String,
+    /// Credits to add — `U256` as a hex string (`0x`-prefixed
+    /// accepted).
+    pub amount_hex: String,
+    /// Nonce embedded in the attestation (strict-equality at submit).
+    pub nonce: u64,
+    /// Event-schema version of the Credit (the funder rejects values
+    /// above `MAX_KNOWN_SCHEMA_VERSION`).
+    pub credit_schema_version: u16,
+    /// Unix timestamp after which the attestation expires.
+    pub expires_at: u64,
+    /// 65-byte `r || s || v` signature from `PAYMENT_AUTHORITY` — hex
+    /// string (`0x`-prefixed accepted).
+    pub signature_hex: String,
+}
+
+/// Schema-version slot value for [`FfiCredit`].
+pub const FFI_CREDIT_SCHEMA_VERSION: u16 = 1;
+
+/// Decode a hex string (optional `0x`/`0X` prefix) into exactly
+/// `expected_len` bytes. TOTAL: any malformed input → a clear
+/// `FfiError::Validation { kind: "credit" }`.
+fn decode_hex_exact(field: &str, s: &str, expected_len: usize) -> Result<Vec<u8>, FfiError> {
+    let stripped = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    let bytes = hex_decode(stripped).ok_or_else(|| FfiError::Validation {
+        kind: "credit".into(),
+        message: format!("credit field `{field}` is not valid hex"),
+    })?;
+    if bytes.len() != expected_len {
+        return Err(FfiError::Validation {
+            kind: "credit".into(),
+            message: format!(
+                "credit field `{field}` length mismatch: expected {expected_len} bytes, got {}",
+                bytes.len()
+            ),
+        });
+    }
+    Ok(bytes)
+}
+
+/// Decode a lowercase/uppercase hex string into bytes. `None` on any
+/// non-hex byte or an odd length.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push(u8::try_from(hi * 16 + lo).ok()?);
+        i += 2;
+    }
+    Some(out)
+}
+
+/// TOTAL [`FfiCredit`]→[`pangolin_funder_client::Credit`] reshape with
+/// strict hex-decode + length validation (R-c). Malformed → a clear
+/// `FfiError::Validation { kind: "credit" }`.
+fn ffi_credit_to_credit(c: &FfiCredit) -> Result<pangolin_funder_client::Credit, FfiError> {
+    let user_id_vec = decode_hex_exact("user_id", &c.user_id_hex, 32)?;
+    let user_id: [u8; 32] = user_id_vec
+        .as_slice()
+        .try_into()
+        .expect("decode_hex_exact guarantees 32 bytes");
+    let sig_vec = decode_hex_exact("signature", &c.signature_hex, 65)?;
+    let signature: [u8; 65] = sig_vec
+        .as_slice()
+        .try_into()
+        .expect("decode_hex_exact guarantees 65 bytes");
+    let amount_stripped = c
+        .amount_hex
+        .strip_prefix("0x")
+        .or_else(|| c.amount_hex.strip_prefix("0X"))
+        .unwrap_or(&c.amount_hex);
+    let amount = alloy::primitives::U256::from_str_radix(amount_stripped, 16).map_err(|e| {
+        FfiError::Validation {
+            kind: "credit".into(),
+            message: format!("credit field `amount` is not a valid hex U256: {e}"),
+        }
+    })?;
+    Ok(pangolin_funder_client::Credit {
+        user_id,
+        amount,
+        nonce: c.nonce,
+        schema_version: c.credit_schema_version,
+        expires_at: c.expires_at,
+        signature,
+    })
+}
+
 /// Request a top-up from the funder service.
 ///
-/// **CLI-V1 (R-g) stub.** The full call requires a
-/// [`alloy::signers::local::PrivateKeySigner`] handle and a
-/// [`pangolin_funder_client::Credit`] attestation, neither of
-/// which has an FFI surface in CLI-V1. The binding is exposed
-/// here for surface-freeze purposes — MVP-3 ships the signer
-/// handle (or routes through an active-vault path that signs
-/// engine-side) and wires the body. Returns
-/// `FfiError::Internal { message: "vault_initiate_top_up requires funder-credit FFI (MVP-3)" }`
-/// at call time.
+/// **MVP-3 issue #100 (R-c / R-d).** Reshapes the host-supplied
+/// [`FfiCredit`] into a [`pangolin_funder_client::Credit`] (TOTAL,
+/// strict-validating), reads the device's gas-paying signer
+/// engine-side from the unlocked vault (`Vault::evm_wallet().signer()`
+/// — cloned engine-side; **no secret material crosses FFI**, L1), and
+/// drives [`pangolin_funder_client::initiate_top_up`] to completion on
+/// a local current-thread runtime.
 ///
 /// # Errors
 ///
-/// `FfiError::Session` if the handle has no vault installed;
-/// otherwise the CLI-V1 stub returns `FfiError::Internal`.
-#[allow(
-    clippy::significant_drop_tightening,
-    clippy::needless_pass_by_value,
-    unused_variables
-)]
+/// `FfiError::Session` for a locked / placeholder handle (the L4
+/// session gate, before any chain primitive);
+/// `FfiError::Validation { kind: "credit" }` for a malformed
+/// `FfiCredit`; `FfiError::Chain` for a funder / transport / signing
+/// failure.
+#[allow(clippy::significant_drop_tightening, clippy::needless_pass_by_value)]
 #[uniffi::export]
 pub fn vault_initiate_top_up(
     handle: Arc<VaultHandle>,
     funder_url: String,
+    credit: FfiCredit,
 ) -> Result<FfiTopUpAttempt, FfiError> {
-    let mut guard = handle.lock_vault();
-    let _vault = guard.as_mut()?;
-    Err(FfiError::Internal {
-        message: "vault_initiate_top_up requires funder-credit FFI (MVP-3); use the CLI for now"
-            .to_string(),
+    // Reshape the Credit BEFORE acquiring the vault guard (no vault
+    // state needed for validation; keeps the lock window short).
+    let credit = ffi_credit_to_credit(&credit)?;
+    // Active-session gate at the FFI boundary (L4) + read the gas
+    // signer engine-side. L1: the signer is cloned from the unlocked
+    // vault and never crosses FFI.
+    let signer = {
+        let mut guard = handle.lock_vault();
+        let vault = guard.as_mut()?;
+        vault.evm_wallet().map_err(store_into_ffi)?.signer().clone()
+    };
+    // `initiate_top_up`'s future IS `Send` (no `!Send` vault held
+    // across the await), but the host calls this binding synchronously
+    // from a worker thread, so we drive it on a local runtime for
+    // posture parity with the other chain bindings.
+    let attempt = crate::chain_config::block_on_local(async {
+        pangolin_funder_client::initiate_top_up(&funder_url, credit, &signer)
+            .await
+            .map_err(|e| FfiError::Chain {
+                message: e.to_string(),
+            })
+    })??;
+    Ok(FfiTopUpAttempt {
+        schema_version: 1,
+        attempt_id: attempt.attempt_id.to_string(),
+        redeem_tx_hash: format!(
+            "0x{}",
+            hex_encode_lower(attempt.funder_response.redeem_tx_hash.as_slice())
+        ),
+        eth_transfer_tx_hash: attempt
+            .funder_response
+            .eth_transfer_tx_hash
+            .map(|h| format!("0x{}", hex_encode_lower(h.as_slice()))),
+        eth_transferred_wei_hex: format!("0x{:x}", attempt.funder_response.eth_transferred_wei),
+        submitted_at_unix: attempt.submitted_at_unix,
     })
+}
+
+/// Lowercase hex-encode helper (local — keeps the dep set tight,
+/// mirrors the funder client's own `hex_encode`).
+fn hex_encode_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
 }
 
 #[cfg(test)]
@@ -419,5 +575,172 @@ mod tests {
             matches!(&err, FfiError::Validation { kind, .. } if kind == "argument"),
             "expected FfiError::Validation, got {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // MVP-3 #100: vault_initiate_top_up + FfiCredit reshape.
+    // -----------------------------------------------------------------
+
+    /// A well-formed [`FfiCredit`] (hex fields, `0x`-prefix optional).
+    fn valid_ffi_credit() -> FfiCredit {
+        FfiCredit {
+            schema_version: FFI_CREDIT_SCHEMA_VERSION,
+            user_id_hex: format!("0x{}", "aa".repeat(32)),
+            amount_hex: "0x1e240".into(), // 123456
+            nonce: 7,
+            credit_schema_version: 1,
+            expires_at: 2_000_000_000,
+            signature_hex: "bb".repeat(65), // no 0x prefix → also accepted
+        }
+    }
+
+    /// **MVP-3 #100 (R-c) — TOTAL reshape, happy path.** A well-formed
+    /// `FfiCredit` reshapes field-for-field into a
+    /// `pangolin_funder_client::Credit`, with `0x`-prefixed and
+    /// bare-hex byte fields both accepted.
+    #[test]
+    fn ffi_credit_to_credit_round_trips_valid_fields() {
+        let credit = ffi_credit_to_credit(&valid_ffi_credit()).expect("valid credit reshapes");
+        assert_eq!(credit.user_id, [0xAAu8; 32]);
+        assert_eq!(credit.amount, alloy::primitives::U256::from(123_456u64));
+        assert_eq!(credit.nonce, 7);
+        assert_eq!(credit.schema_version, 1);
+        assert_eq!(credit.expires_at, 2_000_000_000);
+        assert_eq!(credit.signature, [0xBBu8; 65]);
+    }
+
+    /// **MVP-3 #100 (R-c) — TOTAL reshape, malformed cases.** Each
+    /// malformed byte field surfaces `FfiError::Validation { kind:
+    /// "credit" }` — no panic, no silent mis-bind.
+    #[test]
+    fn ffi_credit_to_credit_rejects_malformed_fields() {
+        // user_id wrong length.
+        let mut c = valid_ffi_credit();
+        c.user_id_hex = "0xaa".into();
+        assert!(matches!(
+            ffi_credit_to_credit(&c),
+            Err(FfiError::Validation { ref kind, .. }) if kind == "credit"
+        ));
+        // signature non-hex.
+        let mut c = valid_ffi_credit();
+        c.signature_hex = "zz".repeat(65);
+        assert!(matches!(
+            ffi_credit_to_credit(&c),
+            Err(FfiError::Validation { ref kind, .. }) if kind == "credit"
+        ));
+        // amount non-hex.
+        let mut c = valid_ffi_credit();
+        c.amount_hex = "0xnothex".into();
+        assert!(matches!(
+            ffi_credit_to_credit(&c),
+            Err(FfiError::Validation { ref kind, .. }) if kind == "credit"
+        ));
+    }
+
+    /// **MVP-3 #100 (R-f) — per-binding session gate (L4).** A
+    /// malformed credit is rejected BEFORE the session gate (validation
+    /// runs first, no vault state needed); a placeholder handle with a
+    /// VALID credit errors `FfiError::Session` before any funder call.
+    #[test]
+    fn initiate_top_up_rejects_placeholder_before_funder_call() {
+        let empty = VaultHandle::new_placeholder();
+        let err =
+            vault_initiate_top_up(empty, "http://127.0.0.1:1".to_string(), valid_ffi_credit())
+                .unwrap_err();
+        assert!(
+            matches!(err, FfiError::Session { .. }),
+            "expected FfiError::Session, got {err:?}"
+        );
+    }
+
+    /// **MVP-3 #100 (R-c) — malformed credit rejected at the boundary
+    /// even on an unlocked vault.**
+    #[test]
+    fn initiate_top_up_rejects_malformed_credit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "v.pvf");
+        let mut bad = valid_ffi_credit();
+        bad.signature_hex = "0x00".into(); // wrong length
+        let err = vault_initiate_top_up(h, "http://127.0.0.1:1".to_string(), bad).unwrap_err();
+        assert!(
+            matches!(&err, FfiError::Validation { kind, .. } if kind == "credit"),
+            "expected FfiError::Validation(credit), got {err:?}"
+        );
+    }
+
+    /// **MVP-3 #100 (R-d / R-f) — REAL-path stub-parity flip against a
+    /// mock funder.** The binding sources the gas signer engine-side
+    /// (no secret crosses FFI), reshapes the Credit, and POSTs to a
+    /// wiremock funder; a 200 response decodes into a real
+    /// `FfiTopUpAttempt` (NOT the old `Internal` stub). Runs on a
+    /// multi-thread runtime so the binding's inner current-thread
+    /// `block_on_local` is driven from a worker thread (the production
+    /// host posture), exactly like `gas_balance_state`'s lifecycle test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initiate_top_up_real_path_against_mock_funder() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let response_body = serde_json::json!({
+            "redeem_tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "eth_transfer_tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+            "eth_transferred_wei": "0x16345785d8a0000"
+        });
+        Mock::given(method("POST"))
+            .and(path("/funder/v1/top-up"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
+            .mount(&mock)
+            .await;
+        let uri = mock.uri();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "v.pvf");
+        let attempt =
+            tokio::task::spawn_blocking(move || vault_initiate_top_up(h, uri, valid_ffi_credit()))
+                .await
+                .unwrap()
+                .expect("top-up should succeed against mock funder");
+        assert_eq!(attempt.schema_version, 1);
+        assert_eq!(
+            attempt.redeem_tx_hash,
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        assert_eq!(
+            attempt.eth_transfer_tx_hash.as_deref(),
+            Some("0x2222222222222222222222222222222222222222222222222222222222222222")
+        );
+        assert_eq!(attempt.eth_transferred_wei_hex, "0x16345785d8a0000");
+        assert!(!attempt.attempt_id.is_empty());
+    }
+
+    /// **MVP-3 #100 (R-d) — skip-clean live `#[ignore]` test.** A real
+    /// end-to-end top-up against the live funder backed by D-019,
+    /// driven through the FFI binding. Skips cleanly when the env vars
+    /// are absent (mirrors `pull_live.rs`). Requires a paid Credit
+    /// attestation; the slot is reserved until one exists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "live-funder FFI test; requires PANGOLIN_FUNDER_URL + a paid Credit"]
+    async fn initiate_top_up_live_via_ffi() {
+        let funder_url = match std::env::var("PANGOLIN_FUNDER_URL") {
+            Ok(s) if !s.is_empty() => s,
+            _ => {
+                eprintln!("SKIP: PANGOLIN_FUNDER_URL not set");
+                return;
+            }
+        };
+        // A real Credit attestation would be read from
+        // PANGOLIN_CREDIT_FILE here; until a paid Credit exists, skip.
+        let credit_file = match std::env::var("PANGOLIN_CREDIT_FILE") {
+            Ok(s) if !s.is_empty() => s,
+            _ => {
+                eprintln!("SKIP: PANGOLIN_CREDIT_FILE not set");
+                return;
+            }
+        };
+        let _ = (funder_url, credit_file);
+        // Future: parse the credit file into an FfiCredit, build an
+        // unlocked handle from a real vault, and assert the live
+        // FfiTopUpAttempt shape. Reserved against D-019.
     }
 }

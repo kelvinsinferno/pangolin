@@ -326,6 +326,39 @@ impl BaseSepoliaAdapter {
         Self::with_signer(rpc_url, deployment, wallet.into_signer()).await
     }
 
+    /// Construct an adapter from a ready secp256k1 signer the caller
+    /// already holds engine-side.
+    ///
+    /// **MVP-3 issue #100 (host-FFI handles).** This is the engine-side
+    /// gas-wallet path for the host FFI bindings (`vault_flush_publish_queue`
+    /// / `vault_lock_with_drain`): the FFI layer reads the unlocked
+    /// vault's per-device EVM wallet (`Vault::evm_wallet().signer()`),
+    /// clones the signer, and hands it here — all engine-side Rust, so
+    /// **no secret material ever crosses the FFI boundary** (L1). The
+    /// host supplies only the non-secret `rpc_url` + `deployment_path`.
+    ///
+    /// The `signer` argument carries secret key material (the secp256k1
+    /// scalar). It MUST NOT be logged, serialized, or otherwise leaked;
+    /// it is moved into alloy's `EthereumWallet` (whose secret is
+    /// `ZeroizeOnDrop`) and only the public `signer_address` is retained
+    /// on the adapter for diagnostics. Same loader + chain-id + runtime-
+    /// bytecode cross-checks as the other constructors.
+    ///
+    /// # Errors
+    ///
+    /// [`ChainError::Deployment`] if the deployment file fails to load;
+    /// [`ChainError::Rpc`] / [`ChainError::WrongChain`] /
+    /// [`ChainError::DeploymentMismatch`] for transport, chain-id, or
+    /// runtime-bytecode failures (identical to the other constructors).
+    pub async fn new_with_signer(
+        rpc_url: &str,
+        deployment_path: &Path,
+        signer: PrivateKeySigner,
+    ) -> Result<Self, ChainError> {
+        let deployment = Deployment::load(deployment_path)?;
+        Self::with_signer(rpc_url, deployment, signer).await
+    }
+
     /// Shared internal constructor: build a wallet-bearing provider
     /// and verify chain id + live bytecode.
     async fn with_signer(
@@ -981,6 +1014,69 @@ mod tests {
         assert!(
             msg.contains("EIP-55"),
             "expected EIP-55-checksum error message, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // MVP-3 issue #100: new_with_signer additive constructor.
+    // -----------------------------------------------------------------
+
+    /// Build a deterministic secp256k1 signer for hermetic tests.
+    /// `0x42` repeated — same fixture value the rest of the chain crate
+    /// uses, so cross-crate audit recognises it.
+    fn fixed_signer() -> alloy::signers::local::PrivateKeySigner {
+        "0x4242424242424242424242424242424242424242424242424242424242424242"
+            .parse()
+            .expect("parse fixed signer")
+    }
+
+    /// **MVP-3 #100.** `new_with_signer` loads the deployment file
+    /// FIRST (mirroring `new_with_device_key` / `new_with_keystore`):
+    /// a missing deployment file surfaces as `ChainError::Io` BEFORE
+    /// any RPC connect is attempted, so the constructor fails fast on
+    /// bad config rather than hanging on an unreachable RPC.
+    #[tokio::test]
+    async fn new_with_signer_loads_deployment_before_rpc() {
+        let missing = std::path::Path::new("/no/such/path/base-sepolia.json");
+        let err = super::BaseSepoliaAdapter::new_with_signer(
+            "http://127.0.0.1:1",
+            missing,
+            fixed_signer(),
+        )
+        .await
+        .expect_err("missing deployment must error");
+        assert!(
+            matches!(err, ChainError::Io(_)),
+            "expected ChainError::Io (deployment load happens before RPC), got {err:?}"
+        );
+    }
+
+    /// **MVP-3 #100.** A malformed deployment file (wrong chain id)
+    /// is rejected by `new_with_signer` at load time with a
+    /// `ChainError::Deployment`, again before any RPC — proving the
+    /// constructor delegates to the same `Deployment::load` path the
+    /// other constructors use.
+    #[tokio::test]
+    async fn new_with_signer_rejects_wrong_chain_id_deployment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let json = r#"{
+            "chain": { "chain_id": 1, "rpc_default": "https://x" },
+            "contracts": {
+                "RevisionLogV0": {
+                    "address": "0x8566D3de653ee55775783bD7918Fe91b66373896",
+                    "deploy_block": 1
+                }
+            }
+        }"#;
+        let p = dir.path().join("base-sepolia.json");
+        std::fs::write(&p, json).expect("write");
+        let err =
+            super::BaseSepoliaAdapter::new_with_signer("http://127.0.0.1:1", &p, fixed_signer())
+                .await
+                .expect_err("wrong-chain deployment must error");
+        assert!(
+            matches!(err, ChainError::Deployment(_)),
+            "expected ChainError::Deployment, got {err:?}"
         );
     }
 }

@@ -555,37 +555,54 @@ pub struct FfiPullReport {
 
 /// Run a single pull cycle.
 ///
-/// **CLI-V1 (R-g) stub.** The full call requires an active tokio
-/// runtime + a `Vault` reference held across `.await`. `Vault` is
-/// `!Send` by design (it holds an `RefCell`-bearing `rusqlite::Connection`
-/// + a `dyn Clock`), which makes it incompatible with `UniFFI`'s
-/// `async fn` export shape (which requires the future to be `Send`).
-/// The CLI consumes the engine method directly. MVP-3 may unblock
-/// this via either a single-threaded executor surface or a sync-
-/// path FFI wrapper. Returns
-/// `FfiError::Internal { message: "vault_pull_once requires single-threaded executor FFI (MVP-3)" }`
-/// at call time.
+/// **MVP-3 issue #100.** Drives the `!Send`
+/// [`pangolin_store::Vault::pull_once`] future to completion on a
+/// local current-thread runtime (the `Vault` is `!Send` — it holds an
+/// `RefCell`-bearing `rusqlite::Connection` + a `dyn Clock` — so the
+/// future never leaves the calling thread; see `chain_config.rs`
+/// module doc). The pull path is read-only: it builds its own provider
+/// internally and needs no adapter + no signer (zero secret crosses
+/// FFI, trivially). `config.rpc_url` (the frozen `rpc_url` arg folded
+/// into the R-a Record) supplies the endpoint; `ChainEnv` is hardcoded
+/// `BaseSepolia` (L8, not crossed FFI).
+///
+/// `config.prefer_websocket` is **accepted-but-not-forwarded** (R-e
+/// amendment): `Vault::pull_once` hardcodes `SyncOptions::default()`
+/// and takes no options arg, so the toggle is a documented no-op on
+/// this path; forwarding it is a deferred follow-up.
 ///
 /// # Errors
 ///
-/// Always returns `FfiError::Internal` in CLI-V1 (after the
-/// active-session gate fires).
-#[allow(
-    clippy::significant_drop_tightening,
-    clippy::needless_pass_by_value,
-    unused_variables
-)]
+/// `FfiError::Session` for a locked / placeholder handle (the L4
+/// session gate, before any chain primitive); `FfiError::Chain` /
+/// `FfiError::Store` for pull-cycle failures.
+#[allow(clippy::significant_drop_tightening, clippy::needless_pass_by_value)]
 #[uniffi::export]
 pub fn vault_pull_once(
     handle: Arc<VaultHandle>,
-    rpc_url: String,
+    config: crate::chain_config::FfiChainConfig,
 ) -> Result<FfiPullReport, FfiError> {
+    // Active-session gate at the FFI boundary (L4), BEFORE any chain
+    // primitive.
     let mut guard = handle.lock_vault();
-    let _vault = guard.as_mut()?;
-    Err(FfiError::Internal {
-        message:
-            "vault_pull_once requires single-threaded executor FFI (MVP-3); use the CLI for now"
-                .to_string(),
+    let vault = guard.as_mut()?;
+    let vault_id = vault.vault_id();
+    // L8: ChainEnv is hardcoded BaseSepolia (not crossed FFI).
+    let env = pangolin_chain::ChainEnv::BaseSepolia;
+    let report = crate::chain_config::block_on_local(async {
+        vault
+            .pull_once(&config.rpc_url, env, &vault_id)
+            .await
+            .map_err(crate::chain_config::pull_into_ffi)
+    })??;
+    Ok(FfiPullReport {
+        schema_version: 1,
+        mode: FfiSyncMode::from(report.mode),
+        pulled_at_unix_ms: report.pulled_at_unix_ms,
+        newly_frozen_count: u32::try_from(report.newly_frozen_accounts.len()).unwrap_or(u32::MAX),
+        newly_forked_count: u32::try_from(report.newly_forked_accounts.len()).unwrap_or(u32::MAX),
+        newly_resolved_count: u32::try_from(report.newly_resolved_accounts.len())
+            .unwrap_or(u32::MAX),
     })
 }
 
@@ -781,6 +798,73 @@ mod tests {
             parse_wei_hex(" 0x1"),
             Err(FfiError::Validation { .. })
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // MVP-3 #100: vault_pull_once REAL-path tests.
+    // -----------------------------------------------------------------
+
+    fn bogus_config() -> crate::chain_config::FfiChainConfig {
+        crate::chain_config::FfiChainConfig {
+            schema_version: 1,
+            // The picker re-runs each cycle; on a fresh vault with no
+            // checkpoint it returns OfferFast WITHOUT making an RPC
+            // call (4.4 first-sync-only heuristic), so an unreachable
+            // URL is never dialed.
+            rpc_url: "http://127.0.0.1:1/should-not-be-called".into(),
+            deployment_path: "/unused-on-pull-path/base-sepolia.json".into(),
+            prefer_websocket: true,
+        }
+    }
+
+    /// **MVP-3 #100 (R-f) — REAL-path stub-parity flip + the `!Send`
+    /// runtime-bridge round-trip.** On a fresh unlocked vault the
+    /// picker returns `OfferFast` without dialing the RPC, so
+    /// `vault_pull_once` drives the `!Send` `Vault::pull_once` future
+    /// to completion on the local current-thread runtime and returns a
+    /// real `FfiPullReport` (NOT the old `Internal` stub). This
+    /// exercises the whole synchronous-binding → `block_on_local` →
+    /// `!Send` future → typed-Record round-trip.
+    #[test]
+    fn pull_once_real_path_round_trips_offer_fast_via_local_runtime() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "v.pvf");
+        let report = vault_pull_once(h, bogus_config()).expect("pull cycle should succeed");
+        assert_eq!(report.schema_version, 1);
+        // Fresh-vault-no-checkpoint → picker returns OfferFast (signal-
+        // only; engine never dispatches RPC).
+        assert_eq!(report.mode, FfiSyncMode::OfferFast);
+        assert_eq!(report.newly_frozen_count, 0);
+        assert_eq!(report.newly_forked_count, 0);
+        assert_eq!(report.newly_resolved_count, 0);
+    }
+
+    /// **MVP-3 #100 (R-f) — per-binding session gate (L4).** A locked
+    /// vault errors `FfiError::Session` BEFORE any chain primitive.
+    #[test]
+    fn pull_once_rejects_locked_vault_before_chain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "v.pvf");
+        {
+            let mut g = h.lock_vault();
+            g.as_mut().unwrap().lock();
+        }
+        let err = vault_pull_once(h, bogus_config()).unwrap_err();
+        assert!(
+            matches!(err, FfiError::Session { .. }),
+            "expected FfiError::Session (L4 gate before chain), got {err:?}"
+        );
+    }
+
+    /// **MVP-3 #100 (R-f) — per-binding session gate (placeholder).**
+    #[test]
+    fn pull_once_rejects_placeholder() {
+        let empty = VaultHandle::new_placeholder();
+        let err = vault_pull_once(empty, bogus_config()).unwrap_err();
+        assert!(
+            matches!(err, FfiError::Session { .. }),
+            "expected FfiError::Session, got {err:?}"
+        );
     }
 
     #[test]

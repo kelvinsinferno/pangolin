@@ -15,17 +15,24 @@
 //!   diagnostic / GC purposes.
 //!
 //! L5: every entry point is active-session-gated at the FFI
-//! boundary. The chain adapter is NOT yet FFI-exposed; this
-//! module's `vault_flush_publish_queue` is a placeholder that
-//! returns `FfiError::Internal { ... }` until the chain-adapter
-//! FFI surface lands in MVP-3. The CLI consumes the engine
-//! method directly (no FFI involved); this binding is for the
-//! host UI's eventual use.
+//! boundary. **MVP-3 issue #100** wires the chain-adapter-bearing
+//! `vault_flush_publish_queue` body: the binding builds a
+//! `BaseSepoliaAdapter` engine-side from the unlocked vault's gas
+//! wallet (no secret crosses FFI — L1) + the host-supplied
+//! [`crate::chain_config::FfiChainConfig`], then drives the `!Send`
+//! `Vault::flush_publish_queue` future on a local current-thread
+//! runtime. The CLI consumes the engine method directly (no FFI
+//! involved); this binding is for the host UI's use.
 
 #![forbid(unsafe_code)]
 
+use std::path::Path;
 use std::sync::Arc;
 
+use pangolin_chain::BaseSepoliaAdapter;
+use pangolin_crypto::keys::DeviceKey;
+
+use crate::chain_config::{batch_flush_into_ffi, block_on_local, chain_into_ffi, FfiChainConfig};
 use crate::error::FfiError;
 use crate::session::VaultHandle;
 
@@ -107,37 +114,64 @@ fn store_into_ffi(err: pangolin_store::StoreError) -> FfiError {
 
 /// Drain the publish queue.
 ///
-/// **CLI-V1 (R-g) stub.** The full call requires a
-/// [`pangolin_chain::ChainAdapter`] handle + a
-/// [`pangolin_crypto::keys::DeviceKey`] handle, neither of which has
-/// an FFI surface in CLI-V1. The binding is exposed here for surface-
-/// freeze purposes — MVP-3 ships the chain-adapter handle and wires
-/// the body. Returns `FfiError::Internal { kind: "ffi_not_wired" }`
-/// at call time.
+/// **MVP-3 issue #100.** Builds a `BaseSepoliaAdapter` engine-side
+/// from the unlocked vault's per-device gas wallet (the signer is
+/// read via `Vault::evm_wallet().signer()` and cloned engine-side —
+/// **no secret material crosses FFI**, L1) plus the host-supplied
+/// non-secret `config` (`rpc_url` + `deployment_path`), then drives
+/// the `!Send` [`pangolin_store::Vault::flush_publish_queue`] future
+/// to completion on a local current-thread runtime. `force = true`
+/// bypasses the 30 s window.
 ///
 /// # Errors
 ///
-/// Always returns
-/// `FfiError::Internal { message: "vault_flush_publish_queue requires chain-adapter FFI (MVP-3)" }`
-/// in CLI-V1.
-#[allow(
-    clippy::significant_drop_tightening,
-    clippy::needless_pass_by_value,
-    unused_variables
-)]
+/// `FfiError::Session` for a locked / placeholder handle (the L4
+/// session gate, before any chain primitive); `FfiError::Store` /
+/// `FfiError::Chain` for adapter-construction or flush failures.
+#[allow(clippy::significant_drop_tightening, clippy::needless_pass_by_value)]
 #[uniffi::export]
 pub fn vault_flush_publish_queue(
     handle: Arc<VaultHandle>,
+    config: FfiChainConfig,
     force: bool,
 ) -> Result<FfiBatchFlushReport, FfiError> {
-    // Active-session gate at the FFI boundary (L5).
+    // Active-session gate at the FFI boundary (L4), BEFORE any chain
+    // primitive — a locked / placeholder vault errors here.
     let mut guard = handle.lock_vault();
-    let _vault = guard.as_mut()?;
-    Err(FfiError::Internal {
-        message:
-            "vault_flush_publish_queue requires chain-adapter FFI (MVP-3); use the CLI for now"
-                .to_string(),
-    })
+    let vault = guard.as_mut()?;
+    // L1: read the gas-paying signer engine-side from the unlocked
+    // vault and clone it. Never crosses FFI.
+    let signer = vault.evm_wallet().map_err(store_into_ffi)?.signer().clone();
+    // The flush engine method takes a `device_key: &DeviceKey` that the
+    // CLI satisfies with a throwaway `DeviceKey::generate()` — the gas
+    // wallet is internal to the adapter (two-key PoC model). Mint the
+    // same ephemeral throwaway here; it is NOT a host input and is
+    // SEPARATE from the gas wallet sourced above.
+    let throwaway_device_key = DeviceKey::generate();
+    // `Vault` is `!Send`; build the adapter AND run the flush inside one
+    // local-runtime `block_on` so the `!Send` future never leaves this
+    // thread (see chain_config.rs module doc).
+    block_on_local(async {
+        let adapter = BaseSepoliaAdapter::new_with_signer(
+            &config.rpc_url,
+            Path::new(&config.deployment_path),
+            signer,
+        )
+        .await
+        .map_err(chain_into_ffi)?;
+        let report = vault
+            .flush_publish_queue(&adapter, &throwaway_device_key, force)
+            .await
+            .map_err(batch_flush_into_ffi)?;
+        Ok(FfiBatchFlushReport {
+            schema_version: 1,
+            coalesced_markers_pruned: u32::try_from(report.coalesced_markers_pruned)
+                .unwrap_or(u32::MAX),
+            published_count: u32::try_from(report.publish_report.published_count())
+                .unwrap_or(u32::MAX),
+            failed_count: u32::try_from(report.publish_report.failed_count()).unwrap_or(u32::MAX),
+        })
+    })?
 }
 
 // ---------------------------------------------------------------------
@@ -238,6 +272,20 @@ mod tests {
         VaultHandle::from_vault(v)
     }
 
+    /// A non-secret chain config pointing at an unreachable RPC + a
+    /// non-existent deployment path. Used to exercise the REAL flush
+    /// path: the binding builds the adapter engine-side (which fails
+    /// fast on the bad config) so the error-mapping path is asserted
+    /// hermetically without a live network.
+    fn bogus_config() -> FfiChainConfig {
+        FfiChainConfig {
+            schema_version: 1,
+            rpc_url: "http://127.0.0.1:1".into(),
+            deployment_path: "/no/such/path/base-sepolia.json".into(),
+            prefer_websocket: false,
+        }
+    }
+
     /// `vault_publish_queue_state` on a fresh vault returns
     /// `dirty_count=0` and the empty queue shape.
     #[test]
@@ -281,16 +329,52 @@ mod tests {
         vault_enable_window_elapsed_flush(h, false).expect("off");
     }
 
-    /// `vault_flush_publish_queue` returns the documented
-    /// `FfiError::Internal` stub for CLI-V1.
+    /// **MVP-3 #100 (R-f) — REAL-path stub-parity flip.** With an
+    /// empty publish queue + a bogus chain config, the REAL flush path
+    /// runs: the binding sources the gas signer engine-side, mints the
+    /// throwaway device key, and attempts to build the adapter — which
+    /// fails fast on the missing deployment file. The error maps to
+    /// `FfiError::Chain` (NOT the old `Internal` stub), proving the
+    /// body is wired to the engine method.
     #[test]
-    fn flush_publish_queue_stub_returns_internal_in_cli_v1() {
+    fn flush_publish_queue_real_path_maps_adapter_error_to_chain() {
         let dir = tempfile::TempDir::new().unwrap();
         let h = unlocked_handle(&dir, "v.pvf");
-        let err = vault_flush_publish_queue(h, true).unwrap_err();
+        let err = vault_flush_publish_queue(h, bogus_config(), true).unwrap_err();
         assert!(
-            matches!(err, FfiError::Internal { .. }),
-            "expected FfiError::Internal (CLI-V1 stub), got {err:?}"
+            matches!(err, FfiError::Chain { .. }),
+            "expected FfiError::Chain from adapter construction, got {err:?}"
+        );
+    }
+
+    /// **MVP-3 #100 (R-f) — per-binding session gate (L4).** A locked
+    /// vault errors `FfiError::Session` BEFORE any chain primitive
+    /// (adapter construction never runs), even with a config present.
+    #[test]
+    fn flush_publish_queue_rejects_locked_vault_before_chain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "v.pvf");
+        {
+            let mut g = h.lock_vault();
+            g.as_mut().unwrap().lock();
+        }
+        let err = vault_flush_publish_queue(h, bogus_config(), true).unwrap_err();
+        assert!(
+            matches!(err, FfiError::Session { .. }),
+            "expected FfiError::Session (L4 gate before chain), got {err:?}"
+        );
+    }
+
+    /// **MVP-3 #100 (R-f) — per-binding session gate (placeholder).**
+    /// A placeholder handle (no vault installed) errors
+    /// `FfiError::Session`.
+    #[test]
+    fn flush_publish_queue_rejects_placeholder() {
+        let empty = VaultHandle::new_placeholder();
+        let err = vault_flush_publish_queue(empty, bogus_config(), true).unwrap_err();
+        assert!(
+            matches!(err, FfiError::Session { .. }),
+            "expected FfiError::Session, got {err:?}"
         );
     }
 }

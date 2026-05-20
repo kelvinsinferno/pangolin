@@ -60,6 +60,7 @@
 pub mod balance;
 pub mod cabi;
 pub mod capture_authority;
+pub mod chain_config;
 pub mod device;
 pub mod error;
 pub mod identity;
@@ -98,8 +99,11 @@ pub use capture_authority::{
 // balance.rs / ffi-surface.md).
 pub use balance::{
     balance_monitor_start, balance_monitor_stop, gas_balance_state, vault_initiate_top_up,
-    FfiTopUpAttempt, GasBalanceStateFfi, MonitorHandle,
+    FfiCredit, FfiTopUpAttempt, GasBalanceStateFfi, MonitorHandle, FFI_CREDIT_SCHEMA_VERSION,
 };
+// MVP-3 issue #100: shared chain-config Record for the host-FFI chain
+// bindings (additive 1.1-surface amendment — see chain_config.rs).
+pub use chain_config::{FfiChainConfig, FFI_CHAIN_CONFIG_SCHEMA_VERSION};
 // CLI-V1 (R-g) — publish-queue FFI surface.
 pub use publish_queue::{
     vault_coalesce_dirty_markers, vault_enable_window_elapsed_flush, vault_flush_publish_queue,
