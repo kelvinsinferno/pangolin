@@ -43,17 +43,28 @@ const P5_4_SMOKE_VAULT_ID: [u8; 32] = {
     v
 };
 
+/// Deployment file for the target chain. Issue #101 (R-b): in dev mode
+/// (`PANGOLIN_CHAIN_ENV=dev`) the harness-generated `dev.json` is used;
+/// otherwise the checked-in `base-sepolia.json`.
 fn deployment_path() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let file = match std::env::var("PANGOLIN_CHAIN_ENV").ok().as_deref() {
+        Some("dev") => "dev.json",
+        _ => "base-sepolia.json",
+    };
     manifest
         .parent()
         .and_then(std::path::Path::parent)
         .expect("CARGO_MANIFEST_DIR has at least two ancestors")
         .join("contracts")
         .join("deployments")
-        .join("base-sepolia.json")
+        .join(file)
 }
 
+/// RPC URL for the target chain. Issue #101 (R-b): in dev mode this
+/// resolves to the local anvil node (`scripts/anvil-ci.sh` repoints
+/// `BASE_SEPOLIA_RPC_URL` at `http://127.0.0.1:8545`); otherwise the
+/// real Base Sepolia endpoint.
 fn rpc_url() -> String {
     if let Ok(v) = std::env::var("BASE_SEPOLIA_RPC_URL") {
         if !v.is_empty() {
@@ -63,8 +74,23 @@ fn rpc_url() -> String {
     // Mirror chaincli's default: `chain.rpc_default` from the
     // deployment file.  We hard-code the well-known public endpoint
     // here rather than re-parse the JSON so this file's dep set stays
-    // small.
-    "https://sepolia.base.org".to_owned()
+    // small. In dev mode default to the local anvil endpoint.
+    if matches!(
+        std::env::var("PANGOLIN_CHAIN_ENV").ok().as_deref(),
+        Some("dev")
+    ) {
+        "http://127.0.0.1:8545".to_owned()
+    } else {
+        "https://sepolia.base.org".to_owned()
+    }
+}
+
+/// Target chain env for the parametrized in-scope live tests.
+fn target_env() -> pangolin_chain::ChainEnv {
+    match std::env::var("PANGOLIN_CHAIN_ENV").ok().as_deref() {
+        Some("dev") => pangolin_chain::ChainEnv::Dev,
+        _ => pangolin_chain::ChainEnv::BaseSepolia,
+    }
 }
 
 #[tokio::test]
@@ -142,13 +168,27 @@ async fn runtime_keccak_cross_check_passes_on_live_chain() {
 #[tokio::test]
 #[ignore = "live-RPC test; requires BASE_SEPOLIA_DEV_WALLET + network"]
 async fn live_balance_query_against_d017_wallet() {
-    use pangolin_chain::{query_evm_balance, ChainEnv};
-    let Ok(addr_hex) = std::env::var("BASE_SEPOLIA_DEV_WALLET") else {
-        eprintln!("skipping live balance test: BASE_SEPOLIA_DEV_WALLET not set");
-        return;
+    use pangolin_chain::query_evm_balance;
+    let env = target_env();
+    let is_dev = matches!(env, pangolin_chain::ChainEnv::Dev);
+    let addr_hex = match std::env::var("BASE_SEPOLIA_DEV_WALLET") {
+        Ok(s) if !s.is_empty() => s,
+        _ => {
+            // L6 (issue #101): clean skip in base-sepolia mode; HARD
+            // error in dev mode (the harness always funds + sets the
+            // fixed wallet address).
+            assert!(
+                !is_dev,
+                "L6 (PANGOLIN_CHAIN_ENV=dev): BASE_SEPOLIA_DEV_WALLET must be set to the \
+                 harness-funded wallet address; a missing value means the anvil harness is \
+                 misconfigured and must fail RED, not skip"
+            );
+            eprintln!("skipping live balance test: BASE_SEPOLIA_DEV_WALLET not set");
+            return;
+        }
     };
     let address: alloy::primitives::Address = addr_hex.parse().expect("addr hex");
-    let balance = query_evm_balance(&rpc_url(), address, ChainEnv::BaseSepolia)
+    let balance = query_evm_balance(&rpc_url(), address, env)
         .await
         .expect("live balance query");
     println!(

@@ -257,8 +257,28 @@ pub struct SignedRevisionV1 {
 /// their `verifyingContract` from the deployment file too; the
 /// pinned-constant cross-check in [`build_signed_revision_v1`] only
 /// applies to `BaseSepolia`.
-pub(crate) fn build_domain(env: ChainEnv, verifying_contract: Address) -> Eip712Domain {
-    let chain_id = env.chain_id().unwrap_or(0);
+///
+/// ## `chain_id` is threaded explicitly (issue #101 amendment)
+///
+/// The EIP-712 domain separator binds the chain id, because the
+/// deployed `RevisionLogV1` contract bakes `block.chainid` into its
+/// `_DOMAIN_SEPARATOR` at construction (`RevisionLogV1.sol`). For the
+/// signature to recover the right signer on-chain, the chain id we
+/// stamp here MUST equal the chain id of the chain the contract lives
+/// on. The caller resolves the id:
+///
+/// - **`BaseSepolia`** (and any other fixed env): pass
+///   `env.chain_id().expect(...)` (`84_532`). This is the production
+///   path; it NEVER reads its signing chain id from an RPC. The
+///   pinned-byte hermetic tests pass `84_532` explicitly, so the
+///   resulting domain separator is byte-identical to the pre-#101
+///   `env.chain_id().unwrap_or(0)` form (which also yielded `84_532`).
+/// - **`Dev`** (local anvil): `ChainEnv::Dev::chain_id()` is `None`, so
+///   the caller reads the live `eth_chainId` from the connected
+///   (trusted, local) node and passes that (e.g. `31337` for anvil).
+///   This is the ONLY path that sources its signing chain id from an
+///   RPC, and only ever a local dev chain.
+pub(crate) fn build_domain(verifying_contract: Address, chain_id: u64) -> Eip712Domain {
     // The macro stamps `name` / `version` into a `Cow<'static, str>`
     // — passing the literal directly via `String::from(...)` would be
     // wasteful; pass the const slot so the macro picks the
@@ -363,6 +383,11 @@ pub fn is_canonical_s(s_be: &[u8; 32]) -> bool {
 /// fails closed with [`ChainError::DeploymentAddressMismatch`] (same
 /// posture as [`build_signed_revision_v1`]).
 ///
+/// `chain_id` MUST be the same id the signature was produced under
+/// (issue #101 amendment): `84_532` for `BaseSepolia` (the production
+/// path; never read from an RPC), or the live local chain id for
+/// `Dev`. See [`build_domain`] for the resolution contract.
+///
 /// # Errors
 ///
 /// - [`ChainError::DeploymentNotFound`] /
@@ -377,11 +402,13 @@ pub fn is_canonical_s(s_be: &[u8; 32]) -> bool {
 pub fn recover_signer_v1(
     signed_revision: &SignedRevisionV1,
     chain_env: ChainEnv,
+    chain_id: u64,
 ) -> Result<Address, ChainError> {
     recover_signer_v1_raw(
         &signed_revision.fields,
         &signed_revision.signature,
         chain_env,
+        chain_id,
     )
 }
 
@@ -406,6 +433,7 @@ pub fn recover_signer_v1_raw(
     fields: &RevisionFieldsV1,
     signature: &[u8; 65],
     chain_env: ChainEnv,
+    chain_id: u64,
 ) -> Result<Address, ChainError> {
     // R-c: deployment-file sourcing of `verifyingContract`. Same load
     // helper the signing path uses → digest reconstruction is identical
@@ -424,8 +452,12 @@ pub fn recover_signer_v1_raw(
     }
 
     // L1 verbatim: re-use the same helpers the signing side ran;
-    // re-implementing the digest would create silent-drift surface.
-    let domain = build_domain(chain_env, verifying_contract);
+    // re-implementing the digest would create silent-drift surface. The
+    // `chain_id` MUST match the id the signer stamped into its domain
+    // (issue #101 amendment): the caller threads `84_532` for
+    // BaseSepolia (byte-identical to the pre-#101 path) and the live
+    // local id for Dev.
+    let domain = build_domain(verifying_contract, chain_id);
     let domain_sep = domain.separator();
     let s_hash = struct_hash(fields);
     let digest = eip712_digest(domain_sep, s_hash);
@@ -530,6 +562,14 @@ fn leak_proof_signer_error(_e: &alloy::signers::Error) -> &'static str {
 ///   fields.enc_payload_hash` (`debug_assert!` in debug builds; the
 ///   3.3 audit-HIGH fix is the load-bearing reason this is required).
 /// - `chain_env` — which env to bind the EIP-712 domain to.
+/// - `chain_id` — the chain id to stamp into the EIP-712 domain
+///   separator (issue #101 amendment). MUST equal the chain id of the
+///   chain `RevisionLogV1` is deployed on, since the contract bakes
+///   `block.chainid` into its `_DOMAIN_SEPARATOR`. The caller resolves
+///   it: `84_532` for `BaseSepolia` (production; never read from an
+///   RPC — byte-identical to the pre-#101 `env.chain_id().unwrap_or(0)`
+///   path), or the live `eth_chainId` from the connected local node for
+///   `Dev` (anvil). See [`build_domain`] for the full contract.
 ///
 /// # Errors
 ///
@@ -544,6 +584,7 @@ pub fn build_signed_revision_v1(
     fields: RevisionFieldsV1,
     enc_payload: Vec<u8>,
     chain_env: ChainEnv,
+    chain_id: u64,
 ) -> Result<SignedRevisionV1, ChainError> {
     // 3.3 audit-HIGH fix: the on-chain contract recomputes
     // `keccak256(encPayload)` on the calldata bytes; the EIP-712 digest
@@ -575,7 +616,7 @@ pub fn build_signed_revision_v1(
     // the hermetic `domain_separator_matches_pinned_constant` test
     // exercises; that test is the byte-equality cross-check against
     // the live D-017 contract's `domainSeparator()` view fn.
-    let domain = build_domain(chain_env, verifying_contract);
+    let domain = build_domain(verifying_contract, chain_id);
     let domain_sep = domain.separator();
     let s_hash = struct_hash(&fields);
     let digest = eip712_digest(domain_sep, s_hash);
@@ -648,7 +689,11 @@ mod tests {
                 load_deployed_address(chain_env, "RevisionLogV1").unwrap_or(Address::ZERO)
             }
         };
-        let domain = build_domain(chain_env, verifying_contract);
+        // Mirror the pre-#101 `env.chain_id().unwrap_or(0)` resolution
+        // so this test helper's recovered digest is byte-identical to
+        // what the signing path produced: BaseSepolia → 84_532, Dev → 0.
+        let chain_id = chain_env.chain_id().unwrap_or(0);
+        let domain = build_domain(verifying_contract, chain_id);
         let domain_sep = domain.separator();
         let s_hash = struct_hash(&signed.fields);
         let digest = eip712_digest(domain_sep, s_hash);
@@ -683,10 +728,11 @@ mod tests {
     /// `verifyingContract`.
     #[test]
     fn domain_separator_matches_pinned_constant() {
-        let domain = build_domain(
-            ChainEnv::BaseSepolia,
-            EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA,
-        );
+        // Pass `84_532` explicitly (the BaseSepolia pinned chain id).
+        // Per the #101 amendment this MUST be byte-identical to the
+        // pre-#101 `env.chain_id().unwrap_or(0)` form which also stamped
+        // `84_532`. This pin test is the byte-equality guard.
+        let domain = build_domain(EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA, 84_532);
         let sep = domain.separator();
         assert_eq!(
             sep.0, DOMAIN_SEPARATOR_BASE_SEPOLIA_V1,
@@ -712,8 +758,8 @@ mod tests {
         let fields = RevisionFieldsV1::with_signer_device_id(
             &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
         );
-        let signed =
-            build_signed_revision_v1(&wallet, fields, pre, ChainEnv::BaseSepolia).expect("sign");
+        let signed = build_signed_revision_v1(&wallet, fields, pre, ChainEnv::BaseSepolia, 84_532)
+            .expect("sign");
         assert_eq!(signed.signature.len(), 65, "EIP-712 sig is 65 bytes");
     }
 
@@ -725,8 +771,8 @@ mod tests {
         let fields = RevisionFieldsV1::with_signer_device_id(
             &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
         );
-        let signed =
-            build_signed_revision_v1(&wallet, fields, pre, ChainEnv::BaseSepolia).expect("sign");
+        let signed = build_signed_revision_v1(&wallet, fields, pre, ChainEnv::BaseSepolia, 84_532)
+            .expect("sign");
         let mut s_be = [0u8; 32];
         s_be.copy_from_slice(&signed.signature[32..64]);
         assert!(
@@ -743,8 +789,8 @@ mod tests {
         let fields = RevisionFieldsV1::with_signer_device_id(
             &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
         );
-        let signed =
-            build_signed_revision_v1(&wallet, fields, pre, ChainEnv::BaseSepolia).expect("sign");
+        let signed = build_signed_revision_v1(&wallet, fields, pre, ChainEnv::BaseSepolia, 84_532)
+            .expect("sign");
         let v = signed.signature[64];
         assert!(v == 27 || v == 28, "v must be 27 or 28, got {v}");
     }
@@ -764,8 +810,9 @@ mod tests {
         let fields = RevisionFieldsV1::with_signer_device_id(
             &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
         );
-        let signed = build_signed_revision_v1(&wallet, fields, pre.clone(), ChainEnv::BaseSepolia)
-            .expect("sign");
+        let signed =
+            build_signed_revision_v1(&wallet, fields, pre.clone(), ChainEnv::BaseSepolia, 84_532)
+                .expect("sign");
         assert_eq!(
             signed.enc_payload, pre,
             "enc_payload must round-trip onto SignedRevisionV1 verbatim"
@@ -794,7 +841,7 @@ mod tests {
         let fields = RevisionFieldsV1::with_signer_device_id(
             &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, wrong_hash,
         );
-        let _ = build_signed_revision_v1(&wallet, fields, pre, ChainEnv::BaseSepolia);
+        let _ = build_signed_revision_v1(&wallet, fields, pre, ChainEnv::BaseSepolia, 84_532);
     }
 
     /// R-d / round-trip: sign + recover via the test helper; the
@@ -808,8 +855,8 @@ mod tests {
         let fields = RevisionFieldsV1::with_signer_device_id(
             &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
         );
-        let signed =
-            build_signed_revision_v1(&wallet, fields, pre, ChainEnv::BaseSepolia).expect("sign");
+        let signed = build_signed_revision_v1(&wallet, fields, pre, ChainEnv::BaseSepolia, 84_532)
+            .expect("sign");
         let recovered = recover_v1_for_test(&signed, ChainEnv::BaseSepolia).expect("recover");
         assert_eq!(
             recovered,
@@ -831,8 +878,9 @@ mod tests {
         let base_fields = RevisionFieldsV1::with_signer_device_id(
             &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
         );
-        let signed = build_signed_revision_v1(&wallet, base_fields, pre, ChainEnv::BaseSepolia)
-            .expect("sign baseline");
+        let signed =
+            build_signed_revision_v1(&wallet, base_fields, pre, ChainEnv::BaseSepolia, 84_532)
+                .expect("sign baseline");
         let baseline_signer =
             recover_v1_for_test(&signed, ChainEnv::BaseSepolia).expect("recover baseline");
         assert_eq!(baseline_signer, wallet.address());
@@ -898,7 +946,7 @@ mod tests {
             &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
         );
         let signed_sepolia =
-            build_signed_revision_v1(&wallet, fields, pre.clone(), ChainEnv::BaseSepolia)
+            build_signed_revision_v1(&wallet, fields, pre.clone(), ChainEnv::BaseSepolia, 84_532)
                 .expect("sign sepolia");
 
         // Manually build a `SignedRevisionV1` against the Dev env by
@@ -907,7 +955,10 @@ mod tests {
         // file; the test exercises only the digest construction's
         // chain-id binding.
         let dev_verifying = Address::ZERO;
-        let dev_domain = build_domain(ChainEnv::Dev, dev_verifying);
+        // Dev's chain id is `None`; the pre-#101 path stamped `0` via
+        // `unwrap_or(0)`. Keep that here so this test's "different
+        // domain ⇒ different signer" property is unchanged.
+        let dev_domain = build_domain(dev_verifying, ChainEnv::Dev.chain_id().unwrap_or(0));
         let dev_sep = dev_domain.separator();
         let s_hash = struct_hash(&fields);
         let dev_digest = eip712_digest(dev_sep, s_hash);
@@ -1469,6 +1520,7 @@ mod redemption_tests {
             fields_direct,
             enc_payload.clone(),
             ChainEnv::BaseSepolia,
+            84_532,
         )
         .expect("sign via direct wallet");
         let via_default = build_signed_revision_v1(
@@ -1476,6 +1528,7 @@ mod redemption_tests {
             fields_via_default,
             enc_payload,
             ChainEnv::BaseSepolia,
+            84_532,
         )
         .expect("sign via default-strategy wallet");
 

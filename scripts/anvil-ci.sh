@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Pangolin anvil-fork CI harness (issue #101).
+#
+# Boots a local `anvil` node, deploys our REAL contract bytecode
+# (RevisionLogV1 + EntitlementRegistry) to it via the existing forge
+# scripts, generates contracts/deployments/dev.json from the structured
+# broadcast artefact, funds the deterministic test wallet, and runs the
+# 3 in-scope `#[ignore]` live tests against the local node in dev mode
+# (PANGOLIN_CHAIN_ENV=dev).
+#
+# WHY (env-quirk #14): hermetic mocks fabricate receipts without running
+# the contract's hash/signature logic, so the 3.3 keccak(encPayload)-vs-
+# preimage calldata bug passed the full suite and was caught only by
+# adversarial audit. This harness runs the deployed bytecode, so that
+# bug class turns CI RED automatically — the prerequisite for the
+# highest-risk MVP-3 Recovery contract.
+#
+# Determinism (L5): anvil readiness is POLLED (never a fixed sleep);
+# teardown is a `trap` that always fires; deploy / parse failures are
+# fail-closed.
+#
+# Usage:
+#   scripts/anvil-ci.sh setup       # start anvil + deploy + dev.json + fund
+#   scripts/anvil-ci.sh run         # run the 3 in-scope tests (dev mode)
+#   scripts/anvil-ci.sh teardown    # stop anvil (idempotent)
+#   scripts/anvil-ci.sh all         # setup + run + teardown (the CI entry)
+#
+# Requires anvil / forge / cast on PATH (foundry-toolchain@v1, pinned to
+# the same version as the contracts jobs — env-quirk #4) plus jq + cargo.
+
+set -euo pipefail
+
+# --- locate repo root so paths work regardless of CWD ----------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+# --- constants -------------------------------------------------------
+ANVIL_HOST="127.0.0.1"
+ANVIL_PORT="8545"
+ANVIL_CHAIN_ID="31337"
+RPC_URL="http://${ANVIL_HOST}:${ANVIL_PORT}"
+# anvil's standard, well-known acct[0] private key (PUBLIC test key — it
+# is published in anvil's docs; never used for anything but local dev).
+# This account is pre-funded with 10000 ETH on a fresh anvil chain, so it
+# pays gas for the deploys.
+ANVIL_ACCT0_PK="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+ANVIL_ACCT0_ADDR="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+# Dummy authority addresses for the EntitlementRegistry constructor —
+# mirrors the deploy-pipeline dry-run convention. No real money flows on
+# a local anvil chain.
+PAYMENT_AUTHORITY="0x0000000000000000000000000000000000000001"
+REDEMPTION_AUTHORITY="0x0000000000000000000000000000000000000002"
+
+DEPLOYMENTS_DIR="$REPO_ROOT/contracts/deployments"
+DEV_JSON="$DEPLOYMENTS_DIR/dev.json"
+BROADCAST_DIR="$REPO_ROOT/contracts/broadcast"
+LOG_DIR="$(mktemp -d)"
+ANVIL_LOG="$LOG_DIR/anvil.log"
+ANVIL_PID=""
+
+# --- teardown (L5: always fires via trap) ----------------------------
+teardown() {
+  if [[ -n "${ANVIL_PID}" ]] && kill -0 "${ANVIL_PID}" 2>/dev/null; then
+    echo "==> tearing down anvil (pid ${ANVIL_PID})"
+    kill "${ANVIL_PID}" 2>/dev/null || true
+    wait "${ANVIL_PID}" 2>/dev/null || true
+  fi
+  ANVIL_PID=""
+  # Remove the runtime-generated dev.json (R-e: never a persistent
+  # fixture). Leaving it on disk would make a subsequent local hermetic
+  # run of the chain suite see a non-empty Dev deployment file (the
+  # `wrong_chain_id_produces_different_signer` test assumes Dev has none)
+  # — in CI the jobs are isolated, but locally this keeps the workspace
+  # hermetic after the harness exits.
+  rm -f "${DEV_JSON}" 2>/dev/null || true
+}
+
+# --- start anvil + poll for readiness (L5: never a fixed sleep) ------
+start_anvil() {
+  echo "==> starting anvil (chain-id ${ANVIL_CHAIN_ID}, port ${ANVIL_PORT})"
+  anvil --silent \
+    --host "${ANVIL_HOST}" \
+    --port "${ANVIL_PORT}" \
+    --chain-id "${ANVIL_CHAIN_ID}" \
+    >"${ANVIL_LOG}" 2>&1 &
+  ANVIL_PID="$!"
+  trap teardown EXIT INT TERM
+
+  # Poll cast block-number until the node answers. Bounded max-attempts,
+  # fail-closed — NO fixed sleep that races slow CI runners.
+  local max_attempts=60
+  local attempt=0
+  while (( attempt < max_attempts )); do
+    if ! kill -0 "${ANVIL_PID}" 2>/dev/null; then
+      echo "ERROR: anvil exited during startup; log follows:" >&2
+      cat "${ANVIL_LOG}" >&2 || true
+      exit 1
+    fi
+    if cast block-number --rpc-url "${RPC_URL}" >/dev/null 2>&1; then
+      echo "==> anvil ready after $((attempt + 1)) poll attempt(s)"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.25
+  done
+  echo "ERROR: anvil did not become ready within ${max_attempts} attempts" >&2
+  cat "${ANVIL_LOG}" >&2 || true
+  exit 1
+}
+
+# --- deploy one contract via its forge script ------------------------
+# Args: <script_name> (e.g. DeployRevisionLogV1)
+# The forge script broadcasts to anvil; the structured artefact lands at
+# contracts/broadcast/<script>.s.sol/<chain-id>/run-latest.json.
+deploy_one() {
+  local script_name="$1"
+  echo "==> deploying via ${script_name}.s.sol"
+  ( cd "$REPO_ROOT/contracts" && \
+    PAYMENT_AUTHORITY="$PAYMENT_AUTHORITY" \
+    REDEMPTION_AUTHORITY="$REDEMPTION_AUTHORITY" \
+    forge script "script/${script_name}.s.sol" \
+      --sig "run()" --tc "$script_name" \
+      --rpc-url "$RPC_URL" \
+      --broadcast \
+      --private-key "$ANVIL_ACCT0_PK" \
+      >"$LOG_DIR/${script_name}.log" 2>&1 ) || {
+        echo "ERROR: forge script failed for ${script_name}; log follows:" >&2
+        cat "$LOG_DIR/${script_name}.log" >&2 || true
+        exit 1
+      }
+}
+
+# --- parse address + deploy block from the broadcast artefact --------
+# env-quirk finding: forge script's human log has NO "Contract Address:"
+# line on the anvil broadcast path — parse the structured artefact, NOT
+# the log.
+# Args: <script_name> <contract_name>
+# Echoes: "<address> <deploy_block>"
+parse_deploy() {
+  local script_name="$1"
+  local contract_name="$2"
+  local artefact="$BROADCAST_DIR/${script_name}.s.sol/${ANVIL_CHAIN_ID}/run-latest.json"
+  if [[ ! -f "$artefact" ]]; then
+    echo "ERROR: broadcast artefact missing: $artefact" >&2
+    exit 1
+  fi
+  local addr block
+  # The CREATE tx for our contract: match on contractName, take its
+  # contractAddress.
+  addr="$(jq -r --arg cn "$contract_name" '
+    [.transactions[]?
+      | select(.contractName == $cn and .contractAddress != null)
+      | .contractAddress] | first // empty' "$artefact")"
+  # Deploy block from the matching receipt (by txhash → blockNumber).
+  local txhash
+  txhash="$(jq -r --arg cn "$contract_name" '
+    [.transactions[]?
+      | select(.contractName == $cn and .contractAddress != null)
+      | .hash] | first // empty' "$artefact")"
+  block="$(jq -r --arg th "$txhash" '
+    [.receipts[]?
+      | select(.transactionHash == $th)
+      | .blockNumber] | first // empty' "$artefact")"
+  # Receipt blockNumber is hex (0x...) → decimal.
+  if [[ "$block" =~ ^0x[0-9a-fA-F]+$ ]]; then
+    block="$((block))"
+  fi
+  if [[ -z "$addr" || -z "$block" ]]; then
+    echo "ERROR: failed to parse ${contract_name} address/block from $artefact" >&2
+    exit 1
+  fi
+  echo "$addr $block"
+}
+
+# --- generate contracts/deployments/dev.json -------------------------
+# Shape walked by pangolin_chain::deployments::load_deployed_address:
+#   .contracts.<Name>.address
+# Plus a deploy_block for RevisionLogV1 (d017_deploy_block(Dev) reads it;
+# 0 means scan-from-genesis, but we record the real value for parity).
+generate_dev_json() {
+  local rev_addr="$1" rev_block="$2" ent_addr="$3" ent_block="$4"
+  echo "==> generating $DEV_JSON"
+  cat >"$DEV_JSON" <<EOF
+{
+  "\$schema": "runtime-generated by scripts/anvil-ci.sh (issue #101); DO NOT COMMIT (gitignored)",
+  "chain": {
+    "name": "anvil-dev",
+    "chain_id": ${ANVIL_CHAIN_ID},
+    "rpc_default": "${RPC_URL}"
+  },
+  "contracts": {
+    "RevisionLogV1": {
+      "address": "${rev_addr}",
+      "deployer": "${ANVIL_ACCT0_ADDR}",
+      "deploy_block": ${rev_block}
+    },
+    "EntitlementRegistry": {
+      "address": "${ent_addr}",
+      "deployer": "${ANVIL_ACCT0_ADDR}",
+      "deploy_block": ${ent_block}
+    }
+  }
+}
+EOF
+  # Validate it's well-formed JSON before the tests rely on it.
+  jq empty "$DEV_JSON" || {
+    echo "ERROR: generated dev.json is not valid JSON" >&2
+    exit 1
+  }
+}
+
+# --- fund the deterministic test wallet ------------------------------
+# The in-scope tests sign with fixed_wallet() (seed [0x42;32]); resolve
+# its EVM address via the harness helper test and fund it so its publish
+# tx (gas payer == signer per D-006) succeeds.
+fund_test_wallet() {
+  echo "==> resolving fixed_wallet() address"
+  local out addr
+  out="$(cargo test -p pangolin-chain --features integration-tests \
+    print_fixed_wallet_address -- --ignored --nocapture 2>/dev/null \
+    | grep -oE 'PANGOLIN_FIXED_WALLET_ADDRESS=0x[0-9a-fA-F]{40}' | head -n1 || true)"
+  addr="${out#PANGOLIN_FIXED_WALLET_ADDRESS=}"
+  # Strip any stray whitespace (env-quirk #13 posture).
+  addr="$(echo "$addr" | tr -d '[:space:]')"
+  if [[ ! "$addr" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
+    echo "ERROR: could not resolve fixed_wallet() address (got '${addr}')" >&2
+    exit 1
+  fi
+  echo "==> funding test wallet ${addr} with 1 ETH"
+  # 0xDE0B6B3A7640000 = 1e18 wei = 1 ETH.
+  cast rpc anvil_setBalance "$addr" 0xDE0B6B3A7640000 --rpc-url "$RPC_URL" >/dev/null
+  # Export for the balance test (which reads BASE_SEPOLIA_DEV_WALLET).
+  export PANGOLIN_FIXED_WALLET_ADDRESS="$addr"
+}
+
+# --- setup: anvil + deploy + dev.json + fund -------------------------
+do_setup() {
+  start_anvil
+  deploy_one "DeployRevisionLogV1"
+  deploy_one "DeployEntitlementRegistry"
+  local rev ent
+  rev="$(parse_deploy "DeployRevisionLogV1" "RevisionLogV1")"
+  ent="$(parse_deploy "DeployEntitlementRegistry" "EntitlementRegistry")"
+  generate_dev_json ${rev} ${ent}
+  fund_test_wallet
+  echo "==> setup complete"
+}
+
+# --- run: the 3 in-scope tests in dev mode ---------------------------
+# L6: dev mode turns skip-clean into HARD error inside the tests.
+do_run() {
+  echo "==> running in-scope live tests against anvil (PANGOLIN_CHAIN_ENV=dev)"
+  # publish_v1_live_d017_smoke (pangolin-chain lib, integration-tests
+  # feature) + live_balance_query_against_d017_wallet (pangolin-chain
+  # integration test).
+  PANGOLIN_CHAIN_ENV=dev \
+  BASE_SEPOLIA_RPC_URL="$RPC_URL" \
+  BASE_SEPOLIA_DEV_WALLET="${PANGOLIN_FIXED_WALLET_ADDRESS:-}" \
+    cargo test -p pangolin-chain --features integration-tests \
+      publish_v1_live_d017_smoke \
+      -- --ignored --nocapture
+
+  PANGOLIN_CHAIN_ENV=dev \
+  BASE_SEPOLIA_RPC_URL="$RPC_URL" \
+  BASE_SEPOLIA_DEV_WALLET="${PANGOLIN_FIXED_WALLET_ADDRESS:-}" \
+    cargo test -p pangolin-chain --features integration-tests \
+      --test integration \
+      live_balance_query_against_d017_wallet \
+      -- --ignored --nocapture
+
+  # live_pull_once_against_d017_advances_checkpoint (pangolin-store). On
+  # a fresh anvil chain the test vault has no events, so the pull cycle
+  # advances the checkpoint without recovering any signer — the
+  # checkpoint-monotonicity property still exercises the chain_sync read
+  # path against the real node. PANGOLIN_PULL_LIVE_VAULT_ID is a fresh
+  # 64-hex vault id (the publish test used a time-tweaked one; here we
+  # use a fixed harness value — its absence of events is expected).
+  PANGOLIN_CHAIN_ENV=dev \
+  BASE_SEPOLIA_RPC_URL="$RPC_URL" \
+  PANGOLIN_PULL_LIVE_VAULT_ID="00000000000000000000000000000000000000000000000000000000000000aa" \
+    cargo test -p pangolin-store --features test-utilities \
+      --test pull_live \
+      live_pull_once_against_d017_advances_checkpoint \
+      -- --ignored --nocapture
+
+  echo "==> all in-scope tests passed against anvil"
+}
+
+# --- dispatch --------------------------------------------------------
+case "${1:-}" in
+  setup)
+    do_setup
+    # In bare `setup` mode the caller is responsible for teardown; keep
+    # anvil up by detaching the trap-on-exit (the EXIT trap would kill it
+    # the moment this subcommand returns). For `all` the trap stays.
+    trap - EXIT INT TERM
+    echo "==> anvil left running at ${RPC_URL} (pid ${ANVIL_PID}); run 'teardown' to stop"
+    ;;
+  run)
+    do_run
+    ;;
+  teardown)
+    # Best-effort: find + kill any anvil on our port.
+    if command -v pkill >/dev/null 2>&1; then
+      pkill -f "anvil .*--port ${ANVIL_PORT}" 2>/dev/null || true
+    fi
+    echo "==> teardown requested (port ${ANVIL_PORT})"
+    ;;
+  all)
+    do_setup
+    do_run
+    teardown
+    echo "==> harness run complete (setup + run + teardown)"
+    ;;
+  *)
+    echo "Usage: $0 {setup|run|teardown|all}" >&2
+    exit 2
+    ;;
+esac

@@ -1269,6 +1269,12 @@ impl Vault {
     ///   `keccak256(enc_payload) == fields.enc_payload_hash`
     ///   (`debug_assert!` inside the chain crate).
     /// - `chain_env` — which env to bind the EIP-712 domain to.
+    /// - `chain_id` — the chain id to stamp into the EIP-712 domain
+    ///   separator (issue #101 amendment). The caller resolves it:
+    ///   `84_532` for `BaseSepolia` (production; never read from an RPC),
+    ///   or the live `eth_chainId` from the connected local node for
+    ///   `Dev` (anvil). See
+    ///   [`pangolin_chain::build_signed_revision_v1`] for the contract.
     ///
     /// # Errors
     ///
@@ -1282,9 +1288,10 @@ impl Vault {
         fields: RevisionFieldsV1,
         enc_payload: Vec<u8>,
         chain_env: ChainEnv,
+        chain_id: u64,
     ) -> Result<SignedRevisionV1> {
         let active = self.require_active()?;
-        build_signed_revision_v1(&active.evm_wallet, fields, enc_payload, chain_env)
+        build_signed_revision_v1(&active.evm_wallet, fields, enc_payload, chain_env, chain_id)
             .map_err(StoreError::ChainSignError)
     }
 
@@ -10725,7 +10732,7 @@ mod tests {
             enc_payload_hash,
         };
         let err = v
-            .sign_revision_v1(fields, enc_payload.clone(), ChainEnv::BaseSepolia)
+            .sign_revision_v1(fields, enc_payload.clone(), ChainEnv::BaseSepolia, 84_532)
             .unwrap_err();
         assert!(
             matches!(err, StoreError::NotUnlocked),
@@ -10745,7 +10752,7 @@ mod tests {
             enc_payload_hash,
         );
         let signed = v
-            .sign_revision_v1(fields, enc_payload.clone(), ChainEnv::BaseSepolia)
+            .sign_revision_v1(fields, enc_payload.clone(), ChainEnv::BaseSepolia, 84_532)
             .expect("active session must sign");
         assert_eq!(signed.signature.len(), 65, "EIP-712 sig is 65 bytes");
         // device_id field carries the left-padded wallet address.
@@ -10771,7 +10778,7 @@ mod tests {
         let (mut v2, clock) = open_vault_with_test_clock(&p2);
         v2.unlock(&fresh_presence(), &fresh_pin()).unwrap();
         assert!(v2
-            .sign_revision_v1(fields, enc_payload.clone(), ChainEnv::BaseSepolia)
+            .sign_revision_v1(fields, enc_payload.clone(), ChainEnv::BaseSepolia, 84_532)
             .is_ok());
         clock.advance(IDLE_TIMEOUT_DEFAULT + Duration::from_secs(1));
         // Trigger expiry via an &mut op — the documented mechanism.
@@ -10779,7 +10786,7 @@ mod tests {
         assert!(matches!(err, StoreError::SessionExpired));
         // Now the &self signing call sees no active state.
         let err = v2
-            .sign_revision_v1(fields, enc_payload, ChainEnv::BaseSepolia)
+            .sign_revision_v1(fields, enc_payload, ChainEnv::BaseSepolia, 84_532)
             .unwrap_err();
         assert!(
             matches!(err, StoreError::NotUnlocked),

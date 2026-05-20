@@ -168,6 +168,7 @@ fn default_strategy_revision_signature_matches_pre_3_6_baseline() {
         fields,
         fixed_enc_payload(),
         ChainEnv::BaseSepolia,
+        84_532,
     )
     .expect("sign via default strategy wallet");
 

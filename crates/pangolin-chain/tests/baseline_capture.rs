@@ -51,9 +51,14 @@ fn capture_baseline_revision_signature() {
     let wallet = derive_evm_wallet(&device).expect("derive wallet");
     let addr_bytes: [u8; 20] = wallet.address().0.into();
     let fields = fixed_fields(addr_bytes);
-    let signed =
-        build_signed_revision_v1(&wallet, fields, fixed_enc_payload(), ChainEnv::BaseSepolia)
-            .expect("build signed revision");
+    let signed = build_signed_revision_v1(
+        &wallet,
+        fields,
+        fixed_enc_payload(),
+        ChainEnv::BaseSepolia,
+        84_532,
+    )
+    .expect("build signed revision");
 
     // Print the hex literal for hand-embedding in
     // `crates/pangolin-chain/src/privacy/tests.rs`. The println output
