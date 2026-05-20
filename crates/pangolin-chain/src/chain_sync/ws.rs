@@ -83,6 +83,16 @@ pub enum WsOpenError {
     /// `eth_subscribe("logs", filter)` request failed at the RPC layer
     /// (e.g. the server rejected the subscription with an error).
     SubscribeFailed(String),
+    /// L3 defence: the WS provider's `eth_chainId` did not match the
+    /// build's expected chain id for `env`. The HTTP-backfill phase
+    /// upstream of the WS path performs the same check on the HTTP
+    /// provider; this variant catches the asymmetric-host topology
+    /// where `chain.ws_default` and `chain.rpc_default` resolve to
+    /// different RPC hosts (post Q-c Option III JSON-pin loader).
+    /// The orchestrator's fallback branch treats this the same as
+    /// any other open-fail — counts toward the circuit breaker, then
+    /// degrades to HTTP polling per L10.
+    ChainIdMismatch(String),
 }
 
 impl From<WsOpenError> for ChainError {
@@ -94,6 +104,9 @@ impl From<WsOpenError> for ChainError {
             WsOpenError::ConnectFailed(s) => Self::Rpc(format!("WebSocket connect failed: {s}")),
             WsOpenError::SubscribeFailed(s) => {
                 Self::Rpc(format!("WebSocket subscribe failed: {s}"))
+            }
+            WsOpenError::ChainIdMismatch(s) => {
+                Self::Rpc(format!("WebSocket chain-id mismatch: {s}"))
             }
         }
     }
@@ -112,6 +125,15 @@ impl From<WsOpenError> for ChainError {
 /// service shuts down + the subscription's broadcast channel
 /// closes. We keep it inside the handle so the subscription stays
 /// live for the recv loop's lifetime.
+///
+/// **L3 chain-id pin.** [`open_subscription`] runs
+/// [`crate::chain_sync::check_chain_id_matches`] against the
+/// freshly-built WS provider BEFORE issuing `eth_subscribe`. The
+/// HTTP-backfill phase upstream of the WS branch already verified
+/// chain-id on the HTTP provider, but a future Q-c Option III
+/// JSON-pin loader can point `chain.ws_default` at a different host
+/// than `chain.rpc_default`; the WS-provider chain-id check makes
+/// that scenario fail-closed instead of silently bypassing L3.
 #[derive(Debug)]
 pub struct WsHandle {
     /// Keeps the alloy WS service task alive for the duration of
@@ -152,6 +174,19 @@ pub enum WsRecvOutcome {
 /// Dev env permits `ws://` (used by hermetic tests against the local
 /// mock server).
 ///
+/// **L3 chain-id pin (issue #99 F-3 fix-pass).** After the WS provider
+/// is built but BEFORE `eth_subscribe` is issued, this helper runs
+/// [`crate::chain_sync::check_chain_id_matches`] on the WS provider.
+/// The HTTP-backfill phase upstream already verifies chain-id on the
+/// HTTP provider for the same RPC endpoint; this WS-side check
+/// defends the asymmetric-host topology where `chain.ws_default`
+/// resolves to a different RPC host than `chain.rpc_default` (post
+/// Q-c Option III JSON-pin loader). On mismatch this returns
+/// [`WsOpenError::ChainIdMismatch`]; the orchestrator's fallback
+/// branch counts this toward the circuit breaker and degrades to
+/// HTTP polling per L10 — the WS path is silently disabled, the
+/// sync continues against the HTTP provider that already passed L3.
+///
 /// # Errors
 ///
 /// - [`WsOpenError::UnsupportedScheme`] when the URL scheme is
@@ -159,6 +194,8 @@ pub enum WsRecvOutcome {
 ///   production env.
 /// - [`WsOpenError::ConnectFailed`] when alloy fails to establish the
 ///   TCP / TLS / WS-handshake layer.
+/// - [`WsOpenError::ChainIdMismatch`] when the WS provider's
+///   `eth_chainId` does not match `env.chain_id()`.
 /// - [`WsOpenError::SubscribeFailed`] when the RPC server rejects the
 ///   `eth_subscribe("logs", filter)` request.
 pub async fn open_subscription(
@@ -183,6 +220,15 @@ pub async fn open_subscription(
         .connect_ws(connect)
         .await
         .map_err(|e| WsOpenError::ConnectFailed(format!("connect_ws {ws_url}: {e}")))?;
+
+    // L3 chain-id pin (issue #99 F-3 fix-pass). Verify the WS
+    // provider's reported chain id matches the expected env id
+    // BEFORE issuing `eth_subscribe`. This closes the gap where a
+    // future Q-c Option III JSON-pin loader can point
+    // `chain.ws_default` at a different host than `chain.rpc_default`.
+    super::check_chain_id_matches(&provider, env)
+        .await
+        .map_err(|e| WsOpenError::ChainIdMismatch(format!("ws-provider eth_chainId: {e}")))?;
 
     // L2 + L4: filter ALL events at the RPC layer by
     // `RevisionPublished` topic0 + contract address + indexed

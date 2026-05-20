@@ -129,6 +129,12 @@ sync_from_chain(rpc_url, env, vault_id, options)
           ├── open_subscription(ws_url, env, vault_id, contract_address)
           │     ├── ProviderBuilder + connect_ws (WsConnect)
           │     │     └── keepalive = WS_KEEPALIVE_INTERVAL_SECS = 30s
+          │     ├── check_chain_id_matches (issue #99 F-3 fix-pass:
+          │     │     L3 defence against asymmetric-host topology
+          │     │     where ws_default + rpc_default resolve to
+          │     │     different chains; soft-fails on mismatch →
+          │     │     WsOpenError::ChainIdMismatch counts toward the
+          │     │     breaker per L10)
           │     └── subscribe_logs(filter:
           │             address=D-017
           │             topic0=RevisionPublished
@@ -147,13 +153,79 @@ sync_from_chain(rpc_url, env, vault_id, options)
                           cadence for the rest of the session
 ```
 
-L10: WS open-fail / mid-session-drop NEVER fails the sync. Only
-HARD failures (chain-id mismatch, contract-address mismatch,
+L10: WS open-fail / mid-session-drop NEVER fails the sync.
+**Chain-id mismatch on the WS provider** (issue #99 F-3 fix-pass:
+`WsOpenError::ChainIdMismatch`, surfaced when an asymmetric-host
+topology — `chain.ws_default` pointing at a different RPC host than
+`chain.rpc_default` — exposes a foreign-chain WS) is also treated as
+an open-fail: counts toward the breaker, advances backoff, degrades to
+HTTP polling per L10. The load-bearing L3 chain-id pin remains
+enforced on the HTTP path (`check_chain_id_matches` inside
+`build_read_provider`); the HTTP provider's check is what would HARD
+abort the sync via `ChainError::ChainIdMismatch`. Only HARD failures
+on the HTTP path (chain-id mismatch, contract-address mismatch,
 unrecoverable RPC) abort.
 
 L9: `SyncReport.event_source` is set to `WebSocket` only if at least
 one WS-delivered event was successfully ingested; otherwise stays at
 `HttpPolling` (the path actually taken at exit).
+
+## Documented limitation — alloy's pubsub transparent reconnect (issue #99 F-4 re-audit)
+
+**alloy 2.0.4's `alloy-pubsub` layer transparently reconnects on WS
+post-handshake drops and does NOT surface this to the orchestrator's
+`recv_next_event`.** Empirically verified during the issue #99 F-4
+re-audit fix-pass: against the `accept_then_drop_subscribe` hermetic
+mock, `recv_next_event` blocked for 10 seconds without surfacing
+`WsRecvOutcome::SubscriptionClosed`, while the mock accepted 1809
+TCP connections in that window (alloy reconnecting ~180/sec).
+
+**Root cause.** Reading `alloy-pubsub-2.0.4/src/service.rs::reconnect_with_retries`:
+`max_retries` (default 10) only counts FAILED reconnect attempts.
+The accept-then-drop pattern causes every reconnect to "succeed"
+at the WS-handshake + eth_subscribe level (the server's response
+arrives before the close), so the retry counter never trips.
+`WsConnect::with_max_retries(0)` does NOT help — the underlying
+counter still observes "success" on each cycle. The cap is on
+consecutive failures, not on connection thrashing.
+
+**What this means for the orchestrator's L10 circuit breaker.** The
+breaker has two trigger paths:
+
+| Path | Triggered when | Status |
+|---|---|---|
+| `open_subscription` Err (TCP refuse, scheme reject, chain-id mismatch, eth_subscribe RPC error) | initial connection or its first RPC fails | **WORKS — breaker increments + falls to HTTP** |
+| `recv_next_event` → `SubscriptionClosed` (alloy gives up reconnecting) | alloy's `max_retries` × backoff exhausts (≈ minutes of FAILED reconnects) | **WORKS — SLOW-failure mode only; the F-2 recv-loop-exit gate fires here** |
+| `recv_next_event` blocks indefinitely (alloy transparently reconnects on every drop) | accept-then-drop storm post-handshake | **MASKED — orchestrator never sees the drop signal** |
+
+The third path is the gap. A malicious or buggy RPC that accepts WS
+connections + replies to `eth_subscribe` + immediately drops can spin
+alloy's pubsub layer indefinitely without the orchestrator falling
+back to HTTP. The user's sync would APPEAR to succeed (no error
+returned) but no events would land. This is a DoS-style failure mode.
+
+**Mitigation in place.** The HTTP path's L3 chain-id pin
+(`check_chain_id_matches` inside `build_read_provider`) still HARD
+aborts the sync if the HTTP RPC is on the wrong chain — so an
+adversarial RPC can't silently swap chains. The Stage 1 HTTP
+backfill still runs on every `sync_from_chain` call, so any events
+the WS path missed during the storm are caught on the next cycle.
+**Net behaviour: the storm reduces WS to "best-effort tip-follow"
+without breaking HTTP-backed sync correctness.** Catch-up cadence
+degrades from "real-time WS push" to "next pull-cycle HTTP poll" —
+i.e., from ~seconds to ~60s (the `pull_once` interval).
+
+**Architectural follow-up (deferred from #99).** A direct WS
+transport that bypasses `alloy-pubsub` — using `tokio-tungstenite` +
+hand-written JSON-RPC framing (same shape the WS hermetic mock uses)
+— would let the orchestrator see every drop in real time. This was
+weighed against a heuristic wrapper (timing-based; vulnerable to
+adversarial threading of the keepalive signal) and an alloy fork
+(maintenance + drift burden). The direct-transport path is the
+project's hand-roll-security-critical pattern (KDBX parser, TOTP
+engine, encrypted-export format, ciborium-ll handshake) applied to
+the WS-sync surface. Tracked as a follow-up — see the issue
+backlog.
 
 ## Two-stage rollback state machine (R-c)
 

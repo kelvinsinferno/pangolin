@@ -55,7 +55,13 @@ use futures_util::{SinkExt, StreamExt};
 
 /// Configurable behaviours of the mock server. Default = "behave like
 /// a real RPC".
+///
+/// `clippy::struct_excessive_bools` is allowed here because each
+/// boolean encodes an INDEPENDENT adversarial mode the tests opt
+/// into; a state machine / two-variant enum split would couple modes
+/// that are intentionally orthogonal.
 #[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct MockBehaviour {
     /// If `true`, refuse the WS upgrade by closing the TCP socket
     /// immediately. Drives `WsOpenError::ConnectFailed` on the
@@ -73,6 +79,26 @@ pub struct MockBehaviour {
     /// (84_532). Tests that exercise the L3 mismatch path set this
     /// to a foreign value.
     pub chain_id: u64,
+    /// If `true`, the server replies to `eth_subscribe` with a valid
+    /// subscription id (open succeeds) and then immediately closes
+    /// the WS connection without emitting any event.
+    ///
+    /// **Scope honesty (F-4 + F-5 re-audit empirical finding).** This
+    /// mode was originally introduced for an orchestrator-level
+    /// breaker-bookkeeping regression test, but the F-4 re-audit
+    /// established empirically that alloy 2.0.4's `alloy-pubsub`
+    /// layer transparently reconnects on accept-then-drop and does
+    /// NOT surface `WsRecvOutcome::SubscriptionClosed` to the
+    /// orchestrator's `recv_next_event`. The mode therefore pins
+    /// the close-without-emitting-events SHAPE of the mock + alloy
+    /// pipeline, NOT orchestrator-level breaker accumulation. See
+    /// `L-ws-alloy-pubsub-masks-fast-drops` in `THREAT_MODEL.md`
+    /// for the full limitation enumeration + the deferred
+    /// direct-WS-transport architectural follow-up. Used by
+    /// `hermetic_ws_accept_then_drop_subscribe_mock_mode_shape_pin`
+    /// in `tests/hermetic_ws.rs` (renamed from the prior
+    /// orchestrator-claiming name during the F-4 fix-pass).
+    pub accept_then_drop_subscribe: bool,
 }
 
 /// Handle to a running mock server. Drop closes the server.
@@ -228,6 +254,18 @@ async fn handle_connection(
                         let resp_str = resp.to_string();
                         let _ = ws.send(Message::Text(resp_str.into())).await;
                         let _ = ws.flush().await;
+                        // Issue #99 F-2 fix-pass. The
+                        // `accept_then_drop_subscribe` mode
+                        // returns a valid subscription id then
+                        // immediately closes the WS connection
+                        // WITHOUT emitting any event. Drives
+                        // the accept-then-drop storm that the
+                        // circuit-breaker recv-loop-exit gate is
+                        // designed to catch.
+                        if behaviour.accept_then_drop_subscribe {
+                            let _ = ws.close(None).await;
+                            return;
+                        }
                         // Set subscribed AFTER the response is
                         // flushed so any pending events that
                         // arrived pre-subscribe land on the wire

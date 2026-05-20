@@ -7675,10 +7675,40 @@ impl Vault {
                 backoff_ms = pangolin_chain::chain_sync::ws::next_reconnect_backoff_ms(backoff_ms);
                 continue 'ws_session;
             };
-            // Open succeeded; reset the backoff (it will only
-            // re-arm if a mid-session drop happens).
-            consecutive_failures = 0;
-            backoff_ms = 0;
+
+            // Issue #99 F-2 fix-pass — recv-loop-exit gate.
+            //
+            // Track whether at least one verified event landed during
+            // this open's recv loop. The breaker counter is reset to
+            // 0 ONLY when this flag is true at recv-loop exit;
+            // otherwise the recv-loop exit accumulates the counter
+            // toward `WS_CIRCUIT_BREAKER_THRESHOLD`.
+            //
+            // **Scope honesty (F-4 re-audit empirical finding).** This
+            // gate fires only when `recv_next_event` returns
+            // `WsRecvOutcome::SubscriptionClosed` — which alloy's
+            // `alloy-pubsub` 2.0.4 layer only surfaces when its
+            // internal `reconnect_with_retries` loop gives up (max
+            // ~10 FAILED-reconnects × exponential-backoff ≈ minutes).
+            // On the accept-then-drop FAST-failure mode (RPC accepts
+            // the WS + replies to eth_subscribe + immediately drops),
+            // every reconnect cycle is a "fresh success" from
+            // alloy's POV, so `max_retries` never increments and the
+            // pubsub layer absorbs the storm silently below the
+            // orchestrator's recv layer. The orchestrator therefore
+            // does NOT receive the close signal in that scenario, and
+            // this gate is unreachable. See
+            // `docs/architecture/chain-sync.md` for the documented
+            // limitation + the deferred wrapper architectural
+            // follow-up (direct WS transport that bypasses
+            // alloy-pubsub and surfaces drops to the orchestrator).
+            //
+            // This gate remains valuable for the SLOW-failure mode
+            // (alloy gives up entirely; rare but real) — it then
+            // correctly distinguishes "open succeeded but no event
+            // landed during this session" from "session was healthy"
+            // for breaker accounting.
+            let mut event_ingested_this_open = false;
 
             // Drain events with a short idle timeout so a quiet
             // tip returns the caller quickly. Any event whose
@@ -7686,6 +7716,11 @@ impl Vault {
             // graph + the v1 checkpoint.
             'recv_loop: loop {
                 if tokio::time::Instant::now() >= stage2_deadline {
+                    // Wall-clock deadline: treat as a successful
+                    // recv-loop exit only if at least one event
+                    // landed (so the breaker resets only on
+                    // healthy sessions). The post-loop reset
+                    // gate below handles the bookkeeping.
                     break 'ws_session;
                 }
                 let recv_fut = recv_next_event(&mut handle);
@@ -7729,6 +7764,15 @@ impl Vault {
                                 // L9: WS path used iff at least one
                                 // event landed via WS.
                                 ws_path_used = true;
+                                // F-2: mark this open's recv loop
+                                // as healthy. Only verified +
+                                // ingested events count — a wire
+                                // event that fails verification
+                                // (foreign address, future schema,
+                                // etc.) doesn't prove the channel
+                                // is real, just that we received
+                                // bytes.
+                                event_ingested_this_open = true;
                                 // Advance the v1 checkpoint to the
                                 // event's block. The block-number
                                 // monotone-advance guard inside
@@ -7752,16 +7796,28 @@ impl Vault {
                     WsRecvOutcome::SubscriptionClosed => {
                         // L-ws-silent-disconnect: server closed
                         // the channel (or broadcast lagged).
-                        // Increment ws_drops, advance backoff,
-                        // retry within the circuit-breaker
-                        // budget.
+                        // Increment ws_drops + back off. The
+                        // breaker-counter bookkeeping happens at
+                        // the recv-loop-exit gate below so the
+                        // accept-then-drop storm is captured.
                         report.ws_drops = report.ws_drops.saturating_add(1);
-                        consecutive_failures = consecutive_failures.saturating_add(1);
                         backoff_ms =
                             pangolin_chain::chain_sync::ws::next_reconnect_backoff_ms(backoff_ms);
                         break 'recv_loop;
                     }
                 }
+            }
+
+            // F-2 recv-loop-exit gate. Reset the breaker counter
+            // ONLY if at least one verified event landed during
+            // this open. Otherwise treat the open-then-drop as a
+            // continuation of the storm and let the counter
+            // accumulate toward WS_CIRCUIT_BREAKER_THRESHOLD.
+            if event_ingested_this_open {
+                consecutive_failures = 0;
+                backoff_ms = 0;
+            } else {
+                consecutive_failures = consecutive_failures.saturating_add(1);
             }
         }
 

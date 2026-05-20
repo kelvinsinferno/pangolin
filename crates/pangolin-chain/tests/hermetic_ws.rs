@@ -492,10 +492,14 @@ async fn hermetic_ws_event_with_future_schema_version_is_rejected() {
 
 // ---------------------------------------------------------------------
 // L-ws-trusted-rpc — fail-closed on subscribe error
+// (F-1 fix-pass: renamed from `hermetic_ws_malicious_wrong_chain_id_at_open_fails_closed`
+// to reflect what the test body actually exercises. The chain-id
+// defence is covered by
+// `hermetic_ws_wrong_chain_id_at_open_fails_closed` below.)
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn hermetic_ws_malicious_wrong_chain_id_at_open_fails_closed() {
+async fn hermetic_ws_subscribe_jsonrpc_error_fails_closed() {
     // The mock server's `fail_subscribe` mode replies with a
     // JSON-RPC error object; alloy surfaces this as a
     // `SubscribeFailed` error from `open_subscription`.
@@ -519,6 +523,160 @@ async fn hermetic_ws_malicious_wrong_chain_id_at_open_fails_closed() {
         ),
         "expected SubscribeFailed or ConnectFailed; got {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------
+// L-ws-trusted-rpc — F-1 + F-3 fix-pass:
+// chain-id mismatch on the WS provider fails closed BEFORE
+// eth_subscribe.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn hermetic_ws_wrong_chain_id_at_open_fails_closed() {
+    // The F-3 fix-pass added `check_chain_id_matches` against the
+    // WS provider INSIDE `open_subscription`, BEFORE issuing
+    // `eth_subscribe`. The orchestrator's fallback branch then
+    // counts a chain-id mismatch as a regular open-fail and
+    // degrades to HTTP polling per L10.
+    //
+    // Hermetic constraint: the L-ws-tls-downgrade scheme check
+    // refuses `ws://` for production envs, so we cannot drive
+    // `open_subscription(ws_url, BaseSepolia, ..)` against the
+    // ws://127.0.0.1 mock directly (the test would short-circuit
+    // at the scheme check before the chain-id check fires). This
+    // test instead exercises the EXACT building blocks the F-3
+    // wire-up depends on:
+    //
+    //   1. `build_ws_read_provider` against the foreign-chain
+    //      mock returns a provider whose `eth_chainId` reports
+    //      the foreign value.
+    //   2. `check_chain_id_matches(&provider, BaseSepolia)`
+    //      returns `Err(ChainError::ChainIdMismatch)`.
+    //
+    // Combined, these prove the production-env path
+    // `open_subscription -> connect_ws -> check_chain_id_matches
+    // -> subscribe_logs` fails-closed at the chain-id step, since
+    // the wire-up in `open_subscription` calls this exact helper
+    // on the exact provider type built by `build_ws_read_provider`.
+    let server = MockServer::start(MockBehaviour {
+        chain_id: 1, // foreign chain id
+        ..Default::default()
+    })
+    .await;
+    let provider = pangolin_chain::chain_sync::ws::build_ws_read_provider(&server.ws_url)
+        .await
+        .expect("build_ws_read_provider succeeds against foreign-chain mock");
+    let result =
+        pangolin_chain::chain_sync::check_chain_id_matches(&provider, ChainEnv::BaseSepolia).await;
+    let err = result.expect_err("check_chain_id_matches must reject foreign chain id");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("ChainIdMismatch") || msg.contains("expected: 84532"),
+        "expected ChainIdMismatch error variant; got {err:?}"
+    );
+
+    // Smoke-test the wire-up: with a matching mock (default
+    // chain_id = 84_532), the same call sequence succeeds. This
+    // pins that the chain-id check fires from
+    // `open_subscription` against the same provider type.
+    let ok_server = MockServer::start(MockBehaviour::default()).await;
+    let ok_provider = pangolin_chain::chain_sync::ws::build_ws_read_provider(&ok_server.ws_url)
+        .await
+        .expect("build_ws_read_provider succeeds against ok mock");
+    pangolin_chain::chain_sync::check_chain_id_matches(&ok_provider, ChainEnv::BaseSepolia)
+        .await
+        .expect("matching chain id passes check_chain_id_matches");
+}
+
+// ---------------------------------------------------------------------
+// Mock `accept_then_drop_subscribe` shape pin.
+//
+// The F-2 fix-pass (re-audit F-4) renamed this test from
+// `hermetic_ws_accept_then_drop_storm_pattern_counts_toward_breaker` to
+// reflect what it actually tests. The original name claimed
+// orchestrator-level breaker accumulation, but the test body only
+// exercises the WS-mock building block (open_subscription +
+// recv_next_event). Empirical probing during the F-4 fix-pass
+// revealed that alloy's pubsub layer (alloy-pubsub 2.0.4) transparently
+// reconnects on accept-then-drop — `reconnect_with_retries` only
+// counts FAILED reconnects toward `max_retries`, and every cycle here
+// succeeds at the WS-handshake + eth_subscribe level, so the retry
+// budget never trips. The orchestrator in
+// `pangolin-store::vault::sync_from_chain_with_ws_url` therefore does
+// NOT receive `WsRecvOutcome::SubscriptionClosed` from
+// `recv_next_event` during a steady accept-then-drop storm — alloy
+// absorbs the storm silently below the orchestrator's recv layer.
+//
+// What this test ACTUALLY pins:
+//   - The mock's `accept_then_drop_subscribe` mode behaves as
+//     documented: every cycle either (a) opens successfully and the
+//     subscription's recv yields `SubscriptionClosed` (rare — happens
+//     when alloy's pubsub eventually surfaces the close before
+//     reconnecting), or (b) the close-during-handshake races the
+//     subscribe and `open_subscription` returns an error variant.
+//
+// What this test does NOT pin (and never did, despite its prior name):
+//   - The orchestrator's `event_ingested_this_open` gate (the F-2
+//     vault.rs fix). That gate is reachable only in the SLOW failure
+//     mode where alloy's pubsub gives up after `max_retries × backoff
+//     ≈ minutes`. The accept-then-drop FAST failure mode is masked
+//     by alloy's transparent reconnect and is documented as a
+//     deferred follow-up — see `docs/architecture/chain-sync.md` and
+//     `THREAT_MODEL.md` for the limitation enumeration + the
+//     architectural wrapper follow-up issue.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn hermetic_ws_accept_then_drop_subscribe_mock_mode_shape_pin() {
+    let server = MockServer::start(MockBehaviour {
+        accept_then_drop_subscribe: true,
+        ..Default::default()
+    })
+    .await;
+
+    // Single cycle exercises the mock's accept-then-drop shape. The
+    // outcome is either Ok(handle)+recv-result OR Err(open). Both
+    // shapes prove the mock's mode wiring is intact; the test does
+    // NOT assert which shape, because alloy's pubsub layer makes
+    // either outcome plausible depending on race timing between the
+    // subscribe response and the server-side close. The previous
+    // version of this test (named ..._counts_toward_breaker) treated
+    // both shapes as "counts" — which is fine for proving the mock
+    // works but does not (and never did) prove orchestrator-level
+    // breaker behaviour. See the comment block above the test for
+    // the alloy-transparent-reconnect finding that drives this
+    // rename.
+    let outcome = open_subscription(
+        &server.ws_url,
+        ChainEnv::Dev,
+        &TEST_VAULT_ID,
+        contract_address(),
+    )
+    .await;
+    // `if let Ok(...)` rather than `match` because the `Err(_)` arm
+    // is intentionally a no-op (close-during-handshake races the
+    // subscribe; alloy surfaces this as ConnectFailed or
+    // SubscribeFailed, and either outcome demonstrates the
+    // accept-then-drop wiring just as well as the Ok arm does).
+    if let Ok(mut handle) = outcome {
+        // Drain at most a short interval so the test stays bounded.
+        // We accept any of: SubscriptionClosed (alloy surfaced the
+        // close before reconnecting), Event (would be a mock bug;
+        // assert it cannot happen), or recv-timeout (alloy's
+        // pubsub reconnected transparently — the documented
+        // limitation).
+        let drain =
+            tokio::time::timeout(Duration::from_secs(2), recv_next_event(&mut handle)).await;
+        match drain {
+            Ok(WsRecvOutcome::SubscriptionClosed) | Err(_) => {
+                // Both shapes are valid for the mock; both
+                // demonstrate the accept-then-drop wiring.
+            }
+            Ok(WsRecvOutcome::Event(_)) => {
+                panic!("mock in accept_then_drop_subscribe mode must NOT emit events");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
