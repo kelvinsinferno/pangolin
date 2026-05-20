@@ -105,6 +105,8 @@ pub mod deployments;
 pub mod error;
 pub mod evm;
 pub mod privacy;
+pub mod recovery_client;
+pub mod recovery_signing;
 pub mod secp256k1_signing;
 pub mod signing;
 pub mod types;
@@ -157,6 +159,17 @@ pub use chain_sync::{
     LOG_BLOCK_CHUNK as CHAIN_SYNC_LOG_BLOCK_CHUNK, MAX_KNOWN_CLIENT_SCHEMA_VERSION,
     WS_CIRCUIT_BREAKER_THRESHOLD, WS_KEEPALIVE_INTERVAL_SECS, WS_RECONNECT_INITIAL_BACKOFF_MS,
     WS_RECONNECT_MAX_BACKOFF_MS,
+};
+pub use recovery_client::{
+    approve_recovery_v1, build_guardian_root, build_live_approve_fields_v1, build_membership_proof,
+    cancel_recovery_v1, finalize_recovery_v1, guardian_leaf, initiate_recovery_v1,
+    read_live_attempt_v1, read_vault_authority_v1, set_guardian_set_v1, verify_membership_proof,
+    LiveAttemptV1, RecoveryAnchorV1, RECOVERY_CONTRACT_NAME, RECOVERY_SCHEMA_VERSION_V1,
+};
+pub use recovery_signing::{
+    approve_digest, approve_struct_hash, build_domain_recovery, build_signed_approval_v1,
+    recover_approver_v1, ApproveFieldsV1, SignedApprovalV1, APPROVE_TYPEHASH_V1,
+    RECOVERY_DOMAIN_SEPARATOR_ANVIL_DEV_V1,
 };
 pub use secp256k1_signing::{
     build_signed_redemption_v1, build_signed_revision_v1, is_canonical_s, recover_signer_v1,
