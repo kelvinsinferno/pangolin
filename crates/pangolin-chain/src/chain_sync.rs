@@ -524,7 +524,18 @@ pub(crate) fn verify_signer_or_reject(
     claimed_signer: Address,
     env: ChainEnv,
 ) -> Result<Address, ChainError> {
-    let recovered = recover_signer_v1_raw(fields, signature, env)?;
+    // Issue #101 amendment: `recover_signer_v1_raw` now takes an
+    // explicit chain id (the EIP-712 domain binds it). The sync/recover
+    // path stays byte-identical to the pre-#101 behavior — it resolves
+    // the id the same way the old `build_domain` did internally
+    // (`env.chain_id().unwrap_or(0)`): BaseSepolia → 84_532, Dev → 0.
+    // The fresh-anvil in-scope pull test never reaches this branch (its
+    // test vault has no on-chain events), so leaving the recover side at
+    // the prior resolution keeps the change scoped to the signing /
+    // broadcast path per the locked amendment, with zero stack-wide
+    // threading.
+    let chain_id = env.chain_id().unwrap_or(0);
+    let recovered = recover_signer_v1_raw(fields, signature, env, chain_id)?;
     if recovered != claimed_signer {
         return Err(ChainError::EventSignerMismatch {
             claimed: claimed_signer,

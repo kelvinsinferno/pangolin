@@ -57,6 +57,11 @@ contracts/deploy/.env.mainnet
 *.key
 secrets/
 deployments/*.local.json
+# Issue #101 (R-e): the anvil-fork CI harness (scripts/anvil-ci.sh)
+# generates contracts/deployments/dev.json at runtime from the fresh
+# local deploy. It is true-by-construction per run and MUST NOT be
+# committed (a stale fixture would point tests at a dead address).
+contracts/deployments/dev.json
 # Pangolin vault files (encrypted user data — never commit even though
 # the AEAD-sealed contents are protected at rest; metadata + structure
 # would still leak, and a committed vault surprises verifiers)

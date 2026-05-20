@@ -69,7 +69,7 @@ fn sample_signed_revision(wallet: &EvmWallet) -> SignedRevisionV1 {
     let (pre, h) = sample_enc_payload();
     let fields =
         RevisionFieldsV1::with_signer_device_id(wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h);
-    build_signed_revision_v1(wallet, fields, pre, ChainEnv::BaseSepolia).expect("sign v1")
+    build_signed_revision_v1(wallet, fields, pre, ChainEnv::BaseSepolia, 84_532).expect("sign v1")
 }
 
 /// Build an `RpcLog` whose ABI-decoded shape is a `RevisionPublished`
@@ -150,7 +150,7 @@ fn push_chain_id(asserter: &Asserter, chain_id: u64) {
 fn recover_signer_v1_round_trip() {
     let wallet = fixed_wallet();
     let signed = sample_signed_revision(&wallet);
-    let recovered = recover_signer_v1(&signed, ChainEnv::BaseSepolia).expect("recover");
+    let recovered = recover_signer_v1(&signed, ChainEnv::BaseSepolia, 84_532).expect("recover");
     assert_eq!(recovered, wallet.address());
 }
 
@@ -160,8 +160,13 @@ fn recover_signer_v1_round_trip() {
 fn recover_signer_v1_raw_round_trip() {
     let wallet = fixed_wallet();
     let signed = sample_signed_revision(&wallet);
-    let recovered = recover_signer_v1_raw(&signed.fields, &signed.signature, ChainEnv::BaseSepolia)
-        .expect("recover raw");
+    let recovered = recover_signer_v1_raw(
+        &signed.fields,
+        &signed.signature,
+        ChainEnv::BaseSepolia,
+        84_532,
+    )
+    .expect("recover raw");
     assert_eq!(recovered, wallet.address());
 }
 
@@ -174,7 +179,7 @@ fn recover_signer_v1_tampered_signature_diverges() {
     // Flip a byte in the `r` component.
     let mut tampered = signed.signature;
     tampered[0] ^= 0x01;
-    let result = recover_signer_v1_raw(&signed.fields, &tampered, ChainEnv::BaseSepolia);
+    let result = recover_signer_v1_raw(&signed.fields, &tampered, ChainEnv::BaseSepolia, 84_532);
     match result {
         Ok(addr) => assert_ne!(
             addr,
@@ -197,7 +202,7 @@ fn recover_signer_v1_raw_rejects_high_s() {
     // Flip the high bit of s (byte 32). Any value with the top bit set
     // and byte32 ≠ 0 will be > n/2.
     high_s_sig[32] = 0xFF;
-    let result = recover_signer_v1_raw(&signed.fields, &high_s_sig, ChainEnv::BaseSepolia);
+    let result = recover_signer_v1_raw(&signed.fields, &high_s_sig, ChainEnv::BaseSepolia, 84_532);
     assert!(matches!(
         result,
         Err(ChainError::SignerRecoveryFailed { .. })
@@ -211,7 +216,7 @@ fn recover_signer_v1_raw_rejects_invalid_v_byte() {
     let signed = sample_signed_revision(&wallet);
     let mut bad_v = signed.signature;
     bad_v[64] = 29;
-    let result = recover_signer_v1_raw(&signed.fields, &bad_v, ChainEnv::BaseSepolia);
+    let result = recover_signer_v1_raw(&signed.fields, &bad_v, ChainEnv::BaseSepolia, 84_532);
     assert!(matches!(
         result,
         Err(ChainError::SignerRecoveryFailed { .. })

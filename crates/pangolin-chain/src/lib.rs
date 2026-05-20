@@ -112,6 +112,13 @@ pub mod types;
 #[cfg(any(test, feature = "test-utilities"))]
 pub mod mock;
 
+/// Test-only env seam for the issue #101 anvil-fork CI harness.
+///
+/// Gated to test / test-utilities / integration-tests builds; never
+/// compiled into a production binary (L1: no production-code change).
+#[cfg(any(test, feature = "test-utilities", feature = "integration-tests"))]
+pub mod test_env;
+
 pub use adapter::{BatchBalanceCheck, ChainAdapter};
 pub use balance_check::{
     compute_balance_state, estimate_next_publish_cost, query_evm_balance, GasBalanceState,

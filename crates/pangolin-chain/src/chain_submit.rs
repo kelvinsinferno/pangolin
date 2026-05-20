@@ -341,18 +341,14 @@ pub async fn publish_revision_v1_with_config(
     }
 
     let provider = build_provider(wallet, rpc_url).await?;
-    // L-rpc-spoof partial defense: cross-check `eth_chainId` against
-    // the build's expected chain id. (`ChainEnv::Dev` returns None
-    // and skips this check.)
-    if let Some(expected_chain_id) = env.chain_id() {
-        let observed = provider.get_chain_id().await.map_err(map_rpc_err)?;
-        if observed != expected_chain_id {
-            return Err(ChainError::ChainIdMismatch {
-                expected: expected_chain_id,
-                observed,
-            });
-        }
-    }
+    // L-rpc-spoof partial defense + issue #101 envelope chain-id
+    // resolution: read `eth_chainId` once. For a fixed env
+    // (`BaseSepolia`) cross-check it against the pinned id and use the
+    // pinned id for the tx envelope (NEVER trust the RPC's value for
+    // production — `expected_chain_id`). For `Dev` (`env.chain_id()` is
+    // `None`) there is nothing to cross-check, so the envelope binds the
+    // live id read from the connected (trusted, local) anvil node.
+    let signing_chain_id = resolve_envelope_chain_id(&provider, env).await?;
 
     // ---- 3.5 R-b pre-publish balance gate ----
     if config.pre_publish_balance_check_enabled {
@@ -364,6 +360,7 @@ pub async fn publish_revision_v1_with_config(
         wallet.address(),
         contract_address,
         signed_revision,
+        signing_chain_id,
     )
     .await
 }
@@ -387,9 +384,16 @@ async fn publish_revision_v1_with_provider(
     wallet_address: Address,
     contract_address: Address,
     signed_revision: &SignedRevisionV1,
+    chain_id: u64,
 ) -> Result<ChainAnchorV1, ChainError> {
-    let pending =
-        broadcast_with_retries(provider, wallet_address, contract_address, signed_revision).await?;
+    let pending = broadcast_with_retries(
+        provider,
+        wallet_address,
+        contract_address,
+        signed_revision,
+        chain_id,
+    )
+    .await?;
 
     // ---- L12 boundary: the tx is in-flight. From here on, NO
     //      re-broadcast. Await the receipt; verify status==1;
@@ -421,6 +425,7 @@ async fn broadcast_with_retries(
     wallet_address: Address,
     contract_address: Address,
     signed_revision: &SignedRevisionV1,
+    chain_id: u64,
 ) -> Result<PendingTransactionBuilder<Ethereum>, ChainError> {
     let mut attempts: u8 = 0;
 
@@ -501,7 +506,10 @@ async fn broadcast_with_retries(
         // chain_id binds via the EthereumWallet filler; for hermetic
         // tests against MockTransport we set it explicitly so the
         // estimate / signing path doesn't need an extra RPC call.
-        tx.set_chain_id(signed_revision_chain_id());
+        // Issue #101: the id is resolved by the caller
+        // (`resolve_envelope_chain_id`) — pinned `84_532` for
+        // BaseSepolia, live id for Dev/anvil.
+        tx.set_chain_id(chain_id);
 
         // ---- Estimate gas (with 1.2x safety margin) ----
         let est = match provider.estimate_gas(tx.clone()).await {
@@ -732,13 +740,40 @@ fn map_rpc_err<E: core::fmt::Display>(e: E) -> ChainError {
     ChainError::Rpc(e.to_string())
 }
 
-/// Chain id binding for the EIP-1559 tx envelope.
+/// Resolve the chain id to bind into the EIP-1559 tx envelope for a
+/// broadcast under `env`, using an already-connected `provider` (issue
+/// #101 amendment).
 ///
-/// Returns the build's expected chain id for `BaseSepolia` (the only
-/// env wired in MVP-2). When `pangolin-chain` grows additional envs
-/// (mainnet / dev) this fn will widen to a match-on-`ChainEnv`.
-const fn signed_revision_chain_id() -> u64 {
-    84_532
+/// **Security boundary (load-bearing):** production envs (`BaseSepolia`,
+/// future `BaseMainnet`) NEVER trust an RPC's reported chain id for
+/// their signing/envelope binding. For a fixed env this fn reads
+/// `eth_chainId` ONLY to cross-check it (the pre-#101 L-rpc-spoof
+/// guard) and returns the *pinned* `env.chain_id()` value — a malicious
+/// RPC that lies about its chain id is rejected with
+/// [`ChainError::ChainIdMismatch`], it can never steer the envelope.
+///
+/// For `Dev` (`env.chain_id()` is `None`) there is no pinned id to
+/// cross-check against; the env is local anvil by construction (R-d:
+/// fresh-anvil deploy, never a fork of a public chain), so the envelope
+/// binds the live id read from the connected (trusted, local) node.
+/// This is the ONLY path that sources its envelope chain id from an
+/// RPC, and only ever a local dev chain.
+async fn resolve_envelope_chain_id<P: Provider>(
+    provider: &P,
+    env: ChainEnv,
+) -> Result<u64, ChainError> {
+    let observed = provider.get_chain_id().await.map_err(map_rpc_err)?;
+    match env.chain_id() {
+        Some(expected) => {
+            if observed != expected {
+                return Err(ChainError::ChainIdMismatch { expected, observed });
+            }
+            // Use the PINNED id, not the RPC's report.
+            Ok(expected)
+        }
+        // Dev / local anvil: the live id from the trusted local node.
+        None => Ok(observed),
+    }
 }
 
 /// Classify an RPC error message as "nonce collision (retry)" vs not.
@@ -958,22 +993,16 @@ pub async fn submit_redemption_v1(
     }
 
     let provider = build_provider_for_signer(signer, rpc_url).await?;
-    // L-rpc-spoof partial defense.
-    if let Some(expected_chain_id) = env.chain_id() {
-        let observed = provider.get_chain_id().await.map_err(map_rpc_err)?;
-        if observed != expected_chain_id {
-            return Err(ChainError::ChainIdMismatch {
-                expected: expected_chain_id,
-                observed,
-            });
-        }
-    }
+    // L-rpc-spoof partial defense + issue #101 envelope chain-id
+    // resolution (pinned id for BaseSepolia, live id for Dev).
+    let signing_chain_id = resolve_envelope_chain_id(&provider, env).await?;
 
     submit_redemption_v1_with_provider(
         &provider,
         signer.address(),
         contract_address,
         signed_redemption,
+        signing_chain_id,
     )
     .await
 }
@@ -984,12 +1013,14 @@ async fn submit_redemption_v1_with_provider(
     signer_address: Address,
     contract_address: Address,
     signed_redemption: &SignedRedemptionV1,
+    chain_id: u64,
 ) -> Result<RedemptionAnchorV1, ChainError> {
     let pending = broadcast_redemption_with_retries(
         provider,
         signer_address,
         contract_address,
         signed_redemption,
+        chain_id,
     )
     .await?;
 
@@ -1012,6 +1043,7 @@ async fn broadcast_redemption_with_retries(
     signer_address: Address,
     contract_address: Address,
     signed_redemption: &SignedRedemptionV1,
+    chain_id: u64,
 ) -> Result<PendingTransactionBuilder<Ethereum>, ChainError> {
     let mut attempts: u8 = 0;
 
@@ -1067,7 +1099,7 @@ async fn broadcast_redemption_with_retries(
             .with_value(U256::ZERO)
             .with_max_fee_per_gas(max_fee_per_gas)
             .with_max_priority_fee_per_gas(PRIORITY_FEE_DEFAULT_WEI);
-        tx.set_chain_id(signed_revision_chain_id());
+        tx.set_chain_id(chain_id);
 
         let est = match provider.estimate_gas(tx.clone()).await {
             Ok(g) => g,
@@ -1333,16 +1365,17 @@ pub async fn submit_eth_transfer_v1(
     rpc_url: &str,
 ) -> Result<EthTransferAnchorV1, ChainError> {
     let provider = build_provider_for_signer(signer, rpc_url).await?;
-    if let Some(expected_chain_id) = env.chain_id() {
-        let observed = provider.get_chain_id().await.map_err(map_rpc_err)?;
-        if observed != expected_chain_id {
-            return Err(ChainError::ChainIdMismatch {
-                expected: expected_chain_id,
-                observed,
-            });
-        }
-    }
-    submit_eth_transfer_v1_with_provider(&provider, signer.address(), to_address, value_wei).await
+    // L-rpc-spoof partial defense + issue #101 envelope chain-id
+    // resolution (pinned id for BaseSepolia, live id for Dev).
+    let signing_chain_id = resolve_envelope_chain_id(&provider, env).await?;
+    submit_eth_transfer_v1_with_provider(
+        &provider,
+        signer.address(),
+        to_address,
+        value_wei,
+        signing_chain_id,
+    )
+    .await
 }
 
 /// Inner submit loop parameterised over a constructed provider. Used
@@ -1352,10 +1385,16 @@ async fn submit_eth_transfer_v1_with_provider(
     signer_address: Address,
     to_address: Address,
     value_wei: U256,
+    chain_id: u64,
 ) -> Result<EthTransferAnchorV1, ChainError> {
-    let pending =
-        broadcast_eth_transfer_with_retries(provider, signer_address, to_address, value_wei)
-            .await?;
+    let pending = broadcast_eth_transfer_with_retries(
+        provider,
+        signer_address,
+        to_address,
+        value_wei,
+        chain_id,
+    )
+    .await?;
     let tx_hash: B256 = *pending.tx_hash();
     let pending = pending.with_timeout(Some(Duration::from_secs(RECEIPT_TIMEOUT_SECS)));
     let receipt = pending
@@ -1375,6 +1414,7 @@ async fn broadcast_eth_transfer_with_retries(
     signer_address: Address,
     to_address: Address,
     value_wei: U256,
+    chain_id: u64,
 ) -> Result<PendingTransactionBuilder<Ethereum>, ChainError> {
     let mut attempts: u8 = 0;
     loop {
@@ -1418,7 +1458,7 @@ async fn broadcast_eth_transfer_with_retries(
             .with_value(value_wei)
             .with_max_fee_per_gas(max_fee_per_gas)
             .with_max_priority_fee_per_gas(PRIORITY_FEE_DEFAULT_WEI);
-        tx.set_chain_id(signed_revision_chain_id());
+        tx.set_chain_id(chain_id);
 
         let est = match provider.estimate_gas(tx.clone()).await {
             Ok(g) => g,
@@ -1706,7 +1746,8 @@ mod tests {
         let fields = RevisionFieldsV1::with_signer_device_id(
             wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
         );
-        build_signed_revision_v1(wallet, fields, pre, ChainEnv::BaseSepolia).expect("sign v1")
+        build_signed_revision_v1(wallet, fields, pre, ChainEnv::BaseSepolia, 84_532)
+            .expect("sign v1")
     }
 
     // -----------------------------------------------------------------
@@ -1804,8 +1845,9 @@ mod tests {
         let fields = RevisionFieldsV1::with_signer_device_id(
             &wallet, [0x11; 32], [0x22; 32], [0x33; 32], 1, h,
         );
-        let signed = build_signed_revision_v1(&wallet, fields, pre.clone(), ChainEnv::BaseSepolia)
-            .expect("sign");
+        let signed =
+            build_signed_revision_v1(&wallet, fields, pre.clone(), ChainEnv::BaseSepolia, 84_532)
+                .expect("sign");
         // Replicate the production calldata construction from
         // `broadcast_with_retries`. Any drift between the two
         // construction sites here would be caught by the byte-pin
@@ -1867,9 +1909,10 @@ mod tests {
         let asserter = Asserter::new();
         push_broadcast_only(&asserter, 0, 1_000_000_000, 500_000, tx_hash);
         let provider = mock_provider(&asserter);
-        let pending = broadcast_with_retries(&provider, wallet.address(), contract, &signed)
-            .await
-            .expect("broadcast leg returns Ok");
+        let pending =
+            broadcast_with_retries(&provider, wallet.address(), contract, &signed, 84_532)
+                .await
+                .expect("broadcast leg returns Ok");
         assert_eq!(*pending.tx_hash(), tx_hash);
     }
 
@@ -1978,7 +2021,7 @@ mod tests {
             "reward": [],
         }));
         let provider = mock_provider(&asserter);
-        let err = broadcast_with_retries(&provider, wallet.address(), contract, &signed)
+        let err = broadcast_with_retries(&provider, wallet.address(), contract, &signed, 84_532)
             .await
             .expect_err("gas cap exceeded must error");
         match err {
@@ -2019,7 +2062,7 @@ mod tests {
         // send fails with "insufficient funds for gas * price + value"
         asserter.push_failure_msg("insufficient funds for gas * price + value");
         let provider = mock_provider(&asserter);
-        let err = broadcast_with_retries(&provider, wallet.address(), contract, &signed)
+        let err = broadcast_with_retries(&provider, wallet.address(), contract, &signed, 84_532)
             .await
             .expect_err("insufficient funds must error");
         assert!(
@@ -2081,7 +2124,7 @@ mod tests {
         }));
         asserter.push_failure_msg("execution reverted: ErrSignerNotRegistered()");
         let provider = mock_provider(&asserter);
-        let err = broadcast_with_retries(&provider, wallet.address(), contract, &signed)
+        let err = broadcast_with_retries(&provider, wallet.address(), contract, &signed, 84_532)
             .await
             .expect_err("estimate revert must error");
         match err {
@@ -2181,9 +2224,10 @@ mod tests {
         // ATTEMPT 2: broadcast succeeds.
         push_broadcast_only(&asserter, 1, 1_000_000_000, 500_000, tx_hash);
         let provider = mock_provider(&asserter);
-        let pending = broadcast_with_retries(&provider, wallet.address(), contract, &signed)
-            .await
-            .expect("retry succeeds");
+        let pending =
+            broadcast_with_retries(&provider, wallet.address(), contract, &signed, 84_532)
+                .await
+                .expect("retry succeeds");
         assert_eq!(*pending.tx_hash(), tx_hash);
     }
 
@@ -2210,7 +2254,7 @@ mod tests {
             asserter.push_failure_msg("nonce too low");
         }
         let provider = mock_provider(&asserter);
-        let err = broadcast_with_retries(&provider, wallet.address(), contract, &signed)
+        let err = broadcast_with_retries(&provider, wallet.address(), contract, &signed, 84_532)
             .await
             .expect_err("exhausted retries must error");
         match err {
@@ -2243,9 +2287,10 @@ mod tests {
         // ATTEMPT 2: broadcast succeeds.
         push_broadcast_only(&asserter, 0, 1_000_000_000, 500_000, tx_hash);
         let provider = mock_provider(&asserter);
-        let pending = broadcast_with_retries(&provider, wallet.address(), contract, &signed)
-            .await
-            .expect("retry succeeds");
+        let pending =
+            broadcast_with_retries(&provider, wallet.address(), contract, &signed, 84_532)
+                .await
+                .expect("retry succeeds");
         assert_eq!(*pending.tx_hash(), tx_hash);
     }
 
@@ -2431,11 +2476,19 @@ mod tests {
     /// `RevisionPublished` event emitted with the submitter's signer
     /// + the fresh `vaultId` + monotonic `sequence`.
     #[tokio::test]
-    #[ignore = "live-RPC test; requires BASE_SEPOLIA_RPC_URL + funded wallet"]
+    #[ignore = "live-RPC test; requires BASE_SEPOLIA_RPC_URL + funded wallet (or PANGOLIN_CHAIN_ENV=dev + local anvil)"]
     #[cfg(feature = "integration-tests")]
     async fn publish_v1_live_d017_smoke() {
-        let rpc_url = std::env::var("BASE_SEPOLIA_RPC_URL")
-            .unwrap_or_else(|_| "https://sepolia.base.org".to_string());
+        // Issue #101 (R-b): parametrized over BaseSepolia (default) vs
+        // Dev / local anvil (PANGOLIN_CHAIN_ENV=dev). The signing chain
+        // id is resolved from the env (pinned 84_532 for BaseSepolia;
+        // live eth_chainId for Dev/anvil) per the #101 amendment.
+        use crate::test_env;
+        let env = test_env::target_chain_env();
+        let rpc_url = test_env::rpc_url();
+        let chain_id = test_env::resolve_signing_chain_id(env, &rpc_url)
+            .await
+            .expect("resolve signing chain id (anvil reachable in dev mode)");
         let wallet = fixed_wallet();
         // Fresh vault_id so the contract self-bootstraps the signer.
         // Random-ish bytes — not crypto-secure (this is a smoke
@@ -2467,12 +2520,30 @@ mod tests {
             1,
             enc_payload_hash,
         );
-        let signed = build_signed_revision_v1(&wallet, fields, enc_payload, ChainEnv::BaseSepolia)
+        let signed = build_signed_revision_v1(&wallet, fields, enc_payload, env, chain_id)
             .expect("sign live");
-        let anchor = publish_revision_v1(&wallet, &signed, ChainEnv::BaseSepolia, &rpc_url)
+        let anchor = publish_revision_v1(&wallet, &signed, env, &rpc_url)
             .await
             .expect("live publish must succeed");
         assert_eq!(anchor.signer, wallet.address());
         assert!(anchor.block_number > 0);
+    }
+
+    /// Issue #101 harness helper: print the deterministic test wallet's
+    /// EVM address so `scripts/anvil-ci.sh` can fund it via
+    /// `anvil_setBalance`. The wallet is derived from the fixed seed
+    /// `[0x42; 32]` (`fixed_wallet()`), the same one the in-scope live
+    /// tests sign with. Run with:
+    ///
+    /// ```text
+    /// cargo test -p pangolin-chain --features integration-tests \
+    ///   print_fixed_wallet_address -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "harness helper: prints fixed_wallet() address for anvil funding"]
+    #[cfg(feature = "integration-tests")]
+    fn print_fixed_wallet_address() {
+        let wallet = fixed_wallet();
+        println!("PANGOLIN_FIXED_WALLET_ADDRESS={:?}", wallet.address());
     }
 }

@@ -177,6 +177,39 @@ jobs:
           FOUNDRY_INVARIANT_RUNS: "10000"
         run: forge test -vv
 
+  # -----------------------------------------------------------------
+  # Issue #101: anvil-fork CI harness. Boots a local anvil node,
+  # deploys our REAL contract bytecode, generates dev.json, funds the
+  # deterministic test wallet, and runs the 3 in-scope live tests
+  # against it in dev mode — so the env-quirk #14 class (the 3.3
+  # keccak(encPayload)-vs-preimage calldata bug, which passed hermetic
+  # mocks) turns CI RED automatically. Purely additive (L3): existing
+  # jobs untouched. Runs on every PR (R-c).
+  # -----------------------------------------------------------------
+  anvil-integration:
+    name: anvil-fork integration (issue #101)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          # SAME pinned Foundry version as the contracts jobs (L4 /
+          # env-quirk #4): CI uses the same anvil/forge/cast as local
+          # dev. Bump in lockstep.
+          version: v1.0.0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1"
+          cache-bin: "false"
+      # The wrapper script owns all the orchestration (start anvil →
+      # deploy → dev.json → fund → run tests → teardown). Per
+      # env-quirk #16 we call the script, never long inline shell.
+      - name: anvil harness (deploy + 3 in-scope tests in dev mode)
+        run: bash scripts/anvil-ci.sh all
+
   contracts-abi-drift:
     name: contracts / ABI drift check
     runs-on: ubuntu-latest

@@ -47,7 +47,6 @@
 
 #![forbid(unsafe_code)]
 
-use pangolin_chain::ChainEnv;
 use pangolin_crypto::secret::SecretBytes;
 use pangolin_store::{
     PinIdentityProof, PressYPresenceProof, PullError, PullReport, SyncMode, SyncModePreference,
@@ -65,18 +64,29 @@ use pangolin_store::{
 #[tokio::test]
 #[ignore = "requires BASE_SEPOLIA_RPC_URL + PANGOLIN_PULL_LIVE_VAULT_ID + captured event fixture"]
 async fn live_pull_once_against_d017_advances_checkpoint() {
+    // Issue #101 (R-b): parametrized over BaseSepolia (default) vs Dev /
+    // local anvil (`PANGOLIN_CHAIN_ENV=dev`). The seam lives in
+    // `pangolin_chain::test_env` (compiled here via the test-utilities
+    // dev-dep). L6: in dev mode a missing RPC / vault id is a HARD error,
+    // never a skip — `require_or_fail` panics in dev mode.
+    use pangolin_chain::test_env;
+    let target = test_env::target_chain_env();
     let rpc_url = match std::env::var("BASE_SEPOLIA_RPC_URL") {
         Ok(s) if !s.is_empty() => s,
         _ => {
-            eprintln!("SKIP: BASE_SEPOLIA_RPC_URL not set");
-            return;
+            if !test_env::require_or_fail("BASE_SEPOLIA_RPC_URL not set") {
+                return;
+            }
+            unreachable!("require_or_fail panics in dev mode");
         }
     };
     let vault_id_hex = match std::env::var("PANGOLIN_PULL_LIVE_VAULT_ID") {
         Ok(s) if !s.is_empty() => s,
         _ => {
-            eprintln!("SKIP: PANGOLIN_PULL_LIVE_VAULT_ID not set");
-            return;
+            if !test_env::require_or_fail("PANGOLIN_PULL_LIVE_VAULT_ID not set") {
+                return;
+            }
+            unreachable!("require_or_fail panics in dev mode");
         }
     };
     assert_eq!(vault_id_hex.len(), 64, "vault id must be 64 hex chars");
@@ -102,7 +112,7 @@ async fn live_pull_once_against_d017_advances_checkpoint() {
 
     let pre_checkpoint = v.last_synced_block_v1().expect("read checkpoint");
     let report = v
-        .pull_once(&rpc_url, ChainEnv::BaseSepolia, &vault_id)
+        .pull_once(&rpc_url, target, &vault_id)
         .await
         .expect("pull cycle should succeed against live D-017");
     let post_checkpoint = v.last_synced_block_v1().expect("read checkpoint");
@@ -127,7 +137,7 @@ async fn live_pull_once_against_d017_advances_checkpoint() {
     // Demonstrate teardown handling: lock + retry.
     v.lock();
     let err = v
-        .pull_once(&rpc_url, ChainEnv::BaseSepolia, &vault_id)
+        .pull_once(&rpc_url, target, &vault_id)
         .await
         .expect_err("locked ⇒ NoActiveSession");
     assert!(matches!(err, PullError::NoActiveSession));
