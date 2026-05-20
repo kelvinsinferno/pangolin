@@ -4,11 +4,13 @@
 # Pangolin anvil-fork CI harness (issue #101).
 #
 # Boots a local `anvil` node, deploys our REAL contract bytecode
-# (RevisionLogV1 + EntitlementRegistry) to it via the existing forge
-# scripts, generates contracts/deployments/dev.json from the structured
-# broadcast artefact, funds the deterministic test wallet, and runs the
-# 3 in-scope `#[ignore]` live tests against the local node in dev mode
-# (PANGOLIN_CHAIN_ENV=dev).
+# (RevisionLogV1 + EntitlementRegistry + RecoveryV1) to it via the
+# existing forge scripts, generates contracts/deployments/dev.json from
+# the structured broadcast artefact, funds the deterministic test
+# wallet, and runs the in-scope `#[ignore]` live tests against the local
+# node in dev mode (PANGOLIN_CHAIN_ENV=dev) — including the issue #103
+# RecoveryV1 Rust↔contract lifecycle test (deploy → setGuardianSet →
+# initiate → approve×threshold → evm_increaseTime(72h) → finalize).
 #
 # WHY (env-quirk #14): hermetic mocks fabricate receipts without running
 # the contract's hash/signature logic, so the 3.3 keccak(encPayload)-vs-
@@ -181,7 +183,7 @@ parse_deploy() {
 # Plus a deploy_block for RevisionLogV1 (d017_deploy_block(Dev) reads it;
 # 0 means scan-from-genesis, but we record the real value for parity).
 generate_dev_json() {
-  local rev_addr="$1" rev_block="$2" ent_addr="$3" ent_block="$4"
+  local rev_addr="$1" rev_block="$2" ent_addr="$3" ent_block="$4" rec_addr="$5" rec_block="$6"
   echo "==> generating $DEV_JSON"
   cat >"$DEV_JSON" <<EOF
 {
@@ -201,6 +203,11 @@ generate_dev_json() {
       "address": "${ent_addr}",
       "deployer": "${ANVIL_ACCT0_ADDR}",
       "deploy_block": ${ent_block}
+    },
+    "RecoveryV1": {
+      "address": "${rec_addr}",
+      "deployer": "${ANVIL_ACCT0_ADDR}",
+      "deploy_block": ${rec_block}
     }
   }
 }
@@ -241,10 +248,12 @@ do_setup() {
   start_anvil
   deploy_one "DeployRevisionLogV1"
   deploy_one "DeployEntitlementRegistry"
-  local rev ent
+  deploy_one "DeployRecoveryV1"
+  local rev ent rec
   rev="$(parse_deploy "DeployRevisionLogV1" "RevisionLogV1")"
   ent="$(parse_deploy "DeployEntitlementRegistry" "EntitlementRegistry")"
-  generate_dev_json ${rev} ${ent}
+  rec="$(parse_deploy "DeployRecoveryV1" "RecoveryV1")"
+  generate_dev_json ${rev} ${ent} ${rec}
   fund_test_wallet
   echo "==> setup complete"
 }
@@ -284,6 +293,18 @@ do_run() {
     cargo test -p pangolin-store --features test-utilities \
       --test pull_live \
       live_pull_once_against_d017_advances_checkpoint \
+      -- --ignored --nocapture
+
+  # issue #103 RecoveryV1 lifecycle (the centerpiece — L10). The
+  # recovering wallet is the same [0x42;32] seed fund_test_wallet
+  # funded; it self-bootstraps as authority + pays gas for all five
+  # lifecycle txs. Guardians sign off-chain (no funding needed). cast
+  # must be on PATH (the test invokes evm_increaseTime / evm_mine for
+  # the 72h time-warp).
+  PANGOLIN_CHAIN_ENV=dev \
+  BASE_SEPOLIA_RPC_URL="$RPC_URL" \
+    cargo test -p pangolin-chain --features integration-tests --lib \
+      recovery_lifecycle_against_anvil \
       -- --ignored --nocapture
 
   echo "==> all in-scope tests passed against anvil"
