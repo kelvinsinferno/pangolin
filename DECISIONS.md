@@ -1636,3 +1636,13 @@ Resolved chain-client decisions (on plan-gate recommendation): **R-where** new `
 **Load-bearing invariants:** L2 merkle byte-identity (mismatch = guardians can never approve = total liveness break) + L3 EIP-712 digest byte-identity (mismatch = every approval reverts) — both the env-quirk #14 silent-and-total class, gated by the anvil time-warp lifecycle test (L10). L5 no guardian secret / VDK touched in #103. L7 chain-no-store. L9 zero new deps. Forge/Cargo gates per the chain-client cycles.
 
 **Concurrent:** Workstream B (escrow crypto) plan-gate spun up in parallel (Kelvin 2026-05-20), starting with a whitepaper-alignment read of the recovery scheme.
+
+### #104 Workstream B — BUILD GO (option A) + primitive-first split (2026-05-20)
+
+Kelvin 2026-05-20: **option A — build now** on the vetted-library design; NO external pre-opinion first (he can't afford an external audit soon). The in-house adversarial audit is therefore the ONLY review before testnet. The **D-011 external audit stays a HARD pre-MAINNET gate**; the entire recovery system (RecoveryV1 #102 + #103 client + #104 escrow) is **TESTNET-ONLY until it clears** — do NOT mainnet-deploy recovery without the external audit.
+
+**Build structure — primitive-first (2 stages):**
+- **#104a (build now):** the threshold-crypto PRIMITIVE in `pangolin-crypto` — the `RecoveryWrapKey` type, `vsss-rs` Gf256 Shamir split/reconstruct, `crypto_box` sealed-share encrypt/decrypt, the `WrappedVdk_recovery` second-wrap, with the L1/L2/L5/L6/L8 properties + exhaustive hermetic tests (KAT, < t reveals nothing, byte-identical round-trip, domain-sep negatives, proptest). The catastrophic-if-wrong core; its own focused in-house audit.
+- **#104b (after #104a audited+merged):** orchestration — `pangolin-core::recovery` (onboard split+seal+distribute; recover reconstruct+unwrap+re-wrap+re-distribute), `pangolin-store` persistence (`WrappedVdk_recovery` + guardian X25519 pubkeys in vault meta), the Q-d new-password-on-recovery in `vault.rs`, and the coupled anvil E2E tying to #103.
+
+**Libraries (LOCKED):** `vsss-rs` 5.4 (`default-features=false`, Gf256 constant-time GF(2^8)) — MANDATORY `cargo tree -p pangolin-crypto | grep -ci serde == 0` build-time check (default features pull serde); `crypto_box` 0.9 (`default-features=false`, `features=["seal","alloc","rand_core"]`, Cure53-audited). Both Apache/MIT, RustCrypto/dalek ecosystem. Each new dep clears `cargo deny`/`cargo audit` (L9).
