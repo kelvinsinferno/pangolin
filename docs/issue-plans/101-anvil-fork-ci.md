@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 # Issue #101 — anvil-fork CI harness (plan-gate DRAFT)
 
-**Status: LOCKED — Kelvin sign-off 2026-05-20. Resolved decisions R-a..R-e in DECISIONS.md (Issue #101).**
+**Status: LOCKED + amended 2026-05-20 (scoped Dev signing chain-id; see DECISIONS.md #101 amendment). BaseSepolia signing byte-identical.**
 **Base tip: `c4c51aa` (main; MVP-2 + pre-MVP-3 cleanup batch complete). MVP-3 foundation issue.**
 
 ## Why
