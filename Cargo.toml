@@ -36,6 +36,45 @@ zeroize           = { version = "=1.8.2", default-features = false, features = [
 subtle            = { version = "=2.6.1", default-features = false }
 rand_core         = { version = "=0.6.4", default-features = false, features = ["getrandom"] }
 static_assertions = "=1.1.0"
+# #104a guardian-escrow / threshold-VDK-recovery primitive. Both deps are
+# RustCrypto/dalek-ecosystem, Apache-2.0 OR MIT, and are added with
+# `default-features = false` SPECIFICALLY so that vsss-rs's serde-gated
+# default features do NOT pull serde into `pangolin-crypto` (HIGH-1
+# zero-serde invariant — `cargo tree -p pangolin-crypto | grep -ci serde`
+# MUST stay 0; enforced by scripts/check-no-serde-in-crypto.sh).
+#   - vsss-rs 5.4 — Shamir secret sharing over the constant-time GF(2^8)
+#     Gf256 field. `features = ["alloc"]` only (NOT "std"/"serde"); the
+#     `alloc` feature is what enables Vec-based share output without the
+#     serde edge that the default feature set would add.
+#   - crypto_box 0.9.1 — libsodium-compatible X25519 sealed boxes
+#     (ephemeral-X25519 -> HSalsa20 KDF -> XSalsa20-Poly1305 AEAD).
+#     Cure53-audited (v0.7.1, no significant findings). `features =
+#     ["seal","alloc","rand_core"]`: "seal" gives the anonymous
+#     sealed-box API used to seal a Shamir share to a guardian's X25519
+#     public key; "rand_core" exposes the 0.6 RngCore-based ctor so we
+#     can drive sealing from the same OsRng chokepoint as the rest of
+#     the crate.
+# NOTE: `primitive` is REQUIRED in addition to `alloc`. vsss-rs 5.4.0's
+# `element.rs` compiles `mod biguint` under `any(feature="alloc","std")`,
+# but `biguint.rs` unconditionally `use num::...` while the `num` crate is
+# only linked by the `primitive`/`bigint` features. With `alloc` alone the
+# build fails `unresolved module num`. `primitive = ["dep:num"]` links
+# `num` (itself `default-features = false`) WITHOUT enabling `num/serde`
+# (that edge lives only in the un-enabled `serde` feature), so the
+# zero-serde invariant is preserved — verified by cargo tree. We avoid
+# `bigint` (heavier: pulls crypto-bigint) since the Gf256 path only needs
+# `num` for the small-field biguint helper module to compile.
+vsss-rs           = { version = "=5.4.0", default-features = false, features = ["alloc", "primitive"] }
+# NOTE: `salsa20` is REQUIRED in addition to `seal`. crypto_box 0.9.1's
+# `seal` feature declares `dep:blake2` + `alloc` but NOT `salsa20`, yet the
+# sealed-box code references `SalsaBox` (the XSalsa20-Poly1305 cipher the
+# libsodium sealed_box uses) which is gated behind `salsa20`. Without it the
+# build fails `unresolved import crate::SalsaBox`. The crate's DEFAULT
+# features include `salsa20`, masking the gap; since we disable defaults we
+# must opt in explicitly. `salsa20` pulls `dep:salsa20` +
+# `crypto_secretbox/salsa20` only — NO serde edge (serde stays behind the
+# separate, un-enabled `serde`/`serdect` feature).
+crypto_box        = { version = "=0.9.1", default-features = false, features = ["seal", "salsa20", "alloc", "rand_core"] }
 
 # Storage primitives for `pangolin-store` (P2). `rusqlite` ships SQLite
 # vendored via the `bundled` feature so no system dependency drift is

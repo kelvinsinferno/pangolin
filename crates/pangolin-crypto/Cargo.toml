@@ -39,6 +39,12 @@ zeroize           = { workspace = true }
 subtle            = { workspace = true }
 rand_core         = { workspace = true }
 static_assertions = { workspace = true }
+# #104a threshold-escrow primitive deps. default-features=false on both
+# (see workspace [dependencies] rationale) — vsss-rs's serde is gated
+# behind its DEFAULT features, so disabling them keeps HIGH-1 (zero
+# serde in pangolin-crypto's tree) intact.
+vsss-rs           = { workspace = true }
+crypto_box        = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

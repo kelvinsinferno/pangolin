@@ -322,6 +322,55 @@ impl WrappedVdk {
         })
     }
 
+    /// Crate-internal seal keyed directly by a pre-derived [`AeadKey`].
+    ///
+    /// Identical to [`Self::seal_under`] except the wrap key is supplied
+    /// rather than derived from an [`AuthorityKey`]. Used by the recovery
+    /// escrow path ([`crate::escrow::wrap_vdk_under_rwk`]), which derives
+    /// its wrap key from a [`crate::escrow::RecoveryWrapKey`] via the
+    /// versioned `pangolin-recovery-wrap-v0` HKDF info. Always pulls a
+    /// fresh nonce from `OsRng`.
+    pub(crate) fn seal_under_key(
+        vdk: &VdkKey,
+        wrap_key: &AeadKey,
+        ctx: &WrapContext,
+    ) -> Result<Self, AeadError> {
+        let nonce = Nonce::random_with(&mut OsRng);
+        let vdk_bytes = vdk.expose_aead_bytes();
+        let aad = ctx.encode();
+        let ciphertext = wrap_key.seal(&nonce, &*vdk_bytes, &aad)?;
+        Ok(Self {
+            ciphertext,
+            nonce,
+            ctx: *ctx,
+        })
+    }
+
+    /// Crate-internal unwrap keyed directly by a pre-derived [`AeadKey`].
+    ///
+    /// Peer of [`Self::seal_under_key`]; mirrors [`Self::unwrap_with`] but
+    /// takes the wrap key and the (possibly migrated) context explicitly.
+    /// The recovery escrow path passes the wrapper's own stored context so
+    /// the same AAD binds; a mismatched context yields
+    /// [`AeadError::Tampered`].
+    pub(crate) fn open_with_key(
+        &self,
+        wrap_key: &AeadKey,
+        ctx: &WrapContext,
+    ) -> Result<VdkKey, AeadError> {
+        let aad = ctx.encode();
+        let plaintext = wrap_key.open(&self.nonce, &self.ciphertext, &aad)?;
+        if plaintext.len() != KEY_LEN {
+            return Err(AeadError::Tampered);
+        }
+        let mut buf = [0u8; KEY_LEN];
+        buf.copy_from_slice(&plaintext);
+        let _wiped = Zeroizing::new(plaintext);
+        Ok(VdkKey {
+            inner: AeadKey::from_bytes(buf),
+        })
+    }
+
     /// Unwraps this `WrappedVdk` using the supplied authority.
     ///
     /// The vault binding stored on the wrapper is fed back into the
