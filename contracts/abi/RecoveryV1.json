@@ -1,0 +1,705 @@
+[
+  {
+    "type": "constructor",
+    "inputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "DOMAIN_SEPARATOR",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MAX_GUARDIANS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MAX_KNOWN_SCHEMA_VERSION",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint16",
+        "internalType": "uint16"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MAX_THRESHOLD",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MIN_DELAY",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MIN_GUARDIANS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MIN_THRESHOLD",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "approveRecovery",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "guardian",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "proof",
+        "type": "bytes32[]",
+        "internalType": "bytes32[]"
+      },
+      {
+        "name": "expiresAt",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "schemaVersion",
+        "type": "uint16",
+        "internalType": "uint16"
+      },
+      {
+        "name": "signature",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "cancelRecovery",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "schemaVersion",
+        "type": "uint16",
+        "internalType": "uint16"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "finalizeRecovery",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "schemaVersion",
+        "type": "uint16",
+        "internalType": "uint16"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "guardianSet",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "root",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "threshold",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "guardianCount",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "initialized",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "hasApproved",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "attemptNonce",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "guardian",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "hashApprove",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "proposedAuthority",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "attemptNonce",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "expiresAt",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "schemaVersion",
+        "type": "uint16",
+        "internalType": "uint16"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "hashCancel",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "attemptNonce",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "schemaVersion",
+        "type": "uint16",
+        "internalType": "uint16"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "hashInitiate",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "proposedAuthority",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "attemptNonce",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "schemaVersion",
+        "type": "uint16",
+        "internalType": "uint16"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "initiateRecovery",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "proposedAuthority",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "schemaVersion",
+        "type": "uint16",
+        "internalType": "uint16"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "recovery",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "proposedAuthority",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "initiatedAt",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "attemptNonce",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "approvals",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "status",
+        "type": "uint8",
+        "internalType": "enum RecoveryV1.Status"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "setGuardianSet",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "root",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "threshold",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "guardianCount",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "schemaVersion",
+        "type": "uint16",
+        "internalType": "uint16"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "vaultAuthority",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "event",
+    "name": "GuardianSetInitialized",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "root",
+        "type": "bytes32",
+        "indexed": false,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "threshold",
+        "type": "uint8",
+        "indexed": false,
+        "internalType": "uint8"
+      },
+      {
+        "name": "guardianCount",
+        "type": "uint8",
+        "indexed": false,
+        "internalType": "uint8"
+      },
+      {
+        "name": "initialAuthority",
+        "type": "address",
+        "indexed": false,
+        "internalType": "address"
+      },
+      {
+        "name": "schemaVersion",
+        "type": "uint16",
+        "indexed": false,
+        "internalType": "uint16"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "RecoveryApproved",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "attemptNonce",
+        "type": "uint64",
+        "indexed": true,
+        "internalType": "uint64"
+      },
+      {
+        "name": "guardian",
+        "type": "address",
+        "indexed": false,
+        "internalType": "address"
+      },
+      {
+        "name": "approvals",
+        "type": "uint8",
+        "indexed": false,
+        "internalType": "uint8"
+      },
+      {
+        "name": "schemaVersion",
+        "type": "uint16",
+        "indexed": false,
+        "internalType": "uint16"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "RecoveryCanceled",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "attemptNonce",
+        "type": "uint64",
+        "indexed": true,
+        "internalType": "uint64"
+      },
+      {
+        "name": "schemaVersion",
+        "type": "uint16",
+        "indexed": false,
+        "internalType": "uint16"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "RecoveryFinalized",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "attemptNonce",
+        "type": "uint64",
+        "indexed": true,
+        "internalType": "uint64"
+      },
+      {
+        "name": "oldAuthority",
+        "type": "address",
+        "indexed": false,
+        "internalType": "address"
+      },
+      {
+        "name": "newAuthority",
+        "type": "address",
+        "indexed": false,
+        "internalType": "address"
+      },
+      {
+        "name": "schemaVersion",
+        "type": "uint16",
+        "indexed": false,
+        "internalType": "uint16"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "RecoveryInitiated",
+    "inputs": [
+      {
+        "name": "vaultId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "attemptNonce",
+        "type": "uint64",
+        "indexed": true,
+        "internalType": "uint64"
+      },
+      {
+        "name": "proposedAuthority",
+        "type": "address",
+        "indexed": false,
+        "internalType": "address"
+      },
+      {
+        "name": "initiatedAt",
+        "type": "uint64",
+        "indexed": false,
+        "internalType": "uint64"
+      },
+      {
+        "name": "schemaVersion",
+        "type": "uint16",
+        "indexed": false,
+        "internalType": "uint16"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "error",
+    "name": "ErrApprovalExpired",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ErrDelayNotElapsed",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ErrDuplicateApproval",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ErrGuardianCountOutOfBounds",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ErrGuardianSetAlreadyInitialized",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ErrGuardianSetNotInitialized",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ErrInvalidMerkleProof",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ErrInvalidSignature",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ErrNoActiveRecovery",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ErrNotAuthorizedToCancel",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ErrRecoveryAlreadyPending",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ErrThresholdNotMet",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ErrThresholdOutOfBounds",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ErrUnsupportedSchemaVersion",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ErrZeroValue",
+    "inputs": []
+  }
+]

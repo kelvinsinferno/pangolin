@@ -130,6 +130,15 @@ jobs:
           PAYMENT_AUTHORITY: "0x0000000000000000000000000000000000000001"
           REDEMPTION_AUTHORITY: "0x0000000000000000000000000000000000000002"
         run: forge script script/DeployEntitlementRegistry.s.sol --sig "run()" --tc DeployEntitlementRegistry
+      # MVP-3 issue #102: same dry-run for RecoveryV1. Same audit-gap-7
+      # rationale — catches a regression in the script (bad import,
+      # vm.startBroadcast misuse) at build time. RecoveryV1 has NO
+      # constructor args (no signer authorities), so no env vars are
+      # needed. Per docs/issue-plans/102-recovery-v1-contract.md L14 the
+      # testnet deploy is a follow-on + mainnet is external-audit-gated
+      # (D-011); this step only gates that the script compiles + dry-runs.
+      - name: forge script (deploy recovery-v1 dry-run)
+        run: forge script script/DeployRecoveryV1.s.sol --sig "run()" --tc DeployRecoveryV1
       # MVP-2 issue 2.3: smoke-test the deploy-wrapper script
       # (scripts/deploy-contracts.sh) in dry-run mode against the dev
       # environment. Catches regressions in the wrapper itself — flag
@@ -272,6 +281,17 @@ jobs:
             echo "::error::Re-run: cd contracts && forge build && python3 -c \"import json; d=json.load(open('out/EntitlementRegistry.sol/EntitlementRegistry.json')); f=open('abi/EntitlementRegistry.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()\""
             exit 1
           fi
+      # MVP-3 issue #102: same ABI-drift discipline for RecoveryV1.
+      - name: Extract freshly built ABI (recovery-v1)
+        run: |
+          python3 -c "import json; d=json.load(open('out/RecoveryV1.sol/RecoveryV1.json')); f=open('/tmp/RecoveryV1.fresh.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()"
+      - name: Diff committed recovery-v1 ABI against fresh ABI
+        run: |
+          if ! diff -u abi/RecoveryV1.json /tmp/RecoveryV1.fresh.json; then
+            echo "::error::ABI drift detected between contracts/abi/RecoveryV1.json and forge build output."
+            echo "::error::Re-run: cd contracts && forge build && python3 -c \"import json; d=json.load(open('out/RecoveryV1.sol/RecoveryV1.json')); f=open('abi/RecoveryV1.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()\""
+            exit 1
+          fi
 
   contracts-slither:
     name: contracts / slither
@@ -319,6 +339,12 @@ jobs:
       # docs/issue-plans/2.2.md success criterion.
       - name: slither (entitlement-registry)
         run: slither src/EntitlementRegistry.sol --fail-high
+      # MVP-3 issue #102: same slither posture for RecoveryV1. Zero
+      # high-severity findings required per
+      # docs/issue-plans/102-recovery-v1-contract.md (the highest-risk
+      # EPIC; external-audit-gated before mainnet per D-011).
+      - name: slither (recovery-v1)
+        run: slither src/RecoveryV1.sol --fail-high
 
   # -----------------------------------------------------------------
   # P1-6: Rust supply-chain hardening
