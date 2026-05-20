@@ -1557,3 +1557,13 @@ Last item in the pre-MVP-3 cleanup batch (5/5). Wires the 4 surface-locked FFI s
 **L1..L10 invariants:** L1 no secret crosses FFI (HARD); L2 engine methods unchanged; L3 frozen wire shape additively amended only; L4 active-session gate at the FFI boundary; L5 `forbid(unsafe_code)` except pangolin-ffi; L6 HIGH-1 + Q3 + L7 preserved; L7 AGPL SPDX; L8 `ChainEnv` hardcoded BaseSepolia (not crossed); L9 no new `=`-pinned dep without advisories+audit (env-quirk #15); L10 §16 ledger + `git merge --no-ff`.
 
 **Deferred follow-ups:** mainnet `ChainEnv` over FFI; keystore-file gas wallet over FFI (deferred indefinitely per R-b); direct-WS-transport wrapper (#99 follow-up); host-side indexer-spawn handshake (separate MVP-3 host-shell cycle); anvil-fork CI integration (own cycle).
+
+### #100 amendment — L2 relaxed for an additive chain-adapter constructor (Kelvin sign-off 2026-05-20)
+
+The builder hit a verified L2 blocker: R-b requires the flush + lock-with-drain bindings to build a signer-bearing `BaseSepoliaAdapter` from the vault's engine-side wallet, but `BaseSepoliaAdapter` had NO production-reachable public constructor that accepts a ready signer — `new_with_keystore` needs a password (violates L1), `new_with_device_key` needs a `&DeviceKey` whose accessors are `#[cfg(test/test-utilities)]`-only, and `with_signer` is private. `Vault::evm_wallet().signer()` IS public + production-reachable (the exact gas wallet R-b wants), but there was no door to hand it to the adapter.
+
+**Decision (Option 1):** relax L2 to permit ONE minimal **additive** engine change — add `BaseSepoliaAdapter::new_with_signer(rpc_url, &Path, PrivateKeySigner)` to `pangolin-chain` (delegates to the existing private `with_signer`; ~6 LoC). The flush/lock-with-drain bindings feed it `vault.evm_wallet().signer().clone()`. **L1 preserved:** the signer is sourced engine-side from the unlocked vault and NEVER crosses the FFI boundary; the host still passes only `FfiChainConfig`. L2's spirit (no change to existing tested engine *methods/behavior*) is preserved — this is a sibling constructor, additive only. The adversarial audit MUST scrutinize the new constructor for signer-handling (no leak, no log, no unexpected retention).
+
+**R-e amendment:** `Vault::pull_once` hardcodes `SyncOptions::default()` and takes no options arg, so `prefer_websocket` cannot be forwarded without a further engine change. Per the existing DECISIONS "Forward-compat note for MVP-3," `prefer_websocket` stays a slot on `FfiChainConfig` but is **accepted-but-not-forwarded** on the pull path for now (documented no-op; wiring it through `pull_once` is a deferred follow-up). No additional scope this cycle.
+
+All four stubs still ship in #100.
