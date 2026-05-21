@@ -33,7 +33,7 @@
 use pangolin_crypto::aead::{AeadKey, Ciphertext, Nonce, NONCE_LEN};
 use pangolin_crypto::escrow::{SealedShare, WrappedVdkRecovery, EPOCH_LEN, X25519_KEY_LEN};
 use pangolin_crypto::keys::{WrapContext, WrappedVdk, VAULT_ID_LEN};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::error::{Result, StoreError};
 
@@ -126,7 +126,16 @@ pub struct GuardianRecord<'a> {
     pub sealed_share: &'a SealedShare,
 }
 
-/// Persist (or replace) the full recovery-escrow state in one transaction.
+/// Persist (or replace) the full recovery-escrow state through a
+/// caller-owned transaction — the atomic-composition primitive.
+///
+/// This does the SAME writes as [`write_recovery_escrow`] but on a
+/// **borrowed** [`Transaction`] the caller opened and will commit (or roll
+/// back) itself. It exists so a higher-level operation can persist the
+/// escrow + ANOTHER write (the recovery new-password meta re-wrap, #105a /
+/// L2) in ONE atomic boundary: a crash before the caller's single
+/// `tx.commit()` rolls BOTH back, so disk never holds a post-recovery
+/// daily wrap beside a pre-recovery (OLD-RWK) escrow generation.
 ///
 /// The single-row `recovery_escrow` table holds the wrapper + `t`/`M` +
 /// epoch as plain BLOBs (non-secret, L9). Each guardian's sealed-share
@@ -141,14 +150,16 @@ pub struct GuardianRecord<'a> {
 /// # Errors
 ///
 /// [`StoreError::Sqlite`] on a DB error; [`StoreError`] from the AEAD seal
-/// (collapsed to an internal/auth error) if double-wrapping fails.
+/// (collapsed to an internal/auth error) if double-wrapping fails. On any
+/// error the caller's still-uncommitted transaction rolls the partial
+/// writes back on `Drop`.
 // The recovery-escrow row is a flat record (wrapper + t/M + epoch + the
 // keying material); bundling it into a struct would only move the same
 // fields behind one indirection without improving the call site, so the
 // faithful persistence signature keeps the columns as explicit arguments.
 #[allow(clippy::too_many_arguments)]
-pub fn write_recovery_escrow(
-    conn: &Connection,
+pub fn write_recovery_escrow_tx(
+    tx: &Transaction<'_>,
     vault_id: &[u8; VAULT_ID_LEN],
     vdk_aead: &AeadKey,
     wrapped_recovery: &WrappedVdkRecovery,
@@ -164,7 +175,6 @@ pub fn write_recovery_escrow(
     let epoch_i = i64::try_from(epoch)
         .map_err(|_| StoreError::Corrupted("recovery_escrow.epoch overflows i64".into()))?;
 
-    let tx = conn.unchecked_transaction()?;
     tx.execute(
         "INSERT OR REPLACE INTO recovery_escrow
             (id, wrapped_ct, wrapped_nonce, wrap_schema_version,
@@ -201,6 +211,46 @@ pub fn write_recovery_escrow(
             ],
         )?;
     }
+    Ok(())
+}
+
+/// Persist (or replace) the full recovery-escrow state in one transaction.
+///
+/// Thin wrapper around [`write_recovery_escrow_tx`]: opens a single
+/// `unchecked_transaction()`, runs the writes on it, and commits once. For
+/// the standalone forward-security re-split when no other write needs to
+/// be coupled into the same atomic boundary (the #104b callers). When the
+/// escrow write MUST be atomic with the recovery new-password meta re-wrap,
+/// use [`write_recovery_escrow_tx`] under a shared transaction instead
+/// (see `Vault::commit_recovery_rekey`, #105a).
+///
+/// # Errors
+///
+/// [`StoreError::Sqlite`] on a DB error; [`StoreError`] from the AEAD seal
+/// (collapsed to an internal/auth error) if double-wrapping fails. On any
+/// error the un-committed transaction rolls the partial writes back.
+#[allow(clippy::too_many_arguments)]
+pub fn write_recovery_escrow(
+    conn: &Connection,
+    vault_id: &[u8; VAULT_ID_LEN],
+    vdk_aead: &AeadKey,
+    wrapped_recovery: &WrappedVdkRecovery,
+    threshold: u8,
+    guardian_count: u8,
+    epoch: u64,
+    guardians: &[GuardianRecord<'_>],
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    write_recovery_escrow_tx(
+        &tx,
+        vault_id,
+        vdk_aead,
+        wrapped_recovery,
+        threshold,
+        guardian_count,
+        epoch,
+        guardians,
+    )?;
     tx.commit()?;
     Ok(())
 }
