@@ -662,6 +662,33 @@ impl VdkKey {
         let bytes = self.inner.expose_bytes_for_keys();
         Zeroizing::new(*bytes)
     }
+
+    /// Crate-internal accessor exposing a heap-allocated, zeroizing copy of
+    /// the raw 32-byte VDK bytes.
+    ///
+    /// Used **only** by [`crate::pairing::seal_vdk_to_device`] to feed the
+    /// VDK into the #104a `crypto_box` sealed-box plaintext, mirroring how
+    /// [`WrappedVdk::seal_under`] feeds the VDK into the AEAD wrap. The
+    /// returned buffer wipes itself on drop; callers must pass it straight
+    /// into the seal without copying it into a non-zeroizing buffer. Not
+    /// exposed to consumers of the crate.
+    pub(crate) fn expose_vdk_bytes(&self) -> Zeroizing<[u8; KEY_LEN]> {
+        self.expose_aead_bytes()
+    }
+
+    /// Crate-internal constructor wrapping recovered 32-byte VDK bytes.
+    ///
+    /// Used **only** by [`crate::pairing::open_vdk_from_pairing`] to
+    /// reconstruct the byte-identical VDK after opening a
+    /// [`crate::pairing::SealedVdkForDevice`], mirroring how
+    /// [`WrappedVdk::open_with_key`] reconstructs the VDK from decrypted
+    /// plaintext. The caller's array is moved into [`AeadKey::from_bytes`],
+    /// which zeroes the stack copy. Not exposed to consumers of the crate.
+    pub(crate) fn from_aead_bytes(bytes: [u8; KEY_LEN]) -> Self {
+        Self {
+            inner: AeadKey::from_bytes(bytes),
+        }
+    }
 }
 
 #[cfg(test)]
