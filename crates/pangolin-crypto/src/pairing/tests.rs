@@ -476,17 +476,10 @@ fn pairing_and_wrap_keys_are_independent() {
 // =========================================================================
 // 6. Secret hygiene (compile-time + Debug redaction)
 // =========================================================================
-
-/// `assert_not_impl_any!(X25519PairingKey: Clone, Copy)` lives at the top of
-/// `pairing.rs` and fires at compile time. This is a documentation marker
-/// that the secret-bearing type is gated.
-#[test]
-fn secret_type_discipline_present() {
-    // Compile-time guarantee: the real assertion is
-    //   assert_not_impl_any!(X25519PairingKey: Clone, Copy);
-    // in pairing.rs. There is no serde in the crate's dep tree (deny.toml +
-    // check-no-serde-in-crypto.sh), so no Serialize impl is expressible.
-}
+//
+// Secret-type discipline for `X25519PairingKey` (!Clone/!Copy) is enforced at
+// compile time by `assert_not_impl_any!(X25519PairingKey: Clone, Copy)` at the
+// top of `pairing.rs` (the escrow.rs precedent); no runtime test wraps it.
 
 /// `Debug` on the pairing key redacts the secret scalar and shows only a
 /// public preview; the raw scalar bytes never appear.
