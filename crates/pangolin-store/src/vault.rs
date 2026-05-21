@@ -70,6 +70,7 @@ use crate::session::{
     next_idle_deadline, AuthError, Clock, IdentityProof, PresenceProof, SessionDuration,
     SessionState, SystemClock, PRESENCE_FRESHNESS,
 };
+use crate::vdk_chain;
 
 // ---------------------------------------------------------------------
 // P4 audit M-3: compile-time thread-safety contract for `Vault`.
@@ -468,6 +469,15 @@ impl Drop for UmaskGuard {
 
 struct ActiveState {
     vdk: VdkKey,
+    /// **MVP-3 issue #106b-2.** The retained-old-epoch VDK chain (plan
+    /// §3.1). After a device-revoke rotation, `vdk` is the CURRENT epoch's
+    /// VDK (new writes) and this chain holds every RETAINED OLD-epoch VDK
+    /// so a surviving device decrypts PRE-rotation entries under
+    /// `chain.aead_for_epoch(entry.vdk_epoch)`. EMPTY for an unrotated /
+    /// legacy vault (every entry is the current epoch 0 -> `vdk`). Built on
+    /// `unlock` under the password authority; drops (zeroizing every
+    /// retained VDK) on every session-teardown path alongside `vdk`.
+    chain: crate::vdk_chain::VdkChain,
     cache: DecryptedCache,
     /// MVP-1 issue 1.3: the `:memory:` FTS5 search index over the
     /// non-secret searchable projection of every live account. Built
@@ -980,10 +990,20 @@ impl Vault {
         drop(password);
 
         // Step 5: AEAD verification. Failure here is the wrong-password
-        // path (or tampered meta — same outcome by design).
+        // path (or tampered meta — same outcome by design). `meta` always
+        // holds the CURRENT epoch's VDK (#106b-2: a rotation re-writes the
+        // meta anchor under the new-password authority), so this unwrap
+        // recovers the current-epoch VDK exactly as for an unrotated vault.
         let wrapped = self.meta.wrapped_vdk();
         let vdk = wrapped.unwrap_with(&authority)?;
-        // Authority was only needed to unwrap; drop immediately.
+
+        // Step 5b (MVP-3 issue #106b-2): build the retained-old-epoch VDK
+        // chain under the SAME password authority (plan §3.1). Empty for an
+        // unrotated / legacy vault. The authority is dropped right after so
+        // its bytes zeroize at the earliest opportunity.
+        let chain =
+            vdk_chain::VdkChain::build_on_unlock(&self.conn, &self.meta.vault_id, &authority)?;
+        // Authority was only needed to unwrap the current + retained VDKs.
         drop(authority);
 
         // Step 6: rebuild the decrypted cache AND the `:memory:` FTS5
@@ -991,9 +1011,12 @@ impl Vault {
         // The index is RAM-only and rebuilt fresh on every unlock, so an
         // interrupted sync can never desync it persistently; V0-format
         // and 1.2-V1-format vaults alike get a working index here
-        // regardless of blob version (the decrypt is V1-aware).
+        // regardless of blob version (the decrypt is V1-aware). Each entry
+        // is decrypted under `chain[entry.vdk_epoch]` (#106b-2 Q-a) —
+        // current-epoch entries under `vdk`, retained-epoch entries under
+        // the chain.
         let (cache, search_index, requires_upgrade) =
-            build_active_state_data(&self.conn, &self.meta, vdk.aead_key())?;
+            build_active_state_data(&self.conn, &self.meta, vdk.aead_key(), &chain)?;
 
         // Step 6b (MVP-1 issue 1.5): register-on-first-unlock /
         // load-on-subsequent-unlock for the device identity. Needs the
@@ -1074,6 +1097,7 @@ impl Vault {
         // seamless"; §8.6 dedup).
         self.active = Some(ActiveState {
             vdk,
+            chain,
             cache,
             search_index,
             // L1 audit fix-pass: `evm_wallet` is declared BEFORE
@@ -1349,6 +1373,213 @@ impl Vault {
         self.active = None;
         self.session_state = SessionState::Locked;
         Ok(())
+    }
+
+    /// **MVP-3 issue #106b-2: the ATOMIC VDK-rotation-on-revoke commit
+    /// (L4 — LOAD-BEARING).** Persist the FRESH (post-revoke) VDK epoch +
+    /// the re-pointed guardian escrow + the demoted OLD epoch into the VDK
+    /// chain + the advanced epoch pointer, ALL in ONE transaction —
+    /// mirroring [`Self::commit_recovery_rekey`]'s single-tx discipline
+    /// (#105a). A crash mid-rotation rolls EVERYTHING back: the vault stays
+    /// on the OLD epoch (fully functional; the rotation is safely
+    /// retryable), never half-rotated.
+    ///
+    /// ## What it writes (ONE `unchecked_transaction()`)
+    ///
+    /// 1. **The new-epoch PASSWORD ANCHOR** of the FRESH VDK, under an
+    ///    [`AuthorityKey`] freshly derived from the re-prompted master
+    ///    `new_password` (PROMPT-on-revoke, §0a — the anchor is ALWAYS
+    ///    current after a rotation, no anchor-behind-current-epoch window).
+    ///    Written into the `meta` row, so the CURRENT epoch's VDK is the
+    ///    meta VDK exactly as for an unrotated vault.
+    /// 2. **The demoted OLD epoch** into the `vdk_chain` table: the OLD
+    ///    (pre-revoke) VDK wrapped under the SAME new-password authority
+    ///    (so one unlock re-derivation opens every epoch) AND under the
+    ///    LOCAL device key — so a surviving device decrypts PRE-rotation
+    ///    entries (L3), and the `vdk_chain_state.current_epoch` pointer
+    ///    advances to the new epoch.
+    /// 3. **The re-pointed escrow** ([`recovery_escrow::write_recovery_escrow_tx`],
+    ///    REUSED verbatim, #104b re-split): the FRESH `WrappedVdkRecovery`
+    ///    and guardians under the NEW VDK's column-AEAD, REPLACING the prior
+    ///    generation (the old guardian rows are `DELETE`d) so a future
+    ///    guardian recovery restores the NEW VDK, not the dead old one
+    ///    (L2/L8). The double-wrap is keyed by the NEW VDK's column-AEAD
+    ///    (`new_vdk.aead_key()`), sourced engine-side.
+    ///
+    /// On any error before the single `tx.commit()`, the un-committed
+    /// transaction's `Drop` rolls ALL of it back (L4). In-memory state is
+    /// updated ONLY after a successful commit. The vault is left `Locked`;
+    /// the caller unlocks with the new password afterward (and the
+    /// surviving devices that synced the seal re-wrap under their own
+    /// device keys).
+    ///
+    /// ## Parameters (store-local; the FFI surface is a later issue)
+    ///
+    /// The caller obtains these from
+    /// `pangolin_core::rotation::rotate_vdk_for_survivors`'s
+    /// [`RotationArtifacts`]: `new_vdk` (consumed + dropped after commit;
+    /// the ONE legitimate `VdkKey::generate` re-create, gated to revoke,
+    /// L9), `new_epoch` (the bumped shared epoch), and the `re_split`
+    /// (`OnboardingArtifacts`) decomposed exactly as `commit_recovery_rekey`
+    /// takes it. `old_vdk` is the CURRENTLY-active VDK (the pre-revoke
+    /// epoch's key) the caller pulls from the active session;
+    /// `local_device` is this device's [`DeviceKey`] (for the OLD epoch's
+    /// device-wrap retention).
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::AuthenticationFailed` if the KDF / wrap / sealed-share
+    /// double-wrap fails (indistinguishability); `StoreError::Sqlite` on a
+    /// DB error; `StoreError::Corrupted` if an epoch overflows the on-disk
+    /// encoding. On any error nothing is committed (L4 rollback).
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_vdk_rotation(
+        &mut self,
+        new_vdk: VdkKey,
+        old_vdk: &VdkKey,
+        local_device: &DeviceKey,
+        new_password: &SecretBytes,
+        new_epoch: u64,
+        re_split_wrapped_recovery: &WrappedVdkRecovery,
+        re_split_threshold: u8,
+        re_split_guardian_count: u8,
+        re_split_epoch: u64,
+        re_split_guardians: &[GuardianRecord<'_>],
+    ) -> Result<()> {
+        let current_epoch = vdk_chain::read_current_epoch(&self.conn)?;
+
+        // Derive the new-password authority ONCE; it wraps BOTH the new
+        // epoch's VDK (meta anchor) AND the demoted old epoch's VDK
+        // (retained chain anchor), so a single unlock re-derivation opens
+        // every epoch. Fresh salt -> the wrap keys are a function of the
+        // new password alone.
+        let salt = KdfSalt::random();
+        let params = KdfParams::RECOMMENDED;
+        let seed = kdf::derive_seed(new_password, &salt, &params)?;
+        let new_authority = AuthorityKey::from_seed(*seed);
+        let wrap_ctx = WrapContext::new(self.meta.vault_id);
+
+        // New-epoch password anchor of the FRESH VDK (prompt-on-revoke).
+        let new_wrapped = new_vdk.wrap(&new_authority, &wrap_ctx)?;
+        let new_meta = VaultMeta {
+            vault_id: self.meta.vault_id,
+            created_at: self.meta.created_at,
+            kdf_params: params,
+            kdf_salt: salt,
+            wrap_context: wrap_ctx,
+            wrapped_ciphertext: new_wrapped.ciphertext().as_bytes().to_vec(),
+            wrapped_nonce: *new_wrapped.nonce().as_bytes(),
+        };
+
+        // The demoted OLD epoch's retention wrappers: the OLD VDK under the
+        // SAME new authority (so one re-derivation opens it on unlock) +
+        // under the LOCAL device key (L3 — survivor reads pre-rotation
+        // entries). Built before the tx so a KDF/wrap failure aborts
+        // cleanly with nothing written.
+        let retained_anchor = old_vdk.wrap(&new_authority, &wrap_ctx)?;
+        // The authority is no longer needed; drop it so its bytes zeroize.
+        drop(new_authority);
+        let retained_device_wrap =
+            pangolin_crypto::pairing::wrap_vdk_for_device(old_vdk, local_device, &wrap_ctx)
+                .map_err(|_| StoreError::AuthenticationFailed)?;
+
+        // ONE transaction spanning ALL rotation writes (L4). On any early
+        // return the un-committed `tx` `Drop`s with rollback semantics,
+        // undoing every partial write — so disk never holds a half-rotated
+        // vault (a new escrow generation beside stale per-epoch wraps, or a
+        // bumped pointer with no chain row, etc.).
+        let tx = self.conn.unchecked_transaction()?;
+        // (1) the new-epoch password anchor THROUGH the shared tx.
+        meta::write(&tx, &new_meta)?;
+        // (2) demote the OLD epoch into the chain + advance the pointer.
+        vdk_chain::append_retained_and_advance_tx(
+            &tx,
+            current_epoch,
+            &retained_anchor,
+            &retained_device_wrap,
+            new_epoch,
+        )?;
+        // (3) the re-pointed escrow THROUGH the SAME tx, double-wrapping
+        //     each sealed share under the NEW VDK's column-AEAD (L2/L8).
+        recovery_escrow::write_recovery_escrow_tx(
+            &tx,
+            &self.meta.vault_id,
+            new_vdk.aead_key(),
+            re_split_wrapped_recovery,
+            re_split_threshold,
+            re_split_guardian_count,
+            re_split_epoch,
+            re_split_guardians,
+        )?;
+        // (4) re-seal the LOCAL device-key seed under the NEW VDK THROUGH
+        //     the SAME tx. The seed is sealed under the VDK column-key; the
+        //     next unlock loads it under the new (current) VDK, so it MUST
+        //     be re-sealed or the post-rotation unlock cannot decrypt it.
+        //     The device-key peer of the escrow re-point — both at-rest
+        //     VDK-keyed blobs re-keyed atomically (L4).
+        device::reseal_device_key_tx(&tx, &self.meta.vault_id, new_vdk.aead_key(), local_device)?;
+        // commit ONCE — all writes land atomically or not at all.
+        tx.commit()?;
+
+        // The fresh VDK has done its job (anchor + escrow column-AEAD); drop
+        // it so its bytes zeroize. The caller re-derives the wrap authority
+        // on the next unlock.
+        drop(new_vdk);
+
+        // Update in-memory state ONLY after a successful commit (L4).
+        self.meta = new_meta;
+        self.active = None;
+        self.session_state = SessionState::Locked;
+        Ok(())
+    }
+
+    /// **Test-only (#106b-2).** Drive [`Self::commit_vdk_rotation`] reusing
+    /// the CURRENTLY-active VDK as the OLD (pre-revoke) epoch's VDK and the
+    /// active session's `DeviceKey` as the local device.
+    ///
+    /// Genuine rotation hands `commit_vdk_rotation` the FRESH VDK +
+    /// `re_split` `pangolin_core::rotation::rotate_vdk_for_survivors`
+    /// produced + the active session's OLD VDK / device key. A hermetic
+    /// vault test cannot run the full off-chain orchestration (it lives
+    /// upstream in `pangolin-core`), so this helper pulls the active VDK +
+    /// device key out and threads them in alongside a caller-built FRESH
+    /// VDK + re-split — exercising the SAME single-tx COMBINED branch (L4).
+    ///
+    /// Requires an active session (so there is an OLD VDK + device key to
+    /// reuse).
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::NotUnlocked` if no session is active; otherwise the
+    /// errors of [`Self::commit_vdk_rotation`].
+    #[cfg(any(test, feature = "test-utilities"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn __test_commit_vdk_rotation_reusing_active(
+        &mut self,
+        new_vdk: VdkKey,
+        new_password: &SecretBytes,
+        new_epoch: u64,
+        re_split_wrapped_recovery: &WrappedVdkRecovery,
+        re_split_threshold: u8,
+        re_split_guardian_count: u8,
+        re_split_epoch: u64,
+        re_split_guardians: &[GuardianRecord<'_>],
+    ) -> Result<()> {
+        let active = self.active.take().ok_or(StoreError::NotUnlocked)?;
+        let old_vdk = active.vdk;
+        let local_device = active.device_key;
+        self.commit_vdk_rotation(
+            new_vdk,
+            &old_vdk,
+            &local_device,
+            new_password,
+            new_epoch,
+            re_split_wrapped_recovery,
+            re_split_threshold,
+            re_split_guardian_count,
+            re_split_epoch,
+            re_split_guardians,
+        )
     }
 
     /// **Test-only.** Drive [`Self::recover_with_new_password`] reusing
@@ -1662,6 +1893,23 @@ impl Vault {
     }
     fn require_active_mut(&mut self) -> Result<&mut ActiveState> {
         self.active.as_mut().ok_or(StoreError::NotUnlocked)
+    }
+
+    /// **MVP-3 issue #106b-2.** The CURRENT VDK epoch a NEW revision write
+    /// must be tagged with (Q-a): the active session's chain current epoch,
+    /// or `0` for an unrotated / legacy vault (or when no session is
+    /// active — the write paths all gate on `require_active` first, so the
+    /// `0` fallback is never reached on a real write). New entries encrypt
+    /// under the active session's `vdk` (= the current epoch's VDK), so the
+    /// stamp MUST equal the current epoch; the read path then decrypts each
+    /// entry under `chain[vdk_epoch]`. As an `i64` for the rusqlite param.
+    fn current_vdk_epoch_i64(&self) -> i64 {
+        let epoch = self.active.as_ref().map_or(0, |a| a.chain.current_epoch());
+        // The epoch is a monotonic counter that in practice never exceeds
+        // i64::MAX (one rotation/sec for ~292 billion years); the column is
+        // i64 and `commit_vdk_rotation` already rejects an overflowing
+        // epoch on write, so this cast is total in practice.
+        i64::try_from(epoch).unwrap_or(i64::MAX)
     }
 
     // -----------------------------------------------------------------
@@ -2070,6 +2318,11 @@ impl Vault {
         // the vault in the pre-transaction state — the dirty marker
         // is never present without the revision row that produced it
         // (and vice versa).
+        //
+        // #106b-2: stamp the new revision with the CURRENT VDK epoch (Q-a)
+        // — it is encrypted under the active session's `vdk` (= the current
+        // epoch's VDK), so the per-entry tag MUST equal the current epoch.
+        let vdk_epoch = self.current_vdk_epoch_i64();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO account_identities (
@@ -2084,8 +2337,8 @@ impl Vault {
         tx.execute(
             "INSERT INTO revisions (
                 revision_id, account_id, parent_revision_id, device_id,
-                schema_version, created_at, enc_payload, enc_nonce, is_tombstone
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+                schema_version, created_at, enc_payload, enc_nonce, is_tombstone, vdk_epoch
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
             params![
                 revision_id.as_bytes().as_slice(),
                 account_id.as_bytes().as_slice(),
@@ -2095,6 +2348,7 @@ impl Vault {
                 now,
                 ct.as_bytes(),
                 nonce.as_bytes().as_slice(),
+                vdk_epoch,
             ],
         )?;
         tx.execute(
@@ -2221,12 +2475,15 @@ impl Vault {
 
         // P8-2: revisions + account_identities head pointer + dirty
         // marker in one transaction.
+        // #106b-2: stamp the CURRENT VDK epoch (Q-a) — encrypted under the
+        // active session's `vdk` (= current epoch's VDK).
+        let vdk_epoch = self.current_vdk_epoch_i64();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO revisions (
                 revision_id, account_id, parent_revision_id, device_id,
-                schema_version, created_at, enc_payload, enc_nonce, is_tombstone
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+                schema_version, created_at, enc_payload, enc_nonce, is_tombstone, vdk_epoch
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
             params![
                 revision_id.as_bytes().as_slice(),
                 id.as_bytes().as_slice(),
@@ -2236,6 +2493,7 @@ impl Vault {
                 now,
                 ct.as_bytes(),
                 nonce.as_bytes().as_slice(),
+                vdk_epoch,
             ],
         )?;
         tx.execute(
@@ -2330,12 +2588,15 @@ impl Vault {
         // P10 (delete) reads them off the chain like any other
         // revision; the dirty marker tracks them through the publish
         // path identically.
+        // #106b-2: stamp the CURRENT VDK epoch (Q-a) on the tombstone
+        // revision — encrypted under the active session's `vdk`.
+        let vdk_epoch = self.current_vdk_epoch_i64();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO revisions (
                 revision_id, account_id, parent_revision_id, device_id,
-                schema_version, created_at, enc_payload, enc_nonce, is_tombstone
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+                schema_version, created_at, enc_payload, enc_nonce, is_tombstone, vdk_epoch
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9)",
             params![
                 revision_id.as_bytes().as_slice(),
                 id.as_bytes().as_slice(),
@@ -2345,6 +2606,7 @@ impl Vault {
                 now,
                 ct.as_bytes(),
                 nonce.as_bytes().as_slice(),
+                vdk_epoch,
             ],
         )?;
         tx.execute(
@@ -2792,10 +3054,13 @@ impl Vault {
         // Read the chosen revision's `(parent, schema_version,
         // enc_payload, enc_nonce)` cross-checked on `account_id` so
         // a `revision_id` from a different account does NOT match.
-        let row: Option<RawRevisionPayload> = self
+        // MVP-3 issue #106b-2: also read the per-entry `vdk_epoch` tag so we
+        // decrypt this revision under `chain[vdk_epoch]` (Q-a) — the same
+        // epoch-aware selection the unlock hydration path uses.
+        let row: Option<(RawRevisionPayload, i64)> = self
             .conn
             .query_row(
-                "SELECT parent_revision_id, schema_version, enc_payload, enc_nonce
+                "SELECT parent_revision_id, schema_version, enc_payload, enc_nonce, vdk_epoch
                  FROM revisions
                  WHERE account_id = ?1 AND revision_id = ?2",
                 params![
@@ -2807,24 +3072,33 @@ impl Vault {
                     let sv: i64 = row.get(1)?;
                     let payload: Vec<u8> = row.get(2)?;
                     let nonce: Vec<u8> = row.get(3)?;
-                    Ok(RawRevisionPayload {
-                        parent,
-                        schema_version: sv,
-                        enc_payload: payload,
-                        enc_nonce: nonce,
-                    })
+                    let epoch: i64 = row.get(4)?;
+                    Ok((
+                        RawRevisionPayload {
+                            parent,
+                            schema_version: sv,
+                            enc_payload: payload,
+                            enc_nonce: nonce,
+                        },
+                        epoch,
+                    ))
                 },
             )
             .optional()?;
         // Per docstring: collapse "wrong account_id for this
         // revision" into the same error variant as "unknown
         // account" so the method is not an oracle.
-        let RawRevisionPayload {
-            parent: parent_blob,
-            schema_version: sv_i64,
-            enc_payload,
-            enc_nonce,
-        } = row.ok_or(StoreError::AccountNotFound)?;
+        let (
+            RawRevisionPayload {
+                parent: parent_blob,
+                schema_version: sv_i64,
+                enc_payload,
+                enc_nonce,
+            },
+            vdk_epoch_i,
+        ) = row.ok_or(StoreError::AccountNotFound)?;
+        let vdk_epoch = u64::try_from(vdk_epoch_i)
+            .map_err(|_| StoreError::Corrupted("revisions.vdk_epoch negative".into()))?;
 
         let parent_arr: [u8; REVISION_ID_LEN] = parent_blob
             .as_slice()
@@ -2854,7 +3128,20 @@ impl Vault {
         let ciphertext = Ciphertext::from_vec(enc_payload);
 
         let active = self.require_active()?;
-        let decoded = open_payload(active.vdk.aead_key(), &nonce, &ciphertext, &aad)?;
+        // Select the decrypting VDK for this entry's epoch (#106b-2 §3.1):
+        // the current epoch's VDK is `active.vdk`; a retained OLD epoch's
+        // VDK comes from the chain. An entry tagged to an epoch this device
+        // does not hold is undecryptable → AuthenticationFailed (the
+        // resolve flow surfaces it cleanly, same as a placeholder-nonce).
+        let entry_aead = if vdk_epoch == active.chain.current_epoch() {
+            active.vdk.aead_key()
+        } else {
+            active
+                .chain
+                .aead_for_epoch(vdk_epoch)
+                .ok_or(StoreError::AuthenticationFailed)?
+        };
+        let decoded = open_payload(entry_aead, &nonce, &ciphertext, &aad)?;
 
         let snapshot = match decoded {
             DecodedPayload::Live(s) => s,
@@ -4740,6 +5027,9 @@ impl Vault {
 
         let active = self.require_active()?;
         let (ct, nonce) = crate::blob::seal_identity(active.vdk.aead_key(), &identity, &aad)?;
+        // #106b-2: the new revision is encrypted under the active session's
+        // `vdk` (= current epoch's VDK), so stamp the current epoch (Q-a).
+        let vdk_epoch = i64::try_from(active.chain.current_epoch()).unwrap_or(i64::MAX);
 
         // Build the V0 cache shadow snapshot (head password / first
         // username / first url). This keeps the existing cache-bearing
@@ -4763,8 +5053,8 @@ impl Vault {
         tx.execute(
             "INSERT INTO revisions (
                 revision_id, account_id, parent_revision_id, device_id,
-                schema_version, created_at, enc_payload, enc_nonce, is_tombstone
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+                schema_version, created_at, enc_payload, enc_nonce, is_tombstone, vdk_epoch
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
             params![
                 revision_id.as_bytes().as_slice(),
                 account_id.as_bytes().as_slice(),
@@ -4774,6 +5064,7 @@ impl Vault {
                 now,
                 ct.as_bytes(),
                 nonce.as_bytes().as_slice(),
+                vdk_epoch,
             ],
         )?;
         tx.execute(
@@ -4865,6 +5156,9 @@ impl Vault {
         );
         let active = self.require_active()?;
         let (ct, nonce) = crate::blob::seal_identity(active.vdk.aead_key(), &identity, &aad)?;
+        // #106b-2: stamp the current VDK epoch (Q-a) — encrypted under
+        // `active.vdk` (= current epoch's VDK).
+        let vdk_epoch = i64::try_from(active.chain.current_epoch()).unwrap_or(i64::MAX);
 
         let cache_snapshot = downgrade_identity_to_snapshot(&identity);
 
@@ -4872,8 +5166,8 @@ impl Vault {
         tx.execute(
             "INSERT INTO revisions (
                 revision_id, account_id, parent_revision_id, device_id,
-                schema_version, created_at, enc_payload, enc_nonce, is_tombstone
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+                schema_version, created_at, enc_payload, enc_nonce, is_tombstone, vdk_epoch
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
             params![
                 revision_id.as_bytes().as_slice(),
                 id.as_bytes().as_slice(),
@@ -4883,6 +5177,7 @@ impl Vault {
                 now,
                 ct.as_bytes(),
                 nonce.as_bytes().as_slice(),
+                vdk_epoch,
             ],
         )?;
         tx.execute(
@@ -5510,6 +5805,10 @@ impl Vault {
         nonce: &Nonce,
         is_tombstone: bool,
     ) -> Result<()> {
+        // #106b-2: the merge revision is sealed under the current epoch's
+        // VDK (the caller seals via `active.vdk`), so stamp the current
+        // epoch (Q-a). Captured before the tx borrow.
+        let vdk_epoch = self.current_vdk_epoch_i64();
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut head_stmt = tx.prepare(
@@ -5565,8 +5864,8 @@ impl Vault {
         tx.execute(
             "INSERT INTO revisions (
                 revision_id, account_id, parent_revision_id, device_id,
-                schema_version, created_at, enc_payload, enc_nonce, is_tombstone
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                schema_version, created_at, enc_payload, enc_nonce, is_tombstone, vdk_epoch
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 merge_revision_id.as_bytes().as_slice(),
                 account_id.as_bytes().as_slice(),
@@ -5577,6 +5876,7 @@ impl Vault {
                 ct.as_bytes(),
                 nonce.as_bytes().as_slice(),
                 i64::from(is_tombstone),
+                vdk_epoch,
             ],
         )?;
         tx.execute(
@@ -8680,6 +8980,7 @@ fn build_active_state_data(
     conn: &Connection,
     meta: &VaultMeta,
     vdk_aead: &AeadKey,
+    chain: &crate::vdk_chain::VdkChain,
 ) -> Result<(
     DecryptedCache,
     SearchIndex,
@@ -8730,6 +9031,7 @@ fn build_active_state_data(
             conn,
             meta,
             vdk_aead,
+            chain,
             account_id,
             cached_head,
             last_modified_at,
@@ -8751,6 +9053,7 @@ fn hydrate_account_into_state(
     conn: &Connection,
     meta: &VaultMeta,
     vdk_aead: &AeadKey,
+    chain: &crate::vdk_chain::VdkChain,
     account_id: AccountId,
     cached_head: RevisionId,
     last_modified_at: i64,
@@ -8787,7 +9090,7 @@ fn hydrate_account_into_state(
     // regardless of which leaf is canonical.
     let mut canonical_outcome: Option<HeadDecodeOutcome> = None;
     for leaf in &all_leaves {
-        match decode_head_row(conn, meta, vdk_aead, account_id, *leaf)? {
+        match decode_head_row(conn, meta, vdk_aead, chain, account_id, *leaf)? {
             HeadDecodeOutcome::FutureVersion => {
                 requires_upgrade.insert(account_id);
             }
@@ -8817,6 +9120,7 @@ fn hydrate_account_into_state(
                 conn,
                 meta,
                 vdk_aead,
+                chain,
                 account_id,
                 cached_head,
             )?)
@@ -8871,37 +9175,65 @@ fn decode_head_row(
     conn: &Connection,
     meta: &VaultMeta,
     vdk_aead: &AeadKey,
+    chain: &crate::vdk_chain::VdkChain,
     account_id: AccountId,
     rev_id: RevisionId,
 ) -> Result<HeadDecodeOutcome> {
-    let row: Option<RawRevisionPayload> = conn
+    // MVP-3 issue #106b-2: also read the per-entry `vdk_epoch` tag (Q-a) so
+    // we decrypt this entry under `chain[entry.vdk_epoch]`. The tuple is a
+    // local extension of `RawRevisionPayload` (which other call sites
+    // share) — we keep the epoch local rather than widen the shared struct.
+    let row: Option<(RawRevisionPayload, i64)> = conn
         .query_row(
-            "SELECT parent_revision_id, schema_version, enc_payload, enc_nonce
+            "SELECT parent_revision_id, schema_version, enc_payload, enc_nonce, vdk_epoch
              FROM revisions WHERE account_id = ?1 AND revision_id = ?2",
             params![
                 account_id.as_bytes().as_slice(),
                 rev_id.as_bytes().as_slice()
             ],
             |row| {
-                Ok(RawRevisionPayload {
-                    parent: row.get(0)?,
-                    schema_version: row.get(1)?,
-                    enc_payload: row.get(2)?,
-                    enc_nonce: row.get(3)?,
-                })
+                Ok((
+                    RawRevisionPayload {
+                        parent: row.get(0)?,
+                        schema_version: row.get(1)?,
+                        enc_payload: row.get(2)?,
+                        enc_nonce: row.get(3)?,
+                    },
+                    row.get(4)?,
+                ))
             },
         )
         .optional()?;
-    let Some(RawRevisionPayload {
-        parent: parent_blob,
-        schema_version: schema_version_i,
-        enc_payload: payload,
-        enc_nonce: nonce_blob,
-    }) = row
+    let Some((
+        RawRevisionPayload {
+            parent: parent_blob,
+            schema_version: schema_version_i,
+            enc_payload: payload,
+            enc_nonce: nonce_blob,
+        },
+        vdk_epoch_i,
+    )) = row
     else {
         return Err(StoreError::Corrupted(
             "account_identities head_revision_id has no matching revisions row".into(),
         ));
+    };
+    let vdk_epoch = u64::try_from(vdk_epoch_i)
+        .map_err(|_| StoreError::Corrupted("revisions.vdk_epoch negative".into()))?;
+    // Select the decrypting VDK for this entry's epoch (plan §3.1): the
+    // CURRENT epoch's VDK is `vdk_aead` (the active session's VDK); a
+    // RETAINED OLD epoch's VDK comes from the chain. An entry tagged to an
+    // epoch this device does not hold (e.g. a post-revoke epoch on a
+    // removed device, or a not-yet-synced wrap) is undecryptable here — we
+    // surface it as a `PlaceholderNonce` outcome (drop from cache/index,
+    // exactly like a foreign-ingested row), NOT an unlock abort.
+    let entry_aead: &AeadKey = if vdk_epoch == chain.current_epoch() {
+        vdk_aead
+    } else {
+        match chain.aead_for_epoch(vdk_epoch) {
+            Some(k) => k,
+            None => return Ok(HeadDecodeOutcome::PlaceholderNonce),
+        }
     };
     let parent_arr: [u8; REVISION_ID_LEN] = parent_blob
         .as_slice()
@@ -8937,7 +9269,7 @@ fn decode_head_row(
     // `FutureVersion`/"requires upgrade". A legit future revision was
     // sealed by a future build with that byte in its AAD, so the open
     // succeeds; only then do we report it as `FutureVersion`.
-    let outcome = match crate::blob::open_identity_payload(vdk_aead, &nonce, &ct, &aad) {
+    let outcome = match crate::blob::open_identity_payload(entry_aead, &nonce, &ct, &aad) {
         Ok(crate::blob::DecodedIdentityPayload::Live(identity)) => {
             HeadDecodeOutcome::Live(identity)
         }
@@ -9544,6 +9876,208 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM recovery_guardians", [], |r| r.get(0))
             .unwrap();
         assert_eq!(guardian_rows, 0, "no guardian row may survive the rollback");
+    }
+
+    // =================================================================
+    // MVP-3 issue #106b-2 — VDK-rotation-on-revoke commit (L4 atomic +
+    // L3 epoch chain + prompt-on-revoke password anchor).
+    // =================================================================
+
+    /// **#106b-2 (L4 positive path + L3 epoch chain + anchor-current).**
+    /// `commit_vdk_rotation` atomically writes the new-epoch password
+    /// anchor + the demoted OLD epoch into the chain + the re-pointed
+    /// escrow. After commit + re-unlock with the NEW password: the vault
+    /// opens (anchor is current under the new password), the OLD password
+    /// fails, a PRE-rotation account (sealed under the OLD VDK at epoch 0)
+    /// still decrypts via the retained chain (L3), the current-epoch
+    /// pointer advanced to 1, and the escrow generation was REPLACED.
+    #[test]
+    fn commit_vdk_rotation_atomic_advances_epoch_and_retains_old_vdk() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "rotate.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        // A PRE-rotation account — sealed under the OLD (epoch 0) VDK.
+        let id = v.add_account(fresh_snapshot()).unwrap();
+        let vault_id = v.vault_id();
+        // Pre-rotation, the entry is tagged epoch 0.
+        let pre_epoch: i64 = v
+            .conn
+            .query_row("SELECT vdk_epoch FROM revisions LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pre_epoch, 0, "pre-rotation entry is tagged epoch 0");
+
+        // The FRESH VDK the pure driver minted for epoch 1 + its re-split
+        // escrow (over the SAME fresh VDK, epoch 1).
+        let new_vdk = VdkKey::generate();
+        let (new_wrapped, new_sealed, new_pubs, _secs) =
+            build_re_split(&new_vdk, &vault_id, 2, 3, 1);
+        let records: Vec<GuardianRecord<'_>> = (0..3)
+            .map(|i| GuardianRecord {
+                index: u8::try_from(i).unwrap(),
+                guardian_x25519_pub: new_pubs[i],
+                sealed_share: &new_sealed[i],
+            })
+            .collect();
+
+        let new_password = SecretBytes::new(b"post-revoke master password".to_vec());
+        v.__test_commit_vdk_rotation_reusing_active(
+            new_vdk,
+            &new_password,
+            1,
+            &new_wrapped,
+            2,
+            3,
+            1,
+            &records,
+        )
+        .unwrap();
+        assert_eq!(v.state(), VaultState::Locked);
+
+        // The current-epoch pointer advanced to 1; the OLD epoch 0 is
+        // retained in the chain.
+        assert_eq!(crate::vdk_chain::read_current_epoch(&v.conn).unwrap(), 1);
+        let chain_rows = crate::vdk_chain::read_chain(&v.conn, &vault_id).unwrap();
+        assert_eq!(chain_rows.len(), 1, "epoch 0 is retained in the chain");
+        assert_eq!(chain_rows[0].epoch, 0);
+
+        // OLD password fails (the anchor was re-written under the NEW
+        // password — prompt-on-revoke); NEW password opens.
+        let old_err = v.unlock(&fresh_presence(), &fresh_pin()).unwrap_err();
+        assert!(matches!(old_err, StoreError::AuthenticationFailed));
+        let new_pin =
+            PinIdentityProof::new(SecretBytes::new(b"post-revoke master password".to_vec()));
+        v.unlock(&fresh_presence(), &new_pin).unwrap();
+        assert_eq!(v.state(), VaultState::Active);
+
+        // L3: the PRE-rotation account (sealed under the OLD epoch-0 VDK)
+        // still decrypts via the retained chain — the cache hydrated it.
+        let after = v
+            .get_account(id)
+            .expect("pre-rotation account decrypts post-rotation (L3)");
+        assert!(
+            bool::from(after.ct_eq(&fresh_snapshot())),
+            "old-epoch entry must decrypt under the retained chain VDK (L3)"
+        );
+
+        // A NEW post-rotation write is stamped with the CURRENT epoch (1)
+        // and reads back under the current VDK.
+        let id3 = v.add_account(fresh_snapshot()).unwrap();
+        let new_epoch_tag: i64 = v
+            .conn
+            .query_row(
+                "SELECT vdk_epoch FROM revisions WHERE account_id = ?1",
+                params![id3.as_bytes().as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            new_epoch_tag, 1,
+            "a post-rotation write must be stamped with the current epoch (1)"
+        );
+        // And it reads back fine under the current VDK.
+        assert!(v.get_account(id3).is_some());
+
+        // The escrow generation was REPLACED: it reads back at epoch 1 with
+        // 3 guardians under the new (current) VDK.
+        let live_vdk_aead = v.active.as_ref().expect("active").vdk.aead_key();
+        let loaded =
+            crate::recovery_escrow::read_recovery_escrow(&v.conn, &vault_id, live_vdk_aead)
+                .unwrap()
+                .expect("escrow present after rotation");
+        assert_eq!(loaded.epoch, 1, "escrow re-pointed at the new epoch");
+        assert_eq!(loaded.guardian_count, 3);
+    }
+
+    /// **#106b-2 (L4 crash-injection — turns RED if the tx is split).**
+    /// Force a fault AFTER the meta anchor + chain writes but DURING the
+    /// escrow write (an `re_split_epoch` of `u64::MAX` overflows the i64
+    /// on-disk encoding inside `write_recovery_escrow_tx`). Because ALL
+    /// rotation writes share ONE transaction, the failure rolls EVERYTHING
+    /// back: re-opened from disk, the vault is still on the OLD epoch — the
+    /// OLD password opens it, NO `vdk_chain` row survives, the pointer is
+    /// unchanged (0), and NO escrow row survives. If the commit were split
+    /// into separate transactions, the OLD password would stop opening (the
+    /// anchor would have been overwritten) and a stale chain row / advanced
+    /// pointer would survive — turning the assertions below RED.
+    #[test]
+    fn commit_vdk_rotation_rolls_back_all_writes_on_escrow_failure() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "rotate-crash.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).unwrap();
+        let vault_id = v.vault_id();
+
+        let new_vdk = VdkKey::generate();
+        let (new_wrapped, new_sealed, new_pubs, _secs) =
+            build_re_split(&new_vdk, &vault_id, 2, 3, 0);
+        let records: Vec<GuardianRecord<'_>> = (0..3)
+            .map(|i| GuardianRecord {
+                index: u8::try_from(i).unwrap(),
+                guardian_x25519_pub: new_pubs[i],
+                sealed_share: &new_sealed[i],
+            })
+            .collect();
+
+        let new_password = SecretBytes::new(b"post-revoke master password".to_vec());
+        // re_split_epoch = u64::MAX overflows i64 inside
+        // write_recovery_escrow_tx — the escrow write FAILS after the meta
+        // anchor + chain writes, forcing the single-tx rollback.
+        let err = v
+            .__test_commit_vdk_rotation_reusing_active(
+                new_vdk,
+                &new_password,
+                1,
+                &new_wrapped,
+                2,
+                3,
+                u64::MAX,
+                &records,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Corrupted(_)),
+            "epoch overflow must surface as the escrow-write error, got {err:?}"
+        );
+
+        // Re-open from disk — assert what actually LANDED.
+        drop(v);
+        let mut v2 = Vault::open(&p).unwrap();
+
+        // L4: the OLD password STILL opens (the anchor re-write rolled back).
+        v2.unlock(&fresh_presence(), &fresh_pin())
+            .expect("OLD password must still open after the rolled-back rotation");
+        assert_eq!(v2.state(), VaultState::Active);
+        let after = v2.get_account(id).expect("account intact");
+        assert!(bool::from(after.ct_eq(&fresh_snapshot())));
+
+        // L4: the pointer is UNCHANGED (still epoch 0) and NO chain row
+        // survives.
+        assert_eq!(
+            crate::vdk_chain::read_current_epoch(&v2.conn).unwrap(),
+            0,
+            "the current-epoch pointer must not advance on rollback"
+        );
+        let chain_rows: i64 = v2
+            .conn
+            .query_row("SELECT COUNT(*) FROM vdk_chain", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            chain_rows, 0,
+            "no vdk_chain row may survive the rollback (L4)"
+        );
+        // L4: NO escrow row survives either.
+        let escrow_rows: i64 = v2
+            .conn
+            .query_row("SELECT COUNT(*) FROM recovery_escrow", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            escrow_rows, 0,
+            "no escrow row may survive the rollback (L4)"
+        );
     }
 
     /// L8: the NORMAL device-add / re-unlock path uses the EXISTING

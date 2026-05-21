@@ -49,6 +49,7 @@ pub mod revision;
 pub mod session;
 pub mod sync_status;
 pub mod vault;
+pub mod vdk_chain;
 
 pub(crate) mod blob;
 pub(crate) mod meta;

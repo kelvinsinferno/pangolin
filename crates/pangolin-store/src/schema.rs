@@ -128,6 +128,17 @@ CREATE TABLE IF NOT EXISTS revisions (
     -- head. NULL = not superseded (the normal case). Legacy vaults
     -- pick up the column via migrate_revision_superseded_by_column.
     superseded_by        BLOB,
+    -- MVP-3 issue #106b-2: the per-entry VDK epoch tag (Q-a). After a
+    -- device-revoke rotation mints a new VDK epoch, NEW writes encrypt
+    -- under the new-epoch VDK while OLD entries stay under their original
+    -- epoch's VDK; the read path decrypts each entry under
+    -- `chain[vdk_epoch]`. DEFAULT 0 so every existing / legacy / never-
+    -- rotated row reads as epoch 0 (the single meta VDK) — additive, no
+    -- format_version bump. The tag is recorded here (a local-row column)
+    -- rather than on chain: RevisionLogV2's encPayload is immutable, so
+    -- we must not need a v3 to carry it. Legacy vaults pick the column
+    -- up via migrate_revision_vdk_epoch_column.
+    vdk_epoch            INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (account_id) REFERENCES account_identities(account_id)
 );
 
@@ -321,6 +332,43 @@ CREATE TABLE IF NOT EXISTS recovery_guardians (
     enc_nonce           BLOB    NOT NULL,
     schema_version      INTEGER NOT NULL
 );
+
+-- MVP-3 issue #106b-2: single-row VDK-chain pointer. current_epoch is
+-- the shared monotonic per-vault epoch (Q-f) whose VDK encrypts NEW
+-- writes; it lives in meta.wrapped_ct (the password anchor) + the
+-- guardian escrow. Absent row = a legacy / never-rotated vault = single
+-- epoch 0 (the meta VDK) -- the additive default, no format_version
+-- bump. id = 0 CHECK enforces single-row; INSERT OR REPLACE keyed on
+-- id = 0 (Vault::commit_vdk_rotation) advances it. Legacy vaults pick
+-- the table up via migrate_vdk_chain_tables.
+CREATE TABLE IF NOT EXISTS vdk_chain_state (
+    id             INTEGER PRIMARY KEY CHECK (id = 0),
+    current_epoch  INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL
+);
+
+-- MVP-3 issue #106b-2: epoch-keyed retained-old VDK chain. One row per
+-- RETAINED (non-current) epoch — the VDKs a SURVIVING device keeps
+-- read-only to decrypt PRE-rotation entries (on-chain history is
+-- immutable, so old entries stay under their original epoch's VDK).
+-- Each row holds that epoch's VDK wrapped two ways: under the password
+-- authority (`anchor_*`, recoverable on unlock by re-deriving the
+-- authority from the password) and under the LOCAL device key
+-- (`device_*`, biometric fast-unlock). Both are AEAD ciphertext keyed by
+-- secrets that never touch disk, so they are non-secret at rest -> plain
+-- BLOBs, the `meta.wrapped_ct` idiom (L9). The CURRENT epoch's VDK is
+-- NEVER duplicated here (it is the meta VDK). Additive table; legacy
+-- vaults pick it up via migrate_vdk_chain_tables.
+CREATE TABLE IF NOT EXISTS vdk_chain (
+    epoch              INTEGER PRIMARY KEY,
+    anchor_ct          BLOB    NOT NULL,
+    anchor_nonce       BLOB    NOT NULL,
+    anchor_wrap_schema INTEGER NOT NULL,
+    device_ct          BLOB    NOT NULL,
+    device_nonce       BLOB    NOT NULL,
+    device_wrap_schema INTEGER NOT NULL,
+    schema_version     INTEGER NOT NULL
+);
 ";
 
 /// Apply all pragmas and the schema DDL on the supplied connection.
@@ -445,6 +493,74 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     // `recovery_escrow::read_recovery_escrow` reads back as `None`.
     migrate_recovery_escrow_tables(conn)?;
 
+    // MVP-3 issue #106b-2 migrations: the additive `vdk_chain_state` +
+    // `vdk_chain` tables (the epoch-keyed retained-VDK chain) and the
+    // additive `revisions.vdk_epoch` per-entry tag column. The SCHEMA_DDL
+    // string above already contains the `CREATE TABLE IF NOT EXISTS` for
+    // both tables, so for fresh-build vaults the table migration is
+    // structurally redundant; the value is pinning the migration intent
+    // for legacy files whose `apply_pragmas_and_schema` ran under an older
+    // DDL. The column migration is the load-bearing one — a legacy
+    // `revisions` table predating #106b-2 gets the `vdk_epoch` column
+    // (DEFAULT 0) so every existing row reads as the single epoch-0 VDK.
+    // Additive; no `format_version` bump.
+    migrate_vdk_chain_tables(conn)?;
+    migrate_revision_vdk_epoch_column(conn)?;
+
+    Ok(())
+}
+
+/// **MVP-3 issue #106b-2 migration.** Ensure the `vdk_chain_state` +
+/// `vdk_chain` tables exist on legacy vaults. Idempotent — `CREATE TABLE
+/// IF NOT EXISTS` directly. Same belt + suspenders pattern as
+/// [`migrate_recovery_escrow_tables`].
+fn migrate_vdk_chain_tables(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS vdk_chain_state (
+            id             INTEGER PRIMARY KEY CHECK (id = 0),
+            current_epoch  INTEGER NOT NULL,
+            schema_version INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS vdk_chain (
+            epoch              INTEGER PRIMARY KEY,
+            anchor_ct          BLOB    NOT NULL,
+            anchor_nonce       BLOB    NOT NULL,
+            anchor_wrap_schema INTEGER NOT NULL,
+            device_ct          BLOB    NOT NULL,
+            device_nonce       BLOB    NOT NULL,
+            device_wrap_schema INTEGER NOT NULL,
+            schema_version     INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// **MVP-3 issue #106b-2 migration.** Add the additive `vdk_epoch` column
+/// to `revisions` on vaults that predate #106b-2. Idempotent — checks
+/// `PRAGMA table_info(revisions)` first. Existing rows pick up the
+/// `DEFAULT 0`, so every pre-rotation entry reads as the single epoch-0
+/// VDK (the meta VDK). Additive; no `format_version` bump.
+fn migrate_revision_vdk_epoch_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(revisions)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_column = false;
+    for r in rows {
+        if r? == "vdk_epoch" {
+            has_column = true;
+            break;
+        }
+    }
+    drop(stmt);
+    if !has_column {
+        conn.execute(
+            "ALTER TABLE revisions ADD COLUMN vdk_epoch INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -1137,6 +1253,120 @@ mod tests {
                 "recovery_escrow.{needed} should appear exactly once"
             );
         }
+    }
+
+    /// MVP-3 issue #106b-2: the `vdk_chain_state` + `vdk_chain` tables land
+    /// via `apply_pragmas_and_schema`, survive an idempotent re-run, and a
+    /// legacy vault (emulated by a DB without them) opens cleanly with the
+    /// tables present-but-empty (the single-epoch-0 default).
+    #[test]
+    fn vdk_chain_tables_migration_is_idempotent_and_additive() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE device_key (
+                id INTEGER PRIMARY KEY CHECK (id = 0),
+                enc_seed BLOB NOT NULL, enc_nonce BLOB NOT NULL,
+                schema_version INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        assert!(!table_exists(&conn, "vdk_chain"));
+        assert!(!table_exists(&conn, "vdk_chain_state"));
+        apply_pragmas_and_schema(&conn).unwrap();
+        assert!(table_exists(&conn, "vdk_chain"));
+        assert!(table_exists(&conn, "vdk_chain_state"));
+        // Empty for a never-rotated vault.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vdk_chain", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+        let s: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vdk_chain_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(s, 0, "no current-epoch pointer row -> defaults to epoch 0");
+        // Idempotent re-run: columns intact.
+        apply_pragmas_and_schema(&conn).unwrap();
+        let cols = column_names(&conn, "vdk_chain");
+        for needed in [
+            "epoch",
+            "anchor_ct",
+            "anchor_nonce",
+            "anchor_wrap_schema",
+            "device_ct",
+            "device_nonce",
+            "device_wrap_schema",
+            "schema_version",
+        ] {
+            assert_eq!(
+                cols.iter().filter(|c| c.as_str() == needed).count(),
+                1,
+                "vdk_chain.{needed} should appear exactly once"
+            );
+        }
+    }
+
+    /// MVP-3 issue #106b-2: a legacy `revisions` table lacking the
+    /// `vdk_epoch` column (a vault written before #106b-2) gets the column
+    /// added on the next migration; the pre-existing row reads as epoch 0
+    /// (the single meta VDK), so legacy entries decrypt under the current
+    /// epoch exactly as before.
+    #[test]
+    fn legacy_revisions_table_gets_vdk_epoch_column_defaulting_zero() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Hand-build a pre-#106b-2 revisions table (1.6 + 4.1 columns, no
+        // vdk_epoch).
+        conn.execute_batch(
+            "CREATE TABLE account_identities (account_id BLOB PRIMARY KEY, created_at INTEGER NOT NULL, last_modified_at INTEGER NOT NULL, tombstoned INTEGER NOT NULL DEFAULT 0, head_revision_id BLOB NOT NULL);
+             CREATE TABLE revisions (
+                revision_id          BLOB PRIMARY KEY,
+                account_id           BLOB    NOT NULL,
+                parent_revision_id   BLOB    NOT NULL,
+                device_id            BLOB    NOT NULL,
+                schema_version       INTEGER NOT NULL,
+                created_at           INTEGER NOT NULL,
+                enc_payload          BLOB    NOT NULL,
+                enc_nonce            BLOB    NOT NULL,
+                is_tombstone         INTEGER NOT NULL DEFAULT 0,
+                chain_tx_hash        BLOB,
+                chain_block_number   INTEGER,
+                chain_log_index      INTEGER,
+                superseded_by        BLOB,
+                FOREIGN KEY (account_id) REFERENCES account_identities(account_id)
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO account_identities (account_id, created_at, last_modified_at, head_revision_id) VALUES (?1, 0, 0, ?2)",
+            [&[0xAAu8; 32] as &[u8], &[0xBBu8; 32] as &[u8]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO revisions
+                (revision_id, account_id, parent_revision_id, device_id, schema_version,
+                 created_at, enc_payload, enc_nonce)
+             VALUES (?1, ?2, ?3, ?4, 1, 0, ?5, ?6)",
+            [
+                &[0xBBu8; 32] as &[u8],
+                &[0xAAu8; 32] as &[u8],
+                &[0x00u8; 32] as &[u8],
+                &[0xCCu8; 32] as &[u8],
+                &[0xDEu8; 4] as &[u8],
+                &[0xEEu8; 24] as &[u8],
+            ],
+        )
+        .unwrap();
+        apply_pragmas_and_schema(&conn).unwrap();
+        let epoch: i64 = conn
+            .query_row(
+                "SELECT vdk_epoch FROM revisions WHERE revision_id = ?1",
+                [&[0xBBu8; 32] as &[u8]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            epoch, 0,
+            "pre-#106b-2 rows must default to epoch 0 (the single meta VDK)"
+        );
     }
 
     /// MVP-2 issue 4.4: the `meta.sync_mode_preference` column lands
