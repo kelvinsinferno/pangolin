@@ -123,6 +123,7 @@ deploy_one() {
   ( cd "$REPO_ROOT/contracts" && \
     PAYMENT_AUTHORITY="$PAYMENT_AUTHORITY" \
     REDEMPTION_AUTHORITY="$REDEMPTION_AUTHORITY" \
+    RECOVERY_V1_ADDRESS="${RECOVERY_V1_ADDRESS:-}" \
     forge script "script/${script_name}.s.sol" \
       --sig "run()" --tc "$script_name" \
       --rpc-url "$RPC_URL" \
@@ -184,6 +185,7 @@ parse_deploy() {
 # 0 means scan-from-genesis, but we record the real value for parity).
 generate_dev_json() {
   local rev_addr="$1" rev_block="$2" ent_addr="$3" ent_block="$4" rec_addr="$5" rec_block="$6"
+  local rv2_addr="$7" rv2_block="$8"
   echo "==> generating $DEV_JSON"
   cat >"$DEV_JSON" <<EOF
 {
@@ -208,6 +210,11 @@ generate_dev_json() {
       "address": "${rec_addr}",
       "deployer": "${ANVIL_ACCT0_ADDR}",
       "deploy_block": ${rec_block}
+    },
+    "RevisionLogV2": {
+      "address": "${rv2_addr}",
+      "deployer": "${ANVIL_ACCT0_ADDR}",
+      "deploy_block": ${rv2_block}
     }
   }
 }
@@ -249,11 +256,19 @@ do_setup() {
   deploy_one "DeployRevisionLogV1"
   deploy_one "DeployEntitlementRegistry"
   deploy_one "DeployRecoveryV1"
-  local rev ent rec
+  local rev ent rec rv2
   rev="$(parse_deploy "DeployRevisionLogV1" "RevisionLogV1")"
   ent="$(parse_deploy "DeployEntitlementRegistry" "EntitlementRegistry")"
   rec="$(parse_deploy "DeployRecoveryV1" "RecoveryV1")"
-  generate_dev_json ${rev} ${ent} ${rec}
+  # #106a: deploy RevisionLogV2 bound to the just-deployed RecoveryV1
+  # address (its sole constructor arg, Q-h cross-bind). Export it so the
+  # deploy script's `vm.envOr("RECOVERY_V1_ADDRESS", ...)` picks the
+  # canonical RecoveryV1 rather than deploying a fresh throwaway one.
+  RECOVERY_V1_ADDRESS="$(echo "$rec" | awk '{print $1}')"
+  export RECOVERY_V1_ADDRESS
+  deploy_one "DeployRevisionLogV2"
+  rv2="$(parse_deploy "DeployRevisionLogV2" "RevisionLogV2")"
+  generate_dev_json ${rev} ${ent} ${rec} ${rv2}
   fund_test_wallet
   echo "==> setup complete"
 }
