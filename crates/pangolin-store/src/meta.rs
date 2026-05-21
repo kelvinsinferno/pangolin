@@ -167,6 +167,42 @@ pub fn write_sync_mode_preference(conn: &Connection, pref: Option<&str>) -> Resu
     Ok(())
 }
 
+/// Read the `meta.revisionlog_version` column (MVP-3 issue #106c2 — the
+/// per-vault v1/v2 `RevisionLog` binding / routing signal).
+///
+/// Returns `Ok(None)` when the row is absent (fresh database not yet
+/// written) **or** the column is NULL (a vault that predates #106c2, or
+/// one that never explicitly set the binding). Both map to
+/// `RevisionLogVersion::V1` at the call site via
+/// [`crate::vault::RevisionLogVersion::from_meta_int`] — the
+/// no-regression default. A present value is returned verbatim; the
+/// caller validates it against the `{1, 2}` set.
+///
+/// Mirrors `read_sync_mode_preference` byte-for-byte in shape.
+pub fn read_revisionlog_version(conn: &Connection) -> Result<Option<i64>> {
+    let raw: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT revisionlog_version FROM meta WHERE id = 0",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    // Outer Option = "row present?"; inner Option = "column non-NULL?".
+    Ok(raw.flatten())
+}
+
+/// Persist (or clear, with `None`) the `meta.revisionlog_version`
+/// column. `Some(v)` writes the integer (`1` = V1, `2` = V2); `None`
+/// writes SQL `NULL`, which the read path interprets as V1. UPDATE-only
+/// (the meta row exists by construction after `Vault::create`).
+pub fn write_revisionlog_version(conn: &Connection, version: Option<i64>) -> Result<()> {
+    conn.execute(
+        "UPDATE meta SET revisionlog_version = ?1 WHERE id = 0",
+        params![version],
+    )?;
+    Ok(())
+}
+
 /// Read the meta row. Returns `Ok(None)` when the row has not yet been
 /// written (fresh database).
 pub fn read(conn: &Connection) -> Result<Option<VaultMeta>> {

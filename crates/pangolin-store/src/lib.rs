@@ -130,7 +130,9 @@ pub use sync_status::{
     compute_next_status, BatchFlushErrorKind, LastFlushOutcome, LastPullOutcome, PullErrorKind,
     SyncStatus, SyncStatusInputs, OFFLINE_THRESHOLD_FAILURES, SYNCED_STALENESS_THRESHOLD_MS,
 };
-pub use vault::{AccountStatus, SyncMode, SyncModePreference, Vault, VaultState};
+pub use vault::{
+    AccountStatus, RevisionLogVersion, SyncMode, SyncModePreference, Vault, VaultState,
+};
 
 /// Returns the crate name. Useful for diagnostics and version reporting.
 #[must_use]

@@ -96,6 +96,7 @@
 
 pub mod poll;
 pub mod reorg;
+pub mod v2;
 pub mod ws;
 
 use alloy::network::Ethereum;
@@ -385,6 +386,54 @@ pub async fn fetch_and_verify_chunk(
     let provider = build_read_provider(rpc_url).await?;
     check_chain_id_matches(&provider, env).await?;
     poll::fetch_chunk(
+        &provider,
+        env,
+        contract_address,
+        vault_id,
+        from_block,
+        to_block,
+    )
+    .await
+}
+
+/// **#106c2 — the V2 read leg.** Fetch + verify a chunk of
+/// `RevisionLogV2.RevisionPublished` events from `from_block..=to_block`.
+///
+/// Mirrors [`fetch_and_verify_chunk`] (the V1 read) but targets the
+/// `RevisionLogV2` contract + the v2 `RevisionPublished` event topic-0
+/// (which differs from V1's because the v2 domain differs — a v1 reader
+/// must never consume v2 events and vice-versa). The per-event verify
+/// chain is byte-identical to V1's: address pin, vault-id topic
+/// cross-check, schema-version bound, anchor materialisation, producing
+/// the SAME [`VerifiedRevisionEvent`].
+///
+/// Production trusts the event `signer` (the contract's publish-time
+/// `ecrecover` under the v2 domain, gated by the chain-id pin + the V2
+/// contract-address pin); the client-side L5 recover arm
+/// (`recover_signer_v2_raw` under the v2 domain) is exposed via
+/// [`v2::verify_signed_event_v2`] for tests/defense-in-depth (V2 events
+/// carry no inline signature — V1 parity).
+///
+/// Returns `(verified_events, chunk_rejected_count)`.
+///
+/// # Errors
+///
+/// Same taxonomy as [`fetch_and_verify_chunk`].
+pub async fn fetch_and_verify_chunk_v2(
+    rpc_url: &str,
+    env: ChainEnv,
+    vault_id: &VaultId,
+    from_block: u64,
+    to_block: u64,
+) -> Result<(Vec<VerifiedRevisionEvent>, u32), ChainError> {
+    // L4 (V2 posture): resolve the RevisionLogV2 address from the
+    // deployment file. The BaseSepolia pinned-address cross-check is a
+    // follow-up (Q-f) until a testnet V2 deploy lands; Dev/anvil reads
+    // dev.json. The chain-id pin below is the active L3/L4 defense.
+    let contract_address = crate::revisionlog_v2_client::resolve_contract_address(env)?;
+    let provider = build_read_provider(rpc_url).await?;
+    check_chain_id_matches(&provider, env).await?;
+    v2::fetch_chunk_v2(
         &provider,
         env,
         contract_address,

@@ -84,7 +84,19 @@ CREATE TABLE IF NOT EXISTS meta (
     -- column via migrate_sync_mode_preference_column at open time.
     -- This is UX state, not secret material; lives in plaintext
     -- alongside session_idle_secs by precedent.
-    sync_mode_preference TEXT
+    sync_mode_preference TEXT,
+    -- MVP-3 issue #106c2: the per-vault v1/v2 RevisionLog binding (the
+    -- sync-loop + publish routing signal). INTEGER 1 = RevisionLogV1,
+    -- 2 = RevisionLogV2. NULL / absence ⇒ V1 (legacy vaults predating
+    -- #106c2 route to the V1 path verbatim — no behaviour change). NEW
+    -- vaults are seeded V1 explicitly (Q-a: the V2 path is testnet-only
+    -- until a Base Sepolia V2 deploy + pinned address land). Additive
+    -- column; absence is a valid (default) state — same doctrine as the
+    -- session_idle_secs / sync_mode_preference rows above (no
+    -- format_version bump, §18.7). Plaintext routing state, not secret
+    -- material. Legacy vault files get the column via
+    -- migrate_revisionlog_version_column at open time.
+    revisionlog_version INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS account_identities (
@@ -259,6 +271,22 @@ CREATE TABLE IF NOT EXISTS pending_merges (
 -- cursors without colliding (in MVP-2 only `BaseSepolia` is wired;
 -- the tag is `1`).
 CREATE TABLE IF NOT EXISTS chain_sync_v1_state (
+    id                  INTEGER PRIMARY KEY CHECK (id = 0),
+    chain_env_tag       INTEGER NOT NULL DEFAULT 1,
+    last_synced_block   INTEGER NOT NULL DEFAULT 0,
+    last_synced_at      INTEGER,
+    schema_version      INTEGER NOT NULL DEFAULT 1
+);
+
+-- MVP-3 issue #106c2: the SEPARATE V2 read-path checkpoint (Q-e). A
+-- V2-bound vault advances its own cursor here, never touching the V1
+-- `chain_sync_v1_state` row, so a vault that ever held both never
+-- cross-contaminates cursors (the L-no-regression invariant). Same
+-- single-row (CHECK id = 0) shape + INSERT OR REPLACE keyed on id = 0
+-- as `chain_sync_v1_state`. Additive `CREATE TABLE IF NOT EXISTS` (no
+-- format_version bump); legacy vaults pick it up on next open through
+-- `apply_pragmas_and_schema`.
+CREATE TABLE IF NOT EXISTS chain_sync_v2_state (
     id                  INTEGER PRIMARY KEY CHECK (id = 0),
     chain_env_tag       INTEGER NOT NULL DEFAULT 1,
     last_synced_block   INTEGER NOT NULL DEFAULT 0,
@@ -474,6 +502,14 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     // doctrine as 1.4 above (no `format_version` bump).
     migrate_sync_mode_preference_column(conn)?;
 
+    // MVP-3 issue #106c2 migration: add `revisionlog_version` to `meta`
+    // on vaults that predate #106c2. Idempotent — PRAGMA table_info
+    // guard. Existing rows pick up NULL, which the read path
+    // (`Vault::revisionlog_version`) maps to `RevisionLogVersion::V1`
+    // (the no-regression default). Additive; no `format_version` bump
+    // (§18.7), same doctrine as the sync_mode_preference precedent.
+    migrate_revisionlog_version_column(conn)?;
+
     // MVP-1 issue 1.5 migrations: the `devices` table grows four
     // additive columns (`capabilities`, `last_sync_at`, `public_key`,
     // `schema_version`) on legacy P2 vaults, and the new single-row
@@ -520,6 +556,9 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     migrate_revision_chain_sync_columns(conn)?;
     migrate_devices_chain_sync_columns(conn)?;
     migrate_chain_sync_v1_state_table(conn)?;
+    // MVP-3 issue #106c2: the SEPARATE V2 read-path checkpoint (Q-e),
+    // additive — never touches the V1 cursor.
+    migrate_chain_sync_v2_state_table(conn)?;
 
     // MVP-3 issue #104b migration: ensure the additive `recovery_escrow`
     // + `recovery_guardians` tables exist on legacy vaults. The SCHEMA_DDL
@@ -763,6 +802,26 @@ fn migrate_chain_sync_v1_state_table(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// **MVP-3 issue #106c2 migration.** Ensure the `chain_sync_v2_state`
+/// table exists on legacy vaults. Same belt + suspenders pattern as
+/// [`migrate_chain_sync_v1_state_table`]. Additive; no `format_version`
+/// bump (§18.7). A legacy vault that has never run a V2 sync simply has
+/// the table present-but-empty → the V2 cursor reads as `None` → first
+/// V2 sync replays from genesis.
+fn migrate_chain_sync_v2_state_table(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS chain_sync_v2_state (
+            id                  INTEGER PRIMARY KEY CHECK (id = 0),
+            chain_env_tag       INTEGER NOT NULL DEFAULT 1,
+            last_synced_block   INTEGER NOT NULL DEFAULT 0,
+            last_synced_at      INTEGER,
+            schema_version      INTEGER NOT NULL DEFAULT 1
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
 /// **MVP-1 issue 1.6 migration.** Add the nullable `superseded_by`
 /// column to `revisions` on vaults that predate 1.6. Idempotent —
 /// checks `PRAGMA table_info(revisions)` first.
@@ -863,6 +922,38 @@ fn migrate_sync_mode_preference_column(conn: &Connection) -> Result<()> {
     drop(stmt);
     if !has_column {
         conn.execute("ALTER TABLE meta ADD COLUMN sync_mode_preference TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// **MVP-3 issue #106c2 migration.** Add the nullable
+/// `revisionlog_version` INTEGER column to `meta` on vaults that predate
+/// #106c2. Idempotent — checks `PRAGMA table_info(meta)` first. Existing
+/// rows pick up NULL, which the read path
+/// ([`crate::vault::RevisionLogVersion::from_meta_int`]) maps to
+/// `RevisionLogVersion::V1` (the no-regression default — a legacy vault
+/// keeps routing to the V1 path verbatim). Mirrors the 4.4
+/// `sync_mode_preference` precedent byte-for-byte; no `format_version`
+/// bump per the additive-nullable-column doctrine (§18.7).
+fn migrate_revisionlog_version_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(meta)")?;
+    let rows = stmt.query_map([], |row| {
+        let name: String = row.get(1)?;
+        Ok(name)
+    })?;
+    let mut has_column = false;
+    for r in rows {
+        if r? == "revisionlog_version" {
+            has_column = true;
+            break;
+        }
+    }
+    drop(stmt);
+    if !has_column {
+        conn.execute(
+            "ALTER TABLE meta ADD COLUMN revisionlog_version INTEGER",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -1554,5 +1645,107 @@ mod tests {
             pref.is_none(),
             "legacy row's sync_mode_preference must read as NULL pre-backfill"
         );
+    }
+
+    /// MVP-3 issue #106c2: the `meta.revisionlog_version` column lands via
+    /// `apply_pragmas_and_schema` and stays singular under idempotent
+    /// re-run.
+    #[test]
+    fn migrate_revisionlog_version_column_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_pragmas_and_schema(&conn).unwrap();
+        apply_pragmas_and_schema(&conn).unwrap();
+        let cols = column_names(&conn, "meta");
+        assert_eq!(
+            cols.iter()
+                .filter(|c| c.as_str() == "revisionlog_version")
+                .count(),
+            1,
+            "meta.revisionlog_version should appear exactly once after idempotent re-run"
+        );
+    }
+
+    /// MVP-3 issue #106c2: a legacy `meta` table lacking the
+    /// `revisionlog_version` column (a vault written before #106c2) gets
+    /// the column added on the next migration; the pre-existing row's
+    /// value reads as NULL (= `RevisionLogVersion::V1`, no regression).
+    #[test]
+    fn migrate_revisionlog_version_column_on_legacy_vault() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Hand-build a pre-#106c2 meta table (carries session_idle_secs +
+        // sync_mode_preference but NOT revisionlog_version).
+        conn.execute_batch(
+            "CREATE TABLE meta (
+                id                INTEGER PRIMARY KEY CHECK (id = 0),
+                magic             BLOB    NOT NULL,
+                format_version    INTEGER NOT NULL,
+                vault_id          BLOB    NOT NULL,
+                created_at        INTEGER NOT NULL,
+                kdf_memory_kib    INTEGER NOT NULL,
+                kdf_time_cost     INTEGER NOT NULL,
+                kdf_parallelism   INTEGER NOT NULL,
+                kdf_salt          BLOB    NOT NULL,
+                schema_version    INTEGER NOT NULL,
+                wrapped_ct        BLOB    NOT NULL,
+                wrapped_nonce     BLOB    NOT NULL,
+                session_idle_secs INTEGER,
+                sync_mode_preference TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meta (
+                id, magic, format_version, vault_id, created_at,
+                kdf_memory_kib, kdf_time_cost, kdf_parallelism, kdf_salt,
+                schema_version, wrapped_ct, wrapped_nonce
+            ) VALUES (
+                0, ?1, 0, ?2, 0,
+                65536, 3, 1, ?3,
+                0, ?4, ?5
+            )",
+            rusqlite::params![
+                &[0u8; 8] as &[u8],
+                &[0u8; 32] as &[u8],
+                &[0u8; 16] as &[u8],
+                &[0u8; 32] as &[u8],
+                &[0u8; 24] as &[u8],
+            ],
+        )
+        .unwrap();
+        let cols_before = column_names(&conn, "meta");
+        assert!(
+            !cols_before
+                .iter()
+                .any(|c| c.as_str() == "revisionlog_version"),
+            "pre-migration meta must lack revisionlog_version"
+        );
+        apply_pragmas_and_schema(&conn).unwrap();
+        let cols_after = column_names(&conn, "meta");
+        assert!(
+            cols_after
+                .iter()
+                .any(|c| c.as_str() == "revisionlog_version"),
+            "revisionlog_version column must be added to a legacy meta table"
+        );
+        let ver: Option<i64> = conn
+            .query_row(
+                "SELECT revisionlog_version FROM meta WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            ver.is_none(),
+            "legacy row's revisionlog_version must read as NULL (→ V1)"
+        );
+    }
+
+    /// MVP-3 issue #106c2: the SEPARATE `chain_sync_v2_state` table lands
+    /// via `apply_pragmas_and_schema`.
+    #[test]
+    fn migrate_chain_sync_v2_state_table_present() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_pragmas_and_schema(&conn).unwrap();
+        assert!(table_exists(&conn, "chain_sync_v2_state"));
     }
 }

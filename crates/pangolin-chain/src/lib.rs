@@ -155,9 +155,9 @@ pub use privacy::{
 /// distributed-impl pattern friction-free at the consumer boundary.
 pub use alloy::primitives::Address;
 pub use chain_sync::{
-    d017_deploy_block, fetch_and_verify_chunk, fetch_current_block_number, ChainEventSource,
-    RevisionStatus, SyncOptions, SyncReport, VerifiedRevisionEvent,
-    CONFIRMATION_DEPTH_FOR_FINALIZATION, HTTP_POLL_INTERVAL_SECS,
+    d017_deploy_block, fetch_and_verify_chunk, fetch_and_verify_chunk_v2,
+    fetch_current_block_number, ChainEventSource, RevisionStatus, SyncOptions, SyncReport,
+    VerifiedRevisionEvent, CONFIRMATION_DEPTH_FOR_FINALIZATION, HTTP_POLL_INTERVAL_SECS,
     LOG_BLOCK_CHUNK as CHAIN_SYNC_LOG_BLOCK_CHUNK, MAX_KNOWN_CLIENT_SCHEMA_VERSION,
     WS_CIRCUIT_BREAKER_THRESHOLD, WS_KEEPALIVE_INTERVAL_SECS, WS_RECONNECT_INITIAL_BACKOFF_MS,
     WS_RECONNECT_MAX_BACKOFF_MS,
@@ -175,14 +175,16 @@ pub use recovery_signing::{
 };
 pub use revisionlog_v2_client::{
     add_device_v2, bootstrap_vault_v2, cancel_promotion_v2, decode_device_mgmt_events,
-    finalize_promotion_v2, propose_promotion_v2, read_authorized_device_count_v2,
-    read_authorized_device_v2, read_bootstrapped_v2, read_current_manager_v2, read_device_nonce_v2,
-    remove_device_v2, DeviceLifecycleAnchorV2, DeviceMgmtEvent, REVISIONLOG_V2_CONTRACT_NAME,
+    finalize_promotion_v2, propose_promotion_v2, publish_revision_v2,
+    read_authorized_device_count_v2, read_authorized_device_v2, read_bootstrapped_v2,
+    read_current_manager_v2, read_device_nonce_v2, remove_device_v2, DeviceLifecycleAnchorV2,
+    DeviceMgmtEvent, REVISIONLOG_V2_CONTRACT_NAME,
 };
 pub use revisionlog_v2_signing::{
-    build_domain_revisionlog_v2, build_signed_device_auth, device_auth_digest,
-    device_auth_struct_hash, recover_device_auth_signer, DeviceAuthFields, DeviceAuthKind,
-    SignedDeviceAuth, ADD_DEVICE_TYPEHASH_V2, PROMOTE_TYPEHASH_V2, REMOVE_DEVICE_TYPEHASH_V2,
+    build_domain_revisionlog_v2, build_signed_device_auth, build_signed_revision_v2,
+    device_auth_digest, device_auth_struct_hash, recover_device_auth_signer, recover_signer_v2_raw,
+    revision_v2_digest, DeviceAuthFields, DeviceAuthKind, SignedDeviceAuth, SignedRevisionV2,
+    ADD_DEVICE_TYPEHASH_V2, PROMOTE_TYPEHASH_V2, REMOVE_DEVICE_TYPEHASH_V2,
     REVISIONLOG_V2_SCHEMA_VERSION,
 };
 pub use secp256k1_signing::{
