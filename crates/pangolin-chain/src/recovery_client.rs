@@ -1355,3 +1355,361 @@ mod anvil_lifecycle {
         assert_eq!(auth1, proposed_authority, "vaultAuthority rotated on chain");
     }
 }
+
+// =====================================================================
+// #104b COUPLED anvil E2E (the CENTERPIECE / L10) — ties the OFF-CHAIN
+// threshold-escrow reconstruction to the ON-CHAIN recovery lifecycle.
+//
+// This is the env-quirk-#14-class regression gate the #104b plan §6
+// mandates: it composes the REAL `split_rwk` -> REAL merkle root over the
+// SAME guardians whose X25519 shares were sealed -> on-chain
+// initiate/approve/finalize against the LIVE RecoveryV1 contract -> REAL
+// `reconstruct_rwk` from the opened shares -> `unwrap_vdk_under_rwk` ->
+// `ct_eq` the original VDK -> new-password re-wrap (via pangolin-store's
+// `Vault::recover_with_new_password`) -> forward-security re-split.
+//
+// The load-bearing join asserted here (L2): each guardian's SINGLE
+// `DeviceKey` yields BOTH their secp256k1 Approve-signer (committed in the
+// merkle root) AND their X25519 share-opener (the seal recipient). The
+// negatives prove a broken join / sub-threshold set turns this RED.
+//
+// Gated on `integration-tests` + `#[ignore]` like the #103 lifecycle test;
+// run by `scripts/anvil-ci.sh` in dev mode against a fresh local anvil.
+// =====================================================================
+#[cfg(all(test, feature = "integration-tests"))]
+mod anvil_recovery_escrow_e2e {
+    use super::*;
+    use crate::evm::derive_evm_wallet;
+    use crate::recovery_signing::build_signed_approval_v1;
+    use crate::test_env;
+    use alloy::signers::local::PrivateKeySigner;
+    use pangolin_crypto::escrow::{
+        open_sealed_share, reconstruct_rwk, seal_share, split_rwk, unwrap_vdk_under_rwk,
+        wrap_vdk_under_rwk, RecoveryWrapKey, SealedShare, Share, X25519_KEY_LEN,
+    };
+    use pangolin_crypto::guardian::derive_x25519_sealing_key;
+    use pangolin_crypto::keys::{DeviceKey, VdkKey, WrapContext};
+
+    /// The recovering device's wallet — the same fixed seed `[0x42;32]`
+    /// `scripts/anvil-ci.sh` funds, so its lifecycle txs pay gas. It
+    /// self-bootstraps as the initial vault authority on `setGuardianSet`.
+    fn recovering_wallet() -> EvmWallet {
+        derive_evm_wallet(&DeviceKey::from_seed([0x42; 32])).expect("derive recovering wallet")
+    }
+
+    /// A guardian is ONE `DeviceKey` yielding BOTH keys (the L2 join):
+    /// their secp256k1 Approve-signer (merkle-committed) and their X25519
+    /// share-opener (seal recipient). Returns
+    /// `(secp256k1_signer, x25519_secret, x25519_public)`.
+    fn guardian_two_keys(
+        seed_byte: u8,
+    ) -> (PrivateKeySigner, [u8; X25519_KEY_LEN], [u8; X25519_KEY_LEN]) {
+        let device = DeviceKey::from_seed([seed_byte; 32]);
+        let signer = derive_evm_wallet(&device)
+            .expect("derive guardian secp256k1")
+            .into_signer();
+        let sealing = derive_x25519_sealing_key(&device);
+        (signer, *sealing.secret_bytes(), *sealing.public_bytes())
+    }
+
+    /// 72h time-warp on the local anvil (same helper shape as the #103
+    /// lifecycle test).
+    fn anvil_time_warp(rpc_url: &str, secs: u64) {
+        let inc = std::process::Command::new("cast")
+            .args([
+                "rpc",
+                "evm_increaseTime",
+                &secs.to_string(),
+                "--rpc-url",
+                rpc_url,
+            ])
+            .output()
+            .expect("invoke cast rpc evm_increaseTime");
+        assert!(
+            inc.status.success(),
+            "evm_increaseTime failed: {}",
+            String::from_utf8_lossy(&inc.stderr)
+        );
+        let mine = std::process::Command::new("cast")
+            .args(["rpc", "evm_mine", "--rpc-url", rpc_url])
+            .output()
+            .expect("invoke cast rpc evm_mine");
+        assert!(
+            mine.status.success(),
+            "evm_mine failed: {}",
+            String::from_utf8_lossy(&mine.stderr)
+        );
+    }
+
+    /// **L10 CENTERPIECE.** The full coupled path: deploy (harness) ->
+    /// `setGuardianSet`(real root from the SAME guardians) ->
+    /// `initiateRecovery`(new-device secp256k1) -> `approveRecovery`×t
+    /// (real EIP-712) -> 72h time-warp -> `finalizeRecovery`
+    /// (`vaultAuthority` == new device) -> off-chain `open_sealed_share`×t
+    /// -> `reconstruct_rwk` -> `unwrap_vdk_under_rwk` -> `ct_eq` original VDK
+    /// -> new-password re-wrap (Vault) -> forward-security re-split.
+    ///
+    /// Asserts L2 (the guardian two-key join), L3 (byte-identical VDK), L5
+    /// (dual-authority: the on-chain `vaultAuthority` rotated to the new
+    /// device AND the re-wrapped daily `WrappedVdk` opens under the new
+    /// password), L6 (the re-split RWK' differs + old shares can't recover
+    /// the re-split wrapper).
+    #[tokio::test]
+    #[ignore = "live-RPC test; requires PANGOLIN_CHAIN_ENV=dev + local anvil (scripts/anvil-ci.sh)"]
+    async fn recovery_escrow_coupled_e2e_against_anvil() {
+        let env = test_env::target_chain_env();
+        if !test_env::is_dev_mode()
+            && !test_env::require_or_fail("coupled recovery-escrow E2E needs dev anvil")
+        {
+            return;
+        }
+        let rpc_url = test_env::rpc_url();
+        let wallet = recovering_wallet();
+        let recovering_addr = wallet.address();
+
+        // ---- A vault to anchor vault_id + the off-chain VDK ----
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let vault_path = tmp.path().join("recovery-e2e.pvf");
+        let original_password =
+            pangolin_crypto::secret::SecretBytes::new(b"the original lost password".to_vec());
+        let vault_id = {
+            let v = pangolin_store::Vault::create(&vault_path, &original_password)
+                .expect("create vault");
+            v.vault_id()
+        };
+
+        // The VDK we onboard the escrow against. In production this is the
+        // vault's own VDK; here we mint one + persist it as the recovery
+        // wrapper, then recover it and re-secure the vault under it.
+        let vdk = VdkKey::generate();
+        let ctx = WrapContext::new(vault_id);
+        let rwk = RecoveryWrapKey::generate();
+        let wrapped_recovery = wrap_vdk_under_rwk(&vdk, &rwk, &ctx).expect("wrap vdk under rwk");
+
+        // ---- 3-of-5 guardians; ONE DeviceKey each -> BOTH keys (L2) ----
+        let threshold: u8 = 3;
+        let guardian_count: u8 = 5;
+        let epoch = [0u8; pangolin_crypto::escrow::EPOCH_LEN];
+        let two_keys: Vec<_> = [0xA1u8, 0xA2, 0xA3, 0xA4, 0xA5]
+            .iter()
+            .map(|b| guardian_two_keys(*b))
+            .collect();
+        // The secp256k1 addresses the merkle root commits.
+        let g_addrs: Vec<Address> = two_keys.iter().map(|(s, _, _)| s.address()).collect();
+        let root = build_guardian_root(&g_addrs);
+
+        // Split the RWK + seal share i to guardian i's X25519 pubkey (the
+        // SAME guardian whose secp256k1 address is committed at position i).
+        let shares = split_rwk(&rwk, threshold, guardian_count).expect("split rwk");
+        let sealed: Vec<SealedShare> = shares
+            .iter()
+            .zip(&two_keys)
+            .map(|(s, (_, _, x_pub))| seal_share(s, x_pub, &vault_id, &epoch).expect("seal"))
+            .collect();
+        drop(rwk);
+        drop(shares);
+
+        let chain_id = test_env::resolve_signing_chain_id(env, &rpc_url)
+            .await
+            .expect("resolve signing chain id");
+        let contract = resolve_contract_address(env).expect("RecoveryV1 in dev.json");
+
+        // The new device's secp256k1 signer (proposedAuthority) — born
+        // locally on the recovering device (Q-e).
+        let new_device = DeviceKey::from_seed([0x42; 32]);
+        let proposed_authority = derive_evm_wallet(&new_device)
+            .expect("derive new-device wallet")
+            .address();
+
+        // ---- on-chain: setGuardianSet (root over the SAME guardians) ----
+        set_guardian_set_v1(
+            &wallet,
+            vault_id,
+            root,
+            threshold,
+            guardian_count,
+            env,
+            &rpc_url,
+        )
+        .await
+        .expect("setGuardianSet");
+        let auth0 = read_vault_authority_v1(env, &rpc_url, vault_id)
+            .await
+            .expect("read authority");
+        assert_eq!(auth0, recovering_addr, "self-bootstrapped authority");
+
+        // ---- initiateRecovery(new-device secp256k1) ----
+        initiate_recovery_v1(&wallet, vault_id, proposed_authority, env, &rpc_url)
+            .await
+            .expect("initiateRecovery");
+
+        // ---- NEGATIVE (L2 / L10): a wrong guardian↔share mapping is
+        //      caught. We seal share[0] to guardian 0's X25519 key, but try
+        //      to open it with guardian 1's X25519 secret — the open fails
+        //      (a mismatched seal/merkle pairing strands recovery). ----
+        assert!(
+            open_sealed_share(&sealed[0], &two_keys[1].1, &vault_id, &epoch).is_err(),
+            "a share sealed to guardian 0 must NOT open with guardian 1's X25519 key (L2)"
+        );
+
+        // ---- approveRecovery × threshold (real EIP-712 + real proofs) ----
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let expires_at = now + 7 * 24 * 60 * 60;
+        let approve_fields = build_live_approve_fields_v1(env, &rpc_url, vault_id, expires_at)
+            .await
+            .expect("build live approve fields (L11)");
+        for (signer, _, _) in two_keys.iter().take(threshold as usize) {
+            let g_addr = signer.address();
+            let signed = build_signed_approval_v1(signer, approve_fields, contract, chain_id)
+                .expect("guardian signs Approve off-chain");
+            let proof = build_membership_proof(&g_addrs, g_addr).expect("guardian in set");
+            approve_recovery_v1(&wallet, g_addr, &proof, root, &signed, env, &rpc_url)
+                .await
+                .expect("approveRecovery accepted by live _verifyMerkleProof");
+        }
+
+        // ---- NEGATIVE: finalize before the 72h delay reverts (L10 /
+        //      already #103) ----
+        assert!(
+            finalize_recovery_v1(&wallet, vault_id, env, &rpc_url)
+                .await
+                .is_err(),
+            "finalize before delay must revert"
+        );
+
+        // ---- 72h time-warp -> finalizeRecovery (authority rotates) ----
+        anvil_time_warp(&rpc_url, 259_200);
+        let anchor = finalize_recovery_v1(&wallet, vault_id, env, &rpc_url)
+            .await
+            .expect("finalizeRecovery after delay");
+        assert_eq!(
+            anchor.new_authority, proposed_authority,
+            "rotated authority"
+        );
+        let auth1 = read_vault_authority_v1(env, &rpc_url, vault_id)
+            .await
+            .expect("read rotated authority");
+        // L5 (on-chain half): the vaultAuthority rotated to the NEW DEVICE.
+        assert_eq!(
+            auth1, proposed_authority,
+            "vaultAuthority == new device (L5)"
+        );
+
+        // ---- off-chain: guardians open THEIR OWN shares (Q-a) ----
+        let opened: Vec<Share> = [0usize, 2, 4]
+            .iter()
+            .map(|&i| {
+                open_sealed_share(&sealed[i], &two_keys[i].1, &vault_id, &epoch)
+                    .expect("guardian opens own sealed share")
+            })
+            .collect();
+
+        // ---- reconstruct RWK -> unwrap VDK -> ct_eq original (L3) ----
+        let rwk2 = reconstruct_rwk(&opened).expect("reconstruct rwk from t shares");
+        let recovered_vdk = unwrap_vdk_under_rwk(&wrapped_recovery, &rwk2).expect("unwrap vdk");
+        assert!(
+            bool::from(vdk.ct_eq(&recovered_vdk)),
+            "recovered VDK must be byte-identical to the original (L3)"
+        );
+        drop(rwk2);
+
+        // ---- NEGATIVE (L10): < t shares cannot reconstruct the VDK ----
+        let sub: Vec<Share> = [0usize, 2]
+            .iter()
+            .map(|&i| open_sealed_share(&sealed[i], &two_keys[i].1, &vault_id, &epoch).unwrap())
+            .collect();
+        match reconstruct_rwk(&sub) {
+            Err(_) => {} // rejected outright — fine.
+            Ok(wrong) => {
+                // If it produced *some* RWK, it must NOT unwrap the VDK.
+                assert!(
+                    unwrap_vdk_under_rwk(&wrapped_recovery, &wrong).is_err(),
+                    "< t shares must NOT recover the VDK (L10)"
+                );
+            }
+        }
+
+        // ---- L5 (off-chain half): set a NEW password -> re-wrap the
+        //      daily VDK -> it opens under the new password, NOT the old. ----
+        let new_password =
+            pangolin_crypto::secret::SecretBytes::new(b"the brand-new recovery password".to_vec());
+        {
+            let mut v = pangolin_store::Vault::open(&vault_path).expect("reopen vault");
+            v.recover_with_new_password(recovered_vdk, &new_password)
+                .expect("re-wrap daily VDK under new password");
+            // The OLD password no longer unlocks.
+            let old_id = pangolin_store::PinIdentityProof::new(
+                pangolin_crypto::secret::SecretBytes::new(b"the original lost password".to_vec()),
+            );
+            assert!(
+                v.unlock(&pangolin_store::PressYPresenceProof::confirmed(), &old_id)
+                    .is_err(),
+                "old password must NOT unlock after recovery (L5/L8)"
+            );
+            // The NEW password unlocks.
+            let new_id =
+                pangolin_store::PinIdentityProof::new(pangolin_crypto::secret::SecretBytes::new(
+                    b"the brand-new recovery password".to_vec(),
+                ));
+            v.unlock(&pangolin_store::PressYPresenceProof::confirmed(), &new_id)
+                .expect("new password unlocks the re-wrapped vault (L5)");
+        }
+
+        // ---- L6 forward security: re-split under a FRESH RWK' + bumped
+        //      epoch; the OLD shares cannot recover the re-split wrapper. ----
+        let vdk_for_resplit = unwrap_vdk_under_rwk(
+            &wrapped_recovery,
+            &reconstruct_rwk(
+                &[0usize, 2, 4]
+                    .iter()
+                    .map(|&i| {
+                        open_sealed_share(&sealed[i], &two_keys[i].1, &vault_id, &epoch).unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let rwk_new = RecoveryWrapKey::generate();
+        let mut epoch_new = [0u8; pangolin_crypto::escrow::EPOCH_LEN];
+        epoch_new[15] = 1; // bumped epoch
+        let wrapped_new = wrap_vdk_under_rwk(&vdk_for_resplit, &rwk_new, &ctx).unwrap();
+        let shares_new = split_rwk(&rwk_new, threshold, guardian_count).unwrap();
+        let sealed_new: Vec<SealedShare> = shares_new
+            .iter()
+            .zip(&two_keys)
+            .map(|(s, (_, _, x_pub))| seal_share(s, x_pub, &vault_id, &epoch_new).unwrap())
+            .collect();
+        drop(rwk_new);
+        drop(shares_new);
+
+        // The OLD epoch-0 shares reconstruct the OLD (dead) RWK, which must
+        // NOT unwrap the re-split wrapper (forward security, L6).
+        let old_again: Vec<Share> = [0usize, 2, 4]
+            .iter()
+            .map(|&i| open_sealed_share(&sealed[i], &two_keys[i].1, &vault_id, &epoch).unwrap())
+            .collect();
+        let rwk_old = reconstruct_rwk(&old_again).unwrap();
+        assert!(
+            unwrap_vdk_under_rwk(&wrapped_new, &rwk_old).is_err(),
+            "old shares must NOT recover the post-recovery (re-split) vault (L6)"
+        );
+
+        // The NEW shares DO recover the re-split wrapper.
+        let new_open: Vec<Share> = [0usize, 1, 2]
+            .iter()
+            .map(|&i| {
+                open_sealed_share(&sealed_new[i], &two_keys[i].1, &vault_id, &epoch_new).unwrap()
+            })
+            .collect();
+        let rwk_back = reconstruct_rwk(&new_open).unwrap();
+        let vdk_back = unwrap_vdk_under_rwk(&wrapped_new, &rwk_back).unwrap();
+        assert!(
+            bool::from(vdk.ct_eq(&vdk_back)),
+            "re-split must preserve the byte-identical VDK (L3/L6)"
+        );
+    }
+}

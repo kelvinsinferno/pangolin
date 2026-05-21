@@ -1109,6 +1109,126 @@ impl Vault {
         Ok(())
     }
 
+    /// **MVP-3 issue #104b: the new-password-on-recovery branch (L8 /
+    /// §5a Q-d/Q-e).** Re-secure the daily VDK-wrap under a FRESH
+    /// password after a true social-recovery, given the byte-identical
+    /// VDK reconstructed off-chain by
+    /// `pangolin_core::recovery::recover_vdk_from_shares`.
+    ///
+    /// ## Why this is DISTINCT from `unlock` / device-add (L8)
+    ///
+    /// The normal "I got a new phone" device-add path reuses the EXISTING
+    /// password (the new phone learns the password, derives the same
+    /// authority, and unlocks via [`Self::unlock`] — no guardians, no RWK
+    /// touch). This entry is ONLY reached on the lost-password recovery:
+    /// the user has lost the password (so `unlock` is impossible), the
+    /// guardians' threshold-shared RWK has recovered the VDK off-chain,
+    /// and the user now sets a NEW password to re-secure the daily path.
+    /// It does NOT touch the recovery-escrow state — the forward-security
+    /// re-split (a fresh RWK' + fresh sealed shares) is the caller's
+    /// separate `pangolin-store::recovery_escrow::write_recovery_escrow`
+    /// step, kept independent so the two authorities stay decoupled (L5).
+    ///
+    /// ## Dual-authority separation (L5)
+    ///
+    /// This rotates ONLY the off-chain password-derived
+    /// [`AuthorityKey`] (the VDK-wrap authority). The on-chain secp256k1
+    /// `vaultAuthority` rotation is a wholly independent
+    /// `pangolin-chain::finalize_recovery_v1` broadcast the caller drives
+    /// separately; neither rotation touches the other. The VDK itself is
+    /// PRESERVED bit-for-bit — `recovered_vdk` is re-wrapped, never
+    /// re-derived (L3); `VdkKey::generate` is never on this path.
+    ///
+    /// A FRESH KDF salt is drawn so the new wrap key is a function of the
+    /// new password alone (no carry-over from the lost password's salt).
+    /// The vault is left `Locked`; the caller unlocks normally with the
+    /// new password afterward (re-deriving the same authority).
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::AuthenticationFailed` if the KDF / re-wrap fails (the
+    /// indistinguishability discipline), `StoreError::Sqlite` on a DB
+    /// error.
+    pub fn recover_with_new_password(
+        &mut self,
+        recovered_vdk: VdkKey,
+        new_password: &SecretBytes,
+    ) -> Result<()> {
+        // Fresh salt + the recommended KDF params, then derive the new
+        // password authority. Wrong-password indistinguishability is moot
+        // here (the user is SETTING the password, not proving it), but we
+        // still route any KDF failure through AuthenticationFailed for a
+        // uniform failure surface.
+        let salt = KdfSalt::random();
+        let params = KdfParams::RECOMMENDED;
+        let seed = kdf::derive_seed(new_password, &salt, &params)?;
+        let new_authority = AuthorityKey::from_seed(*seed);
+
+        // Re-wrap the recovered VDK under the new authority, bound to the
+        // SAME vault context (L3 — same VDK, same vault, new authority).
+        let wrap_ctx = WrapContext::new(self.meta.vault_id);
+        let wrapped = recovered_vdk.wrap(&new_authority, &wrap_ctx)?;
+        // The recovered VDK + the new authority have done their job; drop
+        // them so their bytes zeroize at the earliest opportunity. The
+        // caller re-derives the authority on the next `unlock`.
+        drop(recovered_vdk);
+        drop(new_authority);
+
+        // Persist the new meta row (fresh salt + the re-wrapped daily VDK)
+        // in place of the lost-password row. Update the in-memory `meta`
+        // so a subsequent `unlock` reads the new salt/wrapper.
+        let new_meta = VaultMeta {
+            vault_id: self.meta.vault_id,
+            created_at: self.meta.created_at,
+            kdf_params: params,
+            kdf_salt: salt,
+            wrap_context: wrap_ctx,
+            wrapped_ciphertext: wrapped.ciphertext().as_bytes().to_vec(),
+            wrapped_nonce: *wrapped.nonce().as_bytes(),
+        };
+        meta::write(&self.conn, &new_meta)?;
+        self.meta = new_meta;
+
+        // Leave the vault Locked: recovery re-secures the at-rest wrap;
+        // the user unlocks afresh with the new password. Any prior active
+        // session is dropped (its secrets zeroize) — recovery is a
+        // re-key, not a session continuation.
+        self.active = None;
+        self.session_state = SessionState::Locked;
+        Ok(())
+    }
+
+    /// **Test-only.** Drive [`Self::recover_with_new_password`] reusing
+    /// the CURRENTLY-ACTIVE VDK as the stand-in for the escrow-reconstructed
+    /// VDK.
+    ///
+    /// Genuine recovery hands `recover_with_new_password` the byte-identical
+    /// VDK that `pangolin_core::recovery::recover_vdk_from_shares`
+    /// reconstructed off-chain. A hermetic vault test cannot run the full
+    /// escrow (the orchestration lives upstream in `pangolin-core`), so this
+    /// helper pulls the active session's own VDK out (`Option::take`) and
+    /// feeds it back in — exercising the SAME re-wrap-under-new-password
+    /// branch with the SAME VDK that was protecting the vault's data, which
+    /// is exactly the L3 byte-identity contract recovery upholds. The
+    /// genuine off-chain reconstruction path is exercised end-to-end by the
+    /// coupled anvil E2E in `pangolin-chain`.
+    ///
+    /// Requires an active session (so there is a VDK to reuse).
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::NotUnlocked` if no session is active; otherwise the
+    /// errors of [`Self::recover_with_new_password`].
+    #[cfg(any(test, feature = "test-utilities"))]
+    pub fn __test_recover_reusing_active_vdk(&mut self, new_password: &SecretBytes) -> Result<()> {
+        let active = self.active.take().ok_or(StoreError::NotUnlocked)?;
+        // Move the VDK out of the dropped ActiveState; the rest of the
+        // ActiveState (cache, device key, evm wallet, search index) drops
+        // here, zeroizing — exactly what a true recovery re-key does.
+        let vdk = active.vdk;
+        self.recover_with_new_password(vdk, new_password)
+    }
+
     /// The session's configured idle duration (Session spec §7.2).
     /// Read from `meta` on `open` / `create`; updated by
     /// [`Self::set_session_idle`]. Defaults to
@@ -8904,6 +9024,90 @@ mod tests {
         let err = v.unlock(&fresh_presence(), &wrong_pin()).unwrap_err();
         assert!(matches!(err, StoreError::AuthenticationFailed));
         assert_eq!(v.state(), VaultState::Locked);
+    }
+
+    /// **MVP-3 issue #104b (L8 / L3 / L5).** The new-password-on-recovery
+    /// branch: after `recover_with_new_password` re-keys the daily wrap
+    /// under a fresh password, the OLD password must FAIL and the NEW
+    /// password must unlock — and the vault's pre-recovery data must
+    /// survive byte-for-byte (the recovered VDK was re-wrapped, never
+    /// re-derived; L3).
+    #[test]
+    fn recover_with_new_password_rotates_wrap_and_preserves_data() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "recover.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+
+        // Unlock with the original password + add an account (data sealed
+        // under the vault's VDK).
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).unwrap();
+        assert!(v.get_account(id).is_some(), "account present pre-recovery");
+
+        // True recovery: re-wrap the (byte-identical) VDK under a NEW
+        // password. The helper reuses the active session's own VDK as the
+        // stand-in for the escrow-reconstructed VDK (same bytes).
+        let new_password = SecretBytes::new(b"a brand new recovery passphrase".to_vec());
+        v.__test_recover_reusing_active_vdk(&new_password).unwrap();
+        // Recovery leaves the vault Locked.
+        assert_eq!(v.state(), VaultState::Locked);
+
+        // The OLD password no longer unlocks (the wrap authority rotated).
+        let old_err = v.unlock(&fresh_presence(), &fresh_pin()).unwrap_err();
+        assert!(matches!(old_err, StoreError::AuthenticationFailed));
+        assert_eq!(v.state(), VaultState::Locked);
+
+        // The NEW password unlocks, and the pre-recovery account is intact
+        // (L3 — the VDK was preserved, so the data decrypts unchanged).
+        let new_pin = PinIdentityProof::new(SecretBytes::new(
+            b"a brand new recovery passphrase".to_vec(),
+        ));
+        v.unlock(&fresh_presence(), &new_pin).unwrap();
+        assert_eq!(v.state(), VaultState::Active);
+        let after = v.get_account(id).expect("account present post-recovery");
+        // The pre-recovery data decrypts unchanged under the new password
+        // (L3 — the VDK was preserved, so the same plaintext comes back).
+        assert!(
+            bool::from(after.ct_eq(&fresh_snapshot())),
+            "vault data must survive recovery byte-for-byte (L3)"
+        );
+
+        // L8: the new-password recovery branch does NOT write any
+        // recovery-escrow state (the forward-security re-split is a
+        // separate caller step). The recovery_escrow table is untouched.
+        let escrow_rows: i64 = v
+            .conn
+            .query_row("SELECT COUNT(*) FROM recovery_escrow", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            escrow_rows, 0,
+            "recovery_with_new_password must not touch the recovery-escrow state (L8)"
+        );
+    }
+
+    /// L8: the NORMAL device-add / re-unlock path uses the EXISTING
+    /// password and never invokes the recovery branch — re-unlocking with
+    /// the same password leaves the wrap authority unchanged (no rotation,
+    /// no recovery-escrow write).
+    #[test]
+    fn normal_reunlock_does_not_rotate_or_touch_escrow() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "reunlock.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let id = v.add_account(fresh_snapshot()).unwrap();
+        v.lock();
+        // Re-unlock with the SAME password (the device-add idiom) — works,
+        // data intact, no escrow row written.
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        assert!(v.get_account(id).is_some());
+        let escrow_rows: i64 = v
+            .conn
+            .query_row("SELECT COUNT(*) FROM recovery_escrow", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(escrow_rows, 0);
     }
 
     /// MEDIUM-5 (P2 audit): pin the documented behavior of `unlock`

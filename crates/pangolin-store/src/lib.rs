@@ -44,6 +44,7 @@ pub mod export;
 pub mod pending;
 pub mod publish;
 pub mod pull;
+pub mod recovery_escrow;
 pub mod revision;
 pub mod session;
 pub mod sync_status;
@@ -98,6 +99,10 @@ pub use publish::{
 pub use pull::{
     PullError, PullReport, PULL_INTERVAL_SECS_DEFAULT, PULL_INTERVAL_SECS_ENV_VAR,
     PULL_INTERVAL_SECS_MAX, PULL_INTERVAL_SECS_MIN,
+};
+// MVP-3 issue #104b: recovery-escrow persistence types.
+pub use recovery_escrow::{
+    GuardianRecord, StoredGuardian, StoredRecoveryEscrow, RECOVERY_ESCROW_SCHEMA_VERSION,
 };
 pub use revision::{
     ChainAnchor, DeviceId, RevisionGraph, RevisionId, RevisionMeta, REVISION_SCHEMA_VERSION_MAX,

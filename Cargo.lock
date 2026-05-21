@@ -3340,6 +3340,7 @@ version = "0.0.0"
 dependencies = [
  "pangolin-crypto",
  "pangolin-store",
+ "proptest",
  "thiserror 2.0.18",
  "zeroize",
  "zxcvbn",

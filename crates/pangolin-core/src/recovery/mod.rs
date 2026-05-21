@@ -13,8 +13,17 @@
 //! deferred).
 //!
 //! The substantive Option-2 threshold-VDK-recovery crypto (the
-//! cryptographic heart) is Workstream B; revocation-on-read is #103-C.
-//! Neither lands here.
+//! cryptographic heart) is Workstream B / #104a (the
+//! `pangolin_crypto::escrow` primitive). The PURE orchestration that
+//! sequences that primitive into the onboarding + recovery flows lives in
+//! the [`orchestration`] submodule (#104b); revocation-on-read is #103-C.
+
+pub mod orchestration;
+
+pub use orchestration::{
+    onboard_guardian_escrow, recover_vdk_from_shares, GuardianAssignment, OnboardingArtifacts,
+    RecoveryArtifacts, RecoveryEpoch, RecoveryOrchestrationError,
+};
 
 /// Lifecycle status of a vault's recovery slot, mirroring
 /// `RecoveryV1.sol`'s `Status` enum (`uint8`-backed, same ordinals).
