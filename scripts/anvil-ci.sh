@@ -341,6 +341,27 @@ do_run() {
       recovery_escrow_coupled_e2e_against_anvil \
       -- --ignored --nocapture
 
+  # issue #106c COUPLED multi-device E2E (the centerpiece — L10). Ties the
+  # RevisionLogV2 chain client (#106c add/remove EIP-712, accepted by the
+  # LIVE contract) + the pairing VDK handoff (#106b-1 seal/open ct_eq) + the
+  # VDK rotation-on-revoke (#106b-2 rotate + commit_vdk_rotation):
+  # bootstrapVault(A) -> addDevice(B) -> seal+open VDK (ct_eq) -> B in set
+  # honored -> removeDevice(B) -> B unhonored + the DeviceRemoved trigger
+  # fires (rotation-pending persisted, NOT auto-rotated, L3) -> rotate ->
+  # commit -> forward secrecy (removed B can't open the new epoch; survivor
+  # A can). The negatives (broken AddDevice EIP-712 digest -> the live
+  # contract reverts; honor gate honoring a removed signer; a survivor seal
+  # to the removed device) are assertions inside the test, so a regression
+  # turns this command RED automatically. Manager A == the same [0x42;32]
+  # seed fund_test_wallet funded (it self-bootstraps + pays gas for the
+  # add/remove txs). RevisionLogV2 is already deployed by do_setup.
+  PANGOLIN_CHAIN_ENV=dev \
+  BASE_SEPOLIA_RPC_URL="$RPC_URL" \
+    cargo test -p pangolin-core --features integration-tests \
+      --test anvil_device_e2e \
+      device_add_remove_rotate_e2e_against_anvil \
+      -- --ignored --nocapture
+
   echo "==> all in-scope tests passed against anvil"
 }
 

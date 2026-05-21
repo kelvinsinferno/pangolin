@@ -3338,10 +3338,13 @@ dependencies = [
 name = "pangolin-core"
 version = "0.0.0"
 dependencies = [
+ "pangolin-chain",
  "pangolin-crypto",
  "pangolin-store",
  "proptest",
+ "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "zeroize",
  "zxcvbn",
 ]

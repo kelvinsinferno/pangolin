@@ -7499,6 +7499,150 @@ impl Vault {
         Ok(u32::try_from(n).unwrap_or(u32::MAX))
     }
 
+    // -----------------------------------------------------------------
+    // MVP-3 issue #106c — multi-device device-add + DeviceRemoved trigger
+    // -----------------------------------------------------------------
+
+    /// **#106c GAP A.** Record a known device's
+    /// `signer -> (device_id, pairing_pub)` triple in the local directory
+    /// (populated at device-add, with opportunistic completion). The rotation
+    /// survivor-resolver reads this to seal the new VDK to each survivor (the
+    /// on-chain set stores only secp256k1 addresses; the X25519 pairing pubkey
+    /// lives here).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] on a DB error.
+    pub fn record_device_directory_entry(
+        &self,
+        signer: [u8; crate::device::EVM_ADDRESS_LEN],
+        device_id: [u8; 32],
+        pairing_pub: [u8; 32],
+    ) -> Result<()> {
+        let entry = crate::multi_device::DirectoryEntry {
+            signer,
+            device_id,
+            pairing_pub,
+        };
+        crate::multi_device::upsert_directory_entry(&self.conn, &entry, current_unix_ms())
+    }
+
+    /// **#106c GAP A.** Read the full local survivor-pubkey directory (for
+    /// resolving a rotation's survivors).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] / [`StoreError::Corrupted`] on a DB / decode
+    /// error.
+    pub fn device_directory(&self) -> Result<Vec<crate::multi_device::DirectoryEntry>> {
+        crate::multi_device::read_directory(&self.conn)
+    }
+
+    /// **#106c GAP D / L5.** The minimal set-membership honor gate: returns
+    /// `true` iff `signer` is in the supplied CURRENT on-chain authorized
+    /// set. The host reads the live set via
+    /// `pangolin_chain::read_authorized_device_v2` (or folds the device-
+    /// management events) and passes it here. Replaces the permissive
+    /// "trust any signer seen" posture for the multi-device V2 path; a
+    /// removed / never-added signer is NOT honored. The FULL systematic
+    /// generalization (lineage / v1→v2 dual-read cut-over) is #106d.
+    #[must_use]
+    pub fn is_signer_honored(
+        signer: &[u8; crate::device::EVM_ADDRESS_LEN],
+        current_onchain_set: &[[u8; crate::device::EVM_ADDRESS_LEN]],
+    ) -> bool {
+        crate::multi_device::is_signer_honored(signer, current_onchain_set)
+    }
+
+    /// **#106c GAP D / L5: honor-gated V2 chain-revision ingest.** Ingest a
+    /// V2 revision ONLY if its signer is in the CURRENT on-chain authorized
+    /// set; otherwise it is rejected (NOT ingested, NOT auto-registered).
+    /// This is the set-membership replacement for the permissive
+    /// `auto_register_device_from_chain_sync` on the multi-device path: an
+    /// unhonored signer (removed / never-added) does not land in the local
+    /// graph.
+    ///
+    /// Returns `Some(outcome)` if the signer was honored + the revision
+    /// ingested; `None` if the signer was NOT in the set (rejected).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::ingest_chain_revision`].
+    pub fn ingest_v2_revision_if_honored(
+        &mut self,
+        event: &pangolin_chain::RevisionEvent,
+        signer: [u8; crate::device::EVM_ADDRESS_LEN],
+        current_onchain_set: &[[u8; crate::device::EVM_ADDRESS_LEN]],
+    ) -> Result<Option<IngestOutcome>> {
+        if !crate::multi_device::is_signer_honored(&signer, current_onchain_set) {
+            return Ok(None);
+        }
+        let outcome = self.ingest_chain_revision(event)?;
+        Ok(Some(outcome))
+    }
+
+    /// **#106c: the `DeviceRemoved`→rotation TRIGGER (detection + persist
+    /// half, L3).** Given the CURRENT on-chain authorized set + the locally-
+    /// known honored signers + the observed vault epoch, persist a crash-
+    /// durable rotation-pending row for each signer that is locally-known
+    /// but NO LONGER in the on-chain set (a removal). NEVER auto-rotates —
+    /// it only PERSISTS + SURFACES (the host re-prompts the master password
+    /// and drives `commit_vdk_rotation`). Idempotent (L6): re-observing the
+    /// same removal does not double-queue.
+    ///
+    /// Returns the count of newly-queued rotation-pending rows.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] / [`StoreError::Corrupted`] on a DB error.
+    pub fn process_device_removed_trigger(
+        &self,
+        current_onchain_set: &[[u8; crate::device::EVM_ADDRESS_LEN]],
+        locally_known_signers: &[[u8; crate::device::EVM_ADDRESS_LEN]],
+        observed_epoch: u64,
+    ) -> Result<u32> {
+        let now_ms = current_unix_ms();
+        let mut queued = 0u32;
+        for signer in locally_known_signers {
+            if current_onchain_set.contains(signer) {
+                continue;
+            }
+            let pending = crate::multi_device::RotationPending {
+                removed_signer: *signer,
+                observed_epoch,
+                observed_at: now_ms,
+            };
+            if crate::multi_device::queue_rotation_pending(&self.conn, &pending)? {
+                queued = queued.saturating_add(1);
+            }
+        }
+        Ok(queued)
+    }
+
+    /// **#106c: read the OUTSTANDING rotation-pending rows.** The host
+    /// surfaces these as "rotation pending — enter master password". A
+    /// closed app RESUMES them on next open (crash-durable, L6).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] / [`StoreError::Corrupted`] on a DB error.
+    pub fn pending_rotations(&self) -> Result<Vec<crate::multi_device::RotationPending>> {
+        crate::multi_device::read_pending_rotations(&self.conn)
+    }
+
+    /// **#106c: mark a rotation-pending row resolved** (after the host
+    /// completes `commit_vdk_rotation` for the removal). Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] on a DB error.
+    pub fn resolve_rotation_pending(
+        &self,
+        removed_signer: &[u8; crate::device::EVM_ADDRESS_LEN],
+    ) -> Result<()> {
+        crate::multi_device::mark_rotation_resolved(&self.conn, removed_signer)
+    }
+
     /// Fetch the publish-relevant fields of a single revision row:
     /// `(parent_revision, schema_version, enc_payload)`.
     ///

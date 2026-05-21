@@ -369,6 +369,46 @@ CREATE TABLE IF NOT EXISTS vdk_chain (
     device_wrap_schema INTEGER NOT NULL,
     schema_version     INTEGER NOT NULL
 );
+
+-- MVP-3 issue #106c (GAP A): the LOCAL survivor-pubkey directory. The
+-- on-chain authorized set stores secp256k1 ADDRESSES; rotation needs each
+-- survivor's X25519 PAIRING pubkey, and there is no on-chain mapping
+-- (correct — no VDK-adjacent contract slots). This table maps each known
+-- device's 20-byte secp256k1 `signer` → its stable 32-byte `device_id`
+-- (GAP B) + its 32-byte X25519 `pairing_pub`. Populated at device-add (when
+-- the existing device learns the new device's full triple) + opportunistic
+-- completion as survivors come online. All three columns are NON-SECRET
+-- (the signer + pairing pubkey are public; the seal binds the recipient
+-- pubkey, not these rows) → plain BLOBs. Additive `CREATE TABLE IF NOT
+-- EXISTS`; legacy vaults pick it up via migrate_device_directory_table.
+CREATE TABLE IF NOT EXISTS device_directory (
+    signer          BLOB    PRIMARY KEY,
+    device_id       BLOB    NOT NULL,
+    pairing_pub     BLOB    NOT NULL,
+    discovered_at   INTEGER NOT NULL,
+    schema_version  INTEGER NOT NULL
+);
+
+-- MVP-3 issue #106c: the crash-durable, RESUMABLE rotation-pending state.
+-- When a `DeviceRemoved` is detected (event-decode or set-diff), a row is
+-- persisted so a closed app RESUMES the pending state on next open (the
+-- removed device is already OUT of the on-chain set, so access-control is
+-- closed; the LOCAL VDK gap is what the password-gated rotation closes).
+-- One row per (removed_signer) outstanding; idempotent re-observe is a
+-- no-op (INSERT OR IGNORE on the PK). The engine NEVER auto-rotates (L3):
+-- it only PERSISTS + SURFACES; the HOST re-prompts the master password and
+-- drives `rotate_vdk_for_survivors` + `commit_vdk_rotation`, which clears
+-- the row. `observed_epoch` is the vault epoch at detection; `resolved` is
+-- 0 (pending) / 1 (completed). Additive `CREATE TABLE IF NOT EXISTS`;
+-- legacy vaults pick it up via migrate_rotation_pending_table — a legacy
+-- vault opens with the table absent → clean empty default (no pending).
+CREATE TABLE IF NOT EXISTS rotation_pending (
+    removed_signer  BLOB    PRIMARY KEY,
+    observed_epoch  INTEGER NOT NULL,
+    observed_at     INTEGER NOT NULL,
+    resolved        INTEGER NOT NULL DEFAULT 0,
+    schema_version  INTEGER NOT NULL
+);
 ";
 
 /// Apply all pragmas and the schema DDL on the supplied connection.
@@ -507,6 +547,55 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     migrate_vdk_chain_tables(conn)?;
     migrate_revision_vdk_epoch_column(conn)?;
 
+    // MVP-3 issue #106c migrations: ensure the additive `device_directory`
+    // (GAP A survivor-pubkey directory) + `rotation_pending` (the
+    // crash-durable DeviceRemoved→rotation state) tables exist on legacy
+    // vaults. The SCHEMA_DDL string above already contains both
+    // `CREATE TABLE IF NOT EXISTS` statements, so for fresh-build vaults
+    // these are structurally redundant; the value is pinning the migration
+    // intent for legacy files whose `apply_pragmas_and_schema` ran under an
+    // older DDL. Belt + suspenders, same pattern as
+    // migrate_recovery_escrow_tables. Additive; no `format_version` bump. A
+    // legacy vault opens with both tables present-but-empty → clean default
+    // (no known directory entries, no pending rotation).
+    migrate_device_directory_table(conn)?;
+    migrate_rotation_pending_table(conn)?;
+
+    Ok(())
+}
+
+/// **MVP-3 issue #106c migration (GAP A).** Ensure the `device_directory`
+/// table exists on legacy vaults. Idempotent — `CREATE TABLE IF NOT
+/// EXISTS` directly. Same belt + suspenders pattern as
+/// [`migrate_recovery_escrow_tables`].
+fn migrate_device_directory_table(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS device_directory (
+            signer          BLOB    PRIMARY KEY,
+            device_id       BLOB    NOT NULL,
+            pairing_pub     BLOB    NOT NULL,
+            discovered_at   INTEGER NOT NULL,
+            schema_version  INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// **MVP-3 issue #106c migration.** Ensure the `rotation_pending` table
+/// exists on legacy vaults. Idempotent — `CREATE TABLE IF NOT EXISTS`
+/// directly.
+fn migrate_rotation_pending_table(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS rotation_pending (
+            removed_signer  BLOB    PRIMARY KEY,
+            observed_epoch  INTEGER NOT NULL,
+            observed_at     INTEGER NOT NULL,
+            resolved        INTEGER NOT NULL DEFAULT 0,
+            schema_version  INTEGER NOT NULL
+        )",
+        [],
+    )?;
     Ok(())
 }
 
