@@ -468,6 +468,48 @@ fn backfill_evm_address_if_missing(
 /// `derive_evm_wallet` call, which Drop-zeroizes via k256's secret-key
 /// discipline; here we only keep the public address). Single source of
 /// secrecy: the AEAD-sealed Ed25519 seed already being written above.
+/// **MVP-3 issue #106b-2.** Re-seal the local device's signing-seed
+/// `device_key` row under a NEW VDK, through a caller-owned transaction.
+///
+/// The `device_key` seed is AEAD-sealed under the VDK column-key (AAD binds
+/// `vault_id` + `device_id`). When a device-revoke rotation mints a fresh
+/// VDK, the seed must be re-sealed under the NEW VDK or the next unlock —
+/// which loads the device key under the new (current) VDK — cannot decrypt
+/// it. This is the device-key peer of the escrow re-point: both at-rest
+/// blobs keyed by the VDK column-key are re-sealed under the new VDK inside
+/// the SAME atomic `commit_vdk_rotation` transaction (#105a discipline). A
+/// no-op if no `device_key` row exists yet (a never-unlocked vault).
+///
+/// # Errors
+///
+/// [`StoreError::Sqlite`] on a DB error; [`StoreError`] from the AEAD seal.
+pub fn reseal_device_key_tx(
+    tx: &rusqlite::Transaction<'_>,
+    vault_id: &[u8; 32],
+    new_vdk_aead: &AeadKey,
+    key: &DeviceKey,
+) -> Result<()> {
+    // Only re-seal if a row exists (a never-unlocked vault has none).
+    if read_device_key_row(tx)?.is_none() {
+        return Ok(());
+    }
+    let device_id = device_id_from_key(key);
+    let seed = key.secret_seed_bytes();
+    let nonce = Nonce::random();
+    let aad = device_key_aad(vault_id, &device_id);
+    let ct = new_vdk_aead.seal(&nonce, &*seed, &aad)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO device_key (id, enc_seed, enc_nonce, schema_version)
+         VALUES (0, ?1, ?2, ?3)",
+        params![
+            ct.as_bytes(),
+            nonce.as_bytes().as_slice(),
+            i64::from(DEVICE_IDENTITY_SCHEMA_VERSION),
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn register_device(
     conn: &Connection,
     vault_id: &[u8; 32],

@@ -40,6 +40,7 @@ pub mod identity;
 pub mod pwgen;
 pub mod recovery;
 pub mod revision;
+pub mod rotation;
 pub mod session;
 pub mod sync;
 
