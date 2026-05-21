@@ -14,6 +14,7 @@
 
 pub mod aead;
 pub mod escrow;
+pub mod guardian;
 pub mod kdf;
 pub mod keys;
 pub mod rng;

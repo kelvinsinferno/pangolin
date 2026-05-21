@@ -307,6 +307,25 @@ do_run() {
       recovery_lifecycle_against_anvil \
       -- --ignored --nocapture
 
+  # issue #104b COUPLED recovery-escrow E2E (the centerpiece — L10). Ties
+  # the OFF-CHAIN threshold-escrow reconstruction to the ON-CHAIN
+  # lifecycle: real split_rwk -> real merkle root over the SAME guardians
+  # whose X25519 shares were sealed -> setGuardianSet -> initiate ->
+  # approve×t -> evm_increaseTime(72h) -> finalize -> open_sealed_share×t
+  # -> reconstruct_rwk -> unwrap_vdk_under_rwk -> ct_eq original VDK ->
+  # new-password re-wrap -> forward-security re-split. The recovering
+  # wallet is the same [0x42;32] seed fund_test_wallet funded; guardians
+  # sign off-chain (no funding). cast must be on PATH (the test invokes
+  # evm_increaseTime / evm_mine for the 72h time-warp). The negatives
+  # (<t shares, wrong guardian↔share mapping, finalize-before-delay) MUST
+  # fail-red — they are assertions inside the test, so a regression turns
+  # this command RED automatically.
+  PANGOLIN_CHAIN_ENV=dev \
+  BASE_SEPOLIA_RPC_URL="$RPC_URL" \
+    cargo test -p pangolin-chain --features integration-tests --lib \
+      recovery_escrow_coupled_e2e_against_anvil \
+      -- --ignored --nocapture
+
   echo "==> all in-scope tests passed against anvil"
 }
 

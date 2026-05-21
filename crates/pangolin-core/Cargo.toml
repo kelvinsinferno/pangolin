@@ -39,3 +39,15 @@ zeroize         = { workspace = true }
 # (core → ..., never the reverse) so `pangolin-crypto`'s tree is
 # unaffected.
 zxcvbn         = { version = "=3.1.1", default-features = false }
+
+[dev-dependencies]
+# MVP-3 issue #104b: ≥1024-case proptest over the onboard→recover
+# orchestration round-trip (mirrors the keys.rs / escrow tests.rs
+# discipline). `proptest` is the workspace-pinned dev-dependency the
+# crypto/store crates already use; naming it here adds NO new external
+# crate (it is in the lockfile + dev-only, so it never ships in any
+# production artifact — the #104b "zero new deps" bar concerns
+# production deps). HIGH-1 holds: this is a dev-dep on `pangolin-core`,
+# which is downstream of `pangolin-crypto`, so it cannot affect the
+# crypto crate's serde-free tree.
+proptest = { workspace = true }

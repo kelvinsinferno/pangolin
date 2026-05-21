@@ -277,6 +277,50 @@ CREATE TABLE IF NOT EXISTS capture_authorities (
     schema_version      INTEGER NOT NULL,
     PRIMARY KEY (context_kind, platform_hint)
 );
+
+-- MVP-3 issue #104b: single-row recovery-escrow state table. Holds the
+-- VDK second-wrapped under the threshold-shared RWK (`wrapped_ct` +
+-- `wrapped_nonce` + `wrap_schema_version`), the guardian-set parameters
+-- (`threshold` = on-chain t, `guardian_count` = on-chain M — the L2
+-- equality), and the monotonic recovery `epoch` (GAP FLAG 2 — the
+-- big-endian counter baked into each sealed share's domain header,
+-- advanced on onboarding + each recovery re-split). ALL columns are
+-- non-secret at rest (the recovery wrapper is AEAD ciphertext keyed by
+-- the threshold-shared RWK; the epoch + t/M are public) → plain BLOBs,
+-- same idiom as `meta.wrapped_ct` (plan §5a Q-g / L9). `id = 0` CHECK
+-- enforces single-row; INSERT OR REPLACE keyed on id = 0 writes it.
+-- Additive `CREATE TABLE IF NOT EXISTS` (no format_version bump); legacy
+-- vaults pick it up on next open via migrate_recovery_escrow_tables.
+CREATE TABLE IF NOT EXISTS recovery_escrow (
+    id                  INTEGER PRIMARY KEY CHECK (id = 0),
+    wrapped_ct          BLOB    NOT NULL,
+    wrapped_nonce       BLOB    NOT NULL,
+    wrap_schema_version INTEGER NOT NULL,
+    threshold           INTEGER NOT NULL,
+    guardian_count      INTEGER NOT NULL,
+    epoch               INTEGER NOT NULL,
+    schema_version      INTEGER NOT NULL
+);
+
+-- MVP-3 issue #104b: per-guardian recovery-escrow rows. `guardian_index`
+-- is the ordinal (0..M) that L2-joins the X25519-sealed guardian to the
+-- secp256k1 merkle-committed guardian at the same position.
+-- `guardian_x25519_pub` is the guardian's 32-byte X25519 public key
+-- (non-secret). `enc_sealed_share` is the locally-retained copy of the
+-- guardian's SealedShare, ADDITIONALLY double-wrapped under the VDK
+-- column-AEAD (plan §5a Q-g — defence in depth, matching the `device_key`
+-- discipline; the AEAD AAD binds vault_id + epoch + guardian_index so a
+-- row cannot be transplanted across vault/epoch/slot). `enc_nonce` pairs
+-- with it. The `no_plaintext_on_disk`-style assertion holds for
+-- `enc_sealed_share`. Additive table; legacy vaults pick it up via
+-- migrate_recovery_escrow_tables.
+CREATE TABLE IF NOT EXISTS recovery_guardians (
+    guardian_index      INTEGER PRIMARY KEY,
+    guardian_x25519_pub BLOB    NOT NULL,
+    enc_sealed_share    BLOB    NOT NULL,
+    enc_nonce           BLOB    NOT NULL,
+    schema_version      INTEGER NOT NULL
+);
 ";
 
 /// Apply all pragmas and the schema DDL on the supplied connection.
@@ -389,6 +433,49 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     migrate_devices_chain_sync_columns(conn)?;
     migrate_chain_sync_v1_state_table(conn)?;
 
+    // MVP-3 issue #104b migration: ensure the additive `recovery_escrow`
+    // + `recovery_guardians` tables exist on legacy vaults. The SCHEMA_DDL
+    // string above already contains both `CREATE TABLE IF NOT EXISTS`
+    // statements, so for fresh-build vaults this is structurally
+    // redundant; the value is in pinning the migration intent for legacy
+    // files whose `apply_pragmas_and_schema` ran under an older DDL.
+    // Belt + suspenders, same pattern as migrate_chain_sync_v1_state_table.
+    // Additive; no `format_version` bump. A legacy vault that has never
+    // onboarded guardians simply has the tables present-but-empty, which
+    // `recovery_escrow::read_recovery_escrow` reads back as `None`.
+    migrate_recovery_escrow_tables(conn)?;
+
+    Ok(())
+}
+
+/// **MVP-3 issue #104b migration.** Ensure the `recovery_escrow` +
+/// `recovery_guardians` tables exist on legacy vaults. Idempotent — uses
+/// `CREATE TABLE IF NOT EXISTS` directly. Same belt + suspenders pattern
+/// as [`migrate_chain_sync_v1_state_table`] / [`migrate_device_key_table`].
+fn migrate_recovery_escrow_tables(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS recovery_escrow (
+            id                  INTEGER PRIMARY KEY CHECK (id = 0),
+            wrapped_ct          BLOB    NOT NULL,
+            wrapped_nonce       BLOB    NOT NULL,
+            wrap_schema_version INTEGER NOT NULL,
+            threshold           INTEGER NOT NULL,
+            guardian_count      INTEGER NOT NULL,
+            epoch               INTEGER NOT NULL,
+            schema_version      INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS recovery_guardians (
+            guardian_index      INTEGER PRIMARY KEY,
+            guardian_x25519_pub BLOB    NOT NULL,
+            enc_sealed_share    BLOB    NOT NULL,
+            enc_nonce           BLOB    NOT NULL,
+            schema_version      INTEGER NOT NULL
+        )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -997,6 +1084,59 @@ mod tests {
             evm.is_none(),
             "legacy row's evm_address must be NULL pre-backfill"
         );
+    }
+
+    /// MVP-3 issue #104b: the `recovery_escrow` + `recovery_guardians`
+    /// tables land via `apply_pragmas_and_schema` and survive an
+    /// idempotent re-run. A legacy vault (one that predates #104b — here
+    /// emulated by a DB whose schema was applied under the historical DDL
+    /// then re-run) opens cleanly with the tables present-but-empty.
+    #[test]
+    fn recovery_escrow_tables_migration_is_idempotent_and_additive() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Emulate a legacy vault: build the pre-#104b table set by hand
+        // (just the device_key + meta minimum) WITHOUT the recovery
+        // tables, then run the full migration runner.
+        conn.execute_batch(
+            "CREATE TABLE device_key (
+                id INTEGER PRIMARY KEY CHECK (id = 0),
+                enc_seed BLOB NOT NULL, enc_nonce BLOB NOT NULL,
+                schema_version INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        assert!(!table_exists(&conn, "recovery_escrow"));
+        assert!(!table_exists(&conn, "recovery_guardians"));
+        // First migration run lands both tables.
+        apply_pragmas_and_schema(&conn).unwrap();
+        assert!(table_exists(&conn, "recovery_escrow"));
+        assert!(table_exists(&conn, "recovery_guardians"));
+        // Both empty for a never-onboarded legacy vault → read_recovery_escrow
+        // returns None (verified in recovery_escrow.rs tests); here just
+        // confirm the rows are absent.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM recovery_escrow", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+        // Idempotent re-run: tables still present, single-row CHECK intact.
+        apply_pragmas_and_schema(&conn).unwrap();
+        let cols = column_names(&conn, "recovery_escrow");
+        for needed in [
+            "id",
+            "wrapped_ct",
+            "wrapped_nonce",
+            "wrap_schema_version",
+            "threshold",
+            "guardian_count",
+            "epoch",
+            "schema_version",
+        ] {
+            assert_eq!(
+                cols.iter().filter(|c| c.as_str() == needed).count(),
+                1,
+                "recovery_escrow.{needed} should appear exactly once"
+            );
+        }
     }
 
     /// MVP-2 issue 4.4: the `meta.sync_mode_preference` column lands
