@@ -17,6 +17,7 @@ pub mod escrow;
 pub mod guardian;
 pub mod kdf;
 pub mod keys;
+pub mod pairing;
 pub mod rng;
 pub mod secret;
 pub mod sign;
