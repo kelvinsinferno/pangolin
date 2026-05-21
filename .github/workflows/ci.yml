@@ -139,6 +139,16 @@ jobs:
       # (D-011); this step only gates that the script compiles + dry-runs.
       - name: forge script (deploy recovery-v1 dry-run)
         run: forge script script/DeployRecoveryV1.s.sol --sig "run()" --tc DeployRecoveryV1
+      # MVP-3 issue #106a: same dry-run for RevisionLogV2. Same audit-gap-7
+      # rationale. RevisionLogV2 takes ONE constructor arg (the RecoveryV1
+      # cross-read address, Q-h); with RECOVERY_V1_ADDRESS unset the deploy
+      # script deploys a fresh RecoveryV1 in the same broadcast and wires V2
+      # to it, so the two-contract construction path is exercised without
+      # needing a pre-deployed address. Per
+      # docs/issue-plans/106a-revisionlogv2-contract.md L18 the testnet
+      # deploy is a follow-on + mainnet is external-audit-gated (D-011).
+      - name: forge script (deploy revision-log-v2 dry-run)
+        run: forge script script/DeployRevisionLogV2.s.sol --sig "run()" --tc DeployRevisionLogV2
       # MVP-2 issue 2.3: smoke-test the deploy-wrapper script
       # (scripts/deploy-contracts.sh) in dry-run mode against the dev
       # environment. Catches regressions in the wrapper itself — flag
@@ -292,6 +302,17 @@ jobs:
             echo "::error::Re-run: cd contracts && forge build && python3 -c \"import json; d=json.load(open('out/RecoveryV1.sol/RecoveryV1.json')); f=open('abi/RecoveryV1.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()\""
             exit 1
           fi
+      # MVP-3 issue #106a: same ABI-drift discipline for RevisionLogV2.
+      - name: Extract freshly built ABI (revision-log-v2)
+        run: |
+          python3 -c "import json; d=json.load(open('out/RevisionLogV2.sol/RevisionLogV2.json')); f=open('/tmp/RevisionLogV2.fresh.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()"
+      - name: Diff committed revision-log-v2 ABI against fresh ABI
+        run: |
+          if ! diff -u abi/RevisionLogV2.json /tmp/RevisionLogV2.fresh.json; then
+            echo "::error::ABI drift detected between contracts/abi/RevisionLogV2.json and forge build output."
+            echo "::error::Re-run: cd contracts && forge build && python3 -c \"import json; d=json.load(open('out/RevisionLogV2.sol/RevisionLogV2.json')); f=open('abi/RevisionLogV2.json','w'); json.dump(d['abi'], f, indent=2); f.write('\n'); f.close()\""
+            exit 1
+          fi
 
   contracts-slither:
     name: contracts / slither
@@ -345,6 +366,12 @@ jobs:
       # EPIC; external-audit-gated before mainnet per D-011).
       - name: slither (recovery-v1)
         run: slither src/RecoveryV1.sol --fail-high
+      # MVP-3 issue #106a: same slither posture for RevisionLogV2. Zero
+      # high-severity findings required per
+      # docs/issue-plans/106a-revisionlogv2-contract.md (same external-audit
+      # tier as RecoveryV1 / RevisionLogV1; gated before mainnet by D-011).
+      - name: slither (revision-log-v2)
+        run: slither src/RevisionLogV2.sol --fail-high
 
   # -----------------------------------------------------------------
   # P1-6: Rust supply-chain hardening
