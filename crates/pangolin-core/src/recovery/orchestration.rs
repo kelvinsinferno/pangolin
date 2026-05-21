@@ -310,6 +310,17 @@ pub fn onboard_guardian_escrow(
 /// `WrappedVdkRecovery` under RWK' — the old wrapper is never reused
 /// (GAP FLAG 3).
 ///
+/// # Caller persistence ordering (L6 at-rest)
+///
+/// The returned `re_split` artifacts and the new-password re-wrap of the
+/// daily `WrappedVdk` MUST be persisted together: write the re-split escrow
+/// (`write_recovery_escrow`, which REPLACEs the prior generation) before — or
+/// in the same transaction as — the password rotation. A crash *between* the
+/// two leaves a re-keyed daily wrap alongside stale escrow rows whose OLD
+/// shares still reconstruct the OLD RWK, defeating forward security until the
+/// next successful re-split. The pure driver cannot enforce this (it spans two
+/// crates); it is the recovery caller's contract.
+///
 /// # Errors
 ///
 /// - [`RecoveryOrchestrationError::InsufficientShares`] if fewer than

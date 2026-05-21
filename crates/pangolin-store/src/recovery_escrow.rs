@@ -302,12 +302,29 @@ fn read_escrow_meta_row(conn: &Connection) -> Result<Option<EscrowMetaRow>> {
                     threshold, guardian_count, epoch, schema_version
              FROM recovery_escrow WHERE id = 0",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
         )
         .optional()
         .map_err(StoreError::from)?;
-    let Some((wrapped_ct, wrapped_nonce, wrap_schema_i, threshold_i, guardian_count_i, epoch_i, schema_i)) =
-        row
+    let Some((
+        wrapped_ct,
+        wrapped_nonce,
+        wrap_schema_i,
+        threshold_i,
+        guardian_count_i,
+        epoch_i,
+        schema_i,
+    )) = row
     else {
         return Ok(None);
     };
@@ -350,9 +367,8 @@ fn decode_guardian_row(
             u32::from(RECOVERY_ESCROW_SCHEMA_VERSION),
         ));
     }
-    let index = u8::try_from(index_i).map_err(|_| {
-        StoreError::Corrupted("recovery_guardians.guardian_index out of u8".into())
-    })?;
+    let index = u8::try_from(index_i)
+        .map_err(|_| StoreError::Corrupted("recovery_guardians.guardian_index out of u8".into()))?;
     let guardian_x25519_pub: [u8; X25519_KEY_LEN] =
         pub_blob.as_slice().try_into().map_err(|_| {
             StoreError::Corrupted("recovery_guardians.guardian_x25519_pub length".into())
