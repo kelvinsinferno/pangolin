@@ -922,8 +922,13 @@ contract RevisionLogV2 {
 
     /// @dev Read-only `staticcall` of `RECOVERY_V1.vaultAuthority(vaultId)`
     ///      (Q-h / L15). A `staticcall` cannot mutate state — zero
-    ///      reentrancy surface. Returns `address(0)` if the call reverts or
-    ///      returns malformed data (treated as "no recovery authority").
+    ///      reentrancy surface. Returns `address(0)` only when the vault has
+    ///      NO recovery authority set (the `vaultAuthority` mapping getter's
+    ///      default), in which case `_currentManager` falls back to the
+    ///      V2-local `deviceManager`. The pinned RecoveryV1's getter never
+    ///      reverts; were the cross-call ever to revert it bubbles up here
+    ///      (fail-closed — no mutation proceeds), it does NOT silently
+    ///      degrade to `address(0)`.
     function _recoveryAuthority(bytes32 vaultId) internal view returns (address) {
         return IRecoveryV1(RECOVERY_V1).vaultAuthority(vaultId);
     }
