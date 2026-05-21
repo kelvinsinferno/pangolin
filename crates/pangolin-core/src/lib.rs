@@ -35,6 +35,7 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod device;
+pub mod device_add;
 pub mod error;
 pub mod identity;
 pub mod pwgen;

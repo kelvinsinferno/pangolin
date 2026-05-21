@@ -41,6 +41,7 @@ pub mod device;
 pub mod dirty;
 pub mod error;
 pub mod export;
+pub mod multi_device;
 pub mod pending;
 pub mod publish;
 pub mod pull;
@@ -78,6 +79,11 @@ pub use export::{
     ArchiveHeader, ArchiveSnapshot, ArchivedAccount, ArchivedDevice, ArchivedPasswordEntry,
     PlaintextExportConfirmationData, ARCHIVE_FORMAT_VERSION, ARCHIVE_MAGIC,
     ARCHIVE_SNAPSHOT_SCHEMA_VERSION, PLAINTEXT_EXPORT_BANNER,
+};
+pub use multi_device::{
+    consume_survivor_seal, is_signer_honored, lookup_directory_entry, mark_rotation_resolved,
+    queue_rotation_pending, read_directory, read_pending_rotations, upsert_directory_entry,
+    DirectoryEntry, RotationPending, MULTI_DEVICE_SCHEMA_VERSION,
 };
 // MVP-2 issue 3.1 (R-b convenience re-export): downstream callers
 // (apps/cli, the eventual sync transport in 3.3) get the v1 signing

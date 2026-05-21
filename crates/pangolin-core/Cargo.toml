@@ -12,6 +12,17 @@ description = "Pangolin core vault engine — single source of truth for securit
 [lints]
 workspace = true
 
+[features]
+# MVP-3 issue #106c: gates the coupled multi-device anvil E2E
+# (`tests/anvil_device_e2e.rs`) — the centerpiece regression gate that ties
+# the RevisionLogV2 chain client (#106c) + the pairing handoff (#106b-1) +
+# the VDK rotation (#106b-2) end-to-end against a live local anvil. The
+# `#[ignore]`'d test never runs in the default `cargo test`; it is driven by
+# `scripts/anvil-ci.sh`. Enabling it pulls `pangolin-chain`'s
+# `integration-tests` feature (for `test_env`) — both are dev-only + path
+# deps already in the lockfile, so this adds NO new external crate.
+integration-tests = ["pangolin-chain/integration-tests"]
+
 [dependencies]
 # MVP-1 issue 1.1 (Q2): the Vault / session / account / revision types
 # physically live in `pangolin-store` until issue 1.4 relocates them.
@@ -51,3 +62,17 @@ zxcvbn         = { version = "=3.1.1", default-features = false }
 # which is downstream of `pangolin-crypto`, so it cannot affect the
 # crypto crate's serde-free tree.
 proptest = { workspace = true }
+# MVP-3 issue #106c: the coupled anvil E2E drives the RevisionLogV2 chain
+# client + the test_env harness seam. `pangolin-chain` is already in the
+# lockfile (a workspace member, pulled transitively via `pangolin-store`);
+# naming it as a dev-dep adds NO new external crate. `test-utilities` is
+# needed for `Vault::__test_commit_vdk_rotation_reusing_active`; the
+# `integration-tests` feature (for `test_env`) is enabled via this crate's
+# own `integration-tests` feature. Dev-only — never ships in any production
+# artifact.
+pangolin-chain = { path = "../pangolin-chain", features = ["test-utilities"] }
+pangolin-store = { path = "../pangolin-store", features = ["test-utilities"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+# Dev-only temp dir for the #106c E2E's local vault. Already in the
+# lockfile (store/chain use it); naming it here adds NO new external crate.
+tempfile = { workspace = true }

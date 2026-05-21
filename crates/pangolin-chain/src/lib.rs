@@ -107,6 +107,8 @@ pub mod evm;
 pub mod privacy;
 pub mod recovery_client;
 pub mod recovery_signing;
+pub mod revisionlog_v2_client;
+pub mod revisionlog_v2_signing;
 pub mod secp256k1_signing;
 pub mod signing;
 pub mod types;
@@ -170,6 +172,18 @@ pub use recovery_signing::{
     approve_digest, approve_struct_hash, build_domain_recovery, build_signed_approval_v1,
     recover_approver_v1, ApproveFieldsV1, SignedApprovalV1, APPROVE_TYPEHASH_V1,
     RECOVERY_DOMAIN_SEPARATOR_ANVIL_DEV_V1,
+};
+pub use revisionlog_v2_client::{
+    add_device_v2, bootstrap_vault_v2, cancel_promotion_v2, decode_device_mgmt_events,
+    finalize_promotion_v2, propose_promotion_v2, read_authorized_device_count_v2,
+    read_authorized_device_v2, read_bootstrapped_v2, read_current_manager_v2, read_device_nonce_v2,
+    remove_device_v2, DeviceLifecycleAnchorV2, DeviceMgmtEvent, REVISIONLOG_V2_CONTRACT_NAME,
+};
+pub use revisionlog_v2_signing::{
+    build_domain_revisionlog_v2, build_signed_device_auth, device_auth_digest,
+    device_auth_struct_hash, recover_device_auth_signer, DeviceAuthFields, DeviceAuthKind,
+    SignedDeviceAuth, ADD_DEVICE_TYPEHASH_V2, PROMOTE_TYPEHASH_V2, REMOVE_DEVICE_TYPEHASH_V2,
+    REVISIONLOG_V2_SCHEMA_VERSION,
 };
 pub use secp256k1_signing::{
     build_signed_redemption_v1, build_signed_revision_v1, is_canonical_s, recover_signer_v1,
