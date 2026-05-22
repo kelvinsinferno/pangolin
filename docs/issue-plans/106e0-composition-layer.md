@@ -5,11 +5,23 @@
 
 ## 0a. RESOLVED decisions (Kelvin sign-off 2026-05-22)
 
+### 0a-CORRECTION (2026-05-22, builder dep-arrow finding — supersedes Q-a's location)
+
+The builder correctly found that **Q-a's "all three as `Vault` methods in `vault.rs`" is impossible for two of them.** The workspace dependency arrow is one-way **`pangolin-core` → `pangolin-store`** (`pangolin-core/Cargo.toml` deps on store; store has NO core dep). `complete_rotation`/`recover_from_shares` MUST call `pangolin-core` drivers (`resolve_survivors`, `rotate_vdk_for_survivors`, `recover_vdk_from_shares`), so a `Vault` method physically in `pangolin-store` cannot reach them (Cargo-prohibited cycle). The corrected, verified-clean placement:
+
+- **`complete_rotation` + `recover_from_shares` → free fns in `pangolin-core`** taking `&mut Vault` (core CAN call both the core drivers AND store's pub commits). NOT `Vault` methods.
+- **`guardian_open_sealed_share` → STAYS a `Vault` method in `pangolin-store`** (it only needs `pangolin-crypto` — `derive_x25519_sealing_key`/`open_sealed_share` — which is upstream of store; no core dep). Buildable as Q-a specified.
+- **Secret hygiene holds (verified against vault.rs:1497/1618 + the anvil E2E):** `rotate_vdk_for_survivors` takes ONLY non-secret inputs (survivor/guardian pubkeys, epoch) and MINTS `new_vdk` internally — the core fn never reads `old_vdk`/`device_key`. To keep those store-internal, **PROMOTE `__test_commit_vdk_rotation_reusing_active` (vault.rs:1618) to a production pub `Vault::commit_vdk_rotation_from_active(new_vdk, new_password, new_epoch, re_split…)`** (a thin delegate that does `self.active.take()` then calls the already-audited `commit_vdk_rotation` — NO new atomic surface). The core `complete_rotation` calls THAT, supplying only the driver's `new_vdk` + password + re_split. `recover_from_shares` calls the EXISTING pub `commit_recovery_rekey(recovered_vdk, …)` directly (the recovered VDK is reconstructed by the core driver, not from `self.active`). The `re_split → &[GuardianRecord]` decomposition moves into the core fns (core can construct store's pub `GuardianRecord`). Only secret OUT remains the guardian `Share`.
+
+All other §0a decisions (behavior, GAP-A surfacing, lost-everything scope, Q-b/Q-d/Q-e, the test gate) are UNCHANGED — only the *file/crate location* of two methods moves from store to core.
+
+---
+
 The three methods PROMOTE the existing `#[cfg(any(test, feature="test-utilities"))]` helpers to production — wrapping the already-audited single-tx commits; NO new atomic surface.
 - **`Vault::complete_rotation(master_password, current_onchain_set) -> RotationOutcome { new_epoch, unknown_survivors }`** — pulls `old_vdk` + local `DeviceKey` from `self.active`; `read_directory` → `resolve_survivors` → `rotate_vdk_for_survivors` → `commit_vdk_rotation` → `resolve_rotation_pending`; `(t,M)`/epoch/guardian-pubs read store-side via `read_recovery_escrow(active.vdk.aead_key())` + `read_current_epoch`. **GAP-A:** the `unknown`-pubkey survivors flow into `RotationOutcome.unknown_survivors` (never silently stranded).
 - **Q-b (MAIN) → `Vault::recover_from_shares(wrapped_recovery, opened_shares, roster, new_password) -> RecoveryOutcome { new_epoch }` — LOST-EVERYTHING ONLY.** A fresh device has no VDK → can't read its own escrow (chicken-and-egg), so `wrapped_recovery` + roster `(t,M)`+M-X25519-pubs + recovered epoch + `vault_id` are ALL HOST-SUPPLIED parameters from the backup (backup FORMAT stays deferred — the recurring roster-restore gap). Pulls NOTHING from `self.active`. The has-vault-refresh variant is DROPPED (just a password change, no distinct use). → `recover_vdk_from_shares` → `commit_recovery_rekey`.
 - **`Vault::guardian_open_sealed_share(sealed_share, vault_id, epoch) -> Share`** — derives the guardian X25519 sealing secret from `self.active.device_key` via **`derive_x25519_sealing_key`** (confirmed — the share-to-guardian derivation, NOT pairing) + `open_sealed_share`. The returned `Share` is the only secret out (the #106e-1 FFI wraps it opaque).
-- **Q-a → all three are `Vault` methods in `vault.rs`** (no pure-core helper).
+- **Q-a → SUPERSEDED by 0a-CORRECTION:** `complete_rotation`/`recover_from_shares` are `pangolin-core` free fns over `&mut Vault` (the dep arrow forbids store reaching the core drivers); `guardian_open_sealed_share` stays a store `Vault` method. Plus a new thin pub store wrapper `commit_vdk_rotation_from_active` (promoted from the `__test_` helper) so `old_vdk`/`device_key` never cross into core.
 - **Q-e → `resolve_rotation_pending` loops over the WHOLE survivor set** (a rotation retires the whole set, not one `removed_signer`).
 - **Q-d (secret hygiene — the audit's central check):** the extracted VDK/device-key/guardian-secret are BORROWED from `self.active` (already in memory), not copied/leaked; methods return NON-secret outcomes except the guardian `Share`. ZERO new secret-lifetime surface.
 - **Promote the inline `re_split → &[GuardianRecord]` decomposition** (currently test code at vault.rs:10754) to a production helper.
@@ -45,10 +57,11 @@ All three methods inherit the existing session discipline: `let active = self.ac
 
 ### 3.1 `Vault::complete_rotation` (the rotation method)
 
-**Proposed signature:**
+**Proposed signature (per 0a-CORRECTION: `pangolin-core` free fn over `&mut Vault`, NOT a store method):**
 ```text
+// in pangolin-core (can call both the core drivers AND store's pub commits)
 pub fn complete_rotation(
-    &mut self,
+    vault: &mut Vault,
     master_password: &SecretBytes,
     current_onchain_set: &[[u8; 20]],   // host-supplied: the live RevisionLogV2 authorized set
 ) -> Result<RotationOutcome>
@@ -61,11 +74,11 @@ pub struct RotationOutcome {
 }
 ```
 **Where each input comes from / the composition (mirrors `__test_commit_vdk_rotation_reusing_active`):**
-- **`old_vdk` + `local_device`** — pulled from `self.active` (the `ActiveState { vdk, device_key, … }` at vault.rs:523). The test helper does `let active = self.active.take(); let old_vdk = active.vdk; let local_device = active.device_key;`. Production does the SAME but must hold the borrow only across the commit (the commit borrows `&old_vdk` / `&local_device`).
+- **`old_vdk` + `local_device`** — per 0a-CORRECTION these stay STORE-INTERNAL: the core fn does NOT read them (it can't see private `self.active`). Instead it calls the new pub `vault.commit_vdk_rotation_from_active(new_vdk, master_password, new_epoch, re_split…)` (promoted from `__test_commit_vdk_rotation_reusing_active`, vault.rs:1618), which does `self.active.take()` to pull `old_vdk`/`device_key` and delegates to the audited `commit_vdk_rotation`. So the core fn supplies only the driver's `new_vdk` + password + re_split — the old VDK/device key never cross the crate boundary.
 - **survivor directory + `(survivors, unknown)`** — `resolve_survivors(current_onchain_set, &directory)` where `directory` is built from `multi_device::read_directory(&self.conn)` mapped into `SurvivorDirectoryEntry`. `unknown` flows straight into `RotationOutcome.unknown_survivors` (GAP-A, Q-c).
 - **guardian set `(t, M)` + the M X25519 pubkeys + `current_epoch`** — read store-side: `(t,M)`/epoch from `read_recovery_escrow(&self.conn, vault_id, self.active.vdk.aead_key())` (the CURRENT VDK opens it — a rotation always has a current VDK); the M guardian X25519 pubkeys are the `guardian_x25519_pub` of each `StoredRecoveryEscrow.guardians` entry; `current_epoch` from `vdk_chain::read_current_epoch(&self.conn)`.
 - **`rotate_vdk_for_survivors(survivors, vault_id, GuardianSetConfig{t,M}, &guardian_pubs, current_epoch)`** → `RotationArtifacts { new_vdk, re_split: OnboardingArtifacts, new_epoch, .. }`.
-- **the audited commit** — decompose `re_split` into `&[GuardianRecord]` exactly as the existing tests do (`re_split.assignments[i] → GuardianRecord { index, guardian_x25519_pub, sealed_share: &… }`), then `commit_vdk_rotation(new_vdk, &old_vdk, &local_device, master_password, new_epoch, &re_split.wrapped_recovery, t, M, re_split.epoch.into(), &records)`. ATOMIC via the existing single `unchecked_transaction()` (#106b-2 L4) — no new atomic surface.
+- **the audited commit** — decompose `re_split` into `&[GuardianRecord]` exactly as the existing tests do (`re_split.assignments[i] → GuardianRecord { index, guardian_x25519_pub, sealed_share: &… }`; the core fn constructs store's pub `GuardianRecord`), then `vault.commit_vdk_rotation_from_active(new_vdk, master_password, new_epoch, &re_split.wrapped_recovery, t, M, re_split.epoch.into(), &records)` — which internally pulls `old_vdk`/`device_key` and delegates to the audited `commit_vdk_rotation`. ATOMIC via the existing single `unchecked_transaction()` (#106b-2 L4) — no new atomic surface.
 - **`resolve_rotation_pending(removed_signer)`** — after the commit, mark the pending row(s) resolved. (Open detail Q-e: which removed signer to clear — see §5.)
 
 ### 3.2 `Vault::recover_from_shares` (the recovery method) — THE MAIN NUANCE (Q-b)
@@ -76,10 +89,11 @@ pub struct RotationOutcome {
 
 **Recommendation (Q-b): support LOST-EVERYTHING as the PRIMARY (and, for #106e-0, the ONLY) scenario** — it is the genuine recovery use, and it is the one #106e-1's `vault_recover_from_shares(opened_shares, roster, new_password)` (LOCKED §3.1) is shaped for. The has-vault refresh has no real user need distinct from a normal password change and would force a `read_recovery_escrow` branch keyed on session state. Take the recovery inputs as host-supplied parameters; do NOT read the local escrow.
 
-**Proposed signature (lost-everything):**
+**Proposed signature (lost-everything; per 0a-CORRECTION: `pangolin-core` free fn over `&mut Vault`):**
 ```text
+// in pangolin-core
 pub fn recover_from_shares(
-    &mut self,
+    vault: &mut Vault,
     wrapped_recovery: &WrappedVdkRecovery,   // host-supplied (from backup)
     opened_shares: Vec<Share>,               // collected from >= t guardians (opaque carriers)
     roster: &GuardianRoster,                 // M X25519 pubkeys + (t,M) — host-supplied
@@ -126,7 +140,7 @@ pub fn guardian_open_sealed_share(
 
 ## 5. Open decisions for Kelvin (Q-a … Q-f) — recommendation + plain-English stakes
 
-- **Q-a — Where do the methods live?** **Recommend: all three as `Vault` methods in `pangolin-store/src/vault.rs`** (next to the `commit_*` they wrap), with NO new pure-core helper — the composition is store-state-bound (it reads `self.active`, `self.conn`, the escrow, the directory). *Plain English:* keep the new code in one file beside the audited commits it wraps, rather than scattering it. Stakes: low; a pure-core helper would only add an indirection with no caller.
+- **Q-a — Where do the methods live? → RESOLVED by 0a-CORRECTION (NOT all-in-store; the dep arrow forbids it).** `complete_rotation`/`recover_from_shares` are `pangolin-core` free fns over `&mut Vault` (store cannot call the core drivers); `guardian_open_sealed_share` stays a store `Vault` method; a new thin pub `Vault::commit_vdk_rotation_from_active` keeps `old_vdk`/`device_key` store-internal. See 0a-CORRECTION for the full rationale + secret-flow verification.
 - **Q-b (THE MAIN ONE) — `recover_from_shares` scenario scope: lost-everything only, or BOTH?** **Recommend: lost-everything ONLY for #106e-0.** Take `wrapped_recovery` + roster + `(t,M)` + the recovered epoch + `vault_id` as HOST-SUPPLIED parameters (from a backup); do NOT read the local escrow (a fresh device has no VDK to read it with). *Plain English:* "recovery" means the user lost all their devices and is starting over — there's nothing local to read, so the recovery material has to come from a backup the host hands us. The "refresh an existing vault" variant has no real distinct use (it's just a password change) and would complicate the method with a session-state branch. **Stakes if wrong: HIGH** — if we accidentally shape the method to read the local escrow, lost-everything recovery (the whole point of social recovery) is impossible on a fresh device. **Sub-flag (must resolve in build, not blocking the gate): the recovered EPOCH and `vault_id` must travel in the backup envelope** — on a fresh device `read_current_epoch` returns the default, not the recovered epoch, so the re-split would be tagged at the wrong epoch. The backup-format itself stays deferred (#106e Q-g), but #106e-0 must pin that these two values are method PARAMETERS, not store reads.
 - **Q-c — Guardian-open X25519 derivation + GAP-A surfacing.** **Resolved by reading the code (confirm):** a guardian uses **`derive_x25519_sealing_key`** (not pairing) to open a share sealed to it (orchestration.rs's own tests do exactly this). And `complete_rotation` surfaces `resolve_survivors`'s `unknown` list in `RotationOutcome.unknown_survivors` so the host never silently strands an in-set survivor whose pubkey the local directory doesn't yet know (#106e GAP A). *Plain English:* a guardian's "open my share" key is a different derived key from a device's "receive the vault key" key — we use the guardian one. And if a surviving device's public key isn't in our local address book yet, we tell the caller rather than dropping it.
 - **Q-d — Secret hygiene / new secret-lifetime surface?** **Recommend: confirm NONE.** The extracted secrets are borrowed from `self.active` and live only across the audited commit; the only secret OUT is the opened `Share` (FFI-wrapped opaque). *Plain English:* we're not creating any new place a secret could leak — we borrow what's already in memory, use it, and the only thing that leaves is the guardian's opened share, which the FFI immediately seals behind an opaque handle. Stakes: this is the audit's central claim — pin it precisely.
