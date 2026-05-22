@@ -34,6 +34,7 @@
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
+pub mod composition;
 pub mod device;
 pub mod device_add;
 pub mod error;
@@ -58,7 +59,8 @@ pub use pangolin_store::{
     ConflictDelta, ConflictReport, ConflictSnapshot, DeviceCapabilities, DeviceId, DeviceIdentity,
     IdentityProof, LastFlushOutcome, LastPullOutcome, PasswordEntry, PasswordHistorySummaryEntry,
     PendingMerge, PinIdentityProof, PlaintextExportConfirmationData, PresenceProof,
-    PressYPresenceProof, PullErrorKind, RegistrationOutcome, RevisionGraph, RevisionId,
+    PressYPresenceProof, PullErrorKind, RecoveryEscrowParams, RegistrationOutcome, RevisionGraph,
+    RevisionId,
     RevisionMeta, SessionDuration, SessionState, SyncStatus, SyncStatusInputs, SystemClock,
     TotpAlgorithm, TotpParams, Vault, VaultState, ABSOLUTE_MAX_DEFAULT,
     ACCOUNT_IDENTITY_SCHEMA_VERSION, ARCHIVE_FORMAT_VERSION, ARCHIVE_SNAPSHOT_SCHEMA_VERSION,

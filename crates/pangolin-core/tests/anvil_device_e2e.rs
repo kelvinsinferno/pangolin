@@ -339,6 +339,234 @@ async fn device_add_remove_rotate_e2e_against_anvil() {
     );
 }
 
+/// **#106e-0 — the PUBLIC `complete_rotation` composition driven against a
+/// live anvil set.** The production twin of the rotation half above: instead
+/// of hand-wiring `rotate_vdk_for_survivors` + `__test_commit_*`, it drives
+/// `pangolin_core::composition::complete_rotation`, which reads the survivor
+/// directory + the recovery-escrow params store-side (the active VDK never
+/// crosses the crate boundary), runs the driver, calls the audited
+/// `commit_vdk_rotation_from_active`, and resolves every retired
+/// rotation-pending row (Q-e). Asserts: the epoch advanced, the pending row
+/// cleared, the NEW password unlocks (prompt-on-revoke), the escrow
+/// re-pointed, and GAP-A surfaces an in-set survivor whose pubkey the local
+/// directory does not know.
+#[tokio::test]
+#[ignore = "live-RPC test; requires PANGOLIN_CHAIN_ENV=dev + local anvil (scripts/anvil-ci.sh)"]
+#[allow(clippy::too_many_lines)]
+async fn complete_rotation_public_composition_e2e_against_anvil() {
+    use pangolin_core::composition::complete_rotation;
+    use pangolin_store::{PinIdentityProof, PressYPresenceProof, VaultState};
+
+    let env = test_env::target_chain_env();
+    if !test_env::is_dev_mode()
+        && !test_env::require_or_fail("#106e-0 complete_rotation E2E needs dev anvil")
+    {
+        return;
+    }
+    let rpc_url = test_env::rpc_url();
+    let chain_id = test_env::resolve_signing_chain_id(env, &rpc_url)
+        .await
+        .expect("resolve signing chain id");
+    let contract = pangolin_chain::load_deployed_address(env, "RevisionLogV2")
+        .expect("RevisionLogV2 in dev.json");
+
+    // ---- devices: A (survivor/manager), B (revoked), C (in-set survivor
+    // the local directory does NOT know — GAP-A) ----
+    let a_device = device_a();
+    let a_wallet = wallet_for(&a_device);
+    let a_signer = a_wallet.address();
+    let a_pairing = derive_x25519_pairing_key(&a_device);
+    let a_device_id = device_id_from_device_key(&a_device);
+
+    let b_device = DeviceKey::from_seed([0x7B; 32]);
+    let b_signer = wallet_for(&b_device).address();
+
+    let c_device = DeviceKey::from_seed([0x9C; 32]);
+    let c_signer = wallet_for(&c_device).address();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut vault_id = [0u8; 32];
+    vault_id[..8].copy_from_slice(&now.to_be_bytes());
+    vault_id[31] = 0xE6;
+
+    let current_epoch = 0u64;
+
+    // ---- on-chain: bootstrap A, add B + C, remove B ----
+    let sign = |kind, subject, nonce| {
+        build_signed_device_auth(
+            a_wallet.signer(),
+            DeviceAuthFields {
+                kind,
+                vault_id,
+                subject,
+                nonce,
+                schema_version: 1,
+            },
+            contract,
+            chain_id,
+        )
+        .expect("sign device auth")
+    };
+    bootstrap_vault_v2(
+        &a_wallet,
+        a_signer,
+        &sign(DeviceAuthKind::AddDevice, a_signer, 0),
+        env,
+        &rpc_url,
+    )
+    .await
+    .expect("bootstrapVault(A)");
+    let n1 = read_device_nonce_v2(env, &rpc_url, vault_id).await.unwrap();
+    add_device_v2(
+        &a_wallet,
+        b_signer,
+        &sign(DeviceAuthKind::AddDevice, b_signer, n1),
+        env,
+        &rpc_url,
+    )
+    .await
+    .expect("addDevice(B)");
+    let n2 = read_device_nonce_v2(env, &rpc_url, vault_id).await.unwrap();
+    add_device_v2(
+        &a_wallet,
+        c_signer,
+        &sign(DeviceAuthKind::AddDevice, c_signer, n2),
+        env,
+        &rpc_url,
+    )
+    .await
+    .expect("addDevice(C)");
+    let n3 = read_device_nonce_v2(env, &rpc_url, vault_id).await.unwrap();
+    remove_device_v2(
+        &a_wallet,
+        b_signer,
+        &sign(DeviceAuthKind::RemoveDevice, b_signer, n3),
+        env,
+        &rpc_url,
+    )
+    .await
+    .expect("removeDevice(B)");
+
+    // The live authorized set after the revoke: A + C (B removed).
+    let current_onchain_set = vec![a_signer.into_array(), c_signer.into_array()];
+
+    // ---- a local vault, unlocked, with A's directory entry + an escrow ----
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("complete-rotation-e2e.pvf");
+    let pwd = pangolin_crypto::secret::SecretBytes::new(b"e2e master password".to_vec());
+    Vault::create(&path, &pwd).expect("create vault");
+    let mut vault = Vault::open(&path).expect("open vault");
+    vault
+        .unlock(
+            &PressYPresenceProof::confirmed(),
+            &PinIdentityProof::new(pangolin_crypto::secret::SecretBytes::new(
+                b"e2e master password".to_vec(),
+            )),
+        )
+        .expect("unlock");
+
+    // The local directory knows A (survivor) but NOT C — C must surface in
+    // RotationOutcome.unknown_survivors (GAP-A).
+    vault
+        .record_device_directory_entry(
+            a_signer.into_array(),
+            a_device_id,
+            *a_pairing.public_bytes(),
+        )
+        .expect("record A in directory");
+
+    // Onboard an escrow over the active VDK (2-of-3) so complete_rotation can
+    // read its params + re-point it.
+    let guardian_pubs: Vec<[u8; 32]> = (0u8..3)
+        .map(|i| {
+            let g = DeviceKey::from_seed([0xE0_u8.wrapping_add(i); 32]);
+            *derive_x25519_sealing_key(&g).public_bytes()
+        })
+        .collect();
+    vault
+        .__test_onboard_recovery_escrow(2, &guardian_pubs, current_epoch)
+        .expect("onboard escrow over active VDK");
+
+    // The DeviceRemoved trigger persists a rotation-pending row for B.
+    let queued = vault
+        .process_device_removed_trigger(
+            &current_onchain_set,
+            &[
+                a_signer.into_array(),
+                b_signer.into_array(),
+                c_signer.into_array(),
+            ],
+            current_epoch,
+        )
+        .expect("process DeviceRemoved trigger");
+    assert_eq!(queued, 1, "exactly one removal queued (B)");
+    assert_eq!(vault.pending_rotations().expect("pending").len(), 1);
+
+    // ---- THE PUBLIC COMPOSITION ----
+    let new_password = pangolin_crypto::secret::SecretBytes::new(b"post-revoke master pw".to_vec());
+    let outcome = complete_rotation(&mut vault, &new_password, &current_onchain_set)
+        .expect("complete_rotation composition");
+
+    // Epoch advanced to current+1.
+    assert_eq!(
+        outcome.new_epoch,
+        current_epoch + 1,
+        "the shared epoch advances on rotation"
+    );
+    // GAP-A: C is in-set but its pairing pubkey is unknown locally — surfaced,
+    // never silently stranded.
+    assert_eq!(
+        outcome.unknown_survivors,
+        vec![c_signer.into_array()],
+        "the in-set-but-unknown survivor C surfaces in unknown_survivors (GAP-A)"
+    );
+    // The vault is Locked post-commit; the pending row for B cleared (Q-e).
+    assert_eq!(vault.state(), VaultState::Locked);
+    assert!(
+        vault.pending_rotations().expect("pending").is_empty(),
+        "the rotation-pending row clears after complete_rotation (Q-e)"
+    );
+
+    // The OLD password no longer opens; the NEW password does (prompt-on-revoke).
+    let old_err = vault
+        .unlock(
+            &PressYPresenceProof::confirmed(),
+            &PinIdentityProof::new(pangolin_crypto::secret::SecretBytes::new(
+                b"e2e master password".to_vec(),
+            )),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        old_err,
+        pangolin_store::StoreError::AuthenticationFailed
+    ));
+    vault
+        .unlock(
+            &PressYPresenceProof::confirmed(),
+            &PinIdentityProof::new(pangolin_crypto::secret::SecretBytes::new(
+                b"post-revoke master pw".to_vec(),
+            )),
+        )
+        .expect("NEW password opens the rotated vault");
+    assert_eq!(vault.state(), VaultState::Active);
+
+    // The escrow re-pointed to the new epoch with the same guardian set.
+    let params = vault
+        .recovery_escrow_params()
+        .expect("escrow params")
+        .expect("escrow present after rotation");
+    assert_eq!(
+        params.current_epoch,
+        current_epoch + 1,
+        "the VDK-chain epoch advanced (rotation shares one clock)"
+    );
+    assert_eq!(params.guardian_count, 3);
+    assert_eq!(params.threshold, 2);
+}
+
 /// Fund a wallet on the local anvil chain via `cast rpc anvil_setBalance`
 /// (the harness guarantees `cast` is on PATH in dev mode). Needed so a
 /// device other than the harness-funded A can pay gas for its own publish.

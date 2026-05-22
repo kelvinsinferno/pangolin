@@ -131,7 +131,8 @@ pub use sync_status::{
     SyncStatus, SyncStatusInputs, OFFLINE_THRESHOLD_FAILURES, SYNCED_STALENESS_THRESHOLD_MS,
 };
 pub use vault::{
-    AccountStatus, RevisionLogVersion, SyncMode, SyncModePreference, Vault, VaultState,
+    AccountStatus, RecoveryEscrowParams, RevisionLogVersion, SyncMode, SyncModePreference, Vault,
+    VaultState,
 };
 
 /// Returns the crate name. Useful for diagnostics and version reporting.

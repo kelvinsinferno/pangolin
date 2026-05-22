@@ -352,6 +352,28 @@ pub enum SyncMode {
     AlwaysFast,
 }
 
+/// **MVP-3 issue #106e-0.** The NON-secret recovery-escrow parameters a
+/// VDK rotation needs, returned by [`Vault::recovery_escrow_params`].
+///
+/// Read by the store with the active VDK (which opens the double-wrapped
+/// escrow) but carrying NO secret: just the guardian set shape and the
+/// guardians' SEALING pubkeys + the current recovery epoch. Lets the
+/// `pangolin-core` composition layer drive `rotate_vdk_for_survivors`
+/// without the active VDK ever crossing the crate boundary (Q-d).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryEscrowParams {
+    /// The reconstruction threshold (`t`) — equals the on-chain
+    /// `guardianSet.threshold`.
+    pub threshold: u8,
+    /// The guardian count (`M`) — equals the on-chain `guardianCount`.
+    pub guardian_count: u8,
+    /// The `M` guardians' 32-byte X25519 SEALING pubkeys, ordered by index
+    /// (`0..M`). Non-secret — the re-split re-seals to the SAME guardian set.
+    pub guardian_x25519_pubs: Vec<[u8; 32]>,
+    /// The current recovery epoch the escrow generation is tagged with.
+    pub current_epoch: u64,
+}
+
 /// Encrypted local vault.
 ///
 /// Owns a `SQLite` connection and (when `Active`) the unwrapped VDK plus
@@ -1594,17 +1616,78 @@ impl Vault {
         Ok(())
     }
 
+    /// **MVP-3 issue #106e-0: the PRODUCTION thin wrapper that keeps
+    /// `old_vdk` / `device_key` STORE-INTERNAL (the secret-hygiene seam).**
+    ///
+    /// Drive [`Self::commit_vdk_rotation`] supplying the CURRENTLY-active
+    /// session's VDK as the OLD (pre-revoke) epoch's VDK and the active
+    /// session's `DeviceKey` as the local device — both pulled from the
+    /// private `self.active` here and never crossing a crate boundary.
+    ///
+    /// The composition layer in `pangolin-core`
+    /// (`pangolin_core::composition::complete_rotation`) runs the pure
+    /// rotation driver (which MINTS the FRESH `new_vdk` from non-secret
+    /// inputs) and hands the FRESH `new_vdk` + re-split here. The OLD VDK +
+    /// device key the audited [`Self::commit_vdk_rotation`] needs for the
+    /// retained-epoch wraps are read from the active session INSIDE this
+    /// method, so the dependency arrow (`pangolin-core` → `pangolin-store`)
+    /// never carries `old_vdk` / `device_key` up into core. This is a PURE
+    /// DELEGATE: it adds NO new atomic surface (the single-transaction
+    /// commit lives entirely in [`Self::commit_vdk_rotation`], #106b-2 L4).
+    ///
+    /// Requires an active session (so there is an OLD VDK + device key to
+    /// reuse). On success the vault is left `Locked` (the audited commit's
+    /// posture); the caller re-unlocks with the new password.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::NotUnlocked` if no session is active; otherwise the
+    /// errors of [`Self::commit_vdk_rotation`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_vdk_rotation_from_active(
+        &mut self,
+        new_vdk: VdkKey,
+        new_password: &SecretBytes,
+        new_epoch: u64,
+        re_split_wrapped_recovery: &WrappedVdkRecovery,
+        re_split_threshold: u8,
+        re_split_guardian_count: u8,
+        re_split_epoch: u64,
+        re_split_guardians: &[GuardianRecord<'_>],
+    ) -> Result<()> {
+        // Pull the OLD VDK + local device key out of the active session.
+        // They are BORROWED into the audited commit (which consumes/drops
+        // the fresh `new_vdk`) and zeroize when `active` drops at end of
+        // scope — exactly the discipline the `__test_` helper used, now
+        // promoted to production (L2 — zero new secret-lifetime surface).
+        let active = self.active.take().ok_or(StoreError::NotUnlocked)?;
+        let old_vdk = active.vdk;
+        let local_device = active.device_key;
+        self.commit_vdk_rotation(
+            new_vdk,
+            &old_vdk,
+            &local_device,
+            new_password,
+            new_epoch,
+            re_split_wrapped_recovery,
+            re_split_threshold,
+            re_split_guardian_count,
+            re_split_epoch,
+            re_split_guardians,
+        )
+    }
+
     /// **Test-only (#106b-2).** Drive [`Self::commit_vdk_rotation`] reusing
     /// the CURRENTLY-active VDK as the OLD (pre-revoke) epoch's VDK and the
     /// active session's `DeviceKey` as the local device.
     ///
-    /// Genuine rotation hands `commit_vdk_rotation` the FRESH VDK +
-    /// `re_split` `pangolin_core::rotation::rotate_vdk_for_survivors`
-    /// produced + the active session's OLD VDK / device key. A hermetic
-    /// vault test cannot run the full off-chain orchestration (it lives
-    /// upstream in `pangolin-core`), so this helper pulls the active VDK +
-    /// device key out and threads them in alongside a caller-built FRESH
-    /// VDK + re-split — exercising the SAME single-tx COMBINED branch (L4).
+    /// As of #106e-0 this is a thin alias of the production
+    /// [`Self::commit_vdk_rotation_from_active`] (which promoted this
+    /// helper's exact body): a hermetic vault test cannot run the upstream
+    /// `pangolin-core` rotation orchestration, so it builds a FRESH VDK +
+    /// re-split locally and drives the SAME single-tx COMBINED branch (L4)
+    /// through this entry point. Retained so the existing hermetic store
+    /// coverage keeps its name.
     ///
     /// Requires an active session (so there is an OLD VDK + device key to
     /// reuse).
@@ -1626,13 +1709,8 @@ impl Vault {
         re_split_epoch: u64,
         re_split_guardians: &[GuardianRecord<'_>],
     ) -> Result<()> {
-        let active = self.active.take().ok_or(StoreError::NotUnlocked)?;
-        let old_vdk = active.vdk;
-        let local_device = active.device_key;
-        self.commit_vdk_rotation(
+        self.commit_vdk_rotation_from_active(
             new_vdk,
-            &old_vdk,
-            &local_device,
             new_password,
             new_epoch,
             re_split_wrapped_recovery,
@@ -1715,6 +1793,83 @@ impl Vault {
             re_split_epoch,
             re_split_guardians,
         )
+    }
+
+    /// **Test-only (#106e-0).** Onboard a recovery escrow over the
+    /// CURRENTLY-ACTIVE VDK, sealing one share to each supplied guardian
+    /// X25519 SEALING pubkey, persisted at `epoch`.
+    ///
+    /// Production code onboards the escrow via the upstream
+    /// `pangolin_core::recovery::onboard_guardian_escrow` driver feeding a
+    /// caller-owned transaction; a hermetic / anvil store test needs a vault
+    /// whose escrow is genuinely under its OWN active VDK so a later
+    /// `complete_rotation` can read it back (`recovery_escrow_params`) and
+    /// re-point it. This helper mints a fresh RWK, second-wraps the active
+    /// VDK under it, splits + seals to the supplied pubkeys, and writes the
+    /// escrow row under the active VDK's column-AEAD — exactly the shape
+    /// `commit_recovery_rekey` / `commit_vdk_rotation` persist. Returns the
+    /// `M` guardian X25519 SECRET scalars so the caller can open the shares.
+    ///
+    /// Requires an active session.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::NotUnlocked` if no session is active; otherwise a
+    /// crypto / DB error from the escrow build / write.
+    #[cfg(any(test, feature = "test-utilities"))]
+    pub fn __test_onboard_recovery_escrow(
+        &mut self,
+        threshold: u8,
+        guardian_pubs: &[[u8; 32]],
+        epoch: u64,
+    ) -> Result<()> {
+        use pangolin_crypto::escrow::{seal_share, split_rwk, wrap_vdk_under_rwk, RecoveryWrapKey};
+        let active = self.require_active()?;
+        let vault_id = self.meta.vault_id;
+        let wrap_ctx = WrapContext::new(vault_id);
+        let guardian_count = u8::try_from(guardian_pubs.len())
+            .map_err(|_| StoreError::Corrupted("guardian count overflows u8".into()))?;
+
+        // Mint a fresh RWK, second-wrap the active VDK under it, split, seal.
+        let rwk = RecoveryWrapKey::generate();
+        let wrapped_recovery = wrap_vdk_under_rwk(&active.vdk, &rwk, &wrap_ctx)
+            .map_err(|_| StoreError::AuthenticationFailed)?;
+        let shares =
+            split_rwk(&rwk, threshold, guardian_count).map_err(|_| StoreError::AuthenticationFailed)?;
+        drop(rwk);
+
+        let mut epoch_bytes = [0u8; pangolin_crypto::escrow::EPOCH_LEN];
+        epoch_bytes[8..].copy_from_slice(&epoch.to_be_bytes());
+        let mut sealed = Vec::with_capacity(shares.len());
+        for (share, pubkey) in shares.iter().zip(guardian_pubs) {
+            sealed.push(
+                seal_share(share, pubkey, &vault_id, &epoch_bytes)
+                    .map_err(|_| StoreError::AuthenticationFailed)?,
+            );
+        }
+        drop(shares);
+        let records: Vec<GuardianRecord<'_>> = (0..usize::from(guardian_count))
+            .map(|i| GuardianRecord {
+                index: u8::try_from(i).expect("index <= M-1 fits u8"),
+                guardian_x25519_pub: guardian_pubs[i],
+                sealed_share: &sealed[i],
+            })
+            .collect();
+
+        let vdk_aead = active.vdk.aead_key();
+        let tx = self.conn.unchecked_transaction()?;
+        recovery_escrow::write_recovery_escrow_tx(
+            &tx,
+            &vault_id,
+            vdk_aead,
+            &wrapped_recovery,
+            threshold,
+            guardian_count,
+            epoch,
+            &records,
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// The session's configured idle duration (Session spec §7.2).
@@ -7724,6 +7879,88 @@ impl Vault {
     /// error.
     pub fn device_directory(&self) -> Result<Vec<crate::multi_device::DirectoryEntry>> {
         crate::multi_device::read_directory(&self.conn)
+    }
+
+    /// **MVP-3 issue #106e-0: the NON-secret recovery-escrow parameters a
+    /// rotation needs, read store-side WITHOUT exposing the active VDK.**
+    ///
+    /// `pangolin_core::composition::complete_rotation` needs the guardian
+    /// set `(t, M)`, the `M` guardian X25519 pubkeys, and the current
+    /// recovery epoch to drive `rotate_vdk_for_survivors`. The escrow blob
+    /// is double-wrapped under the CURRENT VDK's column-AEAD, so reading it
+    /// requires `self.active.vdk.aead_key()` — a SECRET that must NOT cross
+    /// the `pangolin-core` ↔ `pangolin-store` boundary. This accessor opens
+    /// the escrow with the active VDK INSIDE the store and returns ONLY the
+    /// non-secret parameters (Q-d). The VDK itself never leaves `self`.
+    ///
+    /// A rotation always runs on an existing unlocked device (it is an
+    /// existing device revoking a peer), so the active VDK is available.
+    ///
+    /// `Ok(None)` if no recovery escrow has been onboarded yet.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] if no session is active;
+    /// [`StoreError::Sqlite`] / [`StoreError::Corrupted`] /
+    /// [`StoreError::AuthenticationFailed`] from the escrow read.
+    pub fn recovery_escrow_params(&self) -> Result<Option<RecoveryEscrowParams>> {
+        let active = self.require_active()?;
+        let vault_id = self.meta.vault_id;
+        let escrow = crate::recovery_escrow::read_recovery_escrow(
+            &self.conn,
+            &vault_id,
+            active.vdk.aead_key(),
+        )?;
+        let current_epoch = vdk_chain::read_current_epoch(&self.conn)?;
+        Ok(escrow.map(|e| RecoveryEscrowParams {
+            threshold: e.threshold,
+            guardian_count: e.guardian_count,
+            // The M guardian X25519 pubkeys, ordered by index (0..M) — all
+            // non-secret (they are the SEALING pubkeys shares were sealed
+            // to). The decrypted `sealed_share` bytes in `e.guardians` are
+            // dropped here (never copied out).
+            guardian_x25519_pubs: e.guardians.iter().map(|g| g.guardian_x25519_pub).collect(),
+            current_epoch,
+        }))
+    }
+
+    /// **MVP-3 issue #106e-0: a guardian opens a share sealed to it.**
+    ///
+    /// The local device is acting as a GUARDIAN for some vault being
+    /// recovered (not necessarily its own — hence the explicit `vault_id` /
+    /// `epoch`). It derives its guardian X25519 SEALING secret from the
+    /// active session's `DeviceKey` via
+    /// [`pangolin_crypto::guardian::derive_x25519_sealing_key`] (the
+    /// share-to-guardian derivation — NOT the device-pairing key) and opens
+    /// the [`SealedShare`] with
+    /// [`pangolin_crypto::escrow::open_sealed_share`].
+    ///
+    /// The returned [`Share`] is the ONE secret this composition layer
+    /// yields; the #106e-1 FFI wraps it behind an opaque handle (#106e L1).
+    /// Session-gated. The derived sealing secret is a `Zeroizing` buffer
+    /// passed straight into `open_sealed_share` (no copy, L2).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] if no session is active;
+    /// [`StoreError::AuthenticationFailed`] if the open fails (wrong key,
+    /// tampered ciphertext, or a `vault_id` / `epoch` mismatch — the
+    /// undifferentiated indistinguishability collapse).
+    pub fn guardian_open_sealed_share(
+        &self,
+        sealed_share: &pangolin_crypto::escrow::SealedShare,
+        vault_id: &[u8; VAULT_ID_LEN],
+        epoch: &[u8; pangolin_crypto::escrow::EPOCH_LEN],
+    ) -> Result<pangolin_crypto::escrow::Share> {
+        let active = self.require_active()?;
+        let sealing = pangolin_crypto::guardian::derive_x25519_sealing_key(&active.device_key);
+        pangolin_crypto::escrow::open_sealed_share(
+            sealed_share,
+            &sealing.secret_bytes(),
+            vault_id,
+            epoch,
+        )
+        .map_err(|_| StoreError::AuthenticationFailed)
     }
 
     /// **#106c GAP D / L5.** The minimal set-membership honor gate: returns
