@@ -1660,4 +1660,9 @@ Kelvin 2026-05-20: **option A — build now** on the vetted-library design; NO e
 
 **Process note (2026-05-21):** builder/audit gates MUST run full `cargo test --workspace` (not just `-p crate`) — a workspace-wide meta-test (`no_empty_ignored_tests`) only runs there; a scoped run let an empty-bodied test redden main post-merge (#106b-1, hotfix `98a35b8`).
 
+**#106 update (2026-05-21) — the V2 revision data-plane was a missing slice, split out + built:**
+- **#106c2 — V2 revision data-plane — MERGED `56eaf10`.** The everyday multi-device sync the #106d build found missing: `meta.revisionlog_version` v1/v2 binding (new vaults default V1 until V2 deployed+D-011-cleared, Q-a) + `publish_revision_v2` (reuses V1 struct_hash/digest, swaps only the EIP-712 domain to v"2" → byte-identical to `RevisionLogV2._hashRevision`) + V2 read/verify/WS (`fetch_and_verify_chunk_v2`, filters topic2 for vaultId) + routing (V1 path verbatim). Library-layer only — the store publish-QUEUE cut-over (still on the old v0 Ed25519 adapter) is a separate downstream slice. Audit CLEAN; full `cargo test --workspace` + live anvil E2E green. Honor gate stays downstream (#106d).
+- **#107 (FOLLOW-UP BUG, MEDIUM, dormant):** V1 read filters `topic1` for vaultId but RevisionLogV1's event puts vaultId at `topic2` → V1 reads return zero logs on a live chain. Masked (mock tests ignore topic filters; live V1 read test is `#[ignore]`'d). 4.1 slow-mode + indexer share it. V2 path is correct. Fix V1 + add a non-ignored regression test.
+- **Re-sequence:** #106c2 (done) → **#106d** (revocation gate, plan LOCKED `2edb722`, now UNBLOCKED) → **#106e** (pairing UX + FFI).
+
 Recovery + multi-device stay TESTNET-ONLY (Base Sepolia) until the D-011 external audit clears.
