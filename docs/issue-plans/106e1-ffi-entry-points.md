@@ -1,7 +1,19 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-# Issue #106e-1 — recovery + rotation FFI entry points (the thin uniffi layer over #106e-0) — plan-gate DRAFT
+# Issue #106e-1 — recovery + rotation FFI entry points (the thin uniffi layer over #106e-0) — plan-gate LOCKED (BLOCKED on #106e-0b)
 
-**Status: DRAFT — awaiting Kelvin sign-off (decisions in §5).** Mirrors the §16 plan-gate format of `106e0-composition-layer.md`. The thin uniffi surface that exposes the merged #106e-0 composition methods to host apps so the multi-device recovery/rotation flows are reachable from the UI. **Subsumes the long-pending #105b recovery-FFI** (per the LOCKED `106e-pairing-ux-ffi.md` §0a Q-a). Pairing transport / QR / SAS / device-add FFI stays #106e-2.
+**Status: LOCKED — Kelvin sign-off 2026-05-22 (§0a). BLOCKED on #106e-0b (onboarding) — build that first.** Mirrors the §16 plan-gate format of `106e0-composition-layer.md`. The thin uniffi surface that exposes the merged #106e-0 composition methods to host apps so the multi-device recovery/rotation flows are reachable from the UI. **Subsumes the long-pending #105b recovery-FFI** (per the LOCKED `106e-pairing-ux-ffi.md` §0a Q-a). Pairing transport / QR / SAS / device-add FFI stays #106e-2.
+
+## 0a. RESOLVED decisions (Kelvin sign-off 2026-05-22)
+
+- **Q-a → SPLIT: onboarding is its own slice #106e-0b, built FIRST.** The production guardian-escrow onboarding path (the missing prerequisite) is NOT folded into #106e-1; it gets its own plan-gate + builder + audit + merge (`106e0b-guardian-onboarding.md`), then #106e-1's recovery FFI builds on top. #106e-1 is BLOCKED until #106e-0b merges.
+- **Q-b → the FFI READS the live authorized set itself** (engine is the single source of truth). `vault_complete_rotation` becomes async (`block_on_local` + the fail-closed `read_authorized_set_v2`), taking `rpc_url`/`deployment_path` like `vault_lock_with_drain`; the host does NOT pass the set in. A buggy/malicious host cannot inject a wrong set that strands a survivor or skips a revocation.
+- **Q-c → opened `Share` as a `SecretPassword`-style opaque `Arc<FfiOpenedShare>` Object** (zeroizing buffer, exposes only `byte_length()`); `vault_recover_from_shares` consumes `Vec<Arc<FfiOpenedShare>>` and extracts the `Share`s engine-side. The Object NEVER exposes the raw scalar (the audit's central FFI check).
+- **Q-d → recovery material (`wrapped_recovery`/`current_epoch`/`vault_id`) crosses as raw length-validated `Vec<u8>`/`u64` params** (host-supplied from a backup; backup FORMAT stays deferred to 6.x).
+- **Q-e → ONE slice** for the 4 recovery/rotation bindings (onboarding is the separate #106e-0b per Q-a).
+- **Q-f → pairing/device-add FFI is OUT** → #106e-2 (QR/short-code/SAS + `vault_add_device`).
+- **L-invariants:** L1 zero-secret-crosses-FFI (only opaque Objects + epochs/survivor-lists out; `grep -ci uniffi` on core/store stays 0); no new atomic surface (wraps the merged commits); rotation never auto-completes (master password crosses IN); session-gated except lost-everything recover; thin (uniffi 0.31.1, no new deps); errors carry no secret; testnet-only/D-011; AGPL; full `cargo test --workspace` + uniffi binding tests; its own #104a-style audit focused on L1.
+
+> NOTE: §5 below is the original DRAFT decision discussion; §0a is authoritative.
 
 ## 0. One-paragraph summary
 
