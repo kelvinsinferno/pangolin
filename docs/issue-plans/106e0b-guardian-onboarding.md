@@ -1,7 +1,15 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-# Issue #106e-0b — production guardian-escrow ONBOARDING (the missing recovery prerequisite) — plan-gate DRAFT
+# Issue #106e-0b — production guardian-escrow ONBOARDING (the missing recovery prerequisite) — plan-gate LOCKED
 
-**Status: DRAFT — awaiting Kelvin sign-off (decisions in §5).** Split out of the #106e-1 plan-gate (Kelvin 2026-05-22: "build onboarding as #106e-0b first"). The production path to SET UP social recovery on a vault — the prerequisite that makes the #106e-1 recovery/rotation FFI a live surface instead of a dead one. Mirrors the §16 plan-gate format of `106e0-composition-layer.md`; its own #104a-style audit (the catastrophic-if-wrong recovery crypto path).
+**Status: LOCKED — Kelvin sign-off 2026-05-22 (§0a).** Split out of the #106e-1 plan-gate (Kelvin 2026-05-22: "build onboarding as #106e-0b first").
+
+## 0a. RESOLVED decisions (Kelvin sign-off 2026-05-22)
+
+- **Q-a → Option B: SHARE one implementation (lift the onboard primitive into `pangolin-crypto`).** Extract the pure onboard split-and-seal composition (RWK-gen → `wrap_vdk_under_rwk` → `split_rwk` → `seal_share` per guardian → build the records) into a single `pangolin-crypto` fn (upstream of BOTH store + core). The new store `Vault::onboard_guardians` calls it; `pangolin_core::recovery::onboard_guardian_escrow` (the rotation/recovery re-split) is refactored to call the SAME fn (no behavior change — a faithful extraction, byte-identical output). ONE implementation of the catastrophic onboard crypto; no drift between initial-onboard and re-split. The extraction must be proven behavior-preserving (the existing core onboard/rotation/recovery tests stay green unchanged).
+- **Q-b → re-onboard REPLACES the prior generation** (the existing `write_recovery_escrow_tx` already DELETEs prior guardian rows) + bumps the generation epoch.
+- **Q-c → the first onboard writes at GENESIS epoch (0)**; rotation/recovery bump it thereafter (the existing epoch model).
+- **Scope:** `pangolin-store` `Vault::onboard_guardians(threshold, &[guardian_x25519_pub]) -> OnboardingOutcome{epoch}` (reads `self.active.vdk` store-internal; one-tx escrow write) + the lifted `pangolin-crypto` shared onboard primitive + the core re-split re-pointed to it. NO FFI (that is #106e-1), NO on-chain guardian set (that is #103 `set_guardian_set_v1`, host-driven).
+- **L-invariants:** atomic one-tx (no partial escrow); secret hygiene (RWK+shares dropped, active VDK borrowed store-internal, only the non-secret epoch out); pure store method (no `pangolin-core` dep — only `pangolin-crypto`); no new crypto/deps; the **L5 reconstruct round-trip** (a vault onboarded via `onboard_guardians` is recoverable via the merged `recover_from_shares` + readable via `recovery_escrow_params`) is the load-bearing hermetic test; `forbid(unsafe)`; AGPL; testnet-only/D-011; full `cargo test --workspace`; its own #104a-style audit. The production path to SET UP social recovery on a vault — the prerequisite that makes the #106e-1 recovery/rotation FFI a live surface instead of a dead one. Mirrors the §16 plan-gate format of `106e0-composition-layer.md`; its own #104a-style audit (the catastrophic-if-wrong recovery crypto path).
 
 ## 0. One-paragraph summary
 
