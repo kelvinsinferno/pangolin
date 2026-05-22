@@ -1668,3 +1668,13 @@ Kelvin 2026-05-20: **option A — build now** on the vetted-library design; NO e
 - **#106 epic status:** #106a/#106b-1/#106b-2/#106c/#106c2/#106d ALL MERGED. Remaining: **#106e** (pairing UX + FFI entry points) + the #107 V1-read-topic bug.
 
 Recovery + multi-device stay TESTNET-ONLY (Base Sepolia) until the D-011 external audit clears.
+
+### #106e-0 — store/core COMPOSITION LAYER — MERGED 2026-05-22
+
+The missing-middle slice between the audited drivers/commits and the (unbuilt) #106e-1 FFI: public composition entry points so the thin FFI never juggles a secret. Plan `docs/issue-plans/106e0-composition-layer.md` §0a (LOCKED) + the **0a-CORRECTION** (Kelvin sign-off 2026-05-22).
+
+- **Q-a SUPERSEDED by the dep-arrow finding (builder caught it):** the arrow is one-way `pangolin-core → pangolin-store`, so a store `Vault` method cannot call the core drivers. RESOLUTION: `complete_rotation` + `recover_from_shares` are `pangolin-core` free fns over `&mut Vault` (core CAN call both the core drivers AND store's pub commits); `guardian_open_sealed_share` STAYS a store `Vault` method (crypto-only, upstream). Promote `__test_commit_vdk_rotation_reusing_active` → a thin pub `Vault::commit_vdk_rotation_from_active` so `old_vdk`/`device_key` stay store-internal; add a non-secret `Vault::recovery_escrow_params` accessor (opens the escrow store-side, returns only `(t,M)`+guardian pubs+epoch — the active VDK never crosses the crate boundary). NO new crypto/deps/atomic surface — each method wraps an already-audited single-tx commit.
+- **Q-b (lost-everything ONLY):** `recover_from_shares` takes `wrapped_recovery`+roster+`(t,M)`+epoch+`vault_id` as HOST-SUPPLIED params, pulls NOTHING from `self.active` (a fresh device has no VDK to read its own escrow); the backup FORMAT stays deferred (6.x).
+- **Q-e:** `complete_rotation` resolves ALL pending-rotation rows whose removed signer is ABSENT from the live set (one rotation retires the whole survivor set); a still-in-set signer's pending row is NOT cleared.
+- **Audit + gates:** adversarial audit CLEAN on all 6 security checks (secret hygiene / old_vdk never crosses into core / new+recovered VDK consumed-and-dropped / lost-everything scope / Q-e dangerous direction / guardian-open sealing-derivation + fail-closed). One LOW finding (GAP-A+Q-e only anvil-covered) closed by a fix-pass: hermetic `composition_rotation.rs` (both tests proven to bite). Host gates: `cargo test --workspace` green incl. the `no_empty_ignored_tests` meta-test; `clippy -D warnings` clean; the 3 device anvil E2Es pass against live RevisionLogV2 bytecode.
+- **#106e remaining:** #106e-1 (thin FFI, subsumes #105b) → #106e-2 (pairing transport + SAS). Plus the standalone #107 V1-read-topic bug.
