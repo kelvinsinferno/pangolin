@@ -1954,7 +1954,12 @@ impl Vault {
     #[cfg(any(test, feature = "test-utilities"))]
     pub fn __test_recovery_backup_material(
         &self,
-    ) -> Result<Option<(WrappedVdkRecovery, Vec<pangolin_crypto::escrow::SealedShare>)>> {
+    ) -> Result<
+        Option<(
+            WrappedVdkRecovery,
+            Vec<pangolin_crypto::escrow::SealedShare>,
+        )>,
+    > {
         let active = self.require_active()?;
         let vault_id = self.meta.vault_id;
         let escrow = crate::recovery_escrow::read_recovery_escrow(
@@ -2007,8 +2012,8 @@ impl Vault {
         let rwk = RecoveryWrapKey::generate();
         let wrapped_recovery = wrap_vdk_under_rwk(&active.vdk, &rwk, &wrap_ctx)
             .map_err(|_| StoreError::AuthenticationFailed)?;
-        let shares =
-            split_rwk(&rwk, threshold, guardian_count).map_err(|_| StoreError::AuthenticationFailed)?;
+        let shares = split_rwk(&rwk, threshold, guardian_count)
+            .map_err(|_| StoreError::AuthenticationFailed)?;
         drop(rwk);
 
         let mut epoch_bytes = [0u8; pangolin_crypto::escrow::EPOCH_LEN];

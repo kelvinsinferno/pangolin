@@ -21,9 +21,7 @@ use pangolin_crypto::escrow::Share;
 use pangolin_crypto::guardian::derive_x25519_sealing_key;
 use pangolin_crypto::keys::DeviceKey;
 use pangolin_crypto::secret::SecretBytes;
-use pangolin_store::{
-    AccountSnapshot, PinIdentityProof, PressYPresenceProof, Vault, VaultState,
-};
+use pangolin_store::{AccountSnapshot, PinIdentityProof, PressYPresenceProof, Vault, VaultState};
 
 const T: u8 = 2;
 const M: u8 = 3;
@@ -82,14 +80,19 @@ fn production_onboard_then_recover_round_trips() {
     // The vault to onboard: create + unlock so it has a real, live VDK.
     let owner_dir = tempfile::TempDir::new().expect("tempdir");
     let owner_path = owner_dir.path().join("owner.pvf");
-    Vault::create(&owner_path, &SecretBytes::new(b"owner master password".to_vec()))
-        .expect("create owner vault");
+    Vault::create(
+        &owner_path,
+        &SecretBytes::new(b"owner master password".to_vec()),
+    )
+    .expect("create owner vault");
     let mut owner = Vault::open(&owner_path).expect("open owner vault");
     unlock(&mut owner, b"owner master password");
 
     // Seed a pre-onboard account so we can prove the recovered VDK decrypts
     // the SAME data (byte-identical VDK, L3 / L5).
-    let pre_id = owner.add_account(snapshot("pre-onboard.example")).expect("add pre-onboard");
+    let pre_id = owner
+        .add_account(snapshot("pre-onboard.example"))
+        .expect("add pre-onboard");
 
     // PRODUCTION onboard — set up social recovery on the owner vault. This is
     // the surface #106e-0b builds: it reads the active VDK store-internal,
@@ -113,7 +116,10 @@ fn production_onboard_then_recover_round_trips() {
     let mut want = guardian_pubs.clone();
     got.sort_unstable();
     want.sort_unstable();
-    assert_eq!(got, want, "params return the SAME guardian set the onboard sealed to");
+    assert_eq!(
+        got, want,
+        "params return the SAME guardian set the onboard sealed to"
+    );
     let current_epoch = params.current_epoch;
 
     // The host-supplied backup material: the non-secret wrapped_recovery + the
@@ -204,17 +210,23 @@ fn production_onboard_then_recover_round_trips() {
     // account written under the original VDK decrypts under the recovered one
     // (the catastrophic L5 check — production onboard produces a reconstructable
     // escrow whose recovered VDK is the SAME key).
-    let read = owner.get_account(pre_id).expect("pre-onboard account decrypts post-recovery");
+    let read = owner
+        .get_account(pre_id)
+        .expect("pre-onboard account decrypts post-recovery");
     assert!(
         bool::from(read.ct_eq(&snapshot("pre-onboard.example"))),
         "the pre-onboard write decrypts under the recovered VDK (byte-identical, L5)"
     );
 
     // And the recovered vault is fully usable for fresh writes across a cycle.
-    let post_id = owner.add_account(snapshot("post-recovery.example")).expect("add post-recovery");
+    let post_id = owner
+        .add_account(snapshot("post-recovery.example"))
+        .expect("add post-recovery");
     owner.lock();
     unlock(&mut owner, b"post-recovery master password");
-    let post = owner.get_account(post_id).expect("post-recovery account decrypts");
+    let post = owner
+        .get_account(post_id)
+        .expect("post-recovery account decrypts");
     assert!(
         bool::from(post.ct_eq(&snapshot("post-recovery.example"))),
         "the recovered vault accepts and reads back fresh writes"
