@@ -1834,8 +1834,8 @@ impl Vault {
         let rwk = RecoveryWrapKey::generate();
         let wrapped_recovery = wrap_vdk_under_rwk(&active.vdk, &rwk, &wrap_ctx)
             .map_err(|_| StoreError::AuthenticationFailed)?;
-        let shares =
-            split_rwk(&rwk, threshold, guardian_count).map_err(|_| StoreError::AuthenticationFailed)?;
+        let shares = split_rwk(&rwk, threshold, guardian_count)
+            .map_err(|_| StoreError::AuthenticationFailed)?;
         drop(rwk);
 
         let mut epoch_bytes = [0u8; pangolin_crypto::escrow::EPOCH_LEN];

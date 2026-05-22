@@ -50,9 +50,7 @@ fn unlock(vault: &mut Vault, password: &[u8]) {
 /// pairs. The guardian opens shares via `Vault::guardian_open_sealed_share`,
 /// which derives the sealing secret from the vault's OWN active device key,
 /// so the escrow must be sealed to each vault's derived sealing pubkey.
-fn guardian_vaults(
-    dirs: &[tempfile::TempDir],
-) -> (Vec<[u8; 32]>, Vec<Vault>) {
+fn guardian_vaults(dirs: &[tempfile::TempDir]) -> (Vec<[u8; 32]>, Vec<Vault>) {
     let mut pubs = Vec::new();
     let mut vaults = Vec::new();
     for (i, dir) in dirs.iter().enumerate() {
@@ -78,8 +76,9 @@ fn guardian_vaults(
 #[allow(clippy::too_many_lines)] // the full lost-everything round-trip is one linear sequence
 fn lost_everything_recovery_round_trips_through_composition() {
     // The guardian set: M guardian vaults, each opening its own sealed share.
-    let g_dirs: Vec<tempfile::TempDir> =
-        (0..M).map(|_| tempfile::TempDir::new().expect("tempdir")).collect();
+    let g_dirs: Vec<tempfile::TempDir> = (0..M)
+        .map(|_| tempfile::TempDir::new().expect("tempdir"))
+        .collect();
     let (guardian_pubs, guardian_vaults) = guardian_vaults(&g_dirs);
     assert_eq!(guardian_pubs.len(), usize::from(M));
 
@@ -179,10 +178,14 @@ fn lost_everything_recovery_round_trips_through_composition() {
 
     // The recovered VDK is LIVE: a post-recovery write seals under it and
     // reads back across a lock/unlock cycle.
-    let id = fresh.add_account(snapshot("recovered.example")).expect("add post-recovery");
+    let id = fresh
+        .add_account(snapshot("recovered.example"))
+        .expect("add post-recovery");
     fresh.lock();
     unlock(&mut fresh, b"post-recovery master password");
-    let read = fresh.get_account(id).expect("post-recovery account decrypts");
+    let read = fresh
+        .get_account(id)
+        .expect("post-recovery account decrypts");
     assert!(
         bool::from(read.ct_eq(&snapshot("recovered.example"))),
         "the post-recovery write decrypts under the recovered VDK"
@@ -214,8 +217,9 @@ fn lost_everything_recovery_round_trips_through_composition() {
 
 #[test]
 fn recover_from_shares_rejects_below_threshold() {
-    let g_dirs: Vec<tempfile::TempDir> =
-        (0..M).map(|_| tempfile::TempDir::new().expect("tempdir")).collect();
+    let g_dirs: Vec<tempfile::TempDir> = (0..M)
+        .map(|_| tempfile::TempDir::new().expect("tempdir"))
+        .collect();
     let (guardian_pubs, guardian_vaults) = guardian_vaults(&g_dirs);
 
     let recovered_vdk = VdkKey::generate();
@@ -283,8 +287,9 @@ fn guardian_open_rejects_wrong_epoch() {
     // A guardian opening a share with the WRONG epoch context fails closed
     // (the bound vault_id/epoch header mismatches) — the indistinguishability
     // collapse to AuthenticationFailed.
-    let g_dirs: Vec<tempfile::TempDir> =
-        (0..M).map(|_| tempfile::TempDir::new().expect("tempdir")).collect();
+    let g_dirs: Vec<tempfile::TempDir> = (0..M)
+        .map(|_| tempfile::TempDir::new().expect("tempdir"))
+        .collect();
     let (guardian_pubs, guardian_vaults) = guardian_vaults(&g_dirs);
 
     let vdk = VdkKey::generate();

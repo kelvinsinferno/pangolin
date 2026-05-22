@@ -99,7 +99,10 @@ fn complete_rotation_surfaces_unknown_survivor_and_clears_retired_pending() {
     let outcome = complete_rotation(&mut vault, &new_password, &current_onchain_set)
         .expect("complete_rotation");
 
-    assert_eq!(outcome.new_epoch, 1, "the shared epoch advances on rotation");
+    assert_eq!(
+        outcome.new_epoch, 1,
+        "the shared epoch advances on rotation"
+    );
     // GAP-A: C is in-set but locally-unknown — surfaced, never silently stranded.
     assert_eq!(
         outcome.unknown_survivors,
@@ -120,7 +123,10 @@ fn complete_rotation_surfaces_unknown_survivor_and_clears_retired_pending() {
             &PinIdentityProof::new(SecretBytes::new(PWD.to_vec())),
         )
         .unwrap_err();
-    assert!(matches!(old_err, pangolin_store::StoreError::AuthenticationFailed));
+    assert!(matches!(
+        old_err,
+        pangolin_store::StoreError::AuthenticationFailed
+    ));
     vault
         .unlock(
             &PressYPresenceProof::confirmed(),
