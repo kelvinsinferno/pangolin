@@ -362,6 +362,25 @@ do_run() {
       device_add_remove_rotate_e2e_against_anvil \
       -- --ignored --nocapture
 
+  # issue #106c2 COUPLED V2 revision data-plane E2E (the centerpiece — L11).
+  # The everyday "publish a revision to RevisionLogV2 -> read + verify it"
+  # path against the LIVE contract: bootstrapVault(publisher) ->
+  # publish_revision_v2 (publisher in the set, real v2 EIP-712 sig accepted
+  # by the live publishRevision set-gate) -> fetch_and_verify_chunk_v2 reads
+  # the RevisionPublished event back + verifies the digest/signer round-trip.
+  # The negatives (a V1-domain sig won't verify against v2; a tampered
+  # payload-hash recovers a different signer; a foreign claimed-signer fails
+  # the cross-check; a non-member publisher reverts ErrSignerNotAuthorized)
+  # are assertions inside the test, so a regression turns this command RED
+  # automatically. The publisher is the same [0x42;32] seed fund_test_wallet
+  # funded (it self-bootstraps + pays gas). RevisionLogV2 is already deployed
+  # by do_setup.
+  PANGOLIN_CHAIN_ENV=dev \
+  BASE_SEPOLIA_RPC_URL="$RPC_URL" \
+    cargo test -p pangolin-chain --features integration-tests --lib \
+      publish_revision_v2_e2e_against_anvil \
+      -- --ignored --nocapture
+
   echo "==> all in-scope tests passed against anvil"
 }
 

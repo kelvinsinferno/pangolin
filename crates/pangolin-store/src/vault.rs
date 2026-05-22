@@ -270,6 +270,59 @@ impl SyncModePreference {
     }
 }
 
+/// **MVP-3 issue #106c2.** The per-vault v1/v2 `RevisionLog` binding —
+/// the routing signal for the sync loop + the publish call site.
+///
+/// Recorded in the `meta.revisionlog_version` column (`1` = V1, `2` =
+/// V2). NULL / absence ⇒ [`Self::V1`] (the no-regression default — a
+/// legacy vault predating #106c2 keeps routing to the V1 path verbatim).
+/// NEW vaults are seeded [`Self::V1`] explicitly (Q-a: the V2 path is
+/// testnet-only until a Base Sepolia V2 deploy + pinned address land).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionLogVersion {
+    /// `RevisionLogV1` (the v1 EIP-712 domain `version "1"` + the v1
+    /// contract / read path). The legacy + current-production binding.
+    V1,
+    /// `RevisionLogV2` (the v2 EIP-712 domain `version "2"` + the v2
+    /// contract / read path). The #106c2 data-plane; testnet-only until
+    /// the Base Sepolia V2 deploy lands.
+    V2,
+}
+
+impl RevisionLogVersion {
+    /// Encode the binding into the storage representation used by the
+    /// `meta.revisionlog_version` column. `1` = V1, `2` = V2.
+    #[must_use]
+    pub fn to_meta_int(self) -> i64 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+        }
+    }
+
+    /// Decode a value read from the `meta.revisionlog_version` column.
+    /// `None` (SQL NULL — both the row-absent and column-NULL cases per
+    /// [`crate::meta::read_revisionlog_version`]) maps to [`Self::V1`]
+    /// (the no-regression default). `Some(1)` → V1, `Some(2)` → V2;
+    /// anything else surfaces as [`StoreError::Corrupted`] so a tampered
+    /// column value cannot silently route to the wrong contract.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupted`] if `v` is `Some(_)` with a value other
+    /// than `1` or `2`.
+    pub fn from_meta_int(v: Option<i64>) -> Result<Self> {
+        match v {
+            None | Some(1) => Ok(Self::V1),
+            Some(2) => Ok(Self::V2),
+            Some(other) => Err(StoreError::Corrupted(format!(
+                "meta.revisionlog_version contains unrecognized value {other}; \
+                 expected NULL, 1 (V1), or 2 (V2)"
+            ))),
+        }
+    }
+}
+
 /// **MVP-2 issue 4.4 — R-e.** Decision returned by
 /// [`Vault::select_sync_mode`]. Carries no payload — the host renders
 /// its own prompt copy without needing the picker to count anything.
@@ -667,6 +720,14 @@ impl Vault {
                 wrapped_nonce: *wrapped.nonce().as_bytes(),
             };
             meta::write(&conn, &meta_row)?;
+
+            // MVP-3 issue #106c2: seed the v1/v2 RevisionLog binding. NEW
+            // vaults default to V1 (Q-a — the V2 path is testnet-only
+            // until a Base Sepolia V2 deploy + pinned address land), so
+            // #106c2 lands with zero behavioural change on the production
+            // testnet path. The value is written explicitly (rather than
+            // left NULL = V1) so the routing signal is unambiguous.
+            meta::write_revisionlog_version(&conn, Some(RevisionLogVersion::V1.to_meta_int()))?;
 
             // Burn the freshly-derived VDK and authority; subsequent
             // operations re-derive them through the unlock path so the
@@ -7231,6 +7292,70 @@ impl Vault {
         Ok(())
     }
 
+    /// **MVP-3 issue #106c2 (Q-e).** Read the per-vault V2
+    /// `last_synced_block` checkpoint stored in `chain_sync_v2_state`.
+    ///
+    /// SEPARATE from [`Self::last_synced_block_v1`] so a V2-bound vault
+    /// never reads/advances the V1 cursor (and vice-versa). Returns
+    /// `Ok(None)` for a vault that has never run a V2 chain sync.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupted`] if the stored value is negative.
+    pub fn last_synced_block_v2(&self) -> Result<Option<u64>> {
+        let raw: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT last_synced_block FROM chain_sync_v2_state WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.map_or(Ok(None), |v| {
+            u64::try_from(v).map(Some).map_err(|_| {
+                StoreError::Corrupted(
+                    "chain_sync_v2_state.last_synced_block is negative; refusing to surface".into(),
+                )
+            })
+        })
+    }
+
+    /// **MVP-3 issue #106c2 (Q-e).** Advance the V2 `last_synced_block`
+    /// checkpoint to `new_block`. Monotonic — refuses to move backward,
+    /// equal values are no-ops (idempotent retry). SEPARATE table from
+    /// the V1 cursor.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupted`] if `new_block` is strictly less than
+    /// the current checkpoint or does not fit in `i64`.
+    pub fn update_last_synced_block_v2(&mut self, new_block: u64) -> Result<()> {
+        let current = self.last_synced_block_v2()?.unwrap_or(0);
+        if new_block < current {
+            return Err(StoreError::Corrupted(format!(
+                "update_last_synced_block_v2: new_block {new_block} < current {current}; \
+                 backward moves violate the monotonic-checkpoint contract"
+            )));
+        }
+        if new_block == current && self.last_synced_block_v2()?.is_some() {
+            return Ok(());
+        }
+        let new_i64 = i64::try_from(new_block).map_err(|_| {
+            StoreError::Corrupted(
+                "chain_sync_v2_state.last_synced_block does not fit in i64; refusing to store"
+                    .into(),
+            )
+        })?;
+        let now_ms = current_unix_ms();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO chain_sync_v2_state \
+                (id, chain_env_tag, last_synced_block, last_synced_at, schema_version) \
+             VALUES (0, 1, ?1, ?2, 1)",
+            params![new_i64, now_ms],
+        )?;
+        Ok(())
+    }
+
     // -----------------------------------------------------------------
     // MVP-2 issue 4.4 — sync-mode selector (R-a..R-e).
     // -----------------------------------------------------------------
@@ -7271,6 +7396,38 @@ impl Vault {
     /// [`StoreError::Sqlite`] for a persistence failure.
     pub fn set_sync_mode_preference(&mut self, pref: SyncModePreference) -> Result<()> {
         meta::write_sync_mode_preference(&self.conn, pref.to_meta_str())?;
+        Ok(())
+    }
+
+    /// **MVP-3 issue #106c2.** Read the per-vault v1/v2 `RevisionLog`
+    /// binding from `meta.revisionlog_version` — the routing signal for
+    /// the sync loop + the publish call site.
+    ///
+    /// SQL NULL / absent column ⇒ [`RevisionLogVersion::V1`] (the
+    /// no-regression default — a legacy vault keeps the V1 path
+    /// verbatim).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupted`] if the column value is non-NULL but not
+    /// `1` or `2` (forwarded from [`RevisionLogVersion::from_meta_int`]).
+    pub fn revisionlog_version(&self) -> Result<RevisionLogVersion> {
+        let raw = meta::read_revisionlog_version(&self.conn)?;
+        RevisionLogVersion::from_meta_int(raw)
+    }
+
+    /// **MVP-3 issue #106c2.** Persist the per-vault v1/v2 `RevisionLog`
+    /// binding into `meta.revisionlog_version` (`1` = V1, `2` = V2).
+    ///
+    /// Plaintext routing state (L2), NOT secret material — same posture
+    /// as `sync_mode_preference`. `&mut self` (a write to the vault
+    /// file).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] for a persistence failure.
+    pub fn set_revisionlog_version(&mut self, version: RevisionLogVersion) -> Result<()> {
+        meta::write_revisionlog_version(&self.conn, Some(version.to_meta_int()))?;
         Ok(())
     }
 
@@ -8252,6 +8409,16 @@ impl Vault {
         // doesn't block the host's pull-loop cadence.
         const WS_RECV_IDLE_TIMEOUT_MS: u64 = 250;
 
+        // MVP-3 issue #106c2 routing: a V2-bound vault reads via the V2
+        // path + its own SEPARATE checkpoint; a V1-bound vault (incl. all
+        // legacy vaults, NULL → V1) keeps the existing V1 path below
+        // VERBATIM — the L-no-regression invariant.
+        if matches!(self.revisionlog_version()?, RevisionLogVersion::V2) {
+            return self
+                .sync_from_chain_v2_path(rpc_url, ws_url_override, env, vault_id, options)
+                .await;
+        }
+
         // R-a: resolve the starting cursor.
         let persisted = self.last_synced_block_v1()?;
         let mut cursor = if options.from_genesis {
@@ -8598,6 +8765,251 @@ impl Vault {
         }
         // L9 default: report.event_source already initialised to
         // HttpPolling. Set here for clarity if WS never took the path.
+        Ok(report)
+    }
+
+    /// **MVP-3 issue #106c2.** The V2 read leg of
+    /// [`Self::sync_from_chain_with_ws_url`]: a mechanical mirror of the
+    /// V1 path that reads `RevisionLogV2.RevisionPublished` via
+    /// [`pangolin_chain::fetch_and_verify_chunk_v2`] + the V2 WS path,
+    /// advancing the SEPARATE `chain_sync_v2_state` checkpoint (Q-e).
+    ///
+    /// Reuses the shared ingest/reorg/finalize machinery
+    /// ([`Self::ingest_pending_chain_revision`],
+    /// [`Self::promote_finalized_revisions`],
+    /// [`Self::rollback_pending_revisions_in_range`]) verbatim — only the
+    /// chunk-fetch + WS-subscribe + checkpoint-state differ from V1, so
+    /// the byte-identity-of-verification + reorg posture cannot drift
+    /// between paths.
+    ///
+    /// # Errors
+    ///
+    /// Same taxonomy as [`Self::sync_from_chain_with_ws_url`].
+    #[allow(clippy::too_many_lines)]
+    async fn sync_from_chain_v2_path(
+        &mut self,
+        rpc_url: &str,
+        ws_url_override: Option<&str>,
+        env: pangolin_chain::ChainEnv,
+        vault_id: &[u8; 32],
+        options: pangolin_chain::SyncOptions,
+    ) -> Result<pangolin_chain::SyncReport> {
+        use pangolin_chain::chain_sync::poll::VerifyOutcome;
+        use pangolin_chain::chain_sync::v2::{
+            open_subscription_v2, recv_next_event_v2, verify_alloy_log_v2,
+        };
+        use pangolin_chain::chain_sync::ws::{resolve_ws_url, WsRecvOutcome};
+        use pangolin_chain::chain_sync::{detect_reorg_via_rpc, fetch_and_verify_chunk_v2};
+        use pangolin_chain::{
+            fetch_current_block_number, ChainEventSource, SyncReport, WS_CIRCUIT_BREAKER_THRESHOLD,
+        };
+        use std::time::Duration;
+
+        const CHUNK: u64 = pangolin_chain::CHAIN_SYNC_LOG_BLOCK_CHUNK;
+        const WS_TIP_FOLLOW_WINDOW_SECS: u64 = 30;
+        const WS_RECV_IDLE_TIMEOUT_MS: u64 = 250;
+
+        // V2 genesis cursor: there is no pinned V2 deploy block (Q-f), so
+        // a never-synced V2-bound vault replays from 0 (anvil/Dev is
+        // fresh per harness run; the chunk loop bounds the window).
+        let persisted = self.last_synced_block_v2()?;
+        let mut cursor = if options.from_genesis {
+            0
+        } else {
+            persisted.unwrap_or(0)
+        };
+
+        let head = match options.until_block {
+            Some(t) => t,
+            None => fetch_current_block_number(rpc_url).await?,
+        };
+
+        if cursor > head {
+            return Err(pangolin_chain::error::ChainError::CheckpointOutOfRange {
+                observed: cursor,
+                tip: head,
+            }
+            .into());
+        }
+
+        let mut report = SyncReport {
+            event_source: ChainEventSource::HttpPolling,
+            ..Default::default()
+        };
+        let mut detector = pangolin_chain::chain_sync::reorg::ReorgDetector::default();
+
+        // Stage 1 — HTTP backfill (V2 events).
+        while cursor < head {
+            let chunk_start = cursor.saturating_add(1);
+            let chunk_end = chunk_start
+                .saturating_add(CHUNK.saturating_sub(1))
+                .min(head);
+            let (events, rejected) =
+                fetch_and_verify_chunk_v2(rpc_url, env, vault_id, chunk_start, chunk_end).await?;
+            report.revisions_pulled = report
+                .revisions_pulled
+                .saturating_add(u32::try_from(events.len()).unwrap_or(u32::MAX));
+            report.revisions_rejected = report.revisions_rejected.saturating_add(rejected);
+
+            for ev in events {
+                let signer_bytes = ev.signer.into_array();
+                let now_ms = current_unix_ms();
+                let inserted_new = device::auto_register_device_from_chain_sync(
+                    &self.conn,
+                    signer_bytes,
+                    ev.event.anchor.block_number,
+                    now_ms,
+                )?;
+                if inserted_new {
+                    report.new_devices_registered = report.new_devices_registered.saturating_add(1);
+                }
+                self.ingest_pending_chain_revision(
+                    &ev.event,
+                    ev.event.anchor.block_number,
+                    ev.block_hash.0,
+                )?;
+                detector.record(ev.event.anchor.block_number, ev.block_hash);
+                report.revisions_applied = report.revisions_applied.saturating_add(1);
+            }
+
+            if let Some(info) = detect_reorg_via_rpc(rpc_url, &detector).await? {
+                let rolled = self.rollback_pending_revisions_in_range(
+                    info.affected_block_low,
+                    info.affected_block_high,
+                )?;
+                report.revisions_rolled_back = report.revisions_rolled_back.saturating_add(rolled);
+                detector.forget_window(info);
+            }
+
+            let promoted = self.promote_finalized_revisions(head)?;
+            report.revisions_finalized = report.revisions_finalized.saturating_add(promoted);
+
+            // Advance the SEPARATE V2 checkpoint (Q-e).
+            self.update_last_synced_block_v2(chunk_end)?;
+            cursor = chunk_end;
+            if chunk_end >= head {
+                break;
+            }
+        }
+
+        let promoted = self.promote_finalized_revisions(head)?;
+        report.revisions_finalized = report.revisions_finalized.saturating_add(promoted);
+        report.last_block_synced = head;
+
+        // Stage 2 — WS tip-follow (V2 events).
+        let tip_follow_eligible = options.prefer_websocket && options.until_block.is_none();
+        if !tip_follow_eligible {
+            return Ok(report);
+        }
+        let Ok(contract_address) =
+            pangolin_chain::revisionlog_v2_client::resolve_contract_address(env)
+        else {
+            return Ok(report);
+        };
+        let ws_url = if let Some(forced) = ws_url_override {
+            forced.to_owned()
+        } else {
+            match resolve_ws_url(rpc_url, env, None) {
+                Ok(s) => s,
+                Err(_) => return Ok(report),
+            }
+        };
+
+        let stage2_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(WS_TIP_FOLLOW_WINDOW_SECS);
+        let mut consecutive_failures: u32 = 0;
+        let mut backoff_ms: u64 = 0;
+        let mut ws_path_used = false;
+
+        'ws_session: while tokio::time::Instant::now() < stage2_deadline
+            && consecutive_failures < WS_CIRCUIT_BREAKER_THRESHOLD
+        {
+            if backoff_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+            let Ok(mut handle) =
+                open_subscription_v2(&ws_url, env, vault_id, contract_address).await
+            else {
+                report.ws_drops = report.ws_drops.saturating_add(1);
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                backoff_ms = pangolin_chain::chain_sync::ws::next_reconnect_backoff_ms(backoff_ms);
+                continue 'ws_session;
+            };
+
+            let mut event_ingested_this_open = false;
+
+            'recv_loop: loop {
+                if tokio::time::Instant::now() >= stage2_deadline {
+                    break 'ws_session;
+                }
+                let recv_fut = recv_next_event_v2(&mut handle);
+                let Ok(outcome) =
+                    tokio::time::timeout(Duration::from_millis(WS_RECV_IDLE_TIMEOUT_MS), recv_fut)
+                        .await
+                else {
+                    break 'ws_session;
+                };
+                match outcome {
+                    WsRecvOutcome::Event(log) => {
+                        match verify_alloy_log_v2(&log, vault_id, &contract_address, env) {
+                            VerifyOutcome::Verified(ev) => {
+                                report.revisions_pulled = report.revisions_pulled.saturating_add(1);
+                                let signer_bytes = ev.signer.into_array();
+                                let now_ms = current_unix_ms();
+                                let inserted_new = device::auto_register_device_from_chain_sync(
+                                    &self.conn,
+                                    signer_bytes,
+                                    ev.event.anchor.block_number,
+                                    now_ms,
+                                )?;
+                                if inserted_new {
+                                    report.new_devices_registered =
+                                        report.new_devices_registered.saturating_add(1);
+                                }
+                                self.ingest_pending_chain_revision(
+                                    &ev.event,
+                                    ev.event.anchor.block_number,
+                                    ev.block_hash.0,
+                                )?;
+                                detector.record(ev.event.anchor.block_number, ev.block_hash);
+                                report.revisions_applied =
+                                    report.revisions_applied.saturating_add(1);
+                                ws_path_used = true;
+                                event_ingested_this_open = true;
+                                let new_cursor = ev.event.anchor.block_number;
+                                if new_cursor > cursor {
+                                    self.update_last_synced_block_v2(new_cursor)?;
+                                    cursor = new_cursor;
+                                }
+                            }
+                            VerifyOutcome::Rejected => {
+                                report.revisions_rejected =
+                                    report.revisions_rejected.saturating_add(1);
+                            }
+                        }
+                    }
+                    WsRecvOutcome::SubscriptionClosed => {
+                        report.ws_drops = report.ws_drops.saturating_add(1);
+                        backoff_ms =
+                            pangolin_chain::chain_sync::ws::next_reconnect_backoff_ms(backoff_ms);
+                        break 'recv_loop;
+                    }
+                }
+            }
+
+            if event_ingested_this_open {
+                consecutive_failures = 0;
+                backoff_ms = 0;
+            } else {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+            }
+        }
+
+        if ws_path_used {
+            report.event_source = ChainEventSource::WebSocket;
+            let promoted = self.promote_finalized_revisions(head)?;
+            report.revisions_finalized = report.revisions_finalized.saturating_add(promoted);
+        }
         Ok(report)
     }
 
@@ -9616,7 +10028,7 @@ impl RawRevisionRow {
 
 #[cfg(test)]
 mod tests {
-    use super::{Vault, VaultState};
+    use super::{RevisionLogVersion, Vault, VaultState};
     use crate::account::AccountSnapshot;
     use crate::error::StoreError;
     use crate::meta::{FORMAT_VERSION, MAGIC};
@@ -14686,6 +15098,91 @@ mod tests {
         let mut v = Vault::open(&p).unwrap();
         v.update_last_synced_block_v1(200).unwrap();
         let err = v.update_last_synced_block_v1(100).unwrap_err();
+        match err {
+            StoreError::Corrupted(msg) => assert!(msg.contains("backward")),
+            other => panic!("expected Corrupted, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // MVP-3 issue #106c2 — v1/v2 binding + V2 checkpoint tests
+    // -----------------------------------------------------------------
+
+    /// A NEW vault is seeded V1 at `Vault::create` (Q-a default), survives
+    /// a reopen, and round-trips through `set_revisionlog_version`.
+    #[test]
+    fn revisionlog_version_default_and_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        let _ = Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        assert_eq!(
+            v.revisionlog_version().unwrap(),
+            RevisionLogVersion::V1,
+            "NEW vaults default to V1 (Q-a)"
+        );
+        v.set_revisionlog_version(RevisionLogVersion::V2).unwrap();
+        assert_eq!(v.revisionlog_version().unwrap(), RevisionLogVersion::V2);
+        // Survives a reopen.
+        v.close().unwrap();
+        let v2 = Vault::open(&p).unwrap();
+        assert_eq!(v2.revisionlog_version().unwrap(), RevisionLogVersion::V2);
+    }
+
+    /// A legacy vault whose `meta.revisionlog_version` is NULL reads as
+    /// V1 (the no-regression default).
+    #[test]
+    fn revisionlog_version_null_reads_v1() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        let _ = Vault::create(&p, &fresh_password()).unwrap();
+        let v = Vault::open(&p).unwrap();
+        // Force the column back to NULL to simulate a legacy vault.
+        v.conn
+            .execute(
+                "UPDATE meta SET revisionlog_version = NULL WHERE id = 0",
+                [],
+            )
+            .unwrap();
+        assert_eq!(v.revisionlog_version().unwrap(), RevisionLogVersion::V1);
+    }
+
+    /// A corrupted (out-of-range) `revisionlog_version` fails closed
+    /// rather than silently routing to a default.
+    #[test]
+    fn revisionlog_version_corrupted_value_rejected() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        let _ = Vault::create(&p, &fresh_password()).unwrap();
+        let v = Vault::open(&p).unwrap();
+        v.conn
+            .execute("UPDATE meta SET revisionlog_version = 9 WHERE id = 0", [])
+            .unwrap();
+        let err = v.revisionlog_version().unwrap_err();
+        match err {
+            StoreError::Corrupted(msg) => assert!(msg.contains("unrecognized")),
+            other => panic!("expected Corrupted, got {other:?}"),
+        }
+    }
+
+    /// The V2 checkpoint is SEPARATE from the V1 checkpoint (Q-e): writing
+    /// one never touches the other.
+    #[test]
+    fn v1_v2_checkpoints_are_independent() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        let _ = Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        assert_eq!(v.last_synced_block_v2().unwrap(), None);
+        v.update_last_synced_block_v1(100).unwrap();
+        // V2 cursor is untouched by a V1 advance.
+        assert_eq!(v.last_synced_block_v2().unwrap(), None);
+        v.update_last_synced_block_v2(50).unwrap();
+        assert_eq!(v.last_synced_block_v2().unwrap(), Some(50));
+        // V1 cursor is untouched by a V2 advance.
+        assert_eq!(v.last_synced_block_v1().unwrap(), Some(100));
+        // V2 monotonic guard.
+        let err = v.update_last_synced_block_v2(10).unwrap_err();
         match err {
             StoreError::Corrupted(msg) => assert!(msg.contains("backward")),
             other => panic!("expected Corrupted, got {other:?}"),

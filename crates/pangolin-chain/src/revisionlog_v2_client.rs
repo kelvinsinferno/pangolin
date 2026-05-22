@@ -46,10 +46,11 @@ use alloy::rpc::types::{BlockNumberOrTag, TransactionRequest};
 // the RevisionLogV2 binding through macro dispatch clippy can't see.
 use alloy::sol_types::{SolCall, SolEvent};
 
+use crate::chain_submit::ChainAnchorV1;
 use crate::deployments::{load_deployed_address, ChainEnv};
 use crate::error::ChainError;
 use crate::evm::EvmWallet;
-use crate::revisionlog_v2_signing::SignedDeviceAuth;
+use crate::revisionlog_v2_signing::{SignedDeviceAuth, SignedRevisionV2};
 
 // Reuse the chain-submit module's pinned gas/retry constants verbatim
 // (L1: same envelope discipline, not a fork).
@@ -180,6 +181,23 @@ pub mod revisionlog_v2_binding {
             );
             event PromotionCanceled(
                 bytes32 indexed vaultId, address candidate, uint16 schemaVersion
+            );
+
+            // #106c2: the everyday revision-publish event (the V2 read
+            // path). Byte-aligned to `RevisionLogV2.sol:107-116`,
+            // field-identical to V1's `RevisionPublished` — but the
+            // DIFFERENT v2 domain gives it a different topic-0 from V1,
+            // which is correct: a v1 reader must never consume v2 events
+            // and vice-versa.
+            event RevisionPublished(
+                uint256 indexed sequence,
+                bytes32 indexed vaultId,
+                bytes32 indexed accountId,
+                bytes32 parentRevision,
+                bytes32 deviceId,
+                uint16 schemaVersion,
+                bytes encPayload,
+                address signer
             );
         }
     }
@@ -502,6 +520,128 @@ pub async fn cancel_promotion_v2(
     .await
 }
 
+/// Broadcast a v2 signed revision to `RevisionLogV2.publishRevision`.
+///
+/// Blocks until a 1-conf receipt. Returns a populated [`ChainAnchorV1`]
+/// (reused verbatim from the V1 publish path — the event shape is
+/// field-identical) on success.
+///
+/// **#106c2 — the everyday revision data-plane PUBLISH leg.** Mirrors
+/// [`crate::chain_submit::publish_revision_v1`] but signs/broadcasts
+/// under the v2 domain + the `RevisionLogV2` contract. The signature in
+/// `signed_revision` was produced over the v2 EIP-712 digest
+/// ([`crate::revisionlog_v2_signing::build_signed_revision_v2`]); this
+/// fn only puts it on the wire + cross-checks the receipt.
+///
+/// Reuses the v2 client's EIP-1559 envelope / R-c retry taxonomy / gas
+/// cap / `resolve_envelope_chain_id` (#101) verbatim via
+/// [`broadcast_call`] — the same plumbing the device-lifecycle calls
+/// use. The contract gates `publishRevision` on the on-chain authorized
+/// SET; a publish by a non-member device reverts `ErrSignerNotAuthorized`
+/// (a fatal pre-broadcast revert — no retry).
+///
+/// The broadcast layer puts the raw `encPayload` PREIMAGE on the wire
+/// (NOT the hash); the contract re-derives `keccak256(encPayload)`
+/// (`RevisionLogV2.sol:560-562`). The `SignedRevisionV2` invariant
+/// (`keccak256(enc_payload) == fields.enc_payload_hash`) makes the
+/// digest the signature was produced over consistent with the contract's
+/// recomputation.
+///
+/// # Errors
+///
+/// Same R-c retry taxonomy as [`bootstrap_vault_v2`], plus
+/// [`ChainError::ReceiptMismatch`] if the event `signer` does not equal
+/// the submitting wallet, and [`ChainError::MissingEvent`] /
+/// [`ChainError::Decode`] on a malformed receipt.
+pub async fn publish_revision_v2(
+    wallet: &EvmWallet,
+    signed_revision: &SignedRevisionV2,
+    env: ChainEnv,
+    rpc_url: &str,
+) -> Result<ChainAnchorV1, ChainError> {
+    let (provider, contract, chain_id) = connect(wallet, env, rpc_url).await?;
+    let call = RevisionLogV2::publishRevisionCall {
+        vaultId: signed_revision.fields.vault_id.into(),
+        accountId: signed_revision.fields.account_id.into(),
+        parentRevision: signed_revision.fields.parent_revision.into(),
+        deviceId: signed_revision.fields.device_id.into(),
+        schemaVersion: signed_revision.fields.schema_version,
+        encPayload: Bytes::copy_from_slice(&signed_revision.enc_payload),
+        signature: Bytes::copy_from_slice(&signed_revision.signature[..]),
+    };
+    let calldata = SolCall::abi_encode(&call);
+    let pending = broadcast_call(&provider, wallet.address(), contract, calldata, chain_id).await?;
+
+    // L12 boundary: the tx is in-flight. Await the receipt; verify
+    // status==1; decode `RevisionPublished`; cross-check the event
+    // `signer == wallet`.
+    let tx_hash: B256 = *pending.tx_hash();
+    let pending = pending.with_timeout(Some(Duration::from_secs(RECEIPT_TIMEOUT_SECS)));
+    let receipt = pending
+        .get_receipt()
+        .await
+        .map_err(|e| ChainError::Rpc(format!("get_receipt({tx_hash:?}): {e}")))?;
+    process_revision_receipt_v2(&receipt, wallet.address(), contract, tx_hash)
+}
+
+/// Decode a `RevisionPublished` receipt into a [`ChainAnchorV1`] + run
+/// the post-receipt cross-checks (mirror of
+/// `chain_submit::process_receipt`):
+///
+/// 1. `receipt.status == 1`; else [`ChainError::RevertedOnChain`].
+/// 2. `block_number` / `block_hash` present.
+/// 3. A `RevisionPublished` log emitted by `contract` present.
+/// 4. The decoded `signer` equals `wallet_address`; else
+///    [`ChainError::ReceiptMismatch`].
+fn process_revision_receipt_v2(
+    receipt: &alloy::rpc::types::TransactionReceipt,
+    wallet_address: Address,
+    contract: Address,
+    tx_hash: B256,
+) -> Result<ChainAnchorV1, ChainError> {
+    if !receipt.status() {
+        return Err(ChainError::RevertedOnChain {
+            reason: "unknown revert (status=0)".to_string(),
+            tx_hash,
+        });
+    }
+    let block_number = receipt
+        .block_number
+        .ok_or_else(|| ChainError::Decode("receipt missing block_number".into()))?;
+    let block_hash = receipt
+        .block_hash
+        .ok_or_else(|| ChainError::Decode("receipt missing block_hash".into()))?;
+
+    let target_topic = RevisionLogV2::RevisionPublished::SIGNATURE_HASH;
+    let log = receipt
+        .inner
+        .logs()
+        .iter()
+        .find(|l| l.address() == contract && l.topics().first().copied() == Some(target_topic))
+        .ok_or_else(|| ChainError::MissingEvent {
+            tx_hash: format!("{tx_hash:?}"),
+        })?;
+    let decoded = RevisionLogV2::RevisionPublished::decode_log(&log.inner)
+        .map_err(|e| ChainError::Decode(format!("RevisionPublished log: {e}")))?;
+    if decoded.signer != wallet_address {
+        return Err(ChainError::ReceiptMismatch {
+            expected_signer: wallet_address,
+            observed_signer: decoded.signer,
+        });
+    }
+    let log_index = log
+        .log_index
+        .ok_or_else(|| ChainError::Decode("RevisionPublished log missing log_index".into()))?;
+    Ok(ChainAnchorV1 {
+        tx_hash,
+        block_number,
+        block_hash,
+        log_index,
+        sequence: decoded.sequence,
+        signer: decoded.signer,
+    })
+}
+
 // ---------------------------------------------------------------------
 // Device-management event folding (a client-side authorized-SET snapshot)
 // ---------------------------------------------------------------------
@@ -598,11 +738,12 @@ pub fn decode_device_mgmt_events(
 // ---------------------------------------------------------------------
 
 /// Resolve the `RevisionLogV2` contract address for `env`.
+///
 /// (TODO: add the `BaseSepolia` pinned-address cross-check + the
 /// `EXPECTED_REVISIONLOG_V2_ADDRESS_BASE_SEPOLIA` constant once a testnet
 /// deploy exists — mirror the v1/RecoveryV1 posture; testnet capture is a
 /// TODO until the Base Sepolia v2 deploy lands.)
-fn resolve_contract_address(env: ChainEnv) -> Result<Address, ChainError> {
+pub fn resolve_contract_address(env: ChainEnv) -> Result<Address, ChainError> {
     load_deployed_address(env, REVISIONLOG_V2_CONTRACT_NAME)
 }
 
@@ -988,5 +1129,240 @@ mod tests {
         let contract = Address::from([0xAB; 20]);
         let folded = decode_device_mgmt_events(contract, &[]);
         assert!(folded.is_empty());
+    }
+
+    /// #106c2 calldata pin: `publishRevision` encodes the exact field
+    /// tuple a `SignedRevisionV2` carries, with the raw `encPayload`
+    /// preimage (NOT the hash) on the wire. Decode-back round-trip.
+    #[test]
+    fn publish_revision_v2_calldata_encodes_fields() {
+        let enc_payload = b"v2-calldata-pin-preimage".to_vec();
+        let sig = [0x33u8; 65];
+        let call = RevisionLogV2::publishRevisionCall {
+            vaultId: [0x11; 32].into(),
+            accountId: [0x22; 32].into(),
+            parentRevision: [0x00; 32].into(),
+            deviceId: [0x44; 32].into(),
+            schemaVersion: 1,
+            encPayload: Bytes::copy_from_slice(&enc_payload),
+            signature: Bytes::copy_from_slice(&sig),
+        };
+        let encoded = SolCall::abi_encode(&call);
+        let decoded =
+            RevisionLogV2::publishRevisionCall::abi_decode(&encoded).expect("decode publish");
+        assert_eq!(decoded.vaultId.0, [0x11; 32]);
+        assert_eq!(decoded.accountId.0, [0x22; 32]);
+        assert_eq!(decoded.parentRevision.0, [0x00; 32]);
+        assert_eq!(decoded.deviceId.0, [0x44; 32]);
+        assert_eq!(decoded.schemaVersion, 1);
+        assert_eq!(decoded.encPayload.as_ref(), &enc_payload[..]);
+        assert_eq!(decoded.signature.as_ref(), &sig[..]);
+    }
+
+    // -----------------------------------------------------------------
+    // #106c2 COUPLED publish→read-back anvil E2E (the centerpiece — L11)
+    // -----------------------------------------------------------------
+
+    /// Deterministic publishing wallet — derived from the `[0x42;32]`
+    /// seed `scripts/anvil-ci.sh` funds (same address as
+    /// `chain_submit::fixed_wallet` / `recovery_client::recovering_wallet`).
+    #[cfg(feature = "integration-tests")]
+    fn publisher_wallet() -> EvmWallet {
+        use crate::evm::derive_evm_wallet;
+        use pangolin_crypto::keys::DeviceKey;
+        derive_evm_wallet(&DeviceKey::from_seed([0x42; 32])).expect("derive publisher wallet")
+    }
+
+    /// **L11 CENTERPIECE.** The full V2 revision data-plane against a live
+    /// local anvil node: bootstrapVault(publisher) → `publish_revision_v2`
+    /// (publisher in the set) → `fetch_and_verify_chunk_v2` reads it back
+    /// + verifies the round-trip (digest/signer parity), plus negative
+    /// gates that MUST turn it RED:
+    ///
+    /// - **wrong domain:** a V1-domain signature does NOT verify against
+    ///   the v2 read (`recover_signer_v2_raw` recovers a different
+    ///   address) AND the live contract reverts a V1-domain publish.
+    /// - **tampered payload:** flipping the read-back `encPayload` makes
+    ///   the client-side v2 recover yield a different signer.
+    /// - **foreign signer address:** the verify cross-check fails.
+    /// - **non-member publisher:** the live contract reverts
+    ///   `ErrSignerNotAuthorized`.
+    #[tokio::test]
+    #[ignore = "live-RPC test; requires PANGOLIN_CHAIN_ENV=dev + local anvil (scripts/anvil-ci.sh)"]
+    #[cfg(feature = "integration-tests")]
+    async fn publish_revision_v2_e2e_against_anvil() {
+        use crate::evm::derive_evm_wallet;
+        use crate::revisionlog_v2_signing::{
+            build_signed_device_auth, build_signed_revision_v2, recover_signer_v2_raw,
+            DeviceAuthFields, DeviceAuthKind,
+        };
+        use crate::secp256k1_signing::RevisionFieldsV1;
+        use crate::test_env;
+        use pangolin_crypto::keys::DeviceKey;
+
+        let env = test_env::target_chain_env();
+        if !test_env::is_dev_mode()
+            && !test_env::require_or_fail("v2 revision data-plane E2E needs dev anvil")
+        {
+            return;
+        }
+        let rpc_url = test_env::rpc_url();
+        let chain_id = test_env::resolve_signing_chain_id(env, &rpc_url)
+            .await
+            .expect("resolve signing chain id");
+        let contract = resolve_contract_address(env).expect("RevisionLogV2 in dev.json");
+
+        let wallet = publisher_wallet();
+        let publisher = wallet.address();
+
+        // Fresh vault id (time-tweaked so reruns don't collide).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut vault_id = [0u8; 32];
+        vault_id[..8].copy_from_slice(&now.to_be_bytes());
+        vault_id[31] = 0xC2;
+
+        // ---- bootstrapVault(publisher) — genesis AddDevice @ nonce 0 ----
+        let boot_fields = DeviceAuthFields {
+            kind: DeviceAuthKind::AddDevice,
+            vault_id,
+            subject: publisher,
+            nonce: 0,
+            schema_version: REVISIONLOG_V2_SCHEMA_VERSION,
+        };
+        let boot_auth = build_signed_device_auth(wallet.signer(), boot_fields, contract, chain_id)
+            .expect("sign bootstrap");
+        bootstrap_vault_v2(&wallet, publisher, &boot_auth, env, &rpc_url)
+            .await
+            .expect("bootstrapVault");
+        assert!(
+            read_authorized_device_v2(env, &rpc_url, vault_id, publisher)
+                .await
+                .expect("authorizedDevice"),
+            "publisher must be in the set after bootstrap"
+        );
+
+        // ---- publish_revision_v2 (publisher in set) ----
+        let enc_payload: Vec<u8> = format!("pangolin-v2-dataplane-{now}").into_bytes();
+        let enc_payload_hash = alloy::primitives::keccak256(&enc_payload).0;
+        let fields = RevisionFieldsV1::with_signer_device_id(
+            &wallet,
+            vault_id,
+            [0x42; 32],
+            [0u8; 32],
+            REVISIONLOG_V2_SCHEMA_VERSION,
+            enc_payload_hash,
+        );
+        let signed =
+            build_signed_revision_v2(&wallet, fields, enc_payload.clone(), contract, chain_id)
+                .expect("sign v2 revision");
+        let anchor = publish_revision_v2(&wallet, &signed, env, &rpc_url)
+            .await
+            .expect("publish_revision_v2 must succeed (publisher in set)");
+        assert_eq!(anchor.signer, publisher, "event signer == publisher");
+        assert!(anchor.block_number > 0);
+
+        // ---- fetch_and_verify_chunk_v2 reads it back ----
+        let head = crate::fetch_current_block_number(&rpc_url)
+            .await
+            .expect("head");
+        let (events, _rejected) =
+            crate::fetch_and_verify_chunk_v2(&rpc_url, env, &vault_id, 0, head)
+                .await
+                .expect("v2 read-back");
+        let found = events
+            .iter()
+            .find(|e| e.event.enc_payload == enc_payload)
+            .expect("the published v2 revision must be read back");
+        assert_eq!(
+            found.signer, publisher,
+            "read-back event signer == publisher"
+        );
+        // Client-side v2 recover round-trip (digest/signer parity).
+        let recovered =
+            recover_signer_v2_raw(&signed.fields, &signed.signature, contract, chain_id)
+                .expect("client recover v2");
+        assert_eq!(recovered, publisher, "v2 sign+recover round-trip");
+
+        // ---- NEGATIVE: wrong domain (V1 sig won't verify against v2) ----
+        // Sign the SAME fields under the V1 domain (version "1"); the v2
+        // recover must NOT yield the publisher.
+        let v1_sig = {
+            use alloy::signers::SignerSync;
+            use alloy::sol_types::eip712_domain;
+            let dom = eip712_domain! {
+                name: "Pangolin RevisionLog",
+                version: "1",
+                chain_id: chain_id,
+                verifying_contract: contract,
+            };
+            let struct_h = crate::secp256k1_signing::struct_hash(&signed.fields);
+            let v1_digest = crate::secp256k1_signing::eip712_digest(dom.separator(), struct_h);
+            let s = wallet.signer().sign_hash_sync(&v1_digest).expect("sign v1");
+            s.normalize_s().unwrap_or(s).as_bytes()
+        };
+        let wrong_domain_recovered =
+            recover_signer_v2_raw(&signed.fields, &v1_sig, contract, chain_id).expect("recover");
+        assert_ne!(
+            wrong_domain_recovered, publisher,
+            "a V1-domain signature must not recover the publisher under the v2 domain"
+        );
+
+        // ---- NEGATIVE: tampered payload → different recovered signer ----
+        let mut tampered_fields = signed.fields;
+        tampered_fields.enc_payload_hash[0] ^= 0xFF;
+        let tampered_recovered =
+            recover_signer_v2_raw(&tampered_fields, &signed.signature, contract, chain_id)
+                .expect("recover");
+        assert_ne!(
+            tampered_recovered, publisher,
+            "tampering the payload hash must change the recovered signer"
+        );
+
+        // ---- NEGATIVE: foreign signer address fails the cross-check ----
+        let foreign = derive_evm_wallet(&DeviceKey::from_seed([0x99; 32]))
+            .expect("foreign")
+            .address();
+        let foreign_check = crate::chain_sync::v2::verify_signed_event_v2(
+            &signed.fields,
+            &signed.signature,
+            foreign,
+            contract,
+            chain_id,
+        );
+        assert!(
+            foreign_check.is_err(),
+            "a foreign claimed-signer must fail the v2 verify cross-check"
+        );
+
+        // ---- NEGATIVE: non-member publisher reverts ErrSignerNotAuthorized ----
+        let stranger = derive_evm_wallet(&DeviceKey::from_seed([0x77; 32])).expect("stranger");
+        assert_ne!(stranger.address(), publisher);
+        let stranger_payload = b"stranger-publish".to_vec();
+        let stranger_hash = alloy::primitives::keccak256(&stranger_payload).0;
+        let stranger_fields = RevisionFieldsV1::with_signer_device_id(
+            &stranger,
+            vault_id,
+            [0x42; 32],
+            [0u8; 32],
+            REVISIONLOG_V2_SCHEMA_VERSION,
+            stranger_hash,
+        );
+        let stranger_signed = build_signed_revision_v2(
+            &stranger,
+            stranger_fields,
+            stranger_payload,
+            contract,
+            chain_id,
+        )
+        .expect("sign stranger");
+        // estimate_gas surfaces the revert pre-broadcast (no gas needed).
+        let bad = publish_revision_v2(&stranger, &stranger_signed, env, &rpc_url).await;
+        assert!(
+            bad.is_err(),
+            "a non-member publisher must revert (ErrSignerNotAuthorized)"
+        );
     }
 }
