@@ -204,6 +204,15 @@ pub struct SyncReport {
     /// to 0 on every `sync_from_chain` call; trips into HTTP fallback
     /// when this hits [`WS_CIRCUIT_BREAKER_THRESHOLD`].
     pub ws_drops: u32,
+    /// **MVP-3 issue #106d.** Count of V2 revisions this sync CUT: the
+    /// new-event gate rejections (a verified V2 event whose signer is
+    /// NOT in the current on-chain authorized set, counted but not
+    /// ingested) PLUS the retroactive-pass rows whose `revoked` flag
+    /// transitioned `0 → 1` (already-stored rows whose signer left the
+    /// set). The two are disjoint (a gated incoming event is never
+    /// stored), so the sum is an honest "what this sync revoked". V1
+    /// syncs never set this (V1 is single-device, permissive — L5).
+    pub revisions_revoked: u32,
 }
 
 // ---------------------------------------------------------------------

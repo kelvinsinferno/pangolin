@@ -151,6 +151,33 @@ CREATE TABLE IF NOT EXISTS revisions (
     -- we must not need a v3 to carry it. Legacy vaults pick the column
     -- up via migrate_revision_vdk_epoch_column.
     vdk_epoch            INTEGER NOT NULL DEFAULT 0,
+    -- MVP-3 issue #106d (salvaged #103-C plumbing, re-keyed): the
+    -- revocation-on-read marker. The V2 chain reader re-evaluates every
+    -- locally-stored chain-anchored revision against the LIVE on-chain
+    -- authorized-device SET each sync and MARKS (does NOT hard-delete)
+    -- any row whose signer is no longer in the set. `0` = honored (the
+    -- default — every legacy + in-set row); `1` = revoked (signer left
+    -- the set). Mark-not-delete (L6) so the user can audit what was cut
+    -- and a re-add un-revokes it. Legacy vaults pick up the column via
+    -- migrate_revision_revoked_column with DEFAULT 0 (clean honored
+    -- default — additive, no format_version bump). The V1 path never
+    -- writes this column (V1 is single-device / permissive, L5).
+    revoked              INTEGER NOT NULL DEFAULT 0,
+    -- MVP-3 issue #106d FIX-PASS (MEDIUM under-revocation fix): the
+    -- secp256k1 signer (20-byte EVM address) that the V2 honor gate
+    -- ecrecovered for this chain-anchored row. RevisionLogV2 treats
+    -- `deviceId` as OPAQUE and gates publishing ONLY on the recovered
+    -- signer — it NEVER enforces deviceId == leftpad(signer). So an
+    -- in-set device B can publish a revision SIGNED by B but carrying
+    -- deviceId = leftpad(A). The retroactive revocation pass MUST key on
+    -- the SAME identity the ingest gate uses (the recovered signer), not
+    -- on the opaque device_id, or B's row would survive B's removal
+    -- (under-revocation). The V2 honor-gated ingest path persists this
+    -- column from the ecrecovered signer. NULL for legacy / V1 / purely-
+    -- local rows (which are never in the V2 retroactive pass). Legacy
+    -- vaults pick up the column via migrate_revision_recovered_signer_column
+    -- (additive, no format_version bump).
+    recovered_signer     BLOB,
     FOREIGN KEY (account_id) REFERENCES account_identities(account_id)
 );
 
@@ -586,6 +613,25 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     migrate_vdk_chain_tables(conn)?;
     migrate_revision_vdk_epoch_column(conn)?;
 
+    // MVP-3 issue #106d migration (salvaged #103-C plumbing): add the
+    // additive `revisions.revoked` column (INTEGER, DEFAULT 0) so the V2
+    // revocation-on-read gate can MARK rows whose signer left the live
+    // on-chain authorized set. Legacy vaults predating #106d pick up the
+    // column absent → DEFAULT 0 (clean "honored" default); additive, no
+    // `format_version` bump (same doctrine as the superseded_by / vdk_epoch
+    // migrations). The SCHEMA_DDL above already includes the column for
+    // fresh vaults; this migration is the legacy path.
+    migrate_revision_revoked_column(conn)?;
+
+    // MVP-3 issue #106d FIX-PASS (MEDIUM under-revocation fix): add the
+    // additive `revisions.recovered_signer` column (BLOB, NULL default) so
+    // the V2 honor-gated ingest can persist the ecrecovered signer and the
+    // retroactive revocation pass can key on the SAME identity the ingest
+    // gate uses (NOT the opaque device_id). Legacy vaults pick up the
+    // column absent → NULL (no V2 signer recorded; never honored in the
+    // retroactive pass); additive, no `format_version` bump.
+    migrate_revision_recovered_signer_column(conn)?;
+
     // MVP-3 issue #106c migrations: ensure the additive `device_directory`
     // (GAP A survivor-pubkey directory) + `rotation_pending` (the
     // crash-durable DeviceRemoved→rotation state) tables exist on legacy
@@ -688,6 +734,61 @@ fn migrate_revision_vdk_epoch_column(conn: &Connection) -> Result<()> {
             "ALTER TABLE revisions ADD COLUMN vdk_epoch INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
+    }
+    Ok(())
+}
+
+/// **MVP-3 issue #106d migration (salvaged #103-C plumbing).** Add the
+/// additive `revisions.revoked` column (INTEGER NOT NULL DEFAULT 0).
+/// Idempotent — gated by a `PRAGMA table_info(revisions)` check. A legacy
+/// vault that predates #106d opens cleanly with the column absent → the
+/// ALTER adds it with DEFAULT 0 (every existing row is "honored", the
+/// correct pre-revocation semantics). No `format_version` bump (additive
+/// doctrine, mirroring [`migrate_revision_vdk_epoch_column`]).
+fn migrate_revision_revoked_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(revisions)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_column = false;
+    for r in rows {
+        if r? == "revoked" {
+            has_column = true;
+            break;
+        }
+    }
+    drop(stmt);
+    if !has_column {
+        conn.execute(
+            "ALTER TABLE revisions ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// **MVP-3 issue #106d FIX-PASS migration (MEDIUM under-revocation fix).**
+/// Add the additive `revisions.recovered_signer` column (BLOB, NULL
+/// default). The V2 honor-gated ingest persists the ecrecovered signer
+/// (the exact identity the ingest gate honors) here so the retroactive
+/// revocation pass keys on the recovered signer rather than the OPAQUE
+/// `device_id` (which `RevisionLogV2` never binds to the signer). Idempotent
+/// — gated by a `PRAGMA table_info(revisions)` check. A legacy vault that
+/// predates this fix opens cleanly with the column absent → the ALTER adds
+/// it as NULL (no recorded V2 signer; those rows are V1 / local and never
+/// enter the V2 retroactive pass). No `format_version` bump (additive
+/// doctrine, mirroring [`migrate_revision_revoked_column`]).
+fn migrate_revision_recovered_signer_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(revisions)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_column = false;
+    for r in rows {
+        if r? == "recovered_signer" {
+            has_column = true;
+            break;
+        }
+    }
+    drop(stmt);
+    if !has_column {
+        conn.execute("ALTER TABLE revisions ADD COLUMN recovered_signer BLOB", [])?;
     }
     Ok(())
 }
@@ -1250,6 +1351,10 @@ mod tests {
             "revision_status",
             "observed_at_block",
             "observed_block_hash",
+            // MVP-3 issue #106d: the revocation-on-read marker.
+            "revoked",
+            // MVP-3 issue #106d FIX-PASS: the persisted ecrecovered signer.
+            "recovered_signer",
         ] {
             assert_eq!(
                 rev_cols.iter().filter(|c| c.as_str() == needed).count(),
@@ -1330,6 +1435,37 @@ mod tests {
         assert_eq!(
             status, "finalized",
             "pre-4.1 rows must default to 'finalized' under the new column"
+        );
+        // MVP-3 issue #106d: the legacy revisions table (which lacked the
+        // `revoked` column entirely) gets it added with DEFAULT 0 — every
+        // pre-#106d row reads as "honored" (the correct pre-revocation
+        // semantics; a legacy vault never re-evaluated against a set has
+        // nothing revoked).
+        let revoked: i64 = conn
+            .query_row(
+                "SELECT revoked FROM revisions WHERE revision_id = ?1",
+                [&[0xBBu8; 32] as &[u8]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            revoked, 0,
+            "legacy rows must default to revoked = 0 (honored) under the additive #106d column"
+        );
+        // MVP-3 issue #106d FIX-PASS: the legacy revisions table also gets
+        // the additive `recovered_signer` column (BLOB, NULL default) — a
+        // pre-fix row has no recorded V2 signer (it is V1 / local and never
+        // enters the V2 retroactive pass).
+        let recovered: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT recovered_signer FROM revisions WHERE revision_id = ?1",
+                [&[0xBBu8; 32] as &[u8]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recovered, None,
+            "legacy rows must default to recovered_signer = NULL under the additive #106d fix column"
         );
     }
 

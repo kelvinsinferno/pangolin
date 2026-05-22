@@ -381,6 +381,28 @@ do_run() {
       publish_revision_v2_e2e_against_anvil \
       -- --ignored --nocapture
 
+  # issue #106d COUPLED revocation-on-read regression gate (the centerpiece
+  # — L11). Drives the live-set honor gate + the retroactive re-eval through
+  # the REAL Vault::sync_from_chain V2 path against the LIVE RevisionLogV2:
+  # bootstrapVault(A) -> addDevice(B) -> publish_revision_v2 as A AND B ->
+  # sync -> BOTH honored (surface as heads/history) -> removeDevice(B) ->
+  # re-sync -> A still honored, B's retroactively-stored entry REVOKED-on-read
+  # (filtered from head + history; revisions_revoked counts it) -> re-add(B)
+  # -> re-sync -> B honored again (re-add un-revokes). The negatives (a
+  # honor-all predicate would leave B's removed entry surfacing; a fail-OPEN
+  # on a set-read error would honor everyone; a marks-but-reads-don't-filter
+  # regression would leave the revoked B row in head/history) are assertions
+  # inside the test, so a regression turns this command RED automatically.
+  # Manager A == the same [0x42;32] seed fund_test_wallet funded; B is funded
+  # by the test via anvil_setBalance so it can pay gas for its own publish.
+  # RevisionLogV2 is already deployed by do_setup.
+  PANGOLIN_CHAIN_ENV=dev \
+  BASE_SEPOLIA_RPC_URL="$RPC_URL" \
+    cargo test -p pangolin-core --features integration-tests \
+      --test anvil_device_e2e \
+      revocation_honor_gate_remove_then_read_e2e_against_anvil \
+      -- --ignored --nocapture
+
   echo "==> all in-scope tests passed against anvil"
 }
 
