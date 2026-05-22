@@ -1,7 +1,18 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-# Issue #106e-2 — device-pairing TRANSPORT (QR / short-code payload) + SAS + device-add FFI — plan-gate DRAFT
+# Issue #106e-2 — device-pairing TRANSPORT (QR + copy-paste string) + SAS + device-add FFI — plan-gate LOCKED
 
-**Status: DRAFT — awaiting Kelvin sign-off (decisions in §5). BLOCKED on #106e-1 (FFI layer).** The final #106e slice + the last of the multi-device epic: the "add a new device" handshake transport. The pairing CRYPTO (#106b-1) and the on-chain `addDevice` (#106c) already exist; #106e-2 is the net-new TRANSPORT payload codec + the SAS (short authentication string, anti-MITM) + the device-add FFI bindings. Its own #106b-style adversarial audit (the SAS is the net-new security property).
+**Status: LOCKED — Kelvin sign-off 2026-05-22 (§0a). BLOCKED on #106e-1 (FFI layer) — build that first.** The final #106e slice + the last of the multi-device epic: the "add a new device" handshake transport.
+
+## 0a. RESOLVED decisions (Kelvin sign-off 2026-05-22)
+
+- **Q-a → bidirectional pubkey exchange + a MANDATORY SAS gate.** The handshake exchanges BOTH devices' pairing pubkeys (B→A and A→B), both derive + display the 6-digit SAS, the humans compare, and ONLY after confirmation does A broadcast `addDevice` + `seal_vdk_to_new_device` (so A never authorizes/seals to a possible attacker). The seal-binding (the VDK seal is locked to B's `device_id`+pubkey) is belt-and-suspenders. The SAS comparison is a hard gate, not advisory.
+- **Q-carrier → QR *and* a copy-pasteable text string (NO relay/server).** The pairing payload codec emits the blob in BOTH forms: a byte form (host renders as a QR for camera devices) AND a copy-pasteable checksummed text string (~80–150 chars, like a license key) for camera-less devices (e.g. laptops) — the user moves the string via clipboard / message / AirDrop / email. The Rust layer is transport-AGNOSTIC: it produces/consumes bytes + the string + the SAS; the HOST moves them. **#106e-2 does NOT build a network relay** (a relay could be added later on top, its own slice + trust/privacy surface). QR stays available for camera devices.
+- **Q-b → 6-digit decimal SAS** (e.g. `472913`) — language-neutral, easy to compare/read-aloud, ZRTP-class.
+- **Q-d → do NOT sign the pairing payload with B's device key** (it doesn't replace the SAS — an attacker self-signs its own consistent triple — and the seal-binding already protects the VDK; skip the surface).
+- **Q-e → ONE slice** (codec + SAS + FFI); the SAS gets focused adversarial-audit attention.
+- **Q-f → codec in `pangolin-core::pairing_transport`, SAS in `pangolin-crypto` (domain-separated hash), FFI in `pangolin-ffi::pairing`.**
+- **Codec must provide BOTH a byte form and a text-string (base32/Bech32-style + checksum) form**, with encode + decode + length/version/checksum validation for each; the SAS is canonical-symmetric (sorted pubkeys ⇒ identical code on both devices regardless of role).
+- **L-invariants:** L1 zero-secret-crosses-FFI (pairing SECRET + VDK stay engine-side; payload/SAS/sealed-envelope are non-secret; `grep -ci uniffi` on core/crypto = 0); L2 SAS defeats a pubkey-swap MITM (tamper ⇒ SAS mismatch — the load-bearing test); L3 SAS canonical-symmetric; L4 zero-serde fixed-layout + checksummed string, version-gated; L5 freshness nonce + on-chain deviceNonce anti-replay; forbid(unsafe); AGPL; testnet-only/D-011; its own #106b-style adversarial audit; full `cargo test --workspace`. The pairing CRYPTO (#106b-1) and the on-chain `addDevice` (#106c) already exist; #106e-2 is the net-new TRANSPORT payload codec + the SAS (short authentication string, anti-MITM) + the device-add FFI bindings. Its own #106b-style adversarial audit (the SAS is the net-new security property).
 
 ## 0. One-paragraph summary
 
