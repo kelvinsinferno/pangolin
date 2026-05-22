@@ -374,6 +374,24 @@ pub struct RecoveryEscrowParams {
     pub current_epoch: u64,
 }
 
+/// **MVP-3 issue #106e-0b.** The NON-secret outcome of
+/// [`Vault::onboard_guardians`] — the recovery-generation epoch the freshly
+/// onboarded escrow was written at.
+///
+/// Carries NO secret: the RWK + the raw shares are minted, used, and
+/// dropped (zeroized) inside the crypto onboard primitive; the active VDK
+/// is borrowed store-internal and never leaves. Only this non-secret epoch
+/// crosses the API boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnboardingOutcome {
+    /// The recovery-generation epoch the escrow was written at. The FIRST
+    /// onboard writes GENESIS (`0`); rotation / recovery bump it thereafter
+    /// (the existing epoch model). A re-onboard REPLACES the prior
+    /// generation in place (still at genesis — the recovery re-split owns
+    /// the bump, not a guardian-set change).
+    pub epoch: u64,
+}
+
 /// Encrypted local vault.
 ///
 /// Owns a `SQLite` connection and (when `Active`) the unwrapped VDK plus
@@ -1793,6 +1811,161 @@ impl Vault {
             re_split_epoch,
             re_split_guardians,
         )
+    }
+
+    /// **MVP-3 issue #106e-0b: set up social recovery on this vault.**
+    ///
+    /// The production twin of [`Self::__test_onboard_recovery_escrow`] and
+    /// the prerequisite that makes the recovery / rotation surface live:
+    /// `complete_rotation` reads the escrow ([`Self::recovery_escrow_params`])
+    /// and `recover_from_shares` re-splits it, but until a vault has been
+    /// onboarded there is NO escrow to read. This writes the INITIAL escrow.
+    ///
+    /// Reads the CURRENTLY-ACTIVE VDK store-internal (never exposed), mints
+    /// a fresh `RecoveryWrapKey`, second-wraps the VDK under it,
+    /// threshold-[`split_rwk`](pangolin_crypto::escrow::split_rwk)s the RWK
+    /// into `M = guardian_x25519_pubs.len()` shares, and seals share `i` to
+    /// guardian `i`'s X25519 SEALING pubkey — all via the ONE shared
+    /// [`pangolin_crypto::escrow::onboard_escrow`] primitive (the SAME fn
+    /// the `pangolin-core` rotation / recovery re-split calls, so the
+    /// initial onboard and the re-split can never drift — #106e-0b Q-a /
+    /// Option B). The resulting `wrapped_recovery` + sealed shares are
+    /// persisted under the active VDK's column-AEAD in ONE
+    /// `unchecked_transaction()`.
+    ///
+    /// **Epoch (Q-c).** The first onboard writes at GENESIS (`0`);
+    /// rotation / recovery bump the recovery-generation epoch thereafter.
+    ///
+    /// **Re-onboard (Q-b).** A second call (the user changes their guardian
+    /// set) REPLACES the prior generation — `write_recovery_escrow_tx`
+    /// DELETEs the prior guardian rows and `INSERT OR REPLACE`s the single
+    /// escrow row, so no stale share lingers. The genesis epoch is reused
+    /// (a guardian-set change is not a recovery re-split — only recovery
+    /// owns the forward-security bump).
+    ///
+    /// **Secret hygiene (L2).** The RWK + raw shares are dropped (zeroized)
+    /// inside `onboard_escrow` before it returns; the active VDK is borrowed
+    /// store-internal and never returned / logged; only the non-secret
+    /// [`OnboardingOutcome`] epoch leaves.
+    ///
+    /// **Atomicity (L1).** Single transaction — a crash leaves NO partial
+    /// escrow (the vault simply has no recovery set up yet; retryable).
+    ///
+    /// Session-gated (`require_active`).
+    ///
+    /// `threshold` (`t`) and `M = guardian_x25519_pubs.len()` must satisfy
+    /// the on-chain bounds (`t ∈ 2..=9`, `M ∈ 3..=15`, `t ≤ M`); the escrow
+    /// split rejects an out-of-bounds pair.
+    ///
+    /// # Errors
+    ///
+    /// - [`StoreError::NotUnlocked`] if no session is active.
+    /// - [`StoreError::AuthenticationFailed`] if the onboard composition
+    ///   (wrap / split / seal) fails (e.g. an out-of-bounds `(t, M)`).
+    /// - [`StoreError::Corrupted`] if `M` overflows `u8`.
+    /// - [`StoreError::Sqlite`] on a DB / transaction error.
+    pub fn onboard_guardians(
+        &mut self,
+        threshold: u8,
+        guardian_x25519_pubs: &[[u8; 32]],
+    ) -> Result<OnboardingOutcome> {
+        // Q-c: the first onboard writes at GENESIS (0); rotation / recovery
+        // bump it thereafter. A re-onboard (Q-b) REPLACES in place at the
+        // same genesis epoch (the re-split, not a guardian-set change, owns
+        // the forward-security bump).
+        const GENESIS_EPOCH: u64 = 0;
+
+        let active = self.require_active()?;
+        let vault_id = self.meta.vault_id;
+        let guardian_count = u8::try_from(guardian_x25519_pubs.len())
+            .map_err(|_| StoreError::Corrupted("guardian count overflows u8".into()))?;
+
+        // The ONE shared onboard split-and-seal primitive (#106e-0b Q-a /
+        // Option B). The fresh RWK + the raw Shares are minted, used, and
+        // dropped (zeroized) INSIDE this call; only the wrapped recovery +
+        // the sealed, non-secret assignments come back. The active VDK is
+        // borrowed by reference and never leaves the store.
+        let onboarding = pangolin_crypto::escrow::onboard_escrow(
+            &active.vdk,
+            &vault_id,
+            threshold,
+            guardian_count,
+            guardian_x25519_pubs,
+            GENESIS_EPOCH,
+        )
+        .map_err(|_| StoreError::AuthenticationFailed)?;
+
+        // Map the crypto-level assignments into the store's borrowing
+        // `GuardianRecord` slice (the sealed-share bytes are borrowed from
+        // `onboarding`, which outlives the transaction below).
+        let records: Vec<GuardianRecord<'_>> = onboarding
+            .assignments
+            .iter()
+            .map(|a| GuardianRecord {
+                index: a.index,
+                guardian_x25519_pub: a.guardian_x25519_pub,
+                sealed_share: &a.sealed_share,
+            })
+            .collect();
+
+        // Persist the escrow under the active VDK's column-AEAD in ONE
+        // transaction (L1 atomic — a crash rolls the whole escrow back).
+        let vdk_aead = active.vdk.aead_key();
+        let tx = self.conn.unchecked_transaction()?;
+        recovery_escrow::write_recovery_escrow_tx(
+            &tx,
+            &vault_id,
+            vdk_aead,
+            &onboarding.wrapped_recovery,
+            threshold,
+            guardian_count,
+            GENESIS_EPOCH,
+            &records,
+        )?;
+        tx.commit()?;
+
+        Ok(OnboardingOutcome {
+            epoch: GENESIS_EPOCH,
+        })
+    }
+
+    /// **Test-only (#106e-0b L5).** Read back the host-supplied recovery
+    /// BACKUP material for the onboarded escrow generation: the
+    /// [`WrappedVdkRecovery`] plus the `M` [`SealedShare`]s, ordered by
+    /// guardian index (`0..M`).
+    ///
+    /// Both are NON-secret: the `wrapped_recovery` is the VDK wrapped under
+    /// the now-dropped RWK (useless without `>= t` reconstructed shares),
+    /// and each sealed share is encrypted to a guardian's X25519 key. In
+    /// production this material travels in the user's recovery backup + the
+    /// guardians' custody and is fed back into `recover_from_shares` as
+    /// host-supplied input; the L5 round-trip test captures it from disk to
+    /// prove a vault onboarded via the PRODUCTION [`Self::onboard_guardians`]
+    /// is reconstructable. Opening the under-VDK double wrap requires the
+    /// active VDK's column-AEAD, which stays store-internal — only the
+    /// non-secret backup material is returned.
+    ///
+    /// `Ok(None)` if no escrow has been onboarded yet.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] if no session is active; the same read
+    /// errors as [`Self::recovery_escrow_params`].
+    #[cfg(any(test, feature = "test-utilities"))]
+    pub fn __test_recovery_backup_material(
+        &self,
+    ) -> Result<Option<(WrappedVdkRecovery, Vec<pangolin_crypto::escrow::SealedShare>)>> {
+        let active = self.require_active()?;
+        let vault_id = self.meta.vault_id;
+        let escrow = crate::recovery_escrow::read_recovery_escrow(
+            &self.conn,
+            &vault_id,
+            active.vdk.aead_key(),
+        )?;
+        Ok(escrow.map(|e| {
+            let shares = e.guardians.into_iter().map(|g| g.sealed_share).collect();
+            (e.wrapped_recovery, shares)
+        }))
     }
 
     /// **Test-only (#106e-0).** Onboard a recovery escrow over the

@@ -585,5 +585,127 @@ pub fn unwrap_vdk_under_rwk(
         .map_err(|_| EscrowError::WrapFailed)
 }
 
+/// One guardian's sealed share plus the join metadata tying it to the
+/// guardian's position in the onboarding set.
+///
+/// The crypto-level peer of `pangolin_core::recovery::GuardianAssignment`
+/// and `pangolin_store::recovery_escrow::GuardianRecord` — carries only the
+/// non-secret join metadata (`index`, `guardian_x25519_pub`) and the
+/// non-secret [`SealedShare`] (encrypted to the guardian). No live RWK or
+/// plaintext [`Share`] survives in here.
+#[derive(Debug)]
+pub struct EscrowAssignment {
+    /// The guardian's ordinal position in the set (`0..M`). Matches the
+    /// ascending Shamir identifier order [`split_rwk`] emits.
+    pub index: u8,
+    /// The guardian's 32-byte X25519 SEALING public key the share was
+    /// sealed to.
+    pub guardian_x25519_pub: [u8; X25519_KEY_LEN],
+    /// The sealed share for this guardian (non-secret — encrypted to the
+    /// guardian's X25519 key + bound to `vault_id` + `epoch`).
+    pub sealed_share: SealedShare,
+}
+
+/// The full output of [`onboard_escrow`] — everything a persistence /
+/// orchestration layer keeps from one onboarding generation.
+///
+/// Carries NO live RWK and NO plaintext [`Share`]: the RWK and the raw
+/// shares are consumed inside [`onboard_escrow`] and dropped (zeroized)
+/// before this returns — only the wrapped recovery + the sealed, non-secret
+/// assignments escape.
+#[derive(Debug)]
+pub struct EscrowOnboarding {
+    /// The VDK wrapped under the (now-dropped) RWK — the recovery-path peer
+    /// of the daily password-`WrappedVdk`. Non-secret BLOB.
+    pub wrapped_recovery: WrappedVdkRecovery,
+    /// Per-guardian sealed shares + join metadata, ordered by `index`
+    /// (`0..M`). Exactly `guardian_count` entries.
+    pub assignments: Vec<EscrowAssignment>,
+}
+
+/// The single shared **onboard split-and-seal composition** (#106e-0b Q-a / Option B).
+///
+/// Mint a fresh [`RecoveryWrapKey`], second-wrap the VDK under it
+/// ([`wrap_vdk_under_rwk`]), threshold-[`split_rwk`] the RWK into
+/// `guardian_count` shares, and [`seal_share`] share `i` to guardian `i`'s
+/// X25519 SEALING pubkey.
+///
+/// This is the ONE implementation of the catastrophic onboard crypto: both
+/// the production `pangolin_store::Vault::onboard_guardians` (initial
+/// set-up) and `pangolin_core::recovery::onboard_guardian_escrow` (the
+/// rotation / recovery RE-split) call it, so the initial-onboard and the
+/// re-split can never drift.
+///
+/// `guardian_x25519_pubs` must contain exactly `guardian_count` (`M`)
+/// pubkeys, ordered so that index `i` is the guardian whose secp256k1
+/// address the caller commits at merkle position `i`. `epoch` tags this
+/// share generation (encoded into each sealed share's authenticated
+/// header for forward-security domain separation).
+///
+/// ### Secret hygiene (L2)
+///
+/// The fresh RWK and the plaintext [`Share`]s are consumed and dropped
+/// (zeroized via the escrow types' `!Clone` zeroizing discipline) before
+/// this returns — only the sealed, non-secret artifacts escape. The caller
+/// borrows the VDK; this fn never copies or returns it.
+///
+/// # Errors
+///
+/// - [`EscrowError::InvalidThreshold`] if `(threshold, guardian_count)` is
+///   outside the on-chain bounds (re-checked inside [`split_rwk`]).
+/// - [`EscrowError::WrapFailed`] if the second-wrap of the VDK fails.
+/// - [`EscrowError::SplitFailed`] if the Shamir split fails.
+/// - [`EscrowError::SealFailed`] if sealing a share to a guardian fails.
+///
+/// Note: when `guardian_x25519_pubs.len() != guardian_count` this seals
+/// only `min(shares, pubs)` entries; callers that need a strict count
+/// mismatch error (e.g. the core orchestration `GuardianCountMismatch`)
+/// validate the count BEFORE calling.
+pub fn onboard_escrow(
+    vdk: &VdkKey,
+    vault_id: &[u8; VAULT_ID_LEN],
+    threshold: u8,
+    guardian_count: u8,
+    guardian_x25519_pubs: &[[u8; X25519_KEY_LEN]],
+    epoch: u64,
+) -> Result<EscrowOnboarding, EscrowError> {
+    // 1. Fresh RWK; 2. second-wrap the VDK under it (the same WrapContext
+    //    the daily wrap uses — vault binding). Delegated to the audited
+    //    primitive.
+    let rwk = RecoveryWrapKey::generate();
+    let ctx = WrapContext::new(*vault_id);
+    let wrapped_recovery = wrap_vdk_under_rwk(vdk, &rwk, &ctx)?;
+
+    // 3. Threshold-split. (threshold, guardian_count) is re-validated
+    //    against the on-chain bounds inside split_rwk (belt-and-suspenders).
+    let shares = split_rwk(&rwk, threshold, guardian_count)?;
+    // The RWK is no longer needed; drop it now so it zeroizes before any
+    // sealing work (the wrapper + shares are all we keep).
+    drop(rwk);
+
+    // 4. Seal share i -> guardian i, recording the join metadata. The
+    //    16-byte escrow-epoch encoding: 8 reserved zero bytes + big-endian
+    //    u64 (the shape `RecoveryEpoch::to_escrow_bytes` produces).
+    let mut epoch_bytes = [0u8; EPOCH_LEN];
+    epoch_bytes[8..].copy_from_slice(&epoch.to_be_bytes());
+    let mut assignments = Vec::with_capacity(shares.len());
+    for (i, (share, pubkey)) in shares.iter().zip(guardian_x25519_pubs).enumerate() {
+        let sealed = seal_share(share, pubkey, vault_id, &epoch_bytes)?;
+        assignments.push(EscrowAssignment {
+            // `i < M <= MAX_GUARDIANS (15)`, always fits u8.
+            index: u8::try_from(i).expect("guardian index <= 15 fits u8"),
+            guardian_x25519_pub: *pubkey,
+            sealed_share: sealed,
+        });
+    }
+    // `shares` (the plaintext Shares) drop here, zeroizing.
+    drop(shares);
+
+    Ok(EscrowOnboarding {
+        wrapped_recovery,
+        assignments,
+    })
+}
+
 #[cfg(test)]
 mod tests;

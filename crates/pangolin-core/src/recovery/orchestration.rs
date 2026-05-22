@@ -39,10 +39,10 @@
 //! the sealed set to the merkle-committed set.
 
 use pangolin_crypto::escrow::{
-    reconstruct_rwk, seal_share, split_rwk, unwrap_vdk_under_rwk, wrap_vdk_under_rwk, EscrowError,
-    RecoveryWrapKey, SealedShare, Share, WrappedVdkRecovery, EPOCH_LEN, X25519_KEY_LEN,
+    reconstruct_rwk, unwrap_vdk_under_rwk, EscrowError, SealedShare, Share, WrappedVdkRecovery,
+    EPOCH_LEN, X25519_KEY_LEN,
 };
-use pangolin_crypto::keys::{VdkKey, WrapContext, VAULT_ID_LEN};
+use pangolin_crypto::keys::{VdkKey, VAULT_ID_LEN};
 
 use super::{GuardianSetConfig, GuardianSetError};
 
@@ -248,40 +248,41 @@ pub fn onboard_guardian_escrow(
         });
     }
 
-    // 1. Fresh RWK; 2. second-wrap the VDK under it (the same WrapContext
-    //    the daily wrap uses — vault binding). Delegated entirely to the
-    //    audited escrow primitive.
-    let rwk = RecoveryWrapKey::generate();
-    let ctx = WrapContext::new(*vault_id);
-    let wrapped_recovery = wrap_vdk_under_rwk(vdk, &rwk, &ctx)?;
+    // Delegate the split-and-seal composition to the ONE shared crypto
+    // primitive (#106e-0b Q-a / Option B) — the SAME fn the production
+    // `pangolin_store::Vault::onboard_guardians` calls, so the initial
+    // onboard and this rotation/recovery re-split can never drift. The RWK
+    // and the plaintext shares are minted, used, and dropped (zeroized)
+    // INSIDE `onboard_escrow`; only the wrapped recovery + sealed,
+    // non-secret assignments come back. This is a byte-identical extraction
+    // of the prior inline composition (validate + count-check stay HERE so
+    // they keep emitting the orchestration-typed errors above).
+    let onboarding = pangolin_crypto::escrow::onboard_escrow(
+        vdk,
+        vault_id,
+        config.threshold,
+        config.guardian_count,
+        guardian_x25519_pubs,
+        epoch.0,
+    )?;
 
-    // 3. Threshold-split. t/M are revalidated inside split_rwk against the
-    //    same on-chain bounds (L2 belt-and-suspenders).
-    let shares = split_rwk(&rwk, config.threshold, config.guardian_count)?;
-    // The RWK is no longer needed; drop it now so it zeroizes before any
-    // sealing work (the wrapper + shares are all we keep).
-    drop(rwk);
-
-    // 4. Seal share i -> guardian i. Record the join metadata (index +
-    //    pubkey) so the caller commits the matching secp256k1 guardian at
-    //    merkle position i (L2). The plaintext `Share`s drop at end of the
-    //    map's iteration scope (zeroizing).
-    let epoch_bytes = epoch.to_escrow_bytes();
-    let mut assignments = Vec::with_capacity(shares.len());
-    for (i, (share, pubkey)) in shares.iter().zip(guardian_x25519_pubs).enumerate() {
-        let sealed = seal_share(share, pubkey, vault_id, &epoch_bytes)?;
-        assignments.push(GuardianAssignment {
-            // `i < M <= MAX_GUARDIANS (15)`, always fits u8.
-            index: u8::try_from(i).expect("guardian index <= 15 fits u8"),
-            guardian_x25519_pub: *pubkey,
-            sealed_share: sealed,
-        });
-    }
-    // `shares` (the plaintext Shares) drop here, zeroizing.
-    drop(shares);
+    // Map the crypto-level result into the unchanged public
+    // `OnboardingArtifacts` shape: re-attach the echoed-back `config` +
+    // `epoch` (which the crypto fn does not carry) and rename the
+    // assignment type. A pure, lossless field-for-field mapping — the
+    // wrapped_recovery + sealed_share bytes are MOVED through unchanged.
+    let assignments = onboarding
+        .assignments
+        .into_iter()
+        .map(|a| GuardianAssignment {
+            index: a.index,
+            guardian_x25519_pub: a.guardian_x25519_pub,
+            sealed_share: a.sealed_share,
+        })
+        .collect();
 
     Ok(OnboardingArtifacts {
-        wrapped_recovery,
+        wrapped_recovery: onboarding.wrapped_recovery,
         config,
         epoch,
         assignments,
