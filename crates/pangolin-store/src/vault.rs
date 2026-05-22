@@ -7753,6 +7753,25 @@ impl Vault {
     /// Returns `Some(outcome)` if the signer was honored + the revision
     /// ingested; `None` if the signer was NOT in the set (rejected).
     ///
+    /// **MEDIUM under-revocation FIX (#106d fix-pass).** On a successful
+    /// honor + ingest, the ecrecovered `signer` is PERSISTED onto the
+    /// chain-anchored row's `recovered_signer` column. This is the SAME
+    /// identity this gate honors. The retroactive revocation pass
+    /// ([`Self::reevaluate_revocation_against_set`]) keys on this stored
+    /// signer rather than the OPAQUE `device_id`, because `RevisionLogV2`
+    /// gates publishing ONLY on the ecrecovered signer and NEVER enforces
+    /// `deviceId == leftpad(signer)`. Keying the retroactive pass on
+    /// `device_id` would let an in-set device B publish a B-signed revision
+    /// carrying `deviceId = leftpad(A)`; after B is removed the row would
+    /// survive (its `device_id` still decodes to in-set A) — the dangerous
+    /// under-revocation direction. Persisting the recovered signer closes
+    /// that hole by making the retroactive predicate use the gating
+    /// identity. The row is located by its unambiguous chain-anchor
+    /// identity `(account_id, chain_tx_hash, chain_block_number,
+    /// chain_log_index)` (idempotency check #2's key), so the stamp lands
+    /// correctly whether the ingest inserted a fresh row or merged onto a
+    /// local pre-publish row. Re-stamping the same value is idempotent.
+    ///
     /// # Errors
     ///
     /// The errors of [`Self::ingest_chain_revision`].
@@ -7766,7 +7785,60 @@ impl Vault {
             return Ok(None);
         }
         let outcome = self.ingest_chain_revision(event)?;
+        // Persist the ecrecovered signer onto the just-ingested chain-
+        // anchored row so the retroactive revocation pass keys on the
+        // gating identity, not the opaque device_id.
+        self.stamp_recovered_signer(event, &signer)?;
         Ok(Some(outcome))
+    }
+
+    /// **#106d fix-pass helper (MEDIUM under-revocation fix).** Persist the
+    /// ecrecovered `signer` onto the V2 chain-anchored row identified by
+    /// its chain-anchor identity `(account_id, chain_tx_hash,
+    /// chain_block_number, chain_log_index)` — the unambiguous chain-event
+    /// key (one `(tx_hash, log_index)` per event). The retroactive
+    /// revocation pass ([`Self::reevaluate_revocation_against_set`]) keys
+    /// on this stored signer rather than the OPAQUE `device_id`, because
+    /// `RevisionLogV2` gates publishing ONLY on the recovered signer and
+    /// NEVER enforces `deviceId == leftpad(signer)`. Stamping by the chain
+    /// anchor lands the value whether the ingest inserted a fresh row or
+    /// merged onto a local pre-publish row; re-stamping the same value is
+    /// idempotent.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] for a DB error; [`StoreError::Corrupted`] if
+    /// the anchor block/log values would not fit in `i64`.
+    fn stamp_recovered_signer(
+        &self,
+        event: &pangolin_chain::RevisionEvent,
+        signer: &[u8; crate::device::EVM_ADDRESS_LEN],
+    ) -> Result<()> {
+        let block_i64 = i64::try_from(event.anchor.block_number).map_err(|_| {
+            StoreError::Corrupted(
+                "RevisionEvent.anchor.block_number does not fit in i64; refusing to stamp signer"
+                    .into(),
+            )
+        })?;
+        let log_i64 = i64::try_from(event.anchor.log_index).map_err(|_| {
+            StoreError::Corrupted(
+                "RevisionEvent.anchor.log_index does not fit in i64; refusing to stamp signer"
+                    .into(),
+            )
+        })?;
+        self.conn.execute(
+            "UPDATE revisions SET recovered_signer = ?1 \
+             WHERE account_id = ?2 AND chain_tx_hash = ?3 \
+               AND chain_block_number = ?4 AND chain_log_index = ?5",
+            params![
+                &signer[..],
+                &event.account_id[..],
+                &event.anchor.tx_hash[..],
+                block_i64,
+                log_i64,
+            ],
+        )?;
+        Ok(())
     }
 
     /// **MVP-3 issue #106d (salvaged #103-C GAP FLAG 3, predicate re-keyed)
@@ -7783,18 +7855,29 @@ impl Vault {
     /// the V2 sync path only filters *incoming* events; this pass closes
     /// the historical hole.
     ///
-    /// **Signer source.** A chain-ingested row's `device_id` is the
-    /// secp256k1 signer's EVM address left-padded to 32 bytes (12 zero
-    /// bytes ‖ 20 address bytes — the shape the V2 publish path emits and
-    /// `auto_register_device_from_chain_sync` mirrors). We recover the
-    /// address from the rightmost 20 bytes and test it against the set.
+    /// **Signer source (#106d fix-pass — MEDIUM under-revocation fix).**
+    /// The pass keys on the stored `recovered_signer` — the ecrecovered
+    /// secp256k1 address the V2 honor gate persisted at ingest
+    /// ([`Self::ingest_v2_revision_if_honored`]) — NOT on the OPAQUE
+    /// `device_id`. `RevisionLogV2` gates publishing ONLY on the recovered
+    /// signer and NEVER enforces `deviceId == leftpad(signer)`, so a row's
+    /// `device_id` is attacker-chosen and may decode to a DIFFERENT address
+    /// than the signer the gate honored. Keying on `device_id` would let an
+    /// in-set device B publish a B-signed revision carrying
+    /// `deviceId = leftpad(A)`; after B is removed, the `device_id` still
+    /// decodes to in-set A and the row would survive — under-revocation
+    /// (the dangerous direction). Keying on `recovered_signer` makes the
+    /// retroactive predicate use the EXACT identity the ingest gate uses.
     /// Only rows with a non-NULL `chain_tx_hash` are re-evaluated —
     /// purely-local (unpublished) rows have no on-chain set binding and are
-    /// never auto-revoked. This is the parked #103-C
-    /// `reevaluate_revocation_against_lineage` with the predicate swapped
-    /// from `lineage.is_honoured(signer)` to `set.contains(&signer)`; the
-    /// loop, the `device_id`→address decode, the both-directions recompute,
-    /// the idempotency, and the malformed-length skip are reused verbatim.
+    /// never auto-revoked. A chain-anchored row with a NULL
+    /// `recovered_signer` (a V1 row, or a row not ingested through the V2
+    /// honor gate) is treated CONSERVATIVELY — it is NOT silently honored;
+    /// if such a row reaches the V2 retroactive pass it is marked revoked
+    /// (it has no V2-honored signer to test against the set). This is the
+    /// parked #103-C `reevaluate_revocation_against_lineage` with the
+    /// predicate swapped to `set.contains(&recovered_signer)`; the loop,
+    /// the both-directions recompute, and the idempotency are reused.
     ///
     /// **Reversible / both directions.** The mark is recomputed in BOTH
     /// directions each pass (a row whose signer is in the current set is
@@ -7809,35 +7892,43 @@ impl Vault {
         &mut self,
         set: &[[u8; crate::device::EVM_ADDRESS_LEN]],
     ) -> Result<u32> {
-        // Collect every chain-anchored row's (revision_id, device_id,
-        // current revoked flag). device_id is the 32-byte left-padded
-        // signer address.
+        // Collect every chain-anchored row's (revision_id,
+        // recovered_signer, current revoked flag). recovered_signer is the
+        // 20-byte ecrecovered EVM address the V2 honor gate persisted at
+        // ingest — the SAME identity the gate honored (NOT the opaque
+        // device_id, which RevisionLogV2 never binds to the signer).
         let mut stmt = self.conn.prepare(
-            "SELECT revision_id, device_id, revoked \
+            "SELECT revision_id, recovered_signer, revoked \
              FROM revisions WHERE chain_tx_hash IS NOT NULL",
         )?;
         let rows = stmt
             .query_map([], |row| {
                 let revision_id: Vec<u8> = row.get(0)?;
-                let device_id: Vec<u8> = row.get(1)?;
+                let recovered_signer: Option<Vec<u8>> = row.get(1)?;
                 let revoked: i64 = row.get(2)?;
-                Ok((revision_id, device_id, revoked))
+                Ok((revision_id, recovered_signer, revoked))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
 
         let mut newly_revoked: u32 = 0;
-        for (revision_id, device_id, was_revoked) in rows {
-            // The rightmost 20 bytes of the 32-byte device_id are the
-            // signer's EVM address. A malformed (non-32-byte) device_id
-            // cannot be mapped to a signer; leave it untouched.
-            if device_id.len() != 32 {
-                continue;
-            }
-            let mut addr_bytes = [0u8; crate::device::EVM_ADDRESS_LEN];
-            addr_bytes.copy_from_slice(&device_id[12..32]);
-            // Honor iff the signer is in the CURRENT on-chain set.
-            let want_revoked = i64::from(!set.contains(&addr_bytes));
+        for (revision_id, recovered_signer, was_revoked) in rows {
+            // Key on the persisted recovered signer (the gating identity).
+            // A NULL or malformed-length recovered_signer on a chain-
+            // anchored row is treated CONSERVATIVELY: it has no V2-honored
+            // signer to test against the set, so it is marked revoked
+            // rather than silently honored (closes the under-revocation
+            // direction the audit flagged).
+            let want_revoked = match recovered_signer {
+                Some(bytes) if bytes.len() == crate::device::EVM_ADDRESS_LEN => {
+                    let mut addr_bytes = [0u8; crate::device::EVM_ADDRESS_LEN];
+                    addr_bytes.copy_from_slice(&bytes);
+                    // Honor iff the recovered signer is in the CURRENT set.
+                    i64::from(!set.contains(&addr_bytes))
+                }
+                // NULL or malformed → conservatively revoked.
+                _ => 1,
+            };
             if want_revoked != was_revoked {
                 self.conn.execute(
                     "UPDATE revisions SET revoked = ?1 WHERE revision_id = ?2",
@@ -9016,6 +9107,10 @@ impl Vault {
                     ev.event.anchor.block_number,
                     ev.block_hash.0,
                 )?;
+                // #106d fix-pass: persist the ecrecovered signer so the
+                // retroactive revocation pass keys on the gating identity
+                // (the recovered signer), NOT the opaque device_id.
+                self.stamp_recovered_signer(&ev.event, &signer_bytes)?;
                 detector.record(ev.event.anchor.block_number, ev.block_hash);
                 report.revisions_applied = report.revisions_applied.saturating_add(1);
             }
@@ -9146,6 +9241,11 @@ impl Vault {
                                     ev.event.anchor.block_number,
                                     ev.block_hash.0,
                                 )?;
+                                // #106d fix-pass: persist the ecrecovered
+                                // signer so the retroactive revocation pass
+                                // keys on the gating identity, NOT the
+                                // opaque device_id.
+                                self.stamp_recovered_signer(&ev.event, &signer_bytes)?;
                                 detector.record(ev.event.anchor.block_number, ev.block_hash);
                                 report.revisions_applied =
                                     report.revisions_applied.saturating_add(1);
@@ -13311,6 +13411,17 @@ mod tests {
         }
     }
 
+    /// **#106d fix-pass helper.** Ingest a V2 chain revision through the
+    /// honor gate ([`Vault::ingest_v2_revision_if_honored`]) with `addr`
+    /// as the ecrecovered signer (in-set at ingest), so the row's
+    /// `recovered_signer` column is persisted — the identity the
+    /// retroactive pass keys on. Mirrors how the live V2 sync path ingests.
+    fn ingest_v2_as_signer(v: &mut Vault, ev: &pangolin_chain::RevisionEvent, addr: [u8; 20]) {
+        v.ingest_v2_revision_if_honored(ev, addr, &[addr])
+            .expect("honor-gated ingest")
+            .expect("signer in-set at ingest");
+    }
+
     /// **#106d L4.** A row stored under signer A (ingested before A left
     /// the set) is retroactively MARKED revoked when re-evaluated against
     /// a set that no longer contains A — and a row signed by an in-set
@@ -13332,8 +13443,8 @@ mod tests {
             chain_event_signed_by(v.vault_id(), [0x11; 32], [0u8; 32], addr_a, b"by-A", 10, 0);
         let ev_b =
             chain_event_signed_by(v.vault_id(), [0x22; 32], [0u8; 32], addr_b, b"by-B", 20, 1);
-        v.ingest_chain_revision(&ev_a).expect("ingest A");
-        v.ingest_chain_revision(&ev_b).expect("ingest B");
+        ingest_v2_as_signer(&mut v, &ev_a, addr_a);
+        ingest_v2_as_signer(&mut v, &ev_b, addr_b);
 
         // Current set = {B} only — A was removed.
         let set = vec![addr_b];
@@ -13395,7 +13506,7 @@ mod tests {
         let addr_a = [0xAA; 20];
         let ev_a =
             chain_event_signed_by(v.vault_id(), [0x11; 32], [0u8; 32], addr_a, b"by-A", 10, 0);
-        v.ingest_chain_revision(&ev_a).expect("ingest A");
+        ingest_v2_as_signer(&mut v, &ev_a, addr_a);
         let rev_id_a = pangolin_chain::canonical_hash(
             &ev_a.vault_id,
             &ev_a.account_id,
@@ -13481,8 +13592,8 @@ mod tests {
             ev_c.schema_version,
             &ev_c.enc_payload,
         );
-        v.ingest_chain_revision(&ev_g).expect("ingest G");
-        v.ingest_chain_revision(&ev_c).expect("ingest C");
+        ingest_v2_as_signer(&mut v, &ev_g, addr_a);
+        ingest_v2_as_signer(&mut v, &ev_c, addr_b);
 
         let acct_id = crate::account::AccountId::from_bytes(acct);
         let rid_g = crate::revision::RevisionId::from_bytes(rev_id_g);
@@ -13535,6 +13646,98 @@ mod tests {
         let graph = v.revision_graph(acct_id).expect("graph");
         assert!(graph.get(&rid_g).is_some(), "honored G present in graph");
         assert!(graph.get(&rid_c).is_none(), "revoked C absent from graph");
+    }
+
+    /// **#106d FIX-PASS regression — MEDIUM under-revocation: the
+    /// retroactive pass MUST key on the recovered signer, NOT the opaque
+    /// `device_id`.**
+    ///
+    /// `RevisionLogV2` treats `deviceId` as OPAQUE and gates publishing
+    /// ONLY on the ecrecovered signer (it NEVER enforces
+    /// `deviceId == leftpad(signer)`). So an authorized in-set device B can
+    /// publish a revision SIGNED by B but carrying `deviceId = leftpad(A)`
+    /// (A another in-set device). The ingest honor gate correctly uses
+    /// B's recovered signer. But once B is REMOVED from the set, a
+    /// retroactive pass keyed on `device_id` would decode the row to A
+    /// (still in-set) and leave it `revoked = 0` — B's revision SURVIVES
+    /// B's removal (under-revocation, the dangerous direction).
+    ///
+    /// This test seeds exactly that row (`device_id = leftpad(A)`,
+    /// recovered signer = B), then runs the retroactive pass against the
+    /// set `{A}` (B removed). The CORRECT (recovered-signer-keyed) logic
+    /// REVOKES the row. The OLD (device_id-keyed) logic would decode A,
+    /// find A in-set, and leave it honored — so this assertion FAILS under
+    /// the old logic, proving the test is real.
+    #[test]
+    fn retroactive_reeval_keys_on_recovered_signer_not_device_id() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+
+        let addr_a = [0xAA; 20]; // stays in-set
+        let addr_b = [0xBB; 20]; // the real signer; removed from the set
+
+        // The event carries device_id = leftpad(A) (attacker-chosen,
+        // RevisionLogV2 never binds it to the signer)...
+        let ev = chain_event_signed_by(
+            v.vault_id(),
+            [0x33; 32],
+            [0u8; 32],
+            addr_a, // device_id = leftpad(A)
+            b"signed-by-B-but-device_id-A",
+            30,
+            2,
+        );
+        // ...but the ecrecovered signer the honor gate saw is B. B is
+        // in-set at ingest time, so the gate honors + persists
+        // recovered_signer = B.
+        ingest_v2_as_signer(&mut v, &ev, addr_b);
+
+        let rev_id = pangolin_chain::canonical_hash(
+            &ev.vault_id,
+            &ev.account_id,
+            &ev.parent_revision,
+            &ev.device_id,
+            ev.schema_version,
+            &ev.enc_payload,
+        );
+
+        // Sanity: the persisted recovered_signer is B (not A from
+        // device_id). Confirms the under-revocation precondition exists.
+        let stored_signer: Vec<u8> = v
+            .conn
+            .query_row(
+                "SELECT recovered_signer FROM revisions WHERE revision_id = ?1",
+                params![&rev_id[..]],
+                |row| row.get(0),
+            )
+            .expect("row present with recovered_signer");
+        assert_eq!(stored_signer, addr_b.to_vec(), "recovered signer is B");
+
+        // B removed; A still in-set. The CORRECT logic revokes this row
+        // (its real signer B is gone). The OLD device_id-keyed logic would
+        // decode A (in-set) and leave it honored → this assertion would
+        // FAIL under the old logic (proving the regression test is real).
+        let newly = v
+            .reevaluate_revocation_against_set(&[addr_a])
+            .expect("re-eval");
+        assert_eq!(
+            newly, 1,
+            "B-signed row (device_id spoofed to A) is revoked after B removed"
+        );
+        let revoked: i64 = v
+            .conn
+            .query_row(
+                "SELECT revoked FROM revisions WHERE revision_id = ?1",
+                params![&rev_id[..]],
+                |row| row.get(0),
+            )
+            .expect("row present");
+        assert_eq!(
+            revoked, 1,
+            "under-revocation closed: B's revision does NOT survive B's removal"
+        );
     }
 
     /// **#106d L5 — V1 path untouched.** A V1-bound vault (the default

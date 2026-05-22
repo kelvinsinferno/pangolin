@@ -835,8 +835,9 @@ pub async fn read_authorized_set_v2(
             // fold). PromotionFinalized rotates the manager, not the set.
             let candidate = match ev {
                 DeviceMgmtEvent::Bootstrapped { first_signer, .. } => Some(first_signer),
-                DeviceMgmtEvent::Added { signer, .. }
-                | DeviceMgmtEvent::Removed { signer, .. } => Some(signer),
+                DeviceMgmtEvent::Added { signer, .. } | DeviceMgmtEvent::Removed { signer, .. } => {
+                    Some(signer)
+                }
                 DeviceMgmtEvent::PromotionFinalized { .. } => None,
             };
             if let Some(signer) = candidate {
