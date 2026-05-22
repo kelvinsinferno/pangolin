@@ -338,3 +338,286 @@ async fn device_add_remove_rotate_e2e_against_anvil() {
         "the new-epoch VDK is a FRESH key (rotation re-created it, L9)"
     );
 }
+
+/// Fund a wallet on the local anvil chain via `cast rpc anvil_setBalance`
+/// (the harness guarantees `cast` is on PATH in dev mode). Needed so a
+/// device other than the harness-funded A can pay gas for its own publish.
+/// Fail-closed: a non-success exit is a hard test failure.
+fn anvil_fund(rpc_url: &str, addr: pangolin_chain::Address) {
+    let out = std::process::Command::new("cast")
+        .args([
+            "rpc",
+            "anvil_setBalance",
+            &format!("{addr:?}"),
+            // 1 ETH = 0xDE0B6B3A7640000 wei.
+            "0xDE0B6B3A7640000",
+            "--rpc-url",
+            rpc_url,
+        ])
+        .output()
+        .expect("invoke cast rpc anvil_setBalance");
+    assert!(
+        out.status.success(),
+        "anvil_setBalance failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// **#106d L11 CENTERPIECE — the revocation-on-read regression gate.**
+///
+/// Drives the live-set honor gate + the retroactive re-eval through the
+/// REAL `Vault::sync_from_chain` V2 path against the deployed
+/// `RevisionLogV2` bytecode:
+///
+/// ```text
+/// 1. bootstrapVault(A) + addDevice(B)        — both in the on-chain set
+/// 2. publish_revision_v2 as A AND as B       — both publishes accepted (in set)
+/// 3. sync (from genesis) → BOTH honored      — both rows land + surface as heads/history
+/// 4. removeDevice(B)                         — B out of the on-chain set
+/// 5. re-sync (from genesis) → A honored, B's stored entry REVOKED-on-read
+///    (filtered from head/history); revisions_revoked counts it
+/// 6. addDevice(B) again → re-sync → B honored again (re-add un-revokes)
+/// ```
+///
+/// Negatives that MUST flip this RED: a "honor-all" predicate (B's removed
+/// entry would still surface — step 5 fails), a fail-OPEN on a set-read
+/// error (the gate would honor everyone), and a marks-revoked-but-reads-
+/// don't-filter regression (the revoked B row would still appear in
+/// head/history — step 5's filter asserts fail).
+#[tokio::test]
+#[ignore = "live-RPC test; requires PANGOLIN_CHAIN_ENV=dev + local anvil (scripts/anvil-ci.sh)"]
+#[allow(clippy::too_many_lines)] // the coupled remove-then-read gate is one long sequence
+#[allow(clippy::similar_names)] // a_/b_ device + acct_a/acct_b are inherent to a 2-device test
+async fn revocation_honor_gate_remove_then_read_e2e_against_anvil() {
+    use pangolin_chain::{
+        build_signed_device_auth, build_signed_revision_v2, keccak256, publish_revision_v2,
+        read_authorized_set_v2, secp256k1_signing::RevisionFieldsV1, SyncOptions,
+    };
+    use pangolin_store::{PinIdentityProof, PressYPresenceProof, RevisionLogVersion};
+
+    let env = test_env::target_chain_env();
+    if !test_env::is_dev_mode()
+        && !test_env::require_or_fail("#106d revocation E2E needs dev anvil")
+    {
+        return;
+    }
+    let rpc_url = test_env::rpc_url();
+    let chain_id = test_env::resolve_signing_chain_id(env, &rpc_url)
+        .await
+        .expect("resolve signing chain id");
+    let contract = pangolin_chain::load_deployed_address(env, "RevisionLogV2")
+        .expect("RevisionLogV2 in dev.json");
+
+    // ---- devices ----
+    let a_device = device_a();
+    let a_wallet = wallet_for(&a_device);
+    let a_signer = a_wallet.address();
+    let b_device = DeviceKey::from_seed([0x7B; 32]);
+    let b_wallet = wallet_for(&b_device);
+    let b_signer = b_wallet.address();
+    // B pays gas for its own publish — fund it on the local chain.
+    anvil_fund(&rpc_url, b_signer);
+
+    // Fresh vault id (time-tweaked so reruns don't collide).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut vault_id = [0u8; 32];
+    vault_id[..8].copy_from_slice(&now.to_be_bytes());
+    vault_id[31] = 0xD6;
+
+    let sv = 1u16;
+
+    // ---- 1. bootstrapVault(A) + addDevice(B) ----
+    let boot_fields = DeviceAuthFields {
+        kind: DeviceAuthKind::AddDevice,
+        vault_id,
+        subject: a_signer,
+        nonce: 0,
+        schema_version: sv,
+    };
+    let boot_sig = build_signed_device_auth(a_wallet.signer(), boot_fields, contract, chain_id)
+        .expect("sign bootstrap");
+    bootstrap_vault_v2(&a_wallet, a_signer, &boot_sig, env, &rpc_url)
+        .await
+        .expect("bootstrapVault");
+    let nonce1 = read_device_nonce_v2(env, &rpc_url, vault_id).await.unwrap();
+    let add_fields = DeviceAuthFields {
+        kind: DeviceAuthKind::AddDevice,
+        vault_id,
+        subject: b_signer,
+        nonce: nonce1,
+        schema_version: sv,
+    };
+    let add_sig = build_signed_device_auth(a_wallet.signer(), add_fields, contract, chain_id)
+        .expect("sign addDevice(B)");
+    add_device_v2(&a_wallet, b_signer, &add_sig, env, &rpc_url)
+        .await
+        .expect("addDevice(B)");
+
+    // ---- 2. publish_revision_v2 as A AND as B (both in set) ----
+    // Distinct account ids so each is its own head. `with_signer_device_id`
+    // sets the deviceId to the 32-byte left-padded signer — exactly the
+    // shape the retroactive re-eval decodes (rightmost 20 bytes).
+    let publish = |wallet: &EvmWallet, account: [u8; 32], tag: &str| {
+        let enc_payload = format!("rev-{tag}-{now}").into_bytes();
+        let enc_payload_hash = keccak256(&enc_payload).0;
+        let fields = RevisionFieldsV1::with_signer_device_id(
+            wallet,
+            vault_id,
+            account,
+            [0u8; 32],
+            sv,
+            enc_payload_hash,
+        );
+        build_signed_revision_v2(wallet, fields, enc_payload, contract, chain_id)
+            .expect("sign v2 revision")
+    };
+    let acct_a = [0xA1; 32];
+    let acct_b = [0xB2; 32];
+    let signed_a = publish(&a_wallet, acct_a, "A");
+    publish_revision_v2(&a_wallet, &signed_a, env, &rpc_url)
+        .await
+        .expect("A publish accepted (A in set)");
+    let signed_b = publish(&b_wallet, acct_b, "B");
+    publish_revision_v2(&b_wallet, &signed_b, env, &rpc_url)
+        .await
+        .expect("B publish accepted (B in set)");
+
+    // ---- a V2-bound local vault to sync into ----
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("revocation-e2e.pvf");
+    let pwd = pangolin_crypto::secret::SecretBytes::new(b"e2e master password".to_vec());
+    Vault::create(&path, &pwd).expect("create vault");
+    let mut vault = Vault::open(&path).expect("open vault");
+    {
+        let presence = PressYPresenceProof::confirmed();
+        let identity = PinIdentityProof::new(pangolin_crypto::secret::SecretBytes::new(
+            b"e2e master password".to_vec(),
+        ));
+        vault.unlock(&presence, &identity).expect("unlock");
+    }
+    // Bind the vault to V2 so sync routes through the honor-gated V2 path.
+    vault
+        .set_revisionlog_version(RevisionLogVersion::V2)
+        .expect("bind V2");
+
+    let acct_a_id = pangolin_store::AccountId::from_bytes(acct_a);
+    let acct_b_id = pangolin_store::AccountId::from_bytes(acct_b);
+    let from_genesis = SyncOptions {
+        from_genesis: true,
+        ..Default::default()
+    };
+
+    // ---- 3. sync (from genesis) → BOTH honored ----
+    let rep1 = vault
+        .sync_from_chain(&rpc_url, env, &vault_id, from_genesis)
+        .await
+        .expect("sync 1");
+    assert_eq!(
+        rep1.revisions_revoked, 0,
+        "nothing revoked while both in set"
+    );
+    assert_eq!(
+        vault.account_heads(acct_a_id).expect("heads A").len(),
+        1,
+        "A's revision is honored (a head)"
+    );
+    assert_eq!(
+        vault.account_heads(acct_b_id).expect("heads B").len(),
+        1,
+        "B's revision is honored (a head) while B is in the set"
+    );
+
+    // Sanity: the live set read returns BOTH A and B (the gate's source).
+    let set_with_b = read_authorized_set_v2(env, &rpc_url, vault_id, 0)
+        .await
+        .expect("set read");
+    assert!(set_with_b.contains(&a_signer) && set_with_b.contains(&b_signer));
+
+    // ---- 4. removeDevice(B) ----
+    let nonce2 = read_device_nonce_v2(env, &rpc_url, vault_id).await.unwrap();
+    let rm_fields = DeviceAuthFields {
+        kind: DeviceAuthKind::RemoveDevice,
+        vault_id,
+        subject: b_signer,
+        nonce: nonce2,
+        schema_version: sv,
+    };
+    let rm_sig = build_signed_device_auth(a_wallet.signer(), rm_fields, contract, chain_id)
+        .expect("sign removeDevice(B)");
+    remove_device_v2(&a_wallet, b_signer, &rm_sig, env, &rpc_url)
+        .await
+        .expect("removeDevice(B)");
+    let set_without_b = read_authorized_set_v2(env, &rpc_url, vault_id, 0)
+        .await
+        .expect("set read after remove");
+    assert!(
+        set_without_b.contains(&a_signer) && !set_without_b.contains(&b_signer),
+        "after removeDevice the live set is {{A}} only"
+    );
+
+    // ---- 5. re-sync → A honored, B's stored entry REVOKED-on-read ----
+    let rep2 = vault
+        .sync_from_chain(&rpc_url, env, &vault_id, from_genesis)
+        .await
+        .expect("sync 2");
+    // B's already-stored row is retroactively marked revoked (≥1; the
+    // from-genesis re-read may ALSO hit the incoming gate, but the count is
+    // disjoint per arm — assert at least the one cut).
+    assert!(
+        rep2.revisions_revoked >= 1,
+        "removed B's entry must be counted as revoked (got {})",
+        rep2.revisions_revoked
+    );
+    assert_eq!(
+        vault.account_heads(acct_a_id).expect("heads A after").len(),
+        1,
+        "A stays honored after B is removed"
+    );
+    assert!(
+        vault
+            .account_heads(acct_b_id)
+            .expect("heads B after")
+            .is_empty(),
+        "removed B's revision is REVOKED-on-read (filtered from heads) — \
+         a honor-all predicate or a marks-but-reads-don't-filter regression \
+         would leave it surfacing here (L11 negative)"
+    );
+    assert!(
+        vault
+            .revisions_for(acct_b_id)
+            .expect("history B")
+            .is_empty(),
+        "removed B's revision is filtered from history too"
+    );
+
+    // ---- 6. re-add B → re-sync → B honored again (re-add un-revokes) ----
+    let nonce3 = read_device_nonce_v2(env, &rpc_url, vault_id).await.unwrap();
+    let re_add_fields = DeviceAuthFields {
+        kind: DeviceAuthKind::AddDevice,
+        vault_id,
+        subject: b_signer,
+        nonce: nonce3,
+        schema_version: sv,
+    };
+    let re_add_sig = build_signed_device_auth(a_wallet.signer(), re_add_fields, contract, chain_id)
+        .expect("sign re-add(B)");
+    add_device_v2(&a_wallet, b_signer, &re_add_sig, env, &rpc_url)
+        .await
+        .expect("re-add(B)");
+    let _rep3 = vault
+        .sync_from_chain(&rpc_url, env, &vault_id, from_genesis)
+        .await
+        .expect("sync 3");
+    assert_eq!(
+        vault
+            .account_heads(acct_b_id)
+            .expect("heads B re-add")
+            .len(),
+        1,
+        "re-added B's revision is honored again (re-add un-revokes — the live \
+         set is the single source of truth)"
+    );
+}

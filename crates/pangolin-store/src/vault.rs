@@ -2987,13 +2987,19 @@ impl Vault {
         // `account_heads` uses for the multi-head detector, scoped
         // by `account_id` (M-1 P3 audit defense-in-depth).
         let mut head_stmt = tx.prepare(
+            // #106d (salvaged #103-C FINDING 2): exclude revoked rows from
+            // the head set. A revoked row is never a head, and a revoked
+            // CHILD must not mask an honored parent from being a head
+            // (hence the `r2.revoked = 0` in the child-existence subquery).
             "SELECT r.revision_id FROM revisions r
              WHERE r.account_id = ?1
                AND r.superseded_by IS NULL
+               AND r.revoked = 0
                AND NOT EXISTS (
                  SELECT 1 FROM revisions r2
                  WHERE r2.parent_revision_id = r.revision_id
                    AND r2.account_id = r.account_id
+                   AND r2.revoked = 0
                )",
         )?;
         let head_rows = head_stmt.query_map(params![account_id.as_bytes().as_slice()], |row| {
@@ -3633,13 +3639,17 @@ impl Vault {
         // that `account_heads` uses, scoped by `account_id` per
         // M-1's defense-in-depth).
         let mut head_stmt = tx.prepare(
+            // #106d (salvaged #103-C FINDING 2): exclude revoked rows
+            // (outer) + revoked children (subquery) from the head set.
             "SELECT r.revision_id FROM revisions r
              WHERE r.account_id = ?1
                AND r.superseded_by IS NULL
+               AND r.revoked = 0
                AND NOT EXISTS (
                  SELECT 1 FROM revisions r2
                  WHERE r2.parent_revision_id = r.revision_id
                    AND r2.account_id = r.account_id
+                   AND r2.revoked = 0
                )",
         )?;
         let head_rows = head_stmt.query_map(params![account_id.as_bytes().as_slice()], |row| {
@@ -4999,11 +5009,14 @@ impl Vault {
     /// revision when the account is tombstoned.
     pub fn revisions_for(&self, id: AccountId) -> Result<Vec<RevisionMeta>> {
         let mut stmt = self.conn.prepare(
+            // #106d (salvaged #103-C FINDING 2): exclude revoked rows from
+            // the history walk so a revoked revision never surfaces.
             "SELECT revision_id, parent_revision_id, device_id,
                     schema_version, created_at, is_tombstone,
                     chain_tx_hash, chain_block_number, chain_log_index,
                     superseded_by
              FROM revisions WHERE account_id = ?1
+               AND revoked = 0
              ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![id.as_bytes().as_slice()], |row| {
@@ -5551,13 +5564,18 @@ impl Vault {
         // collision is cryptographically negligible — this is belt +
         // suspenders, not a fix for a current vulnerability.
         let mut stmt = self.conn.prepare(
+            // #106d (salvaged #103-C FINDING 2): exclude revoked rows
+            // (outer) + revoked children (subquery) so revoked revisions
+            // never surface as honored heads.
             "SELECT r.revision_id, r.created_at FROM revisions r
              WHERE r.account_id = ?1
                AND r.superseded_by IS NULL
+               AND r.revoked = 0
                AND NOT EXISTS (
                  SELECT 1 FROM revisions r2
                  WHERE r2.parent_revision_id = r.revision_id
                    AND r2.account_id = r.account_id
+                   AND r2.revoked = 0
                )
              ORDER BY r.created_at ASC, r.revision_id ASC",
         )?;
@@ -5873,13 +5891,17 @@ impl Vault {
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut head_stmt = tx.prepare(
+                // #106d (salvaged #103-C FINDING 2): exclude revoked rows
+                // (outer) + revoked children (subquery) from the head set.
                 "SELECT r.revision_id FROM revisions r
                  WHERE r.account_id = ?1
                    AND r.superseded_by IS NULL
+                   AND r.revoked = 0
                    AND NOT EXISTS (
                      SELECT 1 FROM revisions r2
                      WHERE r2.parent_revision_id = r.revision_id
                        AND r2.account_id = r.account_id
+                       AND r2.revoked = 0
                    )",
             )?;
             let head_rows =
@@ -6009,14 +6031,19 @@ impl Vault {
         // M-1 (P3 audit): scope the NOT EXISTS subquery by `account_id`
         // (defense-in-depth — see `account_heads` above for rationale).
         let mut stmt = self.conn.prepare(
+            // #106d (salvaged #103-C FINDING 2): exclude revoked rows
+            // (outer) + revoked children (subquery) so a fork that exists
+            // only because of a revoked head is not reported as forked.
             "SELECT account_id FROM (
                 SELECT r.account_id, COUNT(*) AS head_count
                 FROM revisions r
                 WHERE r.superseded_by IS NULL
+                  AND r.revoked = 0
                   AND NOT EXISTS (
                     SELECT 1 FROM revisions r2
                     WHERE r2.parent_revision_id = r.revision_id
                       AND r2.account_id = r.account_id
+                      AND r2.revoked = 0
                 )
                 GROUP BY r.account_id
                 HAVING head_count > 1
@@ -6522,11 +6549,15 @@ impl Vault {
     /// [`RevisionMeta`] form. Used by [`Self::revision_graph`].
     fn read_revision_rows_for(&self, id: AccountId) -> Result<Vec<RevisionMeta>> {
         let mut stmt = self.conn.prepare(
+            // #106d (salvaged #103-C FINDING 2): exclude revoked rows so a
+            // revoked revision never reaches the content / conflict reads
+            // (`revision_graph` feeds them via this helper).
             "SELECT revision_id, parent_revision_id, device_id,
                     schema_version, created_at, is_tombstone,
                     chain_tx_hash, chain_block_number, chain_log_index,
                     superseded_by
              FROM revisions WHERE account_id = ?1
+               AND revoked = 0
              ORDER BY created_at ASC, revision_id ASC",
         )?;
         let rows = stmt.query_map(params![id.as_bytes().as_slice()], |row| {
@@ -7738,6 +7769,88 @@ impl Vault {
         Ok(Some(outcome))
     }
 
+    /// **MVP-3 issue #106d (salvaged #103-C GAP FLAG 3, predicate re-keyed)
+    /// — retroactive revocation re-eval against the live on-chain SET.**
+    /// Re-evaluate every locally-stored CHAIN-ANCHORED revision against the
+    /// current on-chain authorized `set` and MARK (do NOT hard-delete, L6)
+    /// the `revoked` column accordingly. Returns the count of rows whose
+    /// `revoked` flag transitioned `0 → 1` during this pass (newly revoked)
+    /// so the caller can fold it into [`pangolin_chain::SyncReport`].
+    ///
+    /// **Why retroactive (the gap).** The reader may already hold rows
+    /// signed by a signer that has since left the set — ingested by an
+    /// earlier sync before the removal was observed. The new-event GATE in
+    /// the V2 sync path only filters *incoming* events; this pass closes
+    /// the historical hole.
+    ///
+    /// **Signer source.** A chain-ingested row's `device_id` is the
+    /// secp256k1 signer's EVM address left-padded to 32 bytes (12 zero
+    /// bytes ‖ 20 address bytes — the shape the V2 publish path emits and
+    /// `auto_register_device_from_chain_sync` mirrors). We recover the
+    /// address from the rightmost 20 bytes and test it against the set.
+    /// Only rows with a non-NULL `chain_tx_hash` are re-evaluated —
+    /// purely-local (unpublished) rows have no on-chain set binding and are
+    /// never auto-revoked. This is the parked #103-C
+    /// `reevaluate_revocation_against_lineage` with the predicate swapped
+    /// from `lineage.is_honoured(signer)` to `set.contains(&signer)`; the
+    /// loop, the `device_id`→address decode, the both-directions recompute,
+    /// the idempotency, and the malformed-length skip are reused verbatim.
+    ///
+    /// **Reversible / both directions.** The mark is recomputed in BOTH
+    /// directions each pass (a row whose signer is in the current set is
+    /// set `revoked = 0`), so a re-added device un-revokes its rows on the
+    /// next pass. On a set containing every stored signer this pass is a
+    /// no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] for any DB error.
+    pub fn reevaluate_revocation_against_set(
+        &mut self,
+        set: &[[u8; crate::device::EVM_ADDRESS_LEN]],
+    ) -> Result<u32> {
+        // Collect every chain-anchored row's (revision_id, device_id,
+        // current revoked flag). device_id is the 32-byte left-padded
+        // signer address.
+        let mut stmt = self.conn.prepare(
+            "SELECT revision_id, device_id, revoked \
+             FROM revisions WHERE chain_tx_hash IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let revision_id: Vec<u8> = row.get(0)?;
+                let device_id: Vec<u8> = row.get(1)?;
+                let revoked: i64 = row.get(2)?;
+                Ok((revision_id, device_id, revoked))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let mut newly_revoked: u32 = 0;
+        for (revision_id, device_id, was_revoked) in rows {
+            // The rightmost 20 bytes of the 32-byte device_id are the
+            // signer's EVM address. A malformed (non-32-byte) device_id
+            // cannot be mapped to a signer; leave it untouched.
+            if device_id.len() != 32 {
+                continue;
+            }
+            let mut addr_bytes = [0u8; crate::device::EVM_ADDRESS_LEN];
+            addr_bytes.copy_from_slice(&device_id[12..32]);
+            // Honor iff the signer is in the CURRENT on-chain set.
+            let want_revoked = i64::from(!set.contains(&addr_bytes));
+            if want_revoked != was_revoked {
+                self.conn.execute(
+                    "UPDATE revisions SET revoked = ?1 WHERE revision_id = ?2",
+                    params![want_revoked, &revision_id[..]],
+                )?;
+                if want_revoked == 1 && was_revoked == 0 {
+                    newly_revoked = newly_revoked.saturating_add(1);
+                }
+            }
+        }
+        Ok(newly_revoked)
+    }
+
     /// **#106c: the `DeviceRemoved`→rotation TRIGGER (detection + persist
     /// half, L3).** Given the CURRENT on-chain authorized set + the locally-
     /// known honored signers + the observed vault epoch, persist a crash-
@@ -8838,6 +8951,33 @@ impl Vault {
         };
         let mut detector = pangolin_chain::chain_sync::reorg::ReorgDetector::default();
 
+        // -----------------------------------------------------------
+        // Issue #106d (Q-a / L2 / L3) — read the LIVE on-chain
+        // authorized SET once per sync (the honor source of truth).
+        //
+        // FAIL-CLOSED (L3): this vault is V2-bound by its FIXED
+        // `meta.revisionlog_version` (the routing already decided V2,
+        // NOT a chain heuristic). A V2 vault ALWAYS has a bootstrapped
+        // set, so a missing deployment / connect / chain-id /
+        // `eth_getLogs` / `authorizedDevice` view failure is a REAL
+        // error, returned as `Err` and propagated here with `?` — we
+        // MUST NOT swallow it to an empty (honor-all) set, which would
+        // re-honor a removed device on a rotated vault (under-revocation,
+        // the exact hole). Failing the whole sync lets the host retry
+        // later with the set gate intact.
+        //
+        // The gate below honors a verified V2 revision IFF its signer is
+        // in this set; a non-set signer's revision is COUNTED
+        // (`revisions_revoked`) but NOT ingested (NOT auto-registered).
+        // The set is read from the V2 genesis (0; the future Base Sepolia
+        // V2 deploy block once pinned).
+        let current_set: Vec<[u8; crate::device::EVM_ADDRESS_LEN]> =
+            pangolin_chain::read_authorized_set_v2(env, rpc_url, *vault_id, 0)
+                .await?
+                .into_iter()
+                .map(pangolin_chain::Address::into_array)
+                .collect();
+
         // Stage 1 — HTTP backfill (V2 events).
         while cursor < head {
             let chunk_start = cursor.saturating_add(1);
@@ -8853,6 +8993,14 @@ impl Vault {
 
             for ev in events {
                 let signer_bytes = ev.signer.into_array();
+                // Issue #106d honor GATE (L2). A verified V2 event whose
+                // signer is NOT in the current on-chain authorized set is
+                // COUNTED but NOT ingested (NOT auto-registered). Sits ON
+                // TOP of the unchanged V2 signature verification.
+                if !crate::multi_device::is_signer_honored(&signer_bytes, &current_set) {
+                    report.revisions_revoked = report.revisions_revoked.saturating_add(1);
+                    continue;
+                }
                 let now_ms = current_unix_ms();
                 let inserted_new = device::auto_register_device_from_chain_sync(
                     &self.conn,
@@ -8895,6 +9043,20 @@ impl Vault {
         let promoted = self.promote_finalized_revisions(head)?;
         report.revisions_finalized = report.revisions_finalized.saturating_add(promoted);
         report.last_block_synced = head;
+
+        // Issue #106d (salvaged #103-C GAP FLAG 3) — retroactive
+        // revocation re-eval. Re-evaluate ALREADY-STORED chain-anchored
+        // rows against the current on-chain set and MARK any whose signer
+        // left the set (rows ingested in an earlier sync before the
+        // removal was observed). The new-event gate above only filters
+        // incoming events; this closes the historical hole. Both
+        // directions are recomputed each pass (a re-added device
+        // un-revokes its rows). Disjoint from the incoming-gate count (a
+        // gated incoming event is never stored), so adding the
+        // newly-revoked-row count keeps `revisions_revoked` an honest
+        // total of "what this sync cut".
+        let retro_revoked = self.reevaluate_revocation_against_set(&current_set)?;
+        report.revisions_revoked = report.revisions_revoked.saturating_add(retro_revoked);
 
         // Stage 2 — WS tip-follow (V2 events).
         let tip_follow_eligible = options.prefer_websocket && options.until_block.is_none();
@@ -8955,6 +9117,19 @@ impl Vault {
                             VerifyOutcome::Verified(ev) => {
                                 report.revisions_pulled = report.revisions_pulled.saturating_add(1);
                                 let signer_bytes = ev.signer.into_array();
+                                // Issue #106d honor GATE (L2) — the SAME
+                                // predicate as the HTTP backfill arm above.
+                                // A non-set-signer tip event is COUNTED but
+                                // NOT ingested (NOT auto-registered). Sits
+                                // ON TOP of the unchanged V2 verification.
+                                if !crate::multi_device::is_signer_honored(
+                                    &signer_bytes,
+                                    &current_set,
+                                ) {
+                                    report.revisions_revoked =
+                                        report.revisions_revoked.saturating_add(1);
+                                    continue 'recv_loop;
+                                }
                                 let now_ms = current_unix_ms();
                                 let inserted_new = device::auto_register_device_from_chain_sync(
                                     &self.conn,
@@ -9877,13 +10052,17 @@ fn diff_conflict_snapshots(
 /// `&Vault`.
 fn account_heads_inline(conn: &Connection, account_id: AccountId) -> Result<Vec<RevisionId>> {
     let mut stmt = conn.prepare(
+        // #106d (salvaged #103-C FINDING 2): exclude revoked rows (outer)
+        // + revoked children (subquery) — mirror of `account_heads`.
         "SELECT r.revision_id FROM revisions r
          WHERE r.account_id = ?1
            AND r.superseded_by IS NULL
+           AND r.revoked = 0
            AND NOT EXISTS (
              SELECT 1 FROM revisions r2
              WHERE r2.parent_revision_id = r.revision_id
                AND r2.account_id = r.account_id
+               AND r2.revoked = 0
            )",
     )?;
     let rows = stmt.query_map(params![account_id.as_bytes().as_slice()], |row| {
@@ -9910,11 +10089,14 @@ fn read_revision_rows_inline(
     account_id: AccountId,
 ) -> Result<Vec<RevisionMeta>> {
     let mut stmt = conn.prepare(
+        // #106d (salvaged #103-C FINDING 2): exclude revoked rows — mirror
+        // of `read_revision_rows_for`.
         "SELECT revision_id, parent_revision_id, device_id,
                 schema_version, created_at, is_tombstone,
                 chain_tx_hash, chain_block_number, chain_log_index,
                 superseded_by
          FROM revisions WHERE account_id = ?1
+           AND revoked = 0
          ORDER BY created_at ASC, revision_id ASC",
     )?;
     let rows = stmt.query_map(params![account_id.as_bytes().as_slice()], |row| {
@@ -13090,6 +13272,320 @@ mod tests {
             .revisions_for(crate::account::AccountId::from_bytes(ev.account_id))
             .expect("revisions_for");
         assert_eq!(revs.len(), 1, "no duplicate row on re-ingest");
+    }
+
+    // -----------------------------------------------------------------
+    // MVP-3 issue #106d: retroactive revocation re-eval against the live
+    // on-chain SET (salvaged #103-C GAP FLAG 3, predicate re-keyed)
+    // -----------------------------------------------------------------
+
+    /// Build a chain-anchored `RevisionEvent` whose `device_id` is the
+    /// 20-byte EVM `addr` left-padded to 32 bytes (12 zero bytes ‖ 20
+    /// address bytes) — the same shape the V2 publish path emits. Lets the
+    /// #106d re-eval tests seed a row attributable to a specific signer.
+    fn chain_event_signed_by(
+        vault_id: [u8; 32],
+        account_id: [u8; 32],
+        parent: [u8; 32],
+        addr: [u8; 20],
+        payload: &[u8],
+        block: u64,
+        log: u64,
+    ) -> pangolin_chain::RevisionEvent {
+        let mut device_id = [0u8; 32];
+        device_id[12..].copy_from_slice(&addr);
+        pangolin_chain::RevisionEvent {
+            vault_id,
+            account_id,
+            parent_revision: parent,
+            device_id,
+            schema_version: 1,
+            sequence: 0,
+            enc_payload: payload.to_vec(),
+            anchor: pangolin_chain::ChainAnchor {
+                tx_hash: [0xCD; 32],
+                block_number: block,
+                log_index: log,
+                sequence: 0,
+            },
+        }
+    }
+
+    /// **#106d L4.** A row stored under signer A (ingested before A left
+    /// the set) is retroactively MARKED revoked when re-evaluated against
+    /// a set that no longer contains A — and a row signed by an in-set
+    /// signer B is left honored. Mark-not-delete (L6): the row still
+    /// exists. Idempotent: a second pass reports 0 newly-revoked.
+    #[test]
+    fn retroactive_reeval_marks_out_of_set_row_revoked() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+
+        let addr_a = [0xAA; 20];
+        let addr_b = [0xBB; 20];
+
+        // Two chain-anchored rows: one signed by A (soon out-of-set), one
+        // by B (in-set).
+        let ev_a =
+            chain_event_signed_by(v.vault_id(), [0x11; 32], [0u8; 32], addr_a, b"by-A", 10, 0);
+        let ev_b =
+            chain_event_signed_by(v.vault_id(), [0x22; 32], [0u8; 32], addr_b, b"by-B", 20, 1);
+        v.ingest_chain_revision(&ev_a).expect("ingest A");
+        v.ingest_chain_revision(&ev_b).expect("ingest B");
+
+        // Current set = {B} only — A was removed.
+        let set = vec![addr_b];
+        let newly = v.reevaluate_revocation_against_set(&set).expect("re-eval");
+        assert_eq!(newly, 1, "exactly A's row newly revoked");
+
+        let rev_id_a = pangolin_chain::canonical_hash(
+            &ev_a.vault_id,
+            &ev_a.account_id,
+            &ev_a.parent_revision,
+            &ev_a.device_id,
+            ev_a.schema_version,
+            &ev_a.enc_payload,
+        );
+        let rev_id_b = pangolin_chain::canonical_hash(
+            &ev_b.vault_id,
+            &ev_b.account_id,
+            &ev_b.parent_revision,
+            &ev_b.device_id,
+            ev_b.schema_version,
+            &ev_b.enc_payload,
+        );
+        let revoked_a: i64 = v
+            .conn
+            .query_row(
+                "SELECT revoked FROM revisions WHERE revision_id = ?1",
+                params![&rev_id_a[..]],
+                |row| row.get(0),
+            )
+            .expect("A row present");
+        let revoked_b: i64 = v
+            .conn
+            .query_row(
+                "SELECT revoked FROM revisions WHERE revision_id = ?1",
+                params![&rev_id_b[..]],
+                |row| row.get(0),
+            )
+            .expect("B row present");
+        assert_eq!(revoked_a, 1, "A (out-of-set) revoked");
+        assert_eq!(revoked_b, 0, "B (in-set) honored");
+
+        // Idempotent.
+        let again = v
+            .reevaluate_revocation_against_set(&set)
+            .expect("re-eval 2");
+        assert_eq!(again, 0, "second pass is idempotent");
+    }
+
+    /// **#106d L4 — reversible / both directions.** A previously-revoked
+    /// signer that re-enters the set un-revokes its rows on the next pass.
+    /// A set containing every stored signer revokes nothing.
+    #[test]
+    fn retroactive_reeval_is_reversible_and_noop_on_full_set() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+
+        let addr_a = [0xAA; 20];
+        let ev_a =
+            chain_event_signed_by(v.vault_id(), [0x11; 32], [0u8; 32], addr_a, b"by-A", 10, 0);
+        v.ingest_chain_revision(&ev_a).expect("ingest A");
+        let rev_id_a = pangolin_chain::canonical_hash(
+            &ev_a.vault_id,
+            &ev_a.account_id,
+            &ev_a.parent_revision,
+            &ev_a.device_id,
+            ev_a.schema_version,
+            &ev_a.enc_payload,
+        );
+
+        // A removed (set = {B}) ⇒ A revoked.
+        v.reevaluate_revocation_against_set(&[[0xBB; 20]])
+            .expect("revoke pass");
+        let r1: i64 = v
+            .conn
+            .query_row(
+                "SELECT revoked FROM revisions WHERE revision_id = ?1",
+                params![&rev_id_a[..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(r1, 1, "A revoked when out of set");
+
+        // A re-added (set = {A}) ⇒ A un-revokes (re-add un-revokes).
+        v.reevaluate_revocation_against_set(&[addr_a])
+            .expect("restore pass");
+        let r2: i64 = v
+            .conn
+            .query_row(
+                "SELECT revoked FROM revisions WHERE revision_id = ?1",
+                params![&rev_id_a[..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(r2, 0, "A un-revoked when re-added (reversible)");
+    }
+
+    /// **#106d L4 (salvaged #103-C FINDING 2 regression).** Marking a row
+    /// `revoked = 1` MUST exclude it from the materialized honored state —
+    /// the head set, the `revisions_for` history walk, and the
+    /// `revision_graph` content reads. A revoked child must NOT mask its
+    /// honored parent from the head set (the child-existence subquery
+    /// excludes revoked rows). This pins that the read-filters actually
+    /// read the column (a marks-but-reads-don't-filter regression flips it
+    /// red — the L11 negative).
+    #[test]
+    #[allow(clippy::too_many_lines)] // pre + post revocation across head/history/graph
+    fn revoked_rows_excluded_from_head_history_and_content() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+
+        let addr_a = [0xAA; 20]; // in-set (honored)
+        let addr_b = [0xBB; 20]; // removed (revoked)
+        let acct = [0x77; 32];
+
+        // Genesis G signed by A. Child C (parent = G) signed by B. Before
+        // any revocation C is the sole head and G is its ancestor.
+        let ev_g = chain_event_signed_by(
+            v.vault_id(),
+            acct,
+            [0u8; 32],
+            addr_a,
+            b"genesis-by-A",
+            10,
+            0,
+        );
+        let rev_id_g = pangolin_chain::canonical_hash(
+            &ev_g.vault_id,
+            &ev_g.account_id,
+            &ev_g.parent_revision,
+            &ev_g.device_id,
+            ev_g.schema_version,
+            &ev_g.enc_payload,
+        );
+        let ev_c =
+            chain_event_signed_by(v.vault_id(), acct, rev_id_g, addr_b, b"child-by-B", 20, 1);
+        let rev_id_c = pangolin_chain::canonical_hash(
+            &ev_c.vault_id,
+            &ev_c.account_id,
+            &ev_c.parent_revision,
+            &ev_c.device_id,
+            ev_c.schema_version,
+            &ev_c.enc_payload,
+        );
+        v.ingest_chain_revision(&ev_g).expect("ingest G");
+        v.ingest_chain_revision(&ev_c).expect("ingest C");
+
+        let acct_id = crate::account::AccountId::from_bytes(acct);
+        let rid_g = crate::revision::RevisionId::from_bytes(rev_id_g);
+        let rid_c = crate::revision::RevisionId::from_bytes(rev_id_c);
+
+        // Pre-revocation: BOTH rows materialize; C is the head; history
+        // has both. Pins the `revoked = 0` default behavior the gate must
+        // not change.
+        let heads_before = v.account_heads(acct_id).expect("heads before");
+        assert_eq!(heads_before.len(), 1, "single head before revocation");
+        assert_eq!(heads_before[0], rid_c, "C is the head before revocation");
+        let hist_before = v.revisions_for(acct_id).expect("history before");
+        assert_eq!(hist_before.len(), 2, "both rows in history before");
+
+        // Set = {A} only — B removed ⇒ C (by B) revoked, G (by A) honored.
+        let newly = v
+            .reevaluate_revocation_against_set(&[addr_a])
+            .expect("re-eval");
+        assert_eq!(newly, 1, "exactly C newly revoked");
+
+        // C MARKED revoked but still present on disk (L6).
+        let revoked_c: i64 = v
+            .conn
+            .query_row(
+                "SELECT revoked FROM revisions WHERE revision_id = ?1",
+                params![&rev_id_c[..]],
+                |row| row.get(0),
+            )
+            .expect("C row still present");
+        assert_eq!(revoked_c, 1, "C marked revoked (mark-not-delete)");
+
+        // (1) Head set: G is now the head; revoked child C must not mask
+        //     it. C must not appear as a head.
+        let heads_after = v.account_heads(acct_id).expect("heads after");
+        assert_eq!(heads_after.len(), 1, "exactly one honored head");
+        assert_eq!(heads_after[0], rid_g, "G is the head after C revoked");
+        assert!(!heads_after.contains(&rid_c), "revoked C is not a head");
+
+        // (2) History walk: only honored G appears.
+        let hist_after = v.revisions_for(acct_id).expect("history after");
+        let hist_ids: Vec<crate::revision::RevisionId> =
+            hist_after.iter().map(|m| m.revision_id).collect();
+        assert!(hist_ids.contains(&rid_g), "honored G still in history");
+        assert!(
+            !hist_ids.contains(&rid_c),
+            "revoked C excluded from history"
+        );
+
+        // (3) revision_graph (feeds content/conflict reads) excludes C.
+        let graph = v.revision_graph(acct_id).expect("graph");
+        assert!(graph.get(&rid_g).is_some(), "honored G present in graph");
+        assert!(graph.get(&rid_c).is_none(), "revoked C absent from graph");
+    }
+
+    /// **#106d L5 — V1 path untouched.** A V1-bound vault (the default
+    /// binding) never marks any row revoked: the V2 retroactive pass is
+    /// only driven from the V2 sync path, and a V1 vault's permissive
+    /// reads behave byte-identically to pre-#106d. This asserts a freshly
+    /// ingested V1-style chain row reads as `revoked = 0` and surfaces in
+    /// head/history exactly as before (no V2 set gate is ever applied to a
+    /// V1 vault).
+    #[test]
+    fn v1_vault_rows_stay_honored_untouched() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "v.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        // A fresh vault binds V1 by default (NULL → V1).
+        assert_eq!(
+            v.revisionlog_version().unwrap(),
+            RevisionLogVersion::V1,
+            "fresh vault is V1-bound by default"
+        );
+        let acct = [0x55; 32];
+        let ev = fresh_event(v.vault_id(), acct, [0u8; 32], b"v1-row", 5, 0);
+        v.ingest_chain_revision(&ev).expect("ingest");
+        let rev_id = pangolin_chain::canonical_hash(
+            &ev.vault_id,
+            &ev.account_id,
+            &ev.parent_revision,
+            &ev.device_id,
+            ev.schema_version,
+            &ev.enc_payload,
+        );
+        // The row reads as honored (revoked = 0) — the V1 path never
+        // writes the column.
+        let revoked: i64 = v
+            .conn
+            .query_row(
+                "SELECT revoked FROM revisions WHERE revision_id = ?1",
+                params![&rev_id[..]],
+                |row| row.get(0),
+            )
+            .expect("row present");
+        assert_eq!(revoked, 0, "V1 row stays honored (revoked = 0)");
+        let acct_id = crate::account::AccountId::from_bytes(acct);
+        let heads = v.account_heads(acct_id).expect("heads");
+        assert_eq!(heads.len(), 1, "V1 row is the head, as pre-#106d");
+        assert_eq!(
+            heads[0],
+            crate::revision::RevisionId::from_bytes(rev_id),
+            "the V1 row surfaces unchanged"
+        );
     }
 
     // -----------------------------------------------------------------

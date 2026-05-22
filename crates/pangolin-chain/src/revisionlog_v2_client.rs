@@ -41,7 +41,7 @@ use core::time::Duration;
 use alloy::network::{Ethereum, EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::{DynProvider, PendingTransactionBuilder, Provider, ProviderBuilder};
-use alloy::rpc::types::{BlockNumberOrTag, TransactionRequest};
+use alloy::rpc::types::{BlockNumberOrTag, Filter, TransactionRequest};
 #[allow(unused_imports)] // SolEvent / SolCall trait methods are used via
 // the RevisionLogV2 binding through macro dispatch clippy can't see.
 use alloy::sol_types::{SolCall, SolEvent};
@@ -733,6 +733,144 @@ pub fn decode_device_mgmt_events(
     out
 }
 
+/// Block-chunk size for the device-management log scan.
+///
+/// Reuses the [`crate::chain_sync::LOG_BLOCK_CHUNK`] 9k discipline (the
+/// public Base Sepolia RPC's 10k cap with a safety margin) so the set scan
+/// chunks identically to the revision reader.
+pub const DEVICE_MGMT_LOG_BLOCK_CHUNK: u64 = crate::chain_sync::LOG_BLOCK_CHUNK;
+
+/// **MVP-3 issue #106d (Q-a / Q-b / L2 / L3).** Read the vault's CURRENT
+/// on-chain authorized-device SET — the V2 honor source of truth.
+///
+/// The set is built in two passes (Q-b): (1) the cheap **event fold** —
+/// a chunked `eth_getLogs` over the `RevisionLogV2` device-management
+/// events (`VaultBootstrapped`/`DeviceAdded`/`DeviceRemoved`;
+/// `PromotionFinalized` rotates the manager, NOT set membership) folded
+/// via [`decode_device_mgmt_events`] into a candidate set; then (2) the
+/// **live cross-check** — each candidate is reconciled against the live
+/// `authorizedDevice(vaultId, signer)` view (the authoritative tiebreaker,
+/// the #103-C L5 anti-stale anchor re-keyed to membership). A
+/// stale/tampered fold can therefore only OVER-revoke (drop a member that
+/// the live read confirms is gone — a recoverable liveness dent), never
+/// UNDER-revoke (re-honor a removed device — the dangerous direction).
+///
+/// # FAIL-CLOSED (issue #103-C FINDING 1 — L3)
+///
+/// For a V2-bound vault (the only caller — the v1/v2 routing in
+/// `pangolin_store::Vault::sync_from_chain_with_ws_url` decided this is a
+/// V2 vault from its FIXED `meta.revisionlog_version` binding, NOT a chain
+/// heuristic), EVERY read failure is propagated as `Err`: a missing
+/// `RevisionLogV2` deployment, a connect / chain-id / `eth_blockNumber` /
+/// `eth_getLogs` / `authorizedDevice` view failure. A read failure is
+/// NEVER swallowed to an empty (or honor-all) set — doing so would
+/// re-honor a removed device on a rotated V2 vault (under-revocation, the
+/// exact hole). The caller FAILS the whole sync on `Err` (retry later with
+/// the set gate intact). There is no `Ok(empty)`-for-no-deployment arm
+/// here: a V2-bound vault always has a bootstrapped set, so a missing
+/// deployment IS a real failure (unlike the V1 lineage reader, where a
+/// missing `RecoveryV1` deployment was the genuine no-recovery-surface
+/// case).
+///
+/// `from_block` is the genesis cursor for the scan (0 on a fresh anvil;
+/// the future Base Sepolia V2 deploy block once pinned).
+///
+/// # Errors
+///
+/// - [`ChainError::Rpc`] on connect / `eth_blockNumber` / `eth_getLogs` /
+///   `authorizedDevice` view failures (fail-closed; NEVER empty).
+/// - [`ChainError::ChainIdMismatch`] if the RPC's chain-id does not match
+///   the env's pinned id (L4 / L9).
+/// - [`ChainError::DeploymentNotFound`] / [`ChainError::DeploymentParseError`]
+///   if no `RevisionLogV2` address is recorded for `env` (a V2-bound vault
+///   MUST have one — fail-closed, not honor-all).
+pub async fn read_authorized_set_v2(
+    env: ChainEnv,
+    rpc_url: &str,
+    vault_id: [u8; 32],
+    from_block: u64,
+) -> Result<Vec<Address>, ChainError> {
+    // L3 fail-closed: a missing deployment for a V2-bound vault is a real
+    // failure (NOT the V1 "no recovery surface" case) — propagate it.
+    let contract = resolve_contract_address(env)?;
+    let provider = ProviderBuilder::new()
+        .connect(rpc_url)
+        .await
+        .map_err(|e| ChainError::Rpc(format!("connect {rpc_url}: {e}")))?
+        .erased();
+    // L4 / L9: cross-check the RPC chain-id (pinned for prod) BEFORE any
+    // log scan — identical posture to the V1 reader + the lifecycle calls.
+    let _chain_id = resolve_envelope_chain_id(&provider, env).await?;
+
+    let head = provider
+        .get_block_number()
+        .await
+        .map_err(|e| ChainError::Rpc(format!("eth_blockNumber: {e}")))?;
+
+    // Pass 1 — the event fold. Chunked `eth_getLogs` over the device-
+    // management events, filtered server-side by (contract, vaultId
+    // topic1). A per-log address re-check inside `decode_device_mgmt_events`
+    // is defense-in-depth against a misbehaving RPC.
+    let topic1: B256 = vault_id.into();
+    let mut candidates: Vec<Address> = Vec::new();
+    let mut from = from_block.min(head);
+    while from <= head {
+        let to = from
+            .saturating_add(DEVICE_MGMT_LOG_BLOCK_CHUNK.saturating_sub(1))
+            .min(head);
+        let filter = Filter::new()
+            .address(contract)
+            .from_block(BlockNumberOrTag::Number(from))
+            .to_block(BlockNumberOrTag::Number(to))
+            .topic1(topic1);
+        let logs = provider
+            .get_logs(&filter)
+            .await
+            .map_err(|e| ChainError::Rpc(format!("eth_getLogs (device-mgmt): {e}")))?;
+        for ev in decode_device_mgmt_events(contract, &logs) {
+            // Collect every signer EVER seen (bootstrap genesis / add /
+            // remove) as a CANDIDATE; the live `authorizedDevice` cross-
+            // check below decides final membership (so a removal is
+            // reflected by the live read, never by dropping it from the
+            // fold). PromotionFinalized rotates the manager, not the set.
+            let candidate = match ev {
+                DeviceMgmtEvent::Bootstrapped { first_signer, .. } => Some(first_signer),
+                DeviceMgmtEvent::Added { signer, .. }
+                | DeviceMgmtEvent::Removed { signer, .. } => Some(signer),
+                DeviceMgmtEvent::PromotionFinalized { .. } => None,
+            };
+            if let Some(signer) = candidate {
+                if !candidates.contains(&signer) {
+                    candidates.push(signer);
+                }
+            }
+        }
+        if to == head {
+            break;
+        }
+        from = to.saturating_add(1);
+    }
+
+    // Pass 2 — the live cross-check (authoritative tiebreaker, L5). Each
+    // candidate's membership is the LIVE `authorizedDevice` answer; a fold
+    // that lags the chain can only drop a member here (over-revoke), never
+    // add a removed one back (under-revoke). Any view failure is `Err`
+    // (fail-closed).
+    let bound = bind_read(env, rpc_url).await?;
+    let mut set: Vec<Address> = Vec::new();
+    for signer in candidates {
+        let live = bound
+            .authorizedDevice(vault_id.into(), signer)
+            .call()
+            .await
+            .map_err(|e| ChainError::Rpc(format!("authorizedDevice view (set): {e}")))?;
+        if live && !set.contains(&signer) {
+            set.push(signer);
+        }
+    }
+    Ok(set)
+}
+
 // ---------------------------------------------------------------------
 // Shared read/broadcast plumbing (mirrors recovery_client.rs verbatim)
 // ---------------------------------------------------------------------
@@ -1129,6 +1267,32 @@ mod tests {
         let contract = Address::from([0xAB; 20]);
         let folded = decode_device_mgmt_events(contract, &[]);
         assert!(folded.is_empty());
+    }
+
+    /// **#106d L3 — FAIL-CLOSED on a set-read error.** An unreachable RPC
+    /// makes `read_authorized_set_v2` return `Err` (the connect failure),
+    /// NEVER `Ok(empty)`. A V2-bound vault's set read MUST fail the sync
+    /// on a real read failure rather than silently honor everyone
+    /// (under-revocation — the exact hole). This is the salvaged #103-C
+    /// FINDING 1 boundary, re-keyed to the V2 set read. The genuine
+    /// "no V2 set / V1 vault" case is NOT reachable here: the v1/v2 routing
+    /// (a fixed `meta.revisionlog_version` binding) decided this is a V2
+    /// vault BEFORE this read, so any failure here is a real error.
+    #[tokio::test]
+    async fn read_authorized_set_v2_fails_closed_on_read_error() {
+        // Dev env, an unreachable RPC (port 0 never listens). The read MUST
+        // resolve to `Err` — either a missing-deployment error (no V2
+        // address recorded for the test env) or a connect-layer RPC error.
+        // Crucially it is NEVER `Ok(empty)`: a V2-bound vault that cannot
+        // read its set fails the sync rather than silently honoring everyone
+        // (under-revocation). Both arms are fail-closed; the load-bearing
+        // assertion is that it is some `Err`, never an empty/honor-all set.
+        let res = read_authorized_set_v2(ChainEnv::Dev, "http://127.0.0.1:0", [0x11; 32], 0).await;
+        assert!(
+            res.is_err(),
+            "a set-read failure must NEVER resolve to an empty/honor-all set — \
+             fail-closed (L3, salvaged #103-C FINDING 1)"
+        );
     }
 
     /// #106c2 calldata pin: `publishRevision` encodes the exact field

@@ -148,6 +148,11 @@ pub use privacy::{
     PrivacyStrategy,
 };
 
+/// Re-exported `alloy::primitives::keccak256` so consumers that name the
+/// V2 revision signing API (`fields.enc_payload_hash`) can compute the
+/// payload hash without adding a direct `alloy` dep — the natural
+/// companion to the [`Address`] re-export above (#106d test wiring).
+pub use alloy::primitives::keccak256;
 /// Re-exported `alloy::primitives::Address` so consumers of the
 /// [`privacy::PrivacyStrategy`] trait (`pangolin-store`,
 /// `pangolin-funder-client` via dev-dep) can wire calls without
@@ -176,9 +181,9 @@ pub use recovery_signing::{
 pub use revisionlog_v2_client::{
     add_device_v2, bootstrap_vault_v2, cancel_promotion_v2, decode_device_mgmt_events,
     finalize_promotion_v2, propose_promotion_v2, publish_revision_v2,
-    read_authorized_device_count_v2, read_authorized_device_v2, read_bootstrapped_v2,
-    read_current_manager_v2, read_device_nonce_v2, remove_device_v2, DeviceLifecycleAnchorV2,
-    DeviceMgmtEvent, REVISIONLOG_V2_CONTRACT_NAME,
+    read_authorized_device_count_v2, read_authorized_device_v2, read_authorized_set_v2,
+    read_bootstrapped_v2, read_current_manager_v2, read_device_nonce_v2, remove_device_v2,
+    DeviceLifecycleAnchorV2, DeviceMgmtEvent, REVISIONLOG_V2_CONTRACT_NAME,
 };
 pub use revisionlog_v2_signing::{
     build_domain_revisionlog_v2, build_signed_device_auth, build_signed_revision_v2,
