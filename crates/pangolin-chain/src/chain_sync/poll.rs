@@ -173,8 +173,13 @@ pub fn verify_alloy_log(
 
 /// Issue a single `eth_getLogs` for the range `[from_block, to_block]`
 /// filtered by D-017 + `RevisionPublished` topic0 + indexed `vaultId`
-/// topic1, decode + verify each log, return the
+/// topic2, decode + verify each log, return the
 /// `VerifiedRevisionEvent` set + the count of locally-rejected logs.
+///
+/// **V1 event topic layout** (`RevisionLogV1.RevisionPublished`):
+/// `topic0 = signature`, `topic1 = sequence`, `topic2 = vaultId`,
+/// `topic3 = accountId`. Server-side filter pins topic2; defense-in-depth
+/// re-checks `decoded.vaultId` in [`verify_alloy_log`].
 ///
 /// Per L6, the caller chunks at `LOG_BLOCK_CHUNK = 9_000`; this fn is
 /// the per-chunk primitive (so the caller can chunk-loop without this
@@ -187,13 +192,17 @@ pub async fn fetch_chunk<P: Provider>(
     from_block: u64,
     to_block: u64,
 ) -> Result<(Vec<VerifiedRevisionEvent>, u32), ChainError> {
-    let topic1: B256 = (*vault_id).into();
+    // Issue #107: V1's `RevisionPublished(uint256 indexed sequence,
+    // bytes32 indexed vaultId, bytes32 indexed accountId, ...)` puts
+    // `vaultId` at topic2, NOT topic1 (topic1 is `sequence`). Mirrors
+    // `crate::chain_sync::v2::fetch_chunk_v2:~182`.
+    let vault_topic: B256 = (*vault_id).into();
     let filter = Filter::new()
         .address(contract_address)
         .event_signature(RevisionLogV1::RevisionPublished::SIGNATURE_HASH)
         .from_block(BlockNumberOrTag::Number(from_block))
         .to_block(BlockNumberOrTag::Number(to_block))
-        .topic1(topic1);
+        .topic2(vault_topic);
 
     let logs = provider
         .get_logs(&filter)

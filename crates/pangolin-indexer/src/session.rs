@@ -16,7 +16,7 @@
 //!   — random path; Drop-based unlink on normal exit; OS-temp-dir
 //!   GC for abnormal exit.
 //! - **L2:** Per-event filter at fetch time uses
-//!   `pangolin_chain::fetch_and_verify_chunk`'s `topic1 = vault_id`
+//!   `pangolin_chain::fetch_and_verify_chunk`'s `topic2 = vault_id`
 //!   discipline; additionally, the insert path explicitly compares
 //!   the event's `vault_id` against the session's bound vault and
 //!   skips any mismatch (defense-in-depth).
@@ -522,7 +522,7 @@ impl IndexerSession {
         for v in events {
             // L2 defense-in-depth: per-event filter at insert time.
             // `fetch_and_verify_chunk` already filters server-side
-            // by `topic1 = vault_id` + client-side via
+            // by `topic2 = vault_id` + client-side via
             // `decoded.vaultId == requested_vault_id` — the third
             // check here makes the indexer's contract explicit at
             // its own boundary.

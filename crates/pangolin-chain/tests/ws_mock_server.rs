@@ -19,9 +19,16 @@
 //!
 //! ## What the mock does NOT do
 //!
-//! - Subscription filter matching. The test pushes the exact log
-//!   payload it wants delivered; matching is the production path's
-//!   responsibility via `verify_alloy_log`.
+//! - Subscription filter matching by DEFAULT. The mock pushes the
+//!   exact log payload the test queues, regardless of the
+//!   subscribe filter; matching is the production path's
+//!   responsibility via `verify_alloy_log`. **Issue #107 added an
+//!   opt-in `MockBehaviour::respect_filter` flag** that captures
+//!   the `eth_subscribe("logs", filter)` filter argument at
+//!   subscribe time + applies `Filter::matches` + `matches_log_block`
+//!   to each outgoing log; only matching logs reach the
+//!   subscriber. The flag defaults `false` so existing tests keep
+//!   their current behaviour.
 //! - Full Ethereum RPC surface. Only `eth_subscribe`, `eth_chainId`,
 //!   `eth_blockNumber`, and `eth_getBlockByNumber` are answered with
 //!   canned values so the orchestrator's L3 chain-id pin + reorg
@@ -99,6 +106,21 @@ pub struct MockBehaviour {
     /// in `tests/hermetic_ws.rs` (renamed from the prior
     /// orchestrator-claiming name during the F-4 fix-pass).
     pub accept_then_drop_subscribe: bool,
+    /// Issue #107 — when `true`, the server parses the
+    /// `eth_subscribe("logs", filter)` filter argument (via
+    /// `serde_json` into an `alloy::rpc::types::Filter`) and
+    /// applies `Filter::matches` to each outgoing log; only logs
+    /// matching the captured filter are emitted to the subscriber.
+    /// When `false` (the default), the server emits every pushed
+    /// log unfiltered — preserving the original mock semantics for
+    /// existing tests that hand-craft per-event payloads.
+    ///
+    /// Used by `hermetic_ws_subscription_filters_by_topic2_not_topic1`
+    /// to catch the V1 `.topic1(vault_id)` → `.topic2(vault_id)`
+    /// bug at unit-test time. Mirrors the HTTP-path
+    /// `FilteringAsserter` in
+    /// `crates/pangolin-chain/src/chain_sync/filtering_asserter.rs`.
+    pub respect_filter: bool,
 }
 
 /// Handle to a running mock server. Drop closes the server.
@@ -189,6 +211,7 @@ async fn run_listener(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_connection(
     mut ws: WebSocketStream<TcpStream>,
     behaviour: MockBehaviour,
@@ -200,6 +223,12 @@ async fn handle_connection(
     // pubsub matcher accepts the notification.
     let sub_id_str = "0x1".to_string();
     let mut subscribed = false;
+    // Issue #107: when `respect_filter` is set, capture the
+    // `eth_subscribe("logs", filter)` filter at subscribe time +
+    // apply it to outgoing logs via `Filter::matches` +
+    // `matches_log_block`. `None` = unfiltered (legacy mock
+    // behaviour).
+    let mut active_filter: Option<alloy::rpc::types::Filter> = None;
     // Buffer for events that arrived BEFORE the client subscribed.
     // The mock supports the test ordering "push events first, then
     // subscribe" by holding the events here until subscribe lands.
@@ -216,10 +245,17 @@ async fn handle_connection(
         // pre-subscribe pushes, flush them now (in order).
         if subscribed && !pending.is_empty() {
             let log = pending.remove(0);
-            let log_value = serialize_log(&log, &sub_id_str);
-            let _ = ws.send(Message::Text(log_value.to_string().into())).await;
-            if behaviour.silent_disconnect_after_first_event {
-                break;
+            // #107 filter gate: if respect_filter is on, only emit
+            // logs that match the captured subscribe filter.
+            let emit = active_filter
+                .as_ref()
+                .is_none_or(|f| f.matches(&log.inner) && f.matches_log_block(&log));
+            if emit {
+                let log_value = serialize_log(&log, &sub_id_str);
+                let _ = ws.send(Message::Text(log_value.to_string().into())).await;
+                if behaviour.silent_disconnect_after_first_event {
+                    break;
+                }
             }
             continue;
         }
@@ -245,6 +281,24 @@ async fn handle_connection(
                             let _ = ws.send(Message::Text(err.to_string().into())).await;
                             let _ = ws.flush().await;
                             continue;
+                        }
+                        // Issue #107: capture the subscribe filter when
+                        // `respect_filter` is on. Params shape from
+                        // alloy is `[<SubscriptionKind>, <Params>]`
+                        // where SubscriptionKind == "logs" and Params
+                        // is the `Filter` JSON object. Index [1] is
+                        // the Filter; deserialize via serde.
+                        if behaviour.respect_filter {
+                            if let Some(params) = req.get("params").and_then(Value::as_array) {
+                                if params.len() >= 2 {
+                                    if let Ok(f) = serde_json::from_value::<
+                                        alloy::rpc::types::Filter,
+                                    >(params[1].clone())
+                                    {
+                                        active_filter = Some(f);
+                                    }
+                                }
+                            }
                         }
                         let resp = json!({
                             "jsonrpc": "2.0",
@@ -298,6 +352,14 @@ async fn handle_connection(
                 let Some(log) = log else { break };
                 if !subscribed {
                     pending.push(log);
+                    continue;
+                }
+                // #107 filter gate: if respect_filter is on, only emit
+                // logs that match the captured subscribe filter.
+                let emit = active_filter
+                    .as_ref()
+                    .is_none_or(|f| f.matches(&log.inner) && f.matches_log_block(&log));
+                if !emit {
                     continue;
                 }
                 let log_value = serialize_log(&log, &sub_id_str);

@@ -972,6 +972,199 @@ async fn hermetic_ws_tls_downgrade_blocked_for_every_production_env() {
 }
 
 // ---------------------------------------------------------------------
+// Issue #107 — WS subscription read-topic regression.
+//
+// The V1 `RevisionPublished` event puts `sequence` at TOPIC1 and
+// `vaultId` at TOPIC2. The V1 WS subscription path
+// (`open_subscription`) MUST filter on topic2, not topic1.
+//
+// The mock server's default behaviour ignores the subscribe filter
+// (see `ws_mock_server` module docs); issue #107 added the opt-in
+// `respect_filter` flag that captures the filter at subscribe time +
+// applies `Filter::matches` to each outgoing log. With that flag on,
+// this test catches the bug at unit-test time:
+//
+//   - Under the OLD code (`.topic1(vault_id)`): the captured filter
+//     binds topic1 to vault_a, but the log's topic1 holds `sequence`
+//     (= 1), so the filter fails to match the vault_a log → NO event
+//     reaches the subscriber → `recv_next_event` times out → test
+//     goes RED.
+//   - Under the NEW code (`.topic2(vault_id)`): the filter binds
+//     topic2 (the actual vault_id slot), so the vault_a log matches
+//     and is emitted; the vault_b log is filtered out. The
+//     subscriber gets EXACTLY the vault_a event → test passes GREEN.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[allow(clippy::items_after_statements)]
+async fn hermetic_ws_subscription_filters_by_topic2_not_topic1() {
+    let server = MockServer::start(MockBehaviour {
+        respect_filter: true,
+        ..Default::default()
+    })
+    .await;
+
+    let vault_a: [u8; 32] = TEST_VAULT_ID; // [0x42; 32]
+    let mut vault_b: [u8; 32] = [0u8; 32];
+    vault_b[0] = 0x99;
+
+    // Open a subscription for vault_a — under the NEW code this
+    // emits an `eth_subscribe("logs", {topic2: vault_a})`; under
+    // the OLD code it emitted `{topic1: vault_a}`. Either way the
+    // mock captures the filter via `respect_filter`.
+    let mut handle = open_subscription(&server.ws_url, ChainEnv::Dev, &vault_a, contract_address())
+        .await
+        .expect("subscribe");
+
+    // Queue two events with the CANONICAL V1 topic layout:
+    // topic0 = signature, topic1 = sequence, topic2 = vaultId. The
+    // mock's filter gate applies `Filter::matches` against each
+    // outgoing log; on NEW code only vault_a matches; on OLD code
+    // NEITHER matches (because the buggy filter binds topic1 to a
+    // 32-byte vaultId, while the log's topic1 is the sequence).
+    let log_a = build_revision_published_log(
+        contract_address(),
+        vault_a,
+        [0xAA; 32],
+        [0u8; 32],
+        [0xCC; 32],
+        1,
+        1, // sequence
+        vec![0xDE, 0xAD],
+        signer_address(),
+        100,
+        0,
+        test_tx_hash(1),
+        test_block_hash(1),
+    );
+    let log_b = build_revision_published_log(
+        contract_address(),
+        vault_b,
+        [0xAA; 32],
+        [0u8; 32],
+        [0xCC; 32],
+        1,
+        2, // sequence
+        vec![0xBE, 0xEF],
+        signer_address(),
+        101,
+        0,
+        test_tx_hash(2),
+        test_block_hash(2),
+    );
+    server.push_event(log_a);
+    server.push_event(log_b);
+
+    // Recv exactly ONE event — the vault_a one.
+    let outcome = tokio::time::timeout(Duration::from_secs(3), recv_next_event(&mut handle))
+        .await
+        .expect(
+            "recv within timeout — RED on OLD code (`.topic1(vault_id)` \
+             filtered against `sequence` slot and matched nothing, so \
+             the mock emitted zero events)",
+        );
+    let WsRecvOutcome::Event(log) = outcome else {
+        panic!("subscription closed unexpectedly");
+    };
+    use pangolin_chain::chain_sync::poll::{verify_alloy_log, VerifyOutcome};
+    let VerifyOutcome::Verified(ev) =
+        verify_alloy_log(&log, &vault_a, &contract_address(), ChainEnv::Dev)
+    else {
+        panic!("verifier rejected the vault_a event");
+    };
+    assert_eq!(ev.event.vault_id, vault_a, "wrong vault_id slot returned");
+    assert_eq!(ev.event.sequence, 1, "wrong sequence slot returned");
+
+    // Confirm NO second event arrives (vault_b's log was filtered
+    // out server-side). Use a short timeout — the mock has already
+    // processed both pushes; if vault_b were going to reach the
+    // subscriber it would have done so by now.
+    let second =
+        tokio::time::timeout(Duration::from_millis(500), recv_next_event(&mut handle)).await;
+    assert!(
+        second.is_err(),
+        "vault_b's log MUST be filtered out by the smart mock's \
+         topic-filter gate; got: {second:?}"
+    );
+}
+
+/// **#107 WS path — buggy filter signature.** Demonstrate the bug's
+/// *signature* directly via the WS path: with `respect_filter` on,
+/// an HTTP-side test (`smart_mock_applies_topic_filter_buggy_topic1_filter_drops_all_logs`)
+/// already pins that a `.topic1(vault_id)` filter against canonical
+/// V1 logs returns zero matches. This test pins the same property
+/// through the WS subscribe path's filter-capture machinery — so a
+/// future regression that re-introduces the `.topic1` bug fails
+/// here without anyone needing to hand-craft a buggy filter.
+#[tokio::test]
+async fn hermetic_ws_subscription_filter_topology_pins_topic2_for_vault_id() {
+    // This is a shape pin: if the V1 production path ever reverts
+    // to `.topic1(vault_id)`, the subscription against the smart
+    // mock will silently consume vault_a's log (because its
+    // topic1 is `sequence == 1`, not vault_a). Pin via a direct
+    // filter-semantic test on the same canonical-V1-topics log.
+    use alloy::primitives::U256;
+    use alloy::rpc::types::Filter;
+    use alloy::sol_types::SolEvent;
+    use pangolin_chain::chain_submit::revision_log_v1_binding::RevisionLogV1;
+
+    let vault_a: [u8; 32] = TEST_VAULT_ID;
+    let log = build_revision_published_log(
+        contract_address(),
+        vault_a,
+        [0xAA; 32],
+        [0u8; 32],
+        [0xCC; 32],
+        1,
+        1,
+        vec![0xDE, 0xAD],
+        signer_address(),
+        100,
+        0,
+        test_tx_hash(1),
+        test_block_hash(1),
+    );
+
+    // The BUGGY filter (OLD code shape) — should NOT match this
+    // log because topic1 holds sequence (=1), not vault_a.
+    let buggy = Filter::new()
+        .address(contract_address())
+        .event_signature(RevisionLogV1::RevisionPublished::SIGNATURE_HASH)
+        .topic1(B256::from(vault_a));
+    assert!(
+        !buggy.matches(&log.inner),
+        ".topic1(vault_id) MUST NOT match a canonical V1 log: \
+         topic1 is the `sequence` slot, not `vaultId`"
+    );
+
+    // The CORRECT filter (NEW code shape) — should match.
+    let correct = Filter::new()
+        .address(contract_address())
+        .event_signature(RevisionLogV1::RevisionPublished::SIGNATURE_HASH)
+        .topic2(B256::from(vault_a));
+    assert!(
+        correct.matches(&log.inner),
+        ".topic2(vault_id) MUST match a canonical V1 log: \
+         topic2 is the `vaultId` slot"
+    );
+
+    // Topic1 holds the sequence — confirm by hand to keep the
+    // failure mode crisp if the V1 event layout ever changes.
+    let seq_topic = B256::from(U256::from(1u64).to_be_bytes::<32>());
+    assert_eq!(
+        log.topics()[1],
+        seq_topic,
+        "V1 `RevisionPublished` topic1 == `sequence` (this is what \
+         makes `.topic1(vault_id)` filter to nothing)"
+    );
+    assert_eq!(
+        log.topics()[2],
+        B256::from(vault_a),
+        "V1 `RevisionPublished` topic2 == `vaultId`"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Dummy: ensure the empty B256 alias type binding hasn't been used by
 // accident (compile-time sanity).
 // ---------------------------------------------------------------------

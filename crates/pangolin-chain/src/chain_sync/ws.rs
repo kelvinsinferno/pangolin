@@ -167,7 +167,9 @@ pub enum WsRecvOutcome {
 }
 
 /// Try to open a WS log-subscription filtered by `contract_address` +
-/// `RevisionPublished` topic0 + `vault_id` topic1. Issue #99 §2a.
+/// `RevisionPublished` topic0 + `vault_id` topic2. Issue #99 §2a;
+/// issue #107 corrected the topic index from topic1 (which is the
+/// `sequence` field, not `vaultId`) to topic2.
 ///
 /// Per L-ws-tls-downgrade: production envs (`BaseSepolia`,
 /// `BaseMainnet`) refuse `ws://` URLs; only `wss://` is accepted.
@@ -232,12 +234,17 @@ pub async fn open_subscription(
 
     // L2 + L4: filter ALL events at the RPC layer by
     // `RevisionPublished` topic0 + contract address + indexed
-    // vault_id topic1, so verification has less to reject.
-    let topic1: B256 = (*vault_id).into();
+    // vaultId topic2, so verification has less to reject.
+    //
+    // Issue #107: V1's `RevisionPublished(uint256 indexed sequence,
+    // bytes32 indexed vaultId, bytes32 indexed accountId, ...)` puts
+    // `vaultId` at topic2, NOT topic1 (topic1 is `sequence`). Mirrors
+    // `crate::chain_sync::v2::open_subscription_v2:~286`.
+    let vault_topic: B256 = (*vault_id).into();
     let filter = Filter::new()
         .address(contract_address)
         .event_signature(RevisionLogV1::RevisionPublished::SIGNATURE_HASH)
-        .topic1(topic1);
+        .topic2(vault_topic);
 
     let sub = provider
         .subscribe_logs(&filter)

@@ -117,3 +117,17 @@ futures-util       = { version = "=0.3.32", default-features = false, features =
 # hand to keep its scope tiny; same workspace pin already used by
 # `pangolin-chain`'s production deployment-file loader.
 serde_json         = { workspace = true }
+# Issue #107 — the filter-respecting hermetic mock transport
+# (`chain_sync::filtering_asserter`) needs the low-level JSON-RPC
+# request/response types + the `Transport` (tower::Service) trait.
+# These crates are ALREADY in the production dep tree via `alloy`'s
+# `provider-ws` + `pubsub` feature set (resolved transitively through
+# `alloy-provider` → `alloy-rpc-client` → `alloy-json-rpc` /
+# `alloy-transport`), so naming them here as dev-deps introduces NO
+# new external crate. `tower` is likewise transitively present (the
+# alloy MockTransport already uses `tower::Service<RequestPacket>`).
+# Pinned `=X.Y.Z` to the exact versions resolved in `Cargo.lock` so
+# a future alloy bump doesn't quietly drift the smart-mock's tree.
+alloy-json-rpc     = { version = "=2.0.4", default-features = false }
+alloy-transport    = { version = "=2.0.4", default-features = false }
+tower              = { version = "=0.5.3", default-features = false }
