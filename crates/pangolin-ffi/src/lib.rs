@@ -67,8 +67,10 @@ pub mod identity;
 mod identity_bridge;
 pub mod kdbx;
 pub mod publish_queue;
+pub mod recovery_ffi;
 pub mod reveal;
 pub mod revision;
+pub mod rotation_ffi;
 pub mod session;
 pub mod sync_mode;
 pub mod sync_status;
@@ -132,6 +134,20 @@ pub use session::{
     vault_lock_with_drain, PasswordPolicy, PasswordStrength, PlaintextExportConfirmation,
     PresenceProof, SecretPassword, SessionInfo, UnixTimestamp, VaultHandle,
     PASSWORD_POLICY_SCHEMA_VERSION,
+};
+// MVP-3 issue #106e-1: recovery / guardian-open / onboarding FFI surface —
+// the thin uniffi layer over the merged #106e-0 / #106e-0b composition
+// methods. The opened guardian `Share` crosses out ONLY behind the opaque
+// `FfiOpenedShare` Object (L1).
+pub use recovery_ffi::{
+    vault_guardian_open_share, vault_onboard_guardians, vault_recover_from_shares,
+    FfiGuardianRoster, FfiOnboardingResult, FfiOpenedShare, FfiRecoveryResult,
+    RECOVERY_FFI_SCHEMA_VERSION,
+};
+// MVP-3 issue #106e-1: rotation FFI surface — pending-rotation read +
+// engine-reads-the-live-set complete-rotation (§0a Q-b, fail-closed).
+pub use rotation_ffi::{
+    vault_complete_rotation, vault_pending_rotations, FfiRotationPending, FfiRotationResult,
 };
 // MVP-2 issue 5.4: sync orchestrator FFI surface — `vault_sync_status`
 // + `FfiSyncStatus` enum + `FfiSyncMode` mirror + the host-supplied

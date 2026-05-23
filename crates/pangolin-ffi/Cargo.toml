@@ -153,6 +153,14 @@ default-features = false
 pangolin-core   = { path = "../pangolin-core" }
 # 1.2 integration tests build a real on-disk vault file.
 pangolin-crypto = { path = "../pangolin-crypto" }
+# MVP-3 issue #106e-1: the recovery/rotation FFI binding tests drive a
+# full guardian-open→recover round-trip, which needs each guardian's
+# derived X25519 sealing pubkey. `Vault::device_key_secret_seed` is gated
+# behind `pangolin-store/test-utilities` (a test-only affordance — it
+# never links into the production cdylib). dev-dep only; the feature is
+# already enabled across the `cargo test --workspace` build (pangolin-store's
+# own tests use it), so this adds no new surface to the gate.
+pangolin-store  = { path = "../pangolin-store", features = ["test-utilities"] }
 tempfile        = { workspace = true }
 # MVP-3 issue #100 (R-f): hermetic mock funder for the
 # `vault_initiate_top_up` REAL-path test. Same pin as
