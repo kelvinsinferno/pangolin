@@ -76,7 +76,7 @@ sync_from_chain(rpc_url, env, vault_id, options)
     │       ├── resolve_and_check_contract (L4 — load + pinned-address cross-check)
     │       │
     │       └── poll::fetch_chunk (the per-chunk eth_getLogs)
-    │               ├── filter: address + topic0(RevisionPublished) + topic1(vault_id)
+    │               ├── filter: address + topic0(RevisionPublished) + topic2(vault_id)
     │               ├── decode via reused alloy sol! binding (L2)
     │               ├── reject foreign emitter (defense-in-depth past server-side filter)
     │               ├── reject wrong vault_id (L-malicious-vault-id-substitution)
@@ -138,7 +138,7 @@ sync_from_chain(rpc_url, env, vault_id, options)
           │     └── subscribe_logs(filter:
           │             address=D-017
           │             topic0=RevisionPublished
-          │             topic1=vault_id)
+          │             topic2=vault_id)
           │
           └── recv loop (bounded by WS_TIP_FOLLOW_WINDOW_SECS = 30s)
                 ├── per-event: verify_alloy_log → ingest →

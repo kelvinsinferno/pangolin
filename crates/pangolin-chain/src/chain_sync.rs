@@ -99,6 +99,13 @@ pub mod reorg;
 pub mod v2;
 pub mod ws;
 
+// Issue #107: filter-respecting hermetic mock transport. `#[cfg(test)]`
+// only — no production surface. Used by the V1 read-topic regression
+// tests in `chain_sync/tests.rs` to catch any future `topic1` ↔
+// `topic2` mistake at unit-test time.
+#[cfg(test)]
+mod filtering_asserter;
+
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, B256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};

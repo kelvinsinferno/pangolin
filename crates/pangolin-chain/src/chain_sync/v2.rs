@@ -152,7 +152,7 @@ pub fn verify_alloy_log_v2(
 
 /// Issue a single `eth_getLogs` for `[from_block, to_block]` filtered by
 /// the `RevisionLogV2` address + the V2 `RevisionPublished` topic0 +
-/// indexed `vaultId` topic1, decode + verify each log, return the
+/// indexed `vaultId` topic2, decode + verify each log, return the
 /// `VerifiedRevisionEvent` set + the count of locally-rejected logs.
 ///
 /// Mirror of [`crate::chain_sync::poll::fetch_chunk`] (the V1 read).
@@ -247,7 +247,7 @@ pub struct WsHandleV2 {
 }
 
 /// Try to open a WS log-subscription filtered by `contract_address` +
-/// the V2 `RevisionPublished` topic0 + `vault_id` topic1.
+/// the V2 `RevisionPublished` topic0 + `vault_id` topic2.
 ///
 /// Mirror of [`crate::chain_sync::ws::open_subscription`] (the V1 WS
 /// path): same L-ws-tls-downgrade scheme check + L3 chain-id pin BEFORE

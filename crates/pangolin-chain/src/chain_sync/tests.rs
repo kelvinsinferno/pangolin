@@ -31,6 +31,7 @@ use crate::secp256k1_signing::{
 };
 use crate::EvmWallet;
 
+use super::filtering_asserter::FilteringAsserter;
 use super::poll::{fetch_chunk, verify_signed_event};
 use super::reorg::ReorgDetector;
 use super::{
@@ -38,6 +39,7 @@ use super::{
     VerifiedRevisionEvent, CONFIRMATION_DEPTH_FOR_FINALIZATION, LOG_BLOCK_CHUNK,
     MAX_KNOWN_CLIENT_SCHEMA_VERSION,
 };
+use alloy::rpc::client::RpcClient;
 
 // ---------------------------------------------------------------------
 // Test helpers
@@ -388,6 +390,167 @@ async fn fetch_chunk_rejects_wrong_vault_id() {
     .expect("fetch_chunk");
     assert!(events.is_empty());
     assert_eq!(rejected, 1);
+}
+
+// ---------------------------------------------------------------------
+// Issue #107 — V1 read-topic regression tests.
+//
+// The V1 `RevisionPublished` event puts `sequence` at TOPIC1 and
+// `vaultId` at TOPIC2. The V1 read path (`fetch_chunk` in HTTP polling
+// + `open_subscription` in WS) MUST filter on topic2, not topic1.
+//
+// The legacy `Asserter` mock returns canned responses without
+// inspecting the request — so the buggy `.topic1(vault_id)` filter
+// from the original code goes unexercised in hermetic tests. Issue
+// #107 introduces `FilteringAsserter` (a `tower::Service<RequestPacket>`
+// that parses the `eth_getLogs` filter via `serde_json` + applies
+// `Filter::matches`) to close that gap.
+//
+// **Discrimination:** these tests go RED under the OLD code
+// (`.topic1(vault_id)` against the smarter mock filters by topic1 ==
+// vaultId, but the queued logs have topic1 == sequence, so nothing
+// matches → empty result → test fails) and GREEN under the new code
+// (`.topic2(vault_id)` matches the correct topic slot).
+// ---------------------------------------------------------------------
+
+/// Build an `RpcLog` with the canonical V1 topic layout:
+/// `[topic0, sequence, vaultId, accountId]`. Helper for the #107
+/// regression tests to keep their bodies focused on the filter
+/// assertion.
+#[allow(clippy::too_many_arguments)]
+fn v1_log_with_canonical_topics(
+    contract: Address,
+    vault_id: [u8; 32],
+    sequence: u64,
+    block_number: u64,
+    log_index: u64,
+) -> RpcLog {
+    let signer = Address::from([0x77u8; 20]);
+    build_revision_log(
+        contract,
+        vault_id,
+        [0x33; 32],
+        [0u8; 32],
+        [0xCC; 32],
+        1,
+        b"#107-fixture",
+        signer,
+        B256::repeat_byte(0xCC),
+        B256::repeat_byte(0xBB),
+        block_number,
+        log_index,
+        U256::from(sequence),
+    )
+}
+
+/// **#107 HTTP path regression.** Queue two V1 `RevisionPublished`
+/// logs — one for `vault_id = [0xAA; 32]`, one for `[0xBB; 32]`,
+/// each with the CORRECT topic layout (topic1 = `sequence`, topic2
+/// = `vaultId`). Call `fetch_chunk(..., &[0xAA;32], ...)` against
+/// the smarter mock. The mock applies the `Filter.topics` array
+/// server-side (per the `Filter::matches` semantics); ONLY the
+/// `[0xAA; 32]` log comes back.
+///
+/// **The discrimination:** under the OLD code
+/// (`.topic1(vault_id)`), the smarter mock filters by topic1 ==
+/// vault_a — but the logs' topic1 slot holds `sequence`, NOT
+/// vault_id, so neither log matches → `fetch_chunk` returns an
+/// empty Vec → this assertion fails. Under the NEW code
+/// (`.topic2(vault_id)`), the filter binds to topic2 (the actual
+/// vault_id slot), so the `[0xAA; 32]` log matches and is returned.
+#[tokio::test]
+async fn fetch_chunk_filters_by_topic2_not_topic1() {
+    let asserter = FilteringAsserter::new();
+    let provider = ProviderBuilder::new().connect_client(RpcClient::new(asserter.clone(), true));
+
+    let contract = EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA;
+    let vault_a: [u8; 32] = [0xAAu8; 32];
+    let vault_b: [u8; 32] = [0xBBu8; 32];
+
+    asserter.push_log(v1_log_with_canonical_topics(contract, vault_a, 1, 100, 0));
+    asserter.push_log(v1_log_with_canonical_topics(contract, vault_b, 2, 101, 0));
+
+    let (events, rejected) = fetch_chunk(
+        &provider,
+        ChainEnv::BaseSepolia,
+        contract,
+        &vault_a,
+        50,
+        200,
+    )
+    .await
+    .expect("fetch_chunk");
+
+    // The smart mock applied the server-side filter; vault_b's log
+    // never reached the verifier. The verifier sees only vault_a's
+    // log + verifies it cleanly → 1 verified, 0 rejected.
+    assert_eq!(
+        events.len(),
+        1,
+        "expected exactly 1 matching event for vault_a; got {} \
+         (RED on OLD code → 0 events, indicates `.topic1(vault_id)` \
+         filtered against `sequence` slot and matched nothing)",
+        events.len()
+    );
+    assert_eq!(rejected, 0);
+    assert_eq!(
+        events[0].event.vault_id, vault_a,
+        "the returned event must be vault_a's, not vault_b's"
+    );
+    assert_eq!(events[0].event.sequence, 1);
+}
+
+/// **#107 HTTP path regression — buggy filter signature.** Demonstrate
+/// the bug's *signature* directly: the buggy filter
+/// `.topic1(vault_id)` applied to logs whose topic1 is `sequence`
+/// returns ZERO matches. This is what the production V1 read path
+/// observed against a real RPC.
+///
+/// This test does NOT exercise `fetch_chunk`; it pins the smart
+/// mock's filter semantics so the OTHER #107 test's RED-on-old-code
+/// behaviour is well-explained. Together they form the "smart mock
+/// catches this class of bug" guarantee.
+#[tokio::test]
+#[allow(clippy::items_after_statements)]
+async fn smart_mock_applies_topic_filter_buggy_topic1_filter_drops_all_logs() {
+    let asserter = FilteringAsserter::new();
+    let provider = ProviderBuilder::new().connect_client(RpcClient::new(asserter.clone(), true));
+
+    let contract = EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA;
+    let vault_a: [u8; 32] = [0xAAu8; 32];
+    asserter.push_log(v1_log_with_canonical_topics(contract, vault_a, 1, 100, 0));
+
+    // Issue a manual `get_logs` with the BUGGY filter shape
+    // (.topic1(vault_id)). This mirrors what the OLD code did at
+    // poll.rs:~196 + ws.rs:~240 before the #107 fix.
+    use alloy::eips::BlockNumberOrTag;
+    use alloy::rpc::types::Filter;
+    let buggy_filter = Filter::new()
+        .address(contract)
+        .event_signature(RevisionLogV1::RevisionPublished::SIGNATURE_HASH)
+        .from_block(BlockNumberOrTag::Number(50))
+        .to_block(BlockNumberOrTag::Number(200))
+        .topic1(B256::from(vault_a));
+    let logs = provider.get_logs(&buggy_filter).await.expect("get_logs");
+    assert!(
+        logs.is_empty(),
+        "buggy .topic1(vault_id) filter must return zero matches: the \
+         log's topic1 slot holds `sequence`, not `vaultId`"
+    );
+
+    // Same fixture, CORRECT filter — returns the log.
+    let correct_filter = Filter::new()
+        .address(contract)
+        .event_signature(RevisionLogV1::RevisionPublished::SIGNATURE_HASH)
+        .from_block(BlockNumberOrTag::Number(50))
+        .to_block(BlockNumberOrTag::Number(200))
+        .topic2(B256::from(vault_a));
+    let logs = provider.get_logs(&correct_filter).await.expect("get_logs");
+    assert_eq!(
+        logs.len(),
+        1,
+        "correct .topic2(vault_id) filter must return the matching log"
+    );
 }
 
 #[tokio::test]

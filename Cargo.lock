@@ -3293,7 +3293,9 @@ name = "pangolin-chain"
 version = "0.0.0"
 dependencies = [
  "alloy",
+ "alloy-json-rpc",
  "alloy-signer-local",
+ "alloy-transport",
  "async-trait",
  "futures-util",
  "hex",
@@ -3307,6 +3309,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
+ "tower 0.5.3",
  "zeroize",
 ]
 
