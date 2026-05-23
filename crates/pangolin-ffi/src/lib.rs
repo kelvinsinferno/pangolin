@@ -73,6 +73,14 @@ pub mod kdbx;
 pub mod pairing;
 pub mod publish_queue;
 pub mod recovery_ffi;
+/// **MVP-3 issue #108.** Thin uniffi layer over the `RecoveryV1`
+/// on-chain lifecycle (`setGuardianSet` / `initiate` / `approve` /
+/// `cancel` / `finalize`) + the two reads (`vaultAuthority` + live
+/// attempt). Wraps the merged + audited
+/// [`pangolin_chain::recovery_client`] primitives; engine computes the
+/// merkle proof internally (Q-a), session-gates per binding (L4),
+/// fail-closed on chain reads (L3).
+pub mod recovery_lifecycle;
 pub mod reveal;
 pub mod revision;
 pub mod rotation_ffi;
@@ -153,6 +161,17 @@ pub use recovery_ffi::{
 // engine-reads-the-live-set complete-rotation (§0a Q-b, fail-closed).
 pub use rotation_ffi::{
     vault_complete_rotation, vault_pending_rotations, FfiRotationPending, FfiRotationResult,
+};
+// MVP-3 issue #108: on-chain recovery lifecycle FFI — 5 chain-mutating
+// bindings (`setGuardianSet` / `initiate` / `approve` / `cancel` /
+// `finalize`) + 2 reads (`vaultAuthority` + live attempt). Engine
+// computes the merkle proof internally (Q-a); session-gated per binding;
+// fail-closed on chain reads.
+pub use recovery_lifecycle::{
+    vault_approve_recovery, vault_cancel_recovery, vault_finalize_recovery,
+    vault_initiate_recovery, vault_read_recovery_status, vault_read_vault_authority,
+    vault_set_guardian_set, FfiRecoveryStatus, FfiTxOutcome, FfiVaultAuthority,
+    RECOVERY_LIFECYCLE_FFI_SCHEMA_VERSION,
 };
 // MVP-3 issue #106e-2: device-add pairing FFI surface — pairing-payload
 // codec + SAS derivation + `vault_add_device` / `pairing_open_and_join`.
