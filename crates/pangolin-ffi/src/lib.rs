@@ -66,6 +66,11 @@ pub mod error;
 pub mod identity;
 mod identity_bridge;
 pub mod kdbx;
+/// **MVP-3 issue #106e-2.** The device-add pairing FFI surface —
+/// pairing-payload codec + SAS derivation + the `vault_add_device` /
+/// `pairing_open_and_join` bindings. The thin uniffi wrapper over the
+/// merged #106c chain primitives + the #106e-2 transport codec / SAS.
+pub mod pairing;
 pub mod publish_queue;
 pub mod recovery_ffi;
 pub mod reveal;
@@ -148,6 +153,17 @@ pub use recovery_ffi::{
 // engine-reads-the-live-set complete-rotation (§0a Q-b, fail-closed).
 pub use rotation_ffi::{
     vault_complete_rotation, vault_pending_rotations, FfiRotationPending, FfiRotationResult,
+};
+// MVP-3 issue #106e-2: device-add pairing FFI surface — pairing-payload
+// codec + SAS derivation + `vault_add_device` / `pairing_open_and_join`.
+// The thin uniffi wrapper over the merged #106c chain primitives + the
+// #106e-2 transport codec / SAS. The X25519 pairing SECRET + the VDK
+// stay engine-side (L1); only payload bytes + the SAS string + the
+// sealed envelope cross.
+pub use pairing::{
+    pairing_begin_new_device, pairing_decode_bytes, pairing_decode_string, pairing_derive_sas,
+    pairing_local_payload, pairing_open_and_join, vault_add_device, FfiPairingPayload,
+    FfiSealedVdkEnvelope, PAIRING_FFI_SCHEMA_VERSION,
 };
 // MVP-2 issue 5.4: sync orchestrator FFI surface — `vault_sync_status`
 // + `FfiSyncStatus` enum + `FfiSyncMode` mirror + the host-supplied

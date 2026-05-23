@@ -54,7 +54,12 @@ use pangolin_crypto::pairing::{
 ///
 /// #106c's driver takes this as an ALREADY-RESOLVED triple (the QR /
 /// short-code SCANNING + presence proof that physically + securely
-/// delivers it to A is #106e). It carries only public context.
+/// delivers it to A is #106e). It carries only public context. The new
+/// device's 20-byte secp256k1 `signer` (the on-chain authorized-set key
+/// the manager's `addDevice` authorizes) travels OUTSIDE the handshake
+/// (it lives on the wire-form [`crate::pairing_transport::PairingPayload`]
+/// the host moves; the #106e-2 manager FFI passes it as its own argument
+/// to `add_device_v2`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NewDeviceHandshake {
     /// The new device's stable 32-byte identifier (GAP B — see

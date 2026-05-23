@@ -111,6 +111,26 @@ pub const DEVICE_WRAP_KEY_INFO: &[u8] = b"pangolin-device-wrap-v0";
 /// whole plaintext). Versioned the same way as the info strings.
 const SEALED_VDK_DOMAIN: &[u8] = b"pangolin-device-pair-seal-v0";
 
+/// Domain-separator hash input prefix for the device-pairing SAS (Short Authentication String).
+///
+/// The human-comparable 6-digit code the #106e-2 pairing flow derives over
+/// both devices' X25519 pairing pubkeys + the freshness nonce.
+///
+/// **Versioned** alongside [`SEALED_VDK_DOMAIN`] /
+/// [`DEVICE_PAIR_X25519_HKDF_INFO`]. **DISTINCT** from every other domain
+/// string in the codebase (the byte-identity pin lives in
+/// [`tests::sas_domain_distinct_from_other_pairing_domains`] +
+/// `pangolin_core::pairing_transport`'s
+/// `pairing_transport_domain_distinct_from_other_domains`).
+///
+/// The SAS hash is `SHA-256(SAS_DOMAIN || lo || hi || freshness_nonce)`,
+/// where `(lo, hi)` is the lexicographically-sorted pair of the two
+/// devices' 32-byte X25519 pairing pubkeys (canonical-symmetric — both
+/// devices derive the identical code regardless of which was A / B, L3).
+/// Truncated to a 6-digit decimal via `u32::from_be_bytes(H[..4]) %
+/// 1_000_000`.
+pub const SAS_DOMAIN: &[u8] = b"pangolin-pairing-sas-v0";
+
 /// Length of a stable device identifier in bytes, bound into the
 /// [`SealedVdkForDevice`] header (Q-e).
 ///
@@ -550,6 +570,128 @@ pub fn unwrap_vdk_for_device(
         .inner
         .open_with_key(&wrap_key, &ctx)
         .map_err(|_| PairingError::WrapFailed)
+}
+
+// ---------------------------------------------------------------------------
+// 4. Short Authentication String (SAS) — the #106e-2 anti-MITM primitive
+// ---------------------------------------------------------------------------
+
+/// Length of the [`SAS_DOMAIN`]-bound freshness nonce the SAS hash binds (16 bytes).
+///
+/// Matches `pangolin_core::pairing_transport::FRESHNESS_NONCE_LEN`. The
+/// crypto layer pins the length here so a future SAS-format change cannot
+/// accidentally desync from the transport codec.
+pub const SAS_FRESHNESS_NONCE_LEN: usize = 16;
+
+/// A human-comparable Short Authentication String — the 6-decimal-digit
+/// code the #106e-2 pairing flow derives over both devices' X25519
+/// pairing pubkeys + the freshness nonce.
+///
+/// **The SAS is NON-SECRET.** It is what the human READS off both screens
+/// and compares; it is the public anti-MITM anchor (L2). A 6-digit
+/// decimal code is ~ 20 bits of comparison value — sufficient against an
+/// online attacker who must guess the code BEFORE the user dismisses the
+/// confirmation, and easy to read aloud / compare across two devices
+/// (ZRTP-class). `Debug` / `Display` are fine because the value is not a
+/// secret. Always exactly 6 ASCII digits (`000000`..=`999999`), zero-
+/// padded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sas(pub String);
+
+impl core::fmt::Display for Sas {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Sas {
+    /// The 6-digit SAS string, e.g. `"472913"`. Always 6 ASCII digits.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Derive the 6-digit decimal [`Sas`] over both devices' 32-byte X25519
+/// pairing pubkeys + the 16-byte freshness nonce.
+///
+/// ## Canonical-symmetric (L3 — `106e2-pairing-transport-sas.md`)
+///
+/// The two pubkeys are sorted lexicographically as fixed-length byte
+/// strings — assign `(lo, hi)` with `lo <= hi`. This guarantees
+/// `derive_sas(a, b, n) == derive_sas(b, a, n)` for any `(a, b, n)`:
+/// both devices derive the IDENTICAL code regardless of role (new-device
+/// B or existing-device A). The byte-pin test
+/// [`tests::sas_is_canonical_symmetric`] turns the gate RED if the
+/// ordering ever silently changes.
+///
+/// ## The hash construction (the load-bearing L2 byte-identity)
+///
+/// ```text
+/// H = SHA-256( SAS_DOMAIN || lo || hi || freshness_nonce )
+/// digits_u32 = u32::from_be_bytes(H[..4])
+/// sas = format!("{:06}", digits_u32 % 1_000_000)
+/// ```
+///
+/// The 4-byte truncation provides 32 bits of input to the `% 1_000_000`
+/// modulo (~ 20 bits of usable output); the negligible modulo bias
+/// (`2^32 % 10^6 = 96`) is well below the audit-relevant threshold for
+/// 6-digit codes (~ 2.2e-5 per code). The `freshness_nonce` is the
+/// per-pairing entropy that makes a pre-computed table over `(lo, hi)`
+/// pairs useless to a MITM (L5 — anti-replay).
+///
+/// ## Why a SHA-256 hash (not HKDF / not an HMAC)
+///
+/// The SAS is a NON-secret comparison code, not key material. There is
+/// no extraction-from-non-uniform-IKM step (the pubkeys + nonce are
+/// already uniformly random over their domains for any non-malicious
+/// derivation), and there is no need for an authentication tag (no
+/// secret to authenticate with). A single domain-prefixed SHA-256 is
+/// sufficient + obviously-correct + matches the ZRTP `sas-base256`
+/// shape. Using `sha2::Sha256` (already pulled at the workspace level
+/// via the existing crypto deps); NO new external crate (L6).
+///
+/// ## L2 (LOAD-BEARING): a swapped pubkey ⇒ a different SAS
+///
+/// A MITM that substitutes its OWN pairing pubkey for B's gets a
+/// DIFFERENT `(lo, hi)` lexicographic sort, hence a DIFFERENT
+/// SHA-256 input, hence a DIFFERENT 6-digit code — surfaced on the
+/// human comparison. The byte-pin test
+/// [`tests::sas_defeats_pubkey_swap_mitm`] turns the gate RED if the SAS
+/// ever stops binding BOTH pubkeys.
+#[must_use]
+pub fn derive_sas(
+    pub_a: &[u8; X25519_KEY_LEN],
+    pub_b: &[u8; X25519_KEY_LEN],
+    freshness_nonce: &[u8; SAS_FRESHNESS_NONCE_LEN],
+) -> Sas {
+    use sha2::{Digest, Sha256};
+
+    // L3 canonical-symmetric ordering: byte-lexicographic sort assigns
+    // `(lo, hi)` so the SAS is independent of role. `<=` is fine for the
+    // degenerate `a == b` case (whichever order the caller passed, lo ==
+    // hi); the value is non-secret, so a non-constant-time compare is
+    // acceptable here.
+    let (lo, hi) = if pub_a.as_slice() <= pub_b.as_slice() {
+        (pub_a, pub_b)
+    } else {
+        (pub_b, pub_a)
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(SAS_DOMAIN);
+    hasher.update(&lo[..]);
+    hasher.update(&hi[..]);
+    hasher.update(&freshness_nonce[..]);
+    let digest = hasher.finalize();
+
+    // Take the first 4 bytes as a big-endian u32, reduce modulo 1_000_000,
+    // format with leading zeros. The result is always 6 ASCII digits.
+    let mut be4 = [0u8; 4];
+    be4.copy_from_slice(&digest[..4]);
+    let value = u32::from_be_bytes(be4);
+    let digits = value % 1_000_000;
+    Sas(format!("{digits:06}"))
 }
 
 #[cfg(test)]

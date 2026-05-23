@@ -614,3 +614,178 @@ proptest::proptest! {
         }
     }
 }
+
+// =========================================================================
+// 4. Short Authentication String (SAS) — #106e-2 anti-MITM primitive
+// =========================================================================
+
+/// 16-byte fixture nonce for SAS tests (matches `SAS_FRESHNESS_NONCE_LEN`).
+const NONCE_FIXTURE: [u8; SAS_FRESHNESS_NONCE_LEN] = [
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+];
+
+/// `derive_sas` returns an exact 6-digit ASCII-decimal string.
+#[test]
+fn sas_format_is_six_decimal_digits() {
+    let a = [0xA1; X25519_KEY_LEN];
+    let b = [0xB2; X25519_KEY_LEN];
+    let sas = derive_sas(&a, &b, &NONCE_FIXTURE);
+    let s = sas.as_str();
+    assert_eq!(s.len(), 6, "SAS must be exactly 6 chars, got: {s:?}");
+    assert!(
+        s.bytes().all(|c| c.is_ascii_digit()),
+        "SAS must be ASCII digits only, got: {s:?}"
+    );
+}
+
+/// `derive_sas` is deterministic — same inputs ⇒ same output.
+#[test]
+fn sas_is_deterministic() {
+    let a = [0xA1; X25519_KEY_LEN];
+    let b = [0xB2; X25519_KEY_LEN];
+    let sas1 = derive_sas(&a, &b, &NONCE_FIXTURE);
+    let sas2 = derive_sas(&a, &b, &NONCE_FIXTURE);
+    assert_eq!(sas1, sas2, "SAS derivation must be deterministic");
+}
+
+/// **L3 (canonical-symmetric).** Swapping the two pubkey arguments
+/// produces the IDENTICAL SAS (both devices derive the same code
+/// regardless of role).
+///
+/// This is the property the spec calls out as load-bearing for the
+/// human-comparison flow: a role-dependent ordering bug would silently
+/// surface as a non-matching SAS even on an honest handshake, breaking
+/// the gate's usability and likely training users to ignore mismatches.
+#[test]
+fn sas_is_canonical_symmetric() {
+    // Two arbitrary pubkeys (any ordering — the function must yield the
+    // same code regardless of (a, b) vs (b, a)).
+    let a = [0xA1; X25519_KEY_LEN];
+    let b = [0xB2; X25519_KEY_LEN];
+    let sas_ab = derive_sas(&a, &b, &NONCE_FIXTURE);
+    let sas_ba = derive_sas(&b, &a, &NONCE_FIXTURE);
+    assert_eq!(
+        sas_ab, sas_ba,
+        "L3 BROKEN: derive_sas must be canonical-symmetric (sorted-pubkey ordering)",
+    );
+
+    // Reversed-pattern pair (so the lex-sort hits the other branch on
+    // some byte): catch a "<" / ">" flip in the canonical-sort.
+    let mut c = [0u8; X25519_KEY_LEN];
+    c.iter_mut()
+        .enumerate()
+        .for_each(|(i, x)| *x = u8::try_from(i).expect("i < 32 fits u8").wrapping_add(0x10));
+    let d = [0xFF; X25519_KEY_LEN];
+    let sas_cd = derive_sas(&c, &d, &NONCE_FIXTURE);
+    let sas_dc = derive_sas(&d, &c, &NONCE_FIXTURE);
+    assert_eq!(sas_cd, sas_dc, "L3 BROKEN on reversed-pattern pair");
+
+    // Use derived-from-DeviceKey pubkeys (the production shape) for a
+    // realistic pinning.
+    let pa = *derive_x25519_pairing_key(&DeviceKey::from_seed([0x70; 32])).public_bytes();
+    let pb = *derive_x25519_pairing_key(&DeviceKey::from_seed([0x71; 32])).public_bytes();
+    let sas_pa_pb = derive_sas(&pa, &pb, &NONCE_FIXTURE);
+    let sas_pb_pa = derive_sas(&pb, &pa, &NONCE_FIXTURE);
+    assert_eq!(
+        sas_pa_pb, sas_pb_pa,
+        "L3 BROKEN on derived pairing pubkeys (production shape)"
+    );
+}
+
+/// **L2 LOAD-BEARING — the SAS defeats a pubkey-swap MITM.**
+///
+/// An attacker that substitutes its OWN pairing pubkey for B's gets a
+/// DIFFERENT SAS code. This is THE property the human comparison anchors
+/// on; if the SAS ever stops binding both pubkeys, this gate turns RED.
+#[test]
+fn sas_defeats_pubkey_swap_mitm() {
+    let a = *derive_x25519_pairing_key(&DeviceKey::from_seed([0x80; 32])).public_bytes();
+    let b = *derive_x25519_pairing_key(&DeviceKey::from_seed([0x81; 32])).public_bytes();
+    let mallory = *derive_x25519_pairing_key(&DeviceKey::from_seed([0xFF; 32])).public_bytes();
+
+    let sas_honest = derive_sas(&a, &b, &NONCE_FIXTURE);
+    let sas_mitm = derive_sas(&a, &mallory, &NONCE_FIXTURE);
+    assert_ne!(
+        sas_honest, sas_mitm,
+        "L2 BROKEN: SAS must differ when B is replaced by an attacker — the anti-MITM property"
+    );
+
+    // Also: B-side perspective. If A is replaced by Mallory, that side
+    // also gets a different code.
+    let sas_mitm_a = derive_sas(&mallory, &b, &NONCE_FIXTURE);
+    assert_ne!(
+        sas_honest, sas_mitm_a,
+        "L2 BROKEN: SAS must differ when A is replaced by an attacker"
+    );
+
+    // The MITM-side sees its OWN code; honest sides see a (matching)
+    // honest code that doesn't match Mallory's view. Different codes ⇒
+    // human comparison fails ⇒ the flow aborts.
+    let sas_mitm_view_lo = derive_sas(&mallory, &a, &NONCE_FIXTURE);
+    let sas_mitm_view_hi = derive_sas(&mallory, &b, &NONCE_FIXTURE);
+    assert_ne!(
+        sas_mitm_view_lo, sas_mitm_view_hi,
+        "the MITM can't satisfy both sides with one substitution"
+    );
+}
+
+/// A different freshness nonce yields a different SAS — the per-pairing
+/// entropy bind (L5).
+#[test]
+fn sas_binds_freshness_nonce() {
+    let a = [0xA1; X25519_KEY_LEN];
+    let b = [0xB2; X25519_KEY_LEN];
+    let nonce_other = [0xFE; SAS_FRESHNESS_NONCE_LEN];
+    assert_ne!(NONCE_FIXTURE, nonce_other);
+    let sas1 = derive_sas(&a, &b, &NONCE_FIXTURE);
+    let sas2 = derive_sas(&a, &b, &nonce_other);
+    assert_ne!(
+        sas1, sas2,
+        "SAS must bind the freshness nonce (anti-replay, L5)"
+    );
+}
+
+/// **L4 byte-pin.** The `SAS_DOMAIN` byte-string is distinct from every
+/// other pairing/seal/wrap HKDF info / domain string in this module.
+/// A drift here collapses the SAS domain separation against the device-
+/// pairing X25519 / device-wrap / sealed-VDK / X25519 derivation
+/// derivations.
+#[test]
+fn sas_domain_distinct_from_other_pairing_domains() {
+    assert_eq!(SAS_DOMAIN, b"pangolin-pairing-sas-v0");
+    let others: &[&[u8]] = &[
+        DEVICE_PAIR_X25519_DERIVATION_MESSAGE,
+        DEVICE_PAIR_X25519_HKDF_INFO,
+        DEVICE_WRAP_KEY_INFO,
+        SEALED_VDK_DOMAIN,
+        crate::keys::WRAP_KEY_INFO,
+        crate::escrow::RECOVERY_WRAP_KEY_INFO,
+        crate::guardian::X25519_HKDF_INFO,
+        crate::guardian::X25519_DERIVATION_MESSAGE,
+    ];
+    for o in others {
+        assert_ne!(
+            SAS_DOMAIN, *o,
+            "SAS_DOMAIN must be distinct from every other domain string in pangolin-crypto"
+        );
+    }
+}
+
+/// Identical-key edge case: when `pub_a == pub_b` (a degenerate / self-
+/// pair input) the canonical-sort is a no-op. The function still
+/// produces a well-formed 6-digit code; no panic on the `<=` branch.
+#[test]
+fn sas_handles_identical_pubkeys() {
+    let same = [0x77; X25519_KEY_LEN];
+    let sas = derive_sas(&same, &same, &NONCE_FIXTURE);
+    assert_eq!(sas.as_str().len(), 6);
+}
+
+/// `Sas::Display` and `Sas::as_str` agree byte-for-byte.
+#[test]
+fn sas_display_matches_as_str() {
+    let a = [0xA1; X25519_KEY_LEN];
+    let b = [0xB2; X25519_KEY_LEN];
+    let sas = derive_sas(&a, &b, &NONCE_FIXTURE);
+    assert_eq!(format!("{sas}"), sas.as_str());
+}

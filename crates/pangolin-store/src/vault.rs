@@ -8141,6 +8141,277 @@ impl Vault {
         .map_err(|_| StoreError::AuthenticationFailed)
     }
 
+    // -----------------------------------------------------------------
+    // MVP-3 issue #106e-2 — device-pairing handshake store-side surface
+    // -----------------------------------------------------------------
+    //
+    // The pure pairing crypto (`pangolin_crypto::pairing`,
+    // `pangolin_core::device_add`) does not touch a `Vault`. The thin
+    // store methods below are what the #106e-2 FFI bindings call so the
+    // active VDK + the active `DeviceKey` never cross the
+    // `pangolin-core ↔ pangolin-store` boundary. Mirrors the
+    // `commit_vdk_rotation_from_active` discipline (#106e-0).
+    //
+    // L1 (zero secret crosses FFI as readable bytes): the FFI sees only
+    // the resulting `SealedVdkForDevice` bytes (non-secret) on the
+    // manager side, and `()` on the new-device side. The X25519 pairing
+    // secret + the VDK stay inside `ActiveState`.
+
+    /// **#106e-2 MANAGER role.** Seal the active VDK to a new device's
+    /// X25519 pairing pubkey, bound to `(vault_id, device_id, epoch)`.
+    ///
+    /// Mirrors [`pangolin_core::device_add::seal_vdk_to_new_device`] but
+    /// runs INSIDE the store so `self.active.vdk` never has to cross out.
+    /// Session-gated (Active — the manager holds the live VDK). The
+    /// returned [`pangolin_crypto::pairing::SealedVdkForDevice`] is
+    /// non-secret (sealed to the recipient's pairing pubkey) and travels
+    /// to the new device over the SAS-authenticated channel.
+    ///
+    /// The recipient `device_id` MUST be the new device's
+    /// [`pangolin_core::device_add::device_id_from_device_key`] (the seal
+    /// header binds it; the new device only opens with its OWN
+    /// `device_id`). The `vault_id` MUST be `self.vault_id()` (the
+    /// caller passes it as a parameter so a future per-vault add path
+    /// can be reused; the FFI binding asserts equality with the active
+    /// vault's id before calling).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] if no session is active.
+    /// [`StoreError::AuthenticationFailed`] if the underlying sealed-box
+    /// op fails (indistinguishability collapse).
+    pub fn seal_vdk_for_new_device(
+        &self,
+        recipient_x25519_pairing_pub: &[u8; 32],
+        recipient_device_id: &[u8; 32],
+        vault_id: &[u8; VAULT_ID_LEN],
+        epoch: u64,
+    ) -> Result<pangolin_crypto::pairing::SealedVdkForDevice> {
+        let active = self.require_active()?;
+        let mut epoch_bytes = [0u8; pangolin_crypto::escrow::EPOCH_LEN];
+        epoch_bytes[8..].copy_from_slice(&epoch.to_be_bytes());
+        pangolin_crypto::pairing::seal_vdk_to_device(
+            &active.vdk,
+            recipient_x25519_pairing_pub,
+            vault_id,
+            recipient_device_id,
+            &epoch_bytes,
+        )
+        .map_err(|_| StoreError::AuthenticationFailed)
+    }
+
+    /// **#106e-2 NEW-device role.** The active session's local device
+    /// 32-byte X25519 PAIRING PUBKEY (what an existing manager seals the
+    /// VDK to).
+    ///
+    /// Session-gated (Active — the device key lives in `ActiveState`).
+    /// Derived deterministically from the active session's `DeviceKey`
+    /// via [`pangolin_crypto::pairing::derive_x25519_pairing_key`]; the
+    /// SECRET scalar stays inside the derivation closure and never
+    /// crosses out. Returns the non-secret pubkey bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] if no session is active.
+    pub fn device_pairing_pubkey(&self) -> Result<[u8; 32]> {
+        let active = self.require_active()?;
+        Ok(*pangolin_crypto::pairing::derive_x25519_pairing_key(&active.device_key).public_bytes())
+    }
+
+    /// **#106e-2 NEW-device role.** The active session's stable
+    /// `device_id` (the 32-byte Ed25519 verifying-key bytes — GAP B). The
+    /// SAME value the seal header binds.
+    ///
+    /// Session-gated. Required by the new-device FFI binding so the
+    /// engine returns a `device_id` that exactly matches what
+    /// `wrap_vdk_for_device` will later expect.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] if no session is active.
+    pub fn device_pairing_device_id(&self) -> Result<[u8; 32]> {
+        let active = self.require_active()?;
+        Ok(active.device_key.verifying_key().to_bytes())
+    }
+
+    /// **#106e-2 NEW-device role — install a paired VDK + set vault id +
+    /// re-wrap under a master password.**
+    ///
+    /// The final step of the new-device join: the host has decoded
+    /// `SealedVdkForDevice` bytes, the engine has opened it under
+    /// `device_pairing_secret_for_self` and recovered the byte-identical
+    /// VDK, and now this method PERSISTS that VDK as this device's at-
+    /// rest wrap under `new_password` AND adopts the existing-vault's
+    /// `vault_id` (so this device's `.pvf` shares the same logical-vault
+    /// identity as the joining vault).
+    ///
+    /// Mirrors [`Self::build_recovery_meta`] (the recovery commit) but:
+    /// 1. takes the supplied `vault_id` (not `self.meta.vault_id` — the
+    ///    new device freshly-created a `.pvf` with its OWN random
+    ///    `vault_id`; the join replaces it),
+    /// 2. binds the [`WrapContext`] to the SUPPLIED `vault_id`.
+    ///
+    /// Like recovery, leaves the vault Locked on success — the host
+    /// calls `vault_unlock(new_password)` to start a session against the
+    /// newly-installed wrap.
+    ///
+    /// The `recovered_vdk` is borrowed (the caller drops it after); the
+    /// `new_password` is borrowed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::AuthenticationFailed`] if the KDF / wrap fails
+    /// (uniform failure surface — recovery uses the same posture even
+    /// though wrong-password is not the failure mode here, because the
+    /// user is SETTING the password). [`StoreError::Sqlite`] on a write
+    /// failure.
+    pub fn install_paired_vdk(
+        &mut self,
+        recovered_vdk: VdkKey,
+        vault_id: [u8; VAULT_ID_LEN],
+        new_password: &SecretBytes,
+    ) -> Result<()> {
+        // ATOMIC re-key + adopt-vault-id + re-seal device-key row in ONE
+        // transaction. Without this:
+        //
+        //  - The device_key row was sealed under THIS device's ORIGINAL
+        //    (random) VDK + the original (random) vault_id. After this
+        //    method, the persisted VDK is the RECOVERED one (from A)
+        //    and the persisted vault_id is A's. A subsequent
+        //    `Vault::unlock` would derive A's VDK + try to open the
+        //    OLD-VDK-sealed device_key row → fail.
+        //
+        //  - The active session's `device_id` (= the verifying-key bytes
+        //    of the active `DeviceKey`) IS the same `device_id` A's
+        //    pairing seal was bound to. The seal/AAD uses
+        //    `device_key_aad(vault_id, device_id)`, which binds BOTH
+        //    the OLD vault_id AND the device_id. So we MUST re-seal the
+        //    device-key row under the NEW VDK + the NEW vault_id +
+        //    keep the SAME `DeviceKey` (so future re-derivations of the
+        //    pairing pub / signer remain stable — what A registered
+        //    on-chain stays valid).
+        //
+        // Pull the active DeviceKey's seed out engine-side first (Active
+        // session is required — the host always reaches this from
+        // `Active` because `pairing_open_and_join` runs
+        // `open_paired_vdk_seal` on the same borrow). The seed is held
+        // in a Zeroizing buffer so it wipes when dropped at the end of
+        // this method. Scoped block so the `&ActiveState` borrow of
+        // `self.active` releases before we mutate `self.meta` below.
+        let device_key_seed = {
+            let active = self.active.as_ref().ok_or(StoreError::NotUnlocked)?;
+            active.device_key.secret_seed_bytes()
+        };
+
+        // Build the new meta row under the SUPPLIED vault_id. The KDF
+        // salt is fresh per L3 (independent of any other vault's wrap
+        // material); the authority is derived + dropped inside the
+        // builder.
+        let salt = KdfSalt::random();
+        let params = KdfParams::RECOMMENDED;
+        let kdf_seed = kdf::derive_seed(new_password, &salt, &params)?;
+        let new_authority = AuthorityKey::from_seed(*kdf_seed);
+        let wrap_ctx = WrapContext::new(vault_id);
+        let wrapped = recovered_vdk.wrap(&new_authority, &wrap_ctx)?;
+        // Authority + the KDF-derived seed have done their job — drop so
+        // they zeroize early.
+        drop(new_authority);
+
+        let new_meta = VaultMeta {
+            vault_id,
+            created_at: self.meta.created_at,
+            kdf_params: params,
+            kdf_salt: salt,
+            wrap_context: wrap_ctx,
+            wrapped_ciphertext: wrapped.ciphertext().as_bytes().to_vec(),
+            wrapped_nonce: *wrapped.nonce().as_bytes(),
+        };
+
+        // Reconstruct the local DeviceKey from the seed copy we pulled
+        // off the active session. The original session's `DeviceKey` is
+        // about to be dropped when we set `self.active = None`; we hold
+        // an independent zeroizing copy here so the re-seal can run.
+        let local_device = DeviceKey::from_seed(*device_key_seed);
+
+        // Atomic transaction: write meta + re-seal device_key under the
+        // new VDK + new vault_id. Rollback on any error. Mirrors the
+        // `commit_vdk_rotation` re-seal-under-new-VDK pattern at
+        // vault.rs:1621.
+        let tx = self.conn.unchecked_transaction()?;
+        meta::write(&tx, &new_meta)?;
+        device::reseal_device_key_tx(&tx, &vault_id, recovered_vdk.aead_key(), &local_device)?;
+        tx.commit()?;
+
+        // The recovered VDK has done its job here — drop after the
+        // commit so the transaction body sees the live AEAD key, and
+        // it zeroizes the moment we leave this scope.
+        drop(recovered_vdk);
+
+        // Mutate in-memory state ONLY after the atomic commit succeeds
+        // (so a failed write never desyncs memory from disk).
+        self.meta = new_meta;
+        // The device_id field on `self` is the local `.pvf`'s device id
+        // (random per-handle until `unlock` writes a stable row). After
+        // this re-seal the device-key row's `id` is the verifying-key
+        // bytes of `local_device` — stamp that onto `self.device_id` so
+        // the next `unlock` reads the right row.
+        self.device_id = DeviceId(local_device.verifying_key().to_bytes());
+
+        // Drop secrets ASAP.
+        drop(local_device);
+        drop(device_key_seed);
+
+        // Leave the vault Locked: the host calls `vault_unlock` with
+        // `new_password` to start the first active session under the
+        // newly-installed wrap. Any prior session is torn down (its
+        // secrets zeroize) — this is a re-key, not a continuation.
+        self.active = None;
+        self.session_state = SessionState::Locked;
+        Ok(())
+    }
+
+    /// **#106e-2 NEW-device role — open the manager's `SealedVdkForDevice`
+    /// and return the byte-identical VDK.**
+    ///
+    /// Session-gated (Active — the active `DeviceKey` derives the
+    /// recipient X25519 pairing SECRET store-internal; the secret never
+    /// crosses out). The recovered [`VdkKey`] is returned by value to the
+    /// caller — which on the new-device path is the FFI binding, that
+    /// passes it straight into [`Self::install_paired_vdk`] (which
+    /// consumes it and drops it). The VDK NEVER crosses the FFI boundary.
+    ///
+    /// `vault_id` is the EXISTING vault's id (carried in the pairing
+    /// payload, used by the seal header); `epoch` is the current epoch
+    /// on a clean add (host-supplied — typically 0).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] if no session is active.
+    /// [`StoreError::AuthenticationFailed`] if the open fails (wrong
+    /// recipient key / tampered ciphertext / context mismatch —
+    /// indistinguishability collapse).
+    pub fn open_paired_vdk_seal(
+        &self,
+        sealed: &pangolin_crypto::pairing::SealedVdkForDevice,
+        vault_id: &[u8; VAULT_ID_LEN],
+        epoch: u64,
+    ) -> Result<VdkKey> {
+        let active = self.require_active()?;
+        let pairing_key = pangolin_crypto::pairing::derive_x25519_pairing_key(&active.device_key);
+        let secret = pairing_key.secret_bytes();
+        let device_id = active.device_key.verifying_key().to_bytes();
+        let mut epoch_bytes = [0u8; pangolin_crypto::escrow::EPOCH_LEN];
+        epoch_bytes[8..].copy_from_slice(&epoch.to_be_bytes());
+        pangolin_crypto::pairing::open_vdk_from_pairing(
+            sealed,
+            &secret,
+            vault_id,
+            &device_id,
+            &epoch_bytes,
+        )
+        .map_err(|_| StoreError::AuthenticationFailed)
+    }
+
     /// **#106c GAP D / L5.** The minimal set-membership honor gate: returns
     /// `true` iff `signer` is in the supplied CURRENT on-chain authorized
     /// set. The host reads the live set via

@@ -3342,6 +3342,7 @@ dependencies = [
  "pangolin-crypto",
  "pangolin-store",
  "proptest",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

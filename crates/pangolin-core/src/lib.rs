@@ -39,6 +39,11 @@ pub mod device;
 pub mod device_add;
 pub mod error;
 pub mod identity;
+/// **MVP-3 issue #106e-2.** The pairing-payload TRANSPORT codec (the byte
+/// form the host renders as a QR + the copy-pasteable text form). Zero
+/// serde, fixed-layout, length-strict, version-gated; the FFI surface in
+/// `pangolin-ffi::pairing` is a thin wrapper.
+pub mod pairing_transport;
 pub mod pwgen;
 pub mod recovery;
 pub mod revision;
