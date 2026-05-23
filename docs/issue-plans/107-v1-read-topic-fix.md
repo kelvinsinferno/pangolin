@@ -1,7 +1,15 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-# Issue #107 — fix V1 read-topic bug (`.topic1` → `.topic2` for vaultId) + non-ignored regression — plan-gate DRAFT
+# Issue #107 — fix V1 read-topic bug (`.topic1` → `.topic2` for vaultId) + filter-respecting hermetic test infra — plan-gate LOCKED
 
-**Status: DRAFT — awaiting Kelvin sign-off (decisions in §5).** A standalone bug fix dormant since the V1 chain-read path was written. Independent of the #106 multi-device epic.
+**Status: LOCKED — Kelvin sign-off 2026-05-22 (§0a).** A standalone bug fix dormant since the V1 chain-read path was written. Independent of the #106 multi-device epic.
+
+## 0a. RESOLVED decisions (Kelvin sign-off 2026-05-22)
+
+- **Q-a → SMARTER MOCK + HERMETIC TESTS** (the durable choice). Build a project-local filter-respecting Asserter-equivalent that parses an `eth_getLogs` request's `Filter.topics` array (topic0..3 wildcards/values) and applies it to the queued logs server-side. Similarly for `eth_subscribe("logs", filter)`: filter live-pushed logs against the subscription's filter before emitting. Then a hermetic regression test against the smarter mock catches THIS bug AND any future similar V1/V2/V0 filter mistake. Slot it next to / replacing the dumb `Asserter` usage in `crates/pangolin-chain/src/chain_sync/tests.rs`. (Alternative — anvil-only E2E — rejected as a narrower regression that wouldn't catch future similar bugs at compile/PR time.)
+- **Q-b → BOTH HTTP + WS regression tests.** Same bug exists in `fetch_chunk` (HTTP `eth_getLogs`) and `open_subscription` (WS `eth_subscribe`). Cover both paths with hermetic tests against the smarter mock (the existing harness already exercises both; mirror the shape).
+- **Q-c → Ship soon after #106e-2 merges.** V1 is the production default for legacy vaults; this is HIGH-impact, LOW-complexity.
+- **Scope:** (1) the 2-line fix at `poll.rs:~196` + `ws.rs:~240` (`.topic1(vault_id)` → `.topic2(vault_id)`, rename local `topic1` → `vault_topic`); (2) the smarter filter-respecting mock (a `FilteringAsserter` or equivalent project-local helper) covering BOTH `eth_getLogs` and the `eth_subscribe("logs", filter)` push path; (3) hermetic regression tests against the smarter mock — both an HTTP `fetch_chunk` test and a WS `open_subscription` test that ASSERT a topic-mismatch returns zero logs (these are the bug's signature on a real RPC); (4) stale-comment cleanups (any "topic1 = vaultId" V1 references corrected).
+- **L-invariants:** no semantic change beyond the topic correction; V0 untouched (V0's `.topic1(vault_id)` is correct — V0's event puts `vaultId` at topic1); V2 untouched (already correct); no new external crates; AGPL SPDX; the smarter mock lives ONLY behind `#[cfg(test)]` (no production surface change); the regression test must be DISCRIMINATING — proven by running it against the PRE-fix code and confirming it goes RED. Full gate: `cargo fmt --check` + `cargo clippy -D warnings` + `cargo test --workspace` (incl. the workspace `no_empty_ignored_tests` meta-test). The existing anvil harness E2Es continue to pass unchanged.
 
 ## 0. One-paragraph summary
 
