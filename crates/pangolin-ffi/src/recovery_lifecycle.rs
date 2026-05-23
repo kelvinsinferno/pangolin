@@ -76,10 +76,9 @@
 use std::sync::Arc;
 
 use pangolin_chain::{
-    approve_recovery_v1, build_guardian_root, build_membership_proof, build_signed_approval_v1,
-    cancel_recovery_v1, finalize_recovery_v1, initiate_recovery_v1, read_live_attempt_v1,
-    read_vault_authority_v1, set_guardian_set_v1, Address, ApproveFieldsV1, EvmWallet,
-    RECOVERY_SCHEMA_VERSION_V1,
+    approve_recovery_v1, build_guardian_root, build_live_approve_fields_v1, build_membership_proof,
+    build_signed_approval_v1, cancel_recovery_v1, finalize_recovery_v1, initiate_recovery_v1,
+    read_live_attempt_v1, read_vault_authority_v1, set_guardian_set_v1, Address, EvmWallet,
 };
 use pangolin_core::EVM_ADDRESS_LEN;
 use pangolin_crypto::keys::VAULT_ID_LEN;
@@ -378,11 +377,17 @@ pub fn vault_initiate_recovery(
 ///
 /// The active vault is the GUARDIAN's vault — the engine pulls its
 /// secp256k1 signer (`Vault::evm_wallet`), computes the leaf for THIS
-/// signer and the merkle proof against the supplied `guardian_set`, and
-/// builds + signs the `Approve` EIP-712 digest bound to
-/// `(attempt_nonce, proposed_authority, expires_at)` (Q-a — host never
-/// holds derived data). The contract enforces the merkle proof; if the
-/// active signer isn't actually a guardian under the set, the broadcast
+/// signer and the merkle proof against the supplied `guardian_set`,
+/// reads the LIVE PENDING attempt via
+/// [`pangolin_chain::build_live_approve_fields_v1`] (L11 fail-closed:
+/// refuses to build a digest if the on-chain status is not PENDING),
+/// asserts the host-supplied `(attempt_nonce, proposed_authority)`
+/// match the live values (fail-closed `Chain` on mismatch so the host
+/// can re-fetch + re-confirm rather than signing a stale digest), and
+/// signs the LIVE `(attempt_nonce, proposed_authority, expires_at)`
+/// (Q-a — engine is the source of truth; host never holds derived
+/// data). The contract enforces the merkle proof; if the active
+/// signer isn't actually a guardian under the set, the broadcast
 /// fails fast at the client-side pre-flight inside
 /// [`pangolin_chain::approve_recovery_v1`] (`ErrInvalidMerkleProof` mirror).
 ///
@@ -455,24 +460,33 @@ pub fn vault_approve_recovery(
             pangolin_chain::load_deployed_address(env, pangolin_chain::RECOVERY_CONTRACT_NAME)
                 .map_err(chain_into_ffi)?;
 
-        // Build the EIP-712 fields against the host-supplied
-        // `(attempt_nonce, proposed_authority, expires_at_unix)`. Per the
-        // plan, the host carries these values forward from the
-        // `initiate_recovery` receipt + the agreed expiry; the engine
-        // does NOT also redundantly read the live attempt here (the
-        // contract's `_hashApprove` + the merkle proof check are the
-        // authoritative gates). A future amendment could fold in a
-        // `build_live_approve_fields_v1` pre-read for an extra client-
-        // side guard, but it would be redundant with the on-chain
-        // verification.
-        let fields = ApproveFieldsV1 {
-            vault_id: vault_id_arr,
-            proposed_authority: proposed_authority_addr,
-            attempt_nonce,
-            expires_at: expires_at_unix,
-            schema_version: RECOVERY_SCHEMA_VERSION_V1,
-        };
-        let signed_approval = build_signed_approval_v1(&signer, fields, contract, chain_id)
+        // Read the LIVE PENDING attempt via `build_live_approve_fields_v1`
+        // (L11 fail-closed: refuses to build a digest if the on-chain
+        // status is not PENDING). The host's `(attempt_nonce,
+        // proposed_authority)` params are then asserted against the live
+        // values — a mismatch means the on-chain state shifted between
+        // the host's intent-formation and this call (a new attempt
+        // started, the prior was finalized/cancelled, etc.); fail-closed
+        // `Chain` so the host can re-fetch + re-confirm instead of
+        // signing a stale digest. Plan Q-a / "engine is source of truth".
+        let live_fields =
+            build_live_approve_fields_v1(env, &config.rpc_url, vault_id_arr, expires_at_unix)
+                .await
+                .map_err(chain_into_ffi)?;
+        if live_fields.attempt_nonce != attempt_nonce
+            || live_fields.proposed_authority != proposed_authority_addr
+        {
+            return Err(FfiError::Chain {
+                message: format!(
+                    "approve_recovery: host-supplied (attempt_nonce={attempt_nonce}, \
+                     proposed_authority={proposed_authority_addr}) does not match the LIVE \
+                     PENDING attempt (attempt_nonce={}, proposed_authority={}); on-chain state \
+                     shifted — host must re-read recovery status before re-approving",
+                    live_fields.attempt_nonce, live_fields.proposed_authority
+                ),
+            });
+        }
+        let signed_approval = build_signed_approval_v1(&signer, live_fields, contract, chain_id)
             .map_err(chain_into_ffi)?;
 
         let wallet = EvmWallet::from_signer(signer.clone());
