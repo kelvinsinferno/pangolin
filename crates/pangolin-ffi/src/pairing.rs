@@ -58,8 +58,8 @@
 use std::sync::Arc;
 
 use pangolin_chain::{
-    add_device_v2, build_signed_device_auth, load_deployed_address, read_device_nonce_v2, Address,
-    ChainEnv, DeviceAuthFields, DeviceAuthKind,
+    add_device_v2, bootstrap_vault_v2, build_signed_device_auth, load_deployed_address,
+    read_device_nonce_v2, Address, DeviceAuthFields, DeviceAuthKind,
 };
 use pangolin_core::pairing_transport::{
     decode_bytes as decode_payload_bytes, decode_string as decode_payload_string, encode_bytes,
@@ -483,6 +483,98 @@ pub fn pairing_derive_sas(
 }
 
 // ---------------------------------------------------------------------------
+// 4a. vault_bootstrap_chain — FIRST chain mutation (genesis of the SET)
+// ---------------------------------------------------------------------------
+
+/// **The FIRST chain-mutating call for a new vault.** Establishes the
+/// authorized-device set on-chain so the calling device is the FIRST
+/// authorized signer + the manager. The V2 contract REQUIRES this before
+/// any [`vault_add_device`] / publishRevision call: a publish or
+/// `addDevice` against an unbootstrapped vault REVERTS with
+/// `VaultNotBootstrapped` (RevisionLogV2.sol Q-f — "a publish cannot
+/// race an unestablished SET"). Repeated calls REVERT with
+/// `VaultAlreadyBootstrapped` (one-shot flag, Q-f).
+///
+/// Host wiring: call EXACTLY ONCE per `.pvf`, AFTER `vault_unlock` and
+/// BEFORE the first `vault_add_device` / publish. Idempotent at the
+/// chain layer (the contract revert is the source of truth); the FFI
+/// does not cache a "bootstrapped" flag.
+///
+/// L1 — ZERO secret material crosses. The gas-paying signer is sourced
+/// engine-side from the unlocked vault (`Vault::evm_wallet`, identical
+/// to [`vault_add_device`]); the master password is consumed + zeroized
+/// for surface symmetry with the rest of the chain-mutating bindings
+/// (the bootstrap tx itself doesn't need it — the EVM signer is the
+/// existing live key).
+///
+/// L4 — vault MUST be Active (the EVM signer + the live vault_id are
+/// only valid in an unlocked session).
+///
+/// L7 — testnet-only / D-011. Production builds hardcode
+/// `ChainEnv::BaseSepolia` (see [`crate::chain_config::ffi_chain_env_and_id`]);
+/// the dev/anvil path is `integration-tests`-gated and never reaches
+/// shipped binaries.
+///
+/// # Errors
+///
+/// - [`FfiError::Session`] — the vault is Placeholder or Locked.
+/// - [`FfiError::Chain`] — ANY chain-side failure: RPC, deployment-file
+///   load, EIP-712 sign, broadcast, or `bootstrapVault` revert
+///   (e.g. `VaultAlreadyBootstrapped` on a second call).
+/// - [`FfiError::Store`] — engine-side wallet/signing internal failure.
+#[allow(clippy::significant_drop_tightening, clippy::needless_pass_by_value)]
+#[uniffi::export]
+pub fn vault_bootstrap_chain(
+    handle: Arc<VaultHandle>,
+    master_password: Arc<SecretPassword>,
+    config: FfiChainConfig,
+) -> Result<(), FfiError> {
+    // Bridge + zeroize the password (consumed for forward-compat parity
+    // with `vault_add_device`; the bootstrap tx itself does not use it).
+    let mut pw = zeroize::Zeroizing::new(master_password.bytes_for_bridge().to_vec());
+    let secret = SecretBytes::new(std::mem::take(&mut *pw));
+
+    // L4 session gate BEFORE any chain primitive.
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    if vault.state() != pangolin_store::VaultState::Active {
+        return Err(FfiError::Session {
+            message: "vault is not unlocked".to_owned(),
+        });
+    }
+    let active_vault_id = vault.vault_id();
+    let wallet_view = vault.evm_wallet().map_err(store_into_ffi)?;
+    let signer_addr: Address = wallet_view.address();
+    let signer = wallet_view.signer().clone();
+
+    block_on_local(async {
+        let (env, chain_id) = crate::chain_config::ffi_chain_env_and_id(&config.rpc_url)
+            .await
+            .map_err(chain_into_ffi)?;
+        let contract = load_deployed_address(env, "RevisionLogV2").map_err(chain_into_ffi)?;
+        // Genesis AddDevice @ nonce 0 — the V2 contract's bootstrap
+        // shape (mirrors `bootstrap_vault_v2`'s sig requirements).
+        let fields = DeviceAuthFields {
+            kind: DeviceAuthKind::AddDevice,
+            vault_id: active_vault_id,
+            subject: signer_addr,
+            nonce: 0,
+            schema_version: REVISIONLOG_V2_SCHEMA_VERSION,
+        };
+        let signed_auth = build_signed_device_auth(&signer, fields, contract, chain_id)
+            .map_err(chain_into_ffi)?;
+        let wallet = pangolin_chain::EvmWallet::from_signer(signer.clone());
+        bootstrap_vault_v2(&wallet, signer_addr, &signed_auth, env, &config.rpc_url)
+            .await
+            .map_err(chain_into_ffi)?;
+        Ok::<(), FfiError>(())
+    })??;
+
+    drop(secret);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // 5. vault_add_device — MANAGER role (the THIS-IS-THE-CONFIRMATION step)
 // ---------------------------------------------------------------------------
 
@@ -564,15 +656,18 @@ pub fn vault_add_device(
             message: "vault is not unlocked".to_owned(),
         });
     }
-    // Cross-vault replay defense: the payload's vault_id MUST equal the
-    // active vault's (the new device claims to be joining THIS vault).
+    // The new device's payload carries its OWN local vault_id (per
+    // `pairing_begin_new_device`'s documented design — B adopts the
+    // joining vault's id later in step 3 via `pairing_open_and_join` →
+    // `Vault::install_paired_vdk`'s atomic re-key). The cryptographic
+    // anti-attacker defense is the SAS comparison (mismatched code if a
+    // MITM substituted a pubkey) plus the seal binding (the VDK seal is
+    // bound to A's vault_id + B's device_id + B's pairing pubkey
+    // engine-side below — an attacker who substituted their pubkey
+    // would still be caught by the SAS). No vault_id comparison here:
+    // user-error UX safety ("am I adding B to the right vault?") is the
+    // host's job (e.g. a confirmation dialog before this call).
     let active_vault_id = vault.vault_id();
-    if payload.vault_id != active_vault_id {
-        return Err(FfiError::Validation {
-            kind: "argument".into(),
-            message: "pairing payload vault_id does not match the active vault".into(),
-        });
-    }
 
     // Pull the manager's signer out of the active session — never
     // crosses FFI (mirrors `vault_lock_with_drain` / `vault_pull_once`).
@@ -580,20 +675,23 @@ pub fn vault_add_device(
 
     // Drive the chain ops on a local current-thread runtime (the
     // `!Send` futures rule — same as the rotation_ffi / sync_status
-    // bindings). `ChainEnv` is hardcoded `BaseSepolia` (testnet-only /
-    // D-011, never crossed FFI); the signing `chain_id` is the pinned
-    // 84_532 (`env.chain_id().expect(...)` — `BaseSepolia` always has
-    // a pinned id, the `expect` cannot fire in production paths).
-    let env = ChainEnv::BaseSepolia;
-    let contract = load_deployed_address(env, "RevisionLogV2").map_err(chain_into_ffi)?;
-    let chain_id = env.chain_id().expect("BaseSepolia has a pinned chain_id");
+    // bindings). `(env, chain_id)` are resolved via
+    // [`crate::chain_config::ffi_chain_env_and_id`]: production builds
+    // hardcode `BaseSepolia` + its pinned chain_id (testnet-only /
+    // D-011, never crossed FFI); the `integration-tests` feature
+    // (compiled OUT of shipped builds) opts into the `test_env` seam so
+    // anvil-driven FFI E2Es can target `ChainEnv::Dev`.
     let new_signer_addr: Address = Address::from(payload.signer);
     // Note: `config.deployment_path` is unused on this binding (chain_id
-    // + contract address resolve via the pinned `BaseSepolia` env path);
-    // it is accepted in the Record for forward-compatibility with the
-    // other chain bindings (`vault_lock_with_drain` etc.) so the host
-    // surface stays uniform.
+    // + contract address resolve via the env path, NOT a host-supplied
+    // file); it is accepted in the Record for forward-compatibility with
+    // the other chain bindings (`vault_lock_with_drain` etc.) so the
+    // host surface stays uniform.
     block_on_local(async {
+        let (env, chain_id) = crate::chain_config::ffi_chain_env_and_id(&config.rpc_url)
+            .await
+            .map_err(chain_into_ffi)?;
+        let contract = load_deployed_address(env, "RevisionLogV2").map_err(chain_into_ffi)?;
         let nonce = read_device_nonce_v2(env, &config.rpc_url, active_vault_id)
             .await
             .map_err(chain_into_ffi)?;
@@ -935,22 +1033,74 @@ mod tests {
         assert!(matches!(err, FfiError::Validation { ref kind, .. } if kind == "argument"));
     }
 
-    /// `vault_add_device` rejects a payload whose `vault_id` does NOT
-    /// match the active vault (cross-vault replay defense, BEFORE any
-    /// chain primitive runs).
+    /// `vault_add_device` ACCEPTS a payload whose `vault_id` is B's own
+    /// (the new device's local `.pvf` id BEFORE it adopts A's id) — per
+    /// `pairing_begin_new_device`'s documented design: B carries its own
+    /// vault_id in the payload + adopts A's later in step 3 via
+    /// `pairing_open_and_join`. The cryptographic anti-attacker defense
+    /// is the SAS comparison + the engine-side seal binding to A's
+    /// vault_id; the FFI does NOT compare the payload's vault_id against
+    /// A's (user-error UX safety is a host-layer concern). This test
+    /// asserts the binding proceeds PAST the pre-chain validation gates
+    /// + into the chain step (which fails with `FfiError::Chain` against
+    /// the `bogus_config()` rpc — a previous version returned a
+    /// pre-chain `FfiError::Validation` for the same payload, so this
+    /// test bites if a future refactor reintroduces the dropped check).
     #[test]
-    fn vault_add_device_rejects_cross_vault_payload() {
+    fn vault_add_device_proceeds_past_dropped_cross_vault_check() {
         let dir_a = tempfile::TempDir::new().unwrap();
         let dir_b = tempfile::TempDir::new().unwrap();
         let h_a = unlocked_handle(&dir_a, "a.pvf");
         let h_b = unlocked_handle(&dir_b, "b.pvf");
-        // B's payload carries B's vault_id — NOT A's.
+        // B's payload carries B's own vault_id (NOT A's — the documented
+        // design). Previously the binding rejected with Validation; now
+        // it proceeds to the chain read, which fails on the bogus rpc.
         let p_b = pairing_begin_new_device(h_b).unwrap();
         let err = vault_add_device(h_a, SecretPassword::new(pwd_bytes()), bogus_config(), p_b)
             .unwrap_err();
         assert!(
-            matches!(err, FfiError::Validation { ref kind, .. } if kind == "argument"),
-            "expected cross-vault rejection, got {err:?}"
+            matches!(err, FfiError::Chain { .. }),
+            "expected chain failure (binding proceeded past the dropped cross-vault gate), got {err:?}"
+        );
+    }
+
+    /// `vault_bootstrap_chain` on a locked vault → `Session` (L4 gate
+    /// BEFORE any chain primitive — mirrors `vault_add_device`'s gate).
+    #[test]
+    fn vault_bootstrap_chain_rejects_locked_before_chain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "v.pvf");
+        {
+            let mut g = h.lock_vault();
+            g.as_mut().unwrap().lock();
+        }
+        let err =
+            vault_bootstrap_chain(h, SecretPassword::new(pwd_bytes()), bogus_config()).unwrap_err();
+        assert!(matches!(err, FfiError::Session { .. }));
+    }
+
+    /// `vault_bootstrap_chain` on a placeholder handle → `Session`.
+    #[test]
+    fn vault_bootstrap_chain_rejects_placeholder() {
+        let empty = VaultHandle::new_placeholder();
+        let err = vault_bootstrap_chain(empty, SecretPassword::new(pwd_bytes()), bogus_config())
+            .unwrap_err();
+        assert!(matches!(err, FfiError::Session { .. }));
+    }
+
+    /// `vault_bootstrap_chain` on an unlocked vault PROCEEDS past the L4
+    /// gate + fails at the chain step against a bogus RPC. Confirms the
+    /// binding actually reaches the chain side (the L4 gate is not the
+    /// only thing keeping it in `Session` territory).
+    #[test]
+    fn vault_bootstrap_chain_proceeds_to_chain_step_when_unlocked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "v.pvf");
+        let err =
+            vault_bootstrap_chain(h, SecretPassword::new(pwd_bytes()), bogus_config()).unwrap_err();
+        assert!(
+            matches!(err, FfiError::Chain { .. }),
+            "expected chain failure once the L4 gate is cleared, got {err:?}"
         );
     }
 

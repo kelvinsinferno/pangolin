@@ -144,3 +144,36 @@ pub(crate) fn pull_into_ffi(err: pangolin_store::PullError) -> FfiError {
         }
     }
 }
+
+/// Resolve the chain `(env, chain_id)` pair every FFI chain binding uses.
+///
+/// **Production (no `integration-tests` feature)**: hardcoded
+/// [`pangolin_chain::ChainEnv::BaseSepolia`] + its pinned `chain_id`
+/// (`84_532`). Defense-in-depth: dev/anvil mode is NEVER reachable
+/// from a shipped binary; the host cannot opt into a different chain
+/// even if compromised. This is the L1 "testnet-only / D-011" invariant.
+///
+/// **With `integration-tests`**: consults `PANGOLIN_CHAIN_ENV` via the
+/// `pangolin_chain::test_env` seam so anvil-driven FFI E2Es can target
+/// `ChainEnv::Dev` + the locally-deployed contracts. Compiled OUT of
+/// production builds by the cfg gate; cannot leak.
+#[cfg(feature = "integration-tests")]
+pub(crate) async fn ffi_chain_env_and_id(
+    rpc_url: &str,
+) -> Result<(pangolin_chain::ChainEnv, u64), pangolin_chain::ChainError> {
+    let env = pangolin_chain::test_env::target_chain_env();
+    let chain_id = pangolin_chain::test_env::resolve_signing_chain_id(env, rpc_url).await?;
+    Ok((env, chain_id))
+}
+
+#[cfg(not(feature = "integration-tests"))]
+#[allow(clippy::unused_async)] // signature unified with the integration-tests path
+pub(crate) async fn ffi_chain_env_and_id(
+    _rpc_url: &str,
+) -> Result<(pangolin_chain::ChainEnv, u64), pangolin_chain::ChainError> {
+    let env = pangolin_chain::ChainEnv::BaseSepolia;
+    let chain_id = env
+        .chain_id()
+        .expect("BaseSepolia has a pinned chain_id (84_532)");
+    Ok((env, chain_id))
+}

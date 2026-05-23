@@ -11604,6 +11604,110 @@ mod tests {
         );
     }
 
+    /// **#106e-2 LOW-1 / install_paired_vdk atomicity discrimination.**
+    /// The fault-injection regression for `Vault::install_paired_vdk`'s
+    /// single-transaction property: if the device-key re-seal fails AFTER
+    /// the meta write inside the SAME `unchecked_transaction()`, the tx
+    /// drops without committing → SQLite rolls back both writes → the
+    /// vault stays on the OLD meta (the OLD password still opens) and
+    /// has NOT adopted the new `vault_id`.
+    ///
+    /// The fault is injected by renaming the `device_key` table out of
+    /// the way before the call — `device::reseal_device_key_tx`'s
+    /// `read_device_key_row` SELECT hits "no such table: device_key" →
+    /// propagates `StoreError::Sqlite`
+    /// through `install_paired_vdk`'s `?`. The tx (held in scope inside
+    /// `install_paired_vdk`) `Drop`s without commit → rollback (L4).
+    ///
+    /// **Discrimination:** if a future refactor splits the
+    /// `meta::write` + `device::reseal_device_key_tx` into SEPARATE
+    /// transactions, the meta write would land + the reseal would still
+    /// fail → the OLD password would NO LONGER open (it was overwritten
+    /// to the new wrap authority) AND the vault_id would have been
+    /// adopted → the assertions below go RED.
+    #[test]
+    #[allow(clippy::doc_markdown)]
+    fn install_paired_vdk_rolls_back_meta_when_device_reseal_fails() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "install-paired-fault.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        v.unlock(&fresh_presence(), &fresh_pin()).unwrap();
+        let original_vault_id = v.vault_id();
+
+        // Inject the fault: rename the `device_key` table so the upcoming
+        // `device::reseal_device_key_tx` SELECT inside `install_paired_vdk`'s
+        // single tx hits "no such table" AFTER the `meta::write` succeeds.
+        // This forces the tx to drop without commit → rollback (L4).
+        v.conn
+            .execute(
+                "ALTER TABLE device_key RENAME TO device_key_fault_inject",
+                [],
+            )
+            .expect("rename device_key");
+
+        // The host-supplied (post-pairing) recovered VDK + new vault_id + the
+        // user's chosen post-pair password. None of this gets persisted
+        // because the tx will roll back.
+        let recovered_vdk = VdkKey::generate();
+        let new_vault_id: [u8; VAULT_ID_LEN] = [0xCC; VAULT_ID_LEN];
+        let new_password = SecretBytes::new(b"post-pair master pw".to_vec());
+
+        let err = v
+            .install_paired_vdk(recovered_vdk, new_vault_id, &new_password)
+            .expect_err("install_paired_vdk must fail when reseal hits a missing device_key table");
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "expected StoreError::Sqlite from the missing device_key table, got {err:?}"
+        );
+
+        // Restore the schema so we can reopen the vault file and assert
+        // the persisted state.
+        v.conn
+            .execute(
+                "ALTER TABLE device_key_fault_inject RENAME TO device_key",
+                [],
+            )
+            .expect("restore device_key table");
+        drop(v);
+
+        let mut v2 = Vault::open(&p).unwrap();
+
+        // L4 ROLLBACK: the OLD password STILL opens (the meta write
+        // rolled back; the wrap authority is unchanged).
+        v2.unlock(&fresh_presence(), &fresh_pin()).expect(
+            "OLD password must still open — install_paired_vdk's meta::write must have \
+             rolled back when reseal failed",
+        );
+        assert_eq!(v2.state(), VaultState::Active);
+
+        // L4 ROLLBACK: the vault_id was NOT adopted (rollback restored
+        // the original vault_id in the meta row).
+        assert_eq!(
+            v2.vault_id(),
+            original_vault_id,
+            "vault_id must NOT have been adopted on rollback",
+        );
+        assert_ne!(
+            v2.vault_id(),
+            new_vault_id,
+            "vault_id must NOT be the rolled-back-attempted new_vault_id",
+        );
+
+        // The NEW post-pair password must NOT open (no half-joined state
+        // where the meta got partially updated).
+        let new_pw_err = v2
+            .unlock(
+                &fresh_presence(),
+                &PinIdentityProof::new(SecretBytes::new(b"post-pair master pw".to_vec())),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(new_pw_err, StoreError::AuthenticationFailed),
+            "new password must NOT open the rolled-back vault, got {new_pw_err:?}",
+        );
+    }
+
     /// L8: the NORMAL device-add / re-unlock path uses the EXISTING
     /// password and never invokes the recovery branch — re-unlocking with
     /// the same password leaves the wrap authority unchanged (no rotation,

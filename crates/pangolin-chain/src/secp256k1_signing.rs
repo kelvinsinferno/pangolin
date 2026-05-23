@@ -677,17 +677,22 @@ mod tests {
     ) -> Result<Address, alloy::primitives::SignatureError> {
         let verifying_contract = match chain_env {
             ChainEnv::BaseSepolia => EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA,
-            _ => {
-                // For non-Sepolia envs the test cross-check derives
-                // the verifyingContract via the same load helper the
-                // production path uses, so domain construction
-                // matches. If the file is missing we fall back to
-                // the all-zero address; the only caller using
-                // non-Sepolia in tests is `wrong_chain_id_produces_different_signer`,
-                // which deliberately swaps env and expects a different
-                // signer regardless.
-                load_deployed_address(chain_env, "RevisionLogV1").unwrap_or(Address::ZERO)
-            }
+            // Non-Sepolia envs (only `Dev` in tests today) deliberately
+            // use the all-zero verifying contract — the signing side in
+            // `wrong_chain_id_produces_different_signer` hardcodes
+            // `Address::ZERO`, so the recovery side must match it
+            // byte-identically. Previously we loaded
+            // `RevisionLogV1` from a deployment file with a fallback to
+            // `Address::ZERO`, but when the anvil harness has populated
+            // `contracts/deployments/dev.json` (e.g. a parallel
+            // integration-test run) the loaded address is non-zero
+            // and the recovered digest silently shifts — the test
+            // assertion `recovered_dev_under_dev == wallet.address()`
+            // then fails. Pinning the verifying contract to `Address::ZERO`
+            // for Dev removes the harness-state race; the test still
+            // exercises the chain-id-binding property it was written
+            // to assert.
+            _ => Address::ZERO,
         };
         // Mirror the pre-#101 `env.chain_id().unwrap_or(0)` resolution
         // so this test helper's recovered digest is byte-identical to

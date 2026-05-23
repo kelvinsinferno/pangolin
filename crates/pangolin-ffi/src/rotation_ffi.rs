@@ -155,11 +155,16 @@ pub fn vault_complete_rotation(
 
     // The borrow dance (Q-b): the live-set read is ASYNC (block_on_local) but
     // `complete_rotation` is SYNC. Read the set FIRST into an owned Vec
-    // (releasing the chain borrow), THEN run the sync composition. ChainEnv is
-    // hardcoded BaseSepolia (testnet-only / D-011; not crossed FFI). The read
-    // is FAIL-CLOSED: any chain error → FfiError::Chain, never an empty set.
-    let env = pangolin_chain::ChainEnv::BaseSepolia;
+    // (releasing the chain borrow), THEN run the sync composition. `env` is
+    // resolved via [`crate::chain_config::ffi_chain_env_and_id`]: production
+    // hardcodes BaseSepolia (testnet-only / D-011; not crossed FFI); the
+    // `integration-tests` feature opts into `ChainEnv::Dev` via the
+    // `test_env` seam. The read is FAIL-CLOSED: any chain error →
+    // FfiError::Chain, never an empty set.
     let current_set: Vec<[u8; SIGNER_LEN]> = crate::chain_config::block_on_local(async {
+        let (env, _chain_id) = crate::chain_config::ffi_chain_env_and_id(&config.rpc_url)
+            .await
+            .map_err(crate::chain_config::chain_into_ffi)?;
         pangolin_chain::read_authorized_set_v2(env, &config.rpc_url, vault_id, 0)
             .await
             .map(|addrs| {
