@@ -40,6 +40,15 @@ pangolin-store  = { path = "../pangolin-store" }
 pangolin-crypto = { path = "../pangolin-crypto" }
 thiserror       = { workspace = true }
 zeroize         = { workspace = true }
+# MVP-3 issue #106e-2 — the pairing-payload TRANSPORT codec appends a
+# 4-byte truncated-SHA-256 checksum to its text form (transcription-error
+# detection). `sha2` is already pulled at the workspace level via
+# `pangolin-crypto`; naming it here directly adds NO new external crate
+# (it is in `Cargo.lock` already). Dependency arrow stays core → ... ; the
+# `pangolin-core` crate does NOT gain any new transitive that could pull
+# `uniffi` (sha2 is uniffi-free; the `cargo tree -p pangolin-core | grep
+# -ci uniffi` invariant from `lib.rs` is held).
+sha2            = { workspace = true }
 # MVP-1 issue 1.8 — zxcvbn-style password-strength estimator for
 # arbitrary (typed/imported) passwords. A heuristic estimator (not a
 # parser of attacker-structured data), so it lives in `pangolin-core`'s

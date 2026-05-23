@@ -86,6 +86,13 @@ struct_excessive_bools = "allow"
 default = []
 uniffi-cli = ["uniffi/cli"]
 cbindgen-cli = ["dep:cbindgen"]
+# MVP-3 issue #106e-2: gates the coupled FFI-layer device-add anvil E2E
+# (`tests/anvil_pairing_e2e.rs`). Pulls `pangolin-chain`'s
+# `integration-tests` feature (for the `test_env` seam); `#[ignore]`'d
+# + `#[cfg(feature = "integration-tests")]`-gated so it never runs in
+# default `cargo test`. Driven by `scripts/anvil-ci.sh` like the #106c
+# core anvil E2E.
+integration-tests = ["pangolin-chain/integration-tests"]
 
 [dependencies]
 # Workspace-internal dependencies: the FFI surface re-exports / wraps

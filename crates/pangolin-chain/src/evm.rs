@@ -288,6 +288,27 @@ impl EvmWallet {
     pub fn into_signer(self) -> PrivateKeySigner {
         self.signer
     }
+
+    /// **MVP-3 issue #106e-2.** Construct an [`EvmWallet`] from an
+    /// existing alloy [`PrivateKeySigner`].
+    ///
+    /// The inverse of [`Self::into_signer`]. Used by the #106e-2 device-
+    /// add FFI binding (`pangolin_ffi::pairing::vault_add_device`): the
+    /// FFI clones the signer off the active session's `EvmWallet`
+    /// engine-side (the secret material never crosses FFI), then needs
+    /// to thread it back through `add_device_v2`'s `&EvmWallet`
+    /// parameter — this constructor avoids re-running the HKDF /
+    /// rejection-sample derivation (`derive_evm_wallet`) just to
+    /// reconstruct the wrapper. The signer's secp256k1 scalar is the
+    /// same one already in the active session; the resulting
+    /// `EvmWallet` is byte-for-byte equivalent to the source.
+    ///
+    /// NOT a host input — only crate-internal callers (with engine-
+    /// side access to a `PrivateKeySigner`) construct one this way.
+    #[must_use]
+    pub fn from_signer(signer: PrivateKeySigner) -> Self {
+        Self { signer }
+    }
 }
 
 impl core::fmt::Debug for EvmWallet {
