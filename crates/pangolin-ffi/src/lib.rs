@@ -72,6 +72,13 @@ pub mod kdbx;
 /// merged #106c chain primitives + the #106e-2 transport codec / SAS.
 pub mod pairing;
 pub mod publish_queue;
+/// **MVP-3 issue #109.** Thin uniffi layer over the
+/// [`pangolin_store::recovery_backup`] envelope codec: generate +
+/// seal a recovery backup under a 24-word BIP-39 seed phrase, decode
+/// the metadata of an existing backup, and the lost-everything
+/// `recover-from-backup` convenience that decodes + drives
+/// [`pangolin_core::composition::recover_from_shares`].
+pub mod recovery_backup;
 pub mod recovery_ffi;
 /// **MVP-3 issue #108.** Thin uniffi layer over the `RecoveryV1`
 /// on-chain lifecycle (`setGuardianSet` / `initiate` / `approve` /
@@ -156,6 +163,14 @@ pub use recovery_ffi::{
     vault_guardian_open_share, vault_onboard_guardians, vault_recover_from_shares,
     FfiGuardianRoster, FfiOnboardingResult, FfiOpenedShare, FfiRecoveryResult,
     RECOVERY_FFI_SCHEMA_VERSION,
+};
+// MVP-3 issue #109: recovery-backup FFI surface — generate + seal,
+// decode, and recover-from-backup convenience. Wraps the merged
+// `pangolin_store::recovery_backup` codec; the seed phrase is the
+// ONE secret that crosses out at create time (and back in at decode).
+pub use recovery_backup::{
+    vault_create_backup, vault_decode_backup, vault_recover_from_backup, FfiBackup,
+    FfiBackupContents, RECOVERY_BACKUP_FFI_SCHEMA_VERSION,
 };
 // MVP-3 issue #106e-1: rotation FFI surface — pending-rotation read +
 // engine-reads-the-live-set complete-rotation (§0a Q-b, fail-closed).

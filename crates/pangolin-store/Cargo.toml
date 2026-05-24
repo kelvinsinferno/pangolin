@@ -90,6 +90,15 @@ static_assertions = { workspace = true }
 # of `pangolin-store` so the move doesn't affect their trees.
 tokio    = { workspace = true }
 
+# MVP-3 issue #109: SHA-256 for the recovery-backup envelope's
+# 4-byte integrity hash (outer wrapper) + the BIP-39 entropy →
+# checksum derivation in `recovery_backup::bip39_words_from_entropy`.
+# Already pulled at workspace level (same `=0.10.9` pin pangolin-crypto
+# uses for its pairing-payload SHA-256); listing it here is a
+# direct-dep declaration so this crate's recovery_backup module can
+# import `sha2::{Digest, Sha256}` without going through pangolin-crypto.
+sha2     = { workspace = true }
+
 # P11B fix-pass M-1: safe wrapper around POSIX `umask(2)` so
 # `Vault::create` can install a `0o077` umask BEFORE the `.pvf` file
 # is created on disk, structurally eliminating the world-readable

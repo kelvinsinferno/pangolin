@@ -322,6 +322,16 @@ pub enum StoreError {
     /// from "we couldn't read from chain".
     #[error("chain sync error: {0}")]
     ChainSyncError(ChainError),
+
+    /// **MVP-3 issue #109.** Surfaced by
+    /// [`crate::Vault::create_recovery_backup`] when the encrypted-
+    /// envelope build path ([`crate::recovery_backup::seal_backup`] /
+    /// [`crate::recovery_backup::generate_seed_phrase`]) returns an
+    /// error. Wraps the typed [`crate::recovery_backup::BackupError`]
+    /// without flattening so the host can distinguish KDF / AEAD /
+    /// wire-format failure classes if it wants to.
+    #[error("recovery-backup envelope: {0}")]
+    RecoveryBackup(crate::recovery_backup::BackupError),
 }
 
 impl StoreError {

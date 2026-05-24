@@ -108,7 +108,7 @@ impl FfiOpenedShare {
     /// dropped every other clone — see [`vault_recover_from_shares`]). The
     /// `Share`'s zeroizing buffer is preserved across the move (no copy of
     /// the scalar leaves a redacted boundary).
-    fn into_inner(self: Arc<Self>) -> Result<Share, FfiError> {
+    pub(crate) fn into_inner(self: Arc<Self>) -> Result<Share, FfiError> {
         Arc::try_unwrap(self)
             .map(|s| s.inner)
             .map_err(|_| FfiError::Validation {
@@ -198,7 +198,7 @@ pub struct FfiOnboardingResult {
 /// The reconstructed wrapper authenticates only when the recovery driver
 /// unwraps it under the reconstructed RWK + this exact `WrapContext`; a
 /// tampered/short blob fails closed there (or here on a length check).
-fn decode_wrapped_recovery(
+pub(crate) fn decode_wrapped_recovery(
     bytes: &[u8],
     vault_id: [u8; VAULT_ID_LEN],
 ) -> Result<WrappedVdkRecovery, FfiError> {
