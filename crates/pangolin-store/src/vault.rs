@@ -8175,12 +8175,16 @@ impl Vault {
             epoch: current_epoch,
             threshold: escrow.threshold,
             guardian_count: escrow.guardian_count,
-            guardian_x25519_pubs: escrow.guardians.iter().map(|g| g.guardian_x25519_pub).collect(),
+            guardian_x25519_pubs: escrow
+                .guardians
+                .iter()
+                .map(|g| g.guardian_x25519_pub)
+                .collect(),
             vault_display_name: String::new(),
             created_at_unix,
         };
-        let seed_phrase = crate::recovery_backup::generate_seed_phrase()
-            .map_err(StoreError::RecoveryBackup)?;
+        let seed_phrase =
+            crate::recovery_backup::generate_seed_phrase().map_err(StoreError::RecoveryBackup)?;
         let bytes = crate::recovery_backup::seal_backup(&contents, seed_phrase.as_slice())
             .map_err(StoreError::RecoveryBackup)?;
         Ok(Some((seed_phrase, bytes)))
