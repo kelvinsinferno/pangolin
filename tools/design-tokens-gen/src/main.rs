@@ -408,8 +408,7 @@ fn walk_color(obj: &serde_json::Map<String, Value>) -> Result<Vec<Token>, Genera
                     let collapsed_rust = rust_ident_from_css(&collapsed_css);
                     let light =
                         leaf_from_json(&format!("color.{group}.{key}.light"), &pair["light"])?;
-                    let dark =
-                        leaf_from_json(&format!("color.{group}.{key}.dark"), &pair["dark"])?;
+                    let dark = leaf_from_json(&format!("color.{group}.{key}.dark"), &pair["dark"])?;
                     out.push(Token {
                         css_name: collapsed_css.clone(),
                         rust_name: format!("{collapsed_rust}_LIGHT"),
