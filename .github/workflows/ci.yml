@@ -78,6 +78,40 @@ jobs:
       - run: cargo test --workspace --all-targets
 
   # -----------------------------------------------------------------
+  # MVP-4-A: design-tokens up-to-date gate
+  # -----------------------------------------------------------------
+  #
+  # Plan-LOCK: docs/issue-plans/mvp4-a-design-tokens.md §6 + success
+  # criterion #3 — the dist files (`apps/design-tokens/dist/tokens.css`
+  # + `apps/design-tokens/src/lib.rs`) MUST be byte-identical to what
+  # `cargo run -p design-tokens-gen` produces from the committed
+  # `tokens.json`. This job catches a designer editing the JSON
+  # without re-running the generator. Mirrors the existing job pattern
+  # (Swatinem cache, `prefix-key: "v1"`, `cache-bin: "false"`).
+  design-tokens-up-to-date:
+    name: design-tokens / up-to-date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1"
+          cache-bin: "false"
+      - name: Regenerate design-tokens dist artifacts
+        run: cargo run -p design-tokens-gen
+      # If the generator produced anything different from what's
+      # committed, the dist files drifted from tokens.json — fail
+      # CI with a clear message that points at the fix.
+      - name: Assert dist files are up to date
+        run: |
+          if ! git diff --exit-status apps/design-tokens/dist apps/design-tokens/src/lib.rs; then
+            echo "::error::design-tokens dist artifacts are out of date."
+            echo "::error::Re-run: cargo run -p design-tokens-gen && commit apps/design-tokens/dist + apps/design-tokens/src/lib.rs"
+            exit 1
+          fi
+
+  # -----------------------------------------------------------------
   # P5-1: contracts pipeline
   # -----------------------------------------------------------------
 

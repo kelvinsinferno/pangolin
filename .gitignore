@@ -19,6 +19,12 @@ dist/
 build/
 .next/
 .turbo/
+# MVP-4-A: apps/design-tokens/dist/ holds GENERATED-but-COMMITTED
+# artifacts (so PR review can eyeball the diff against the JSON source;
+# CI gates them via `cargo run -p design-tokens-gen` +
+# `git diff --exit-status`). Exception to the catch-all `dist/` above.
+!apps/design-tokens/dist/
+!apps/design-tokens/dist/**
 
 # Tauri
 apps/desktop/src-tauri/target/

@@ -1,0 +1,21 @@
+[package]
+name = "pangolin-design-tokens"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "pangolin-design-tokens — generated Rust constants module exposing every UI design token (colors, typography, spacing, radius, elevation, motion). Generated from apps/design-tokens/tokens.json by `cargo run -p design-tokens-gen`; DO NOT edit src/lib.rs by hand. See docs/issue-plans/mvp4-a-design-tokens.md."
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Intentionally none — this crate is the GENERATED output of
+# `design-tokens-gen`. It exposes only `pub const` strings/integers, so
+# it has no runtime dependencies. Anything else would be drift.
