@@ -90,6 +90,7 @@ These ship in MVP-4's second 2–3 weeks; sub-plan-LOCKs drafted as they're disp
 - **Settings + KDBX import UI** — wraps the existing pangolin-kdbx + reveal/export flows.
 - **First closed-beta-feedback iteration** — Kelvin-driven; beta-list mechanics settled here.
 - **Firefox + Safari extension targets** — slip to MVP-4.5 if time tight.
+- **MVP-4-H secure-input plugin (pre-mainnet hardening)** — upgrade the password-field IPC posture from the staged option-1 (Tauri `invoke()` — password string lingers in V8 heap until GC) to option-2 (native Rust input widget via custom Tauri plugin — password never enters JS / V8 heap). Required BEFORE mainnet; ships alongside D-011 audit fixes. Decision rationale captured in the `pangolin_secure_input.md` memory entry. Per-OS native-widget work (Windows / macOS / Linux); ~1-2 weeks engineering + own audit surface.
 
 ## 2. Splittable? — yes, ALWAYS split by sub-issue
 
