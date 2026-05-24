@@ -112,6 +112,50 @@ jobs:
           fi
 
   # -----------------------------------------------------------------
+  # MVP-4-C: browser-extension scaffold (apps/extension/)
+  # -----------------------------------------------------------------
+  #
+  # Plan-LOCK: docs/issue-plans/mvp4-c-extension-scaffold.md §1 +
+  # success criteria §7. Runs pnpm install --frozen-lockfile + the four
+  # script gates (typecheck/lint/test/build) + a manifest smoke parse
+  # against the built dist/manifest.json. Node version pinned via the
+  # extension's .nvmrc; pnpm cache keyed off the extension's lockfile.
+  extension:
+    name: extension / scaffold
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # pnpm 11 matches the version pnpm-workspace.yaml's `allowBuilds`
+      # block targets (introduced in pnpm 11). Bump in lockstep when
+      # local dev moves.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: 'apps/extension/.nvmrc'
+          cache: 'pnpm'
+          cache-dependency-path: 'apps/extension/pnpm-lock.yaml'
+      - name: pnpm install --frozen-lockfile
+        working-directory: apps/extension
+        run: pnpm install --frozen-lockfile
+      - name: pnpm typecheck
+        working-directory: apps/extension
+        run: pnpm typecheck
+      - name: pnpm lint
+        working-directory: apps/extension
+        run: pnpm lint
+      - name: pnpm test
+        working-directory: apps/extension
+        run: pnpm test
+      - name: pnpm build
+        working-directory: apps/extension
+        run: pnpm build
+      - name: Manifest smoke parse (MV3 + service_worker present)
+        working-directory: apps/extension
+        run: node -e "const m=JSON.parse(require('fs').readFileSync('dist/manifest.json')); if(m.manifest_version!==3) throw new Error('manifest_version not 3'); if(!m.background?.service_worker) throw new Error('service_worker missing');"
+
+  # -----------------------------------------------------------------
   # P5-1: contracts pipeline
   # -----------------------------------------------------------------
 
