@@ -1,0 +1,102 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+.pcl-popup-root {
+  width: 340px;
+  padding: var(--space-4);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-family: var(--font-family-sans);
+  font-size: var(--font-size-base);
+  line-height: var(--font-line-height-base);
+  box-sizing: border-box;
+}
+
+.pcl-popup-brand {
+  margin: 0 0 var(--space-4) 0;
+  font-size: var(--font-size-xl);
+  font-weight: var(--font-weight-bold);
+  color: var(--color-text);
+}
+
+.pcl-popup-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+.pcl-popup-status-dot {
+  display: inline-block;
+  width: var(--space-3);
+  height: var(--space-3);
+  border-radius: var(--radius-full);
+  border: 1px solid var(--color-text-muted);
+  background: transparent;
+  flex-shrink: 0;
+}
+
+.pcl-popup-status-dot[data-connected="true"] {
+  background: var(--color-success);
+  border-color: var(--color-success);
+}
+
+.pcl-popup-body {
+  margin-bottom: var(--space-4);
+}
+
+.pcl-placeholder-card {
+  background: var(--color-surface-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+}
+
+.pcl-placeholder-text {
+  margin: 0 0 var(--space-2) 0;
+}
+
+.pcl-placeholder-text:last-child {
+  margin-bottom: 0;
+}
+
+.pcl-placeholder-text-heading {
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text);
+  line-height: var(--font-line-height-tight);
+}
+
+.pcl-placeholder-text-body {
+  font-size: var(--font-size-base);
+  color: var(--color-text);
+}
+
+.pcl-placeholder-text-muted {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+.pcl-placeholder-button {
+  display: inline-block;
+  padding: var(--space-2) var(--space-4);
+  border: none;
+  border-radius: var(--radius-md);
+  background: var(--color-accent-primary);
+  color: var(--color-surface);
+  font-family: var(--font-family-sans);
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-semibold);
+  cursor: pointer;
+  transition: background var(--motion-duration-fast) var(--motion-easing-standard);
+}
+
+.pcl-placeholder-button:hover:not(:disabled) {
+  background: var(--color-accent-primary-hover);
+}
+
+.pcl-placeholder-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
