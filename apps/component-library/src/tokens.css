@@ -1,0 +1,8 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/* Re-export the design-tokens layer via a relative path. The
+   apps/design-tokens/dist/tokens.css file is a committed, generated
+   artifact (see apps/design-tokens/ — the gate keeps it in sync with
+   the JSON source). Every component in this library reads its visual
+   values from the CSS custom properties this file emits; NO component
+   hard-codes a color, spacing, radius, font, or motion value. */
+@import url('../../design-tokens/dist/tokens.css');

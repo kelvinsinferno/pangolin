@@ -112,6 +112,46 @@ jobs:
           fi
 
   # -----------------------------------------------------------------
+  # MVP-4-D: component library (React + TypeScript + Vite + Storybook)
+  # -----------------------------------------------------------------
+  #
+  # Plan-LOCK: docs/issue-plans/mvp4-d-component-library.md §6 — runs
+  # `pnpm install --frozen-lockfile`, `pnpm typecheck`, `pnpm lint`,
+  # `pnpm test` (vitest + @testing-library/react), `pnpm storybook:build`
+  # (catches broken stories + axe-core a11y violations), and `pnpm build`
+  # (Vite library mode → ESM + CJS + .d.ts). Uses
+  # `actions/setup-node@v4` with the .nvmrc + pnpm-lockfile cache key,
+  # mirroring the shape of the existing Rust jobs.
+  component-library:
+    name: component-library
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/component-library
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: 'apps/component-library/.nvmrc'
+          cache: 'pnpm'
+          cache-dependency-path: 'apps/component-library/pnpm-lock.yaml'
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+      - name: TypeScript strict typecheck
+        run: pnpm typecheck
+      - name: ESLint
+        run: pnpm lint
+      - name: Vitest (unit + behavior)
+        run: pnpm test
+      - name: Storybook static build (incl. axe-core a11y)
+        run: pnpm storybook:build
+      - name: Vite library build (ESM + CJS + .d.ts)
+        run: pnpm build
+
+  # -----------------------------------------------------------------
   # P5-1: contracts pipeline
   # -----------------------------------------------------------------
 

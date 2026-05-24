@@ -1,0 +1,17 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+.pcl-divider {
+  border: 0;
+  background: var(--color-border);
+  margin: 0;
+}
+
+.pcl-divider--horizontal {
+  height: 1px;
+  width: 100%;
+}
+
+.pcl-divider--vertical {
+  width: 1px;
+  align-self: stretch;
+  min-height: var(--space-4);
+}
