@@ -219,9 +219,8 @@ pub fn vault_create_backup(
     // `Validation { kind = "argument" }` so the host sees a clear
     // "onboard guardians first" signal instead of an opaque inner
     // error.
-    let Some((seed_phrase, bytes)) = vault
-        .create_recovery_backup(&secret)
-        .map_err(|e| match e {
+    let Some((seed_phrase, bytes)) =
+        vault.create_recovery_backup(&secret).map_err(|e| match e {
             pangolin_store::StoreError::RecoveryBackup(be) => backup_into_ffi(be),
             other => FfiError::from(pangolin_core::Error::from(other)),
         })?
@@ -270,8 +269,8 @@ pub fn vault_decode_backup(
     backup_bytes_or_text: Vec<u8>,
     seed_phrase: Vec<String>,
 ) -> Result<FfiBackupContents, FfiError> {
-    let contents = core_decode_backup(&backup_bytes_or_text, &seed_phrase)
-        .map_err(backup_into_ffi)?;
+    let contents =
+        core_decode_backup(&backup_bytes_or_text, &seed_phrase).map_err(backup_into_ffi)?;
     Ok(into_ffi_contents(&contents))
 }
 
@@ -326,8 +325,8 @@ pub fn vault_recover_from_backup(
 ) -> Result<FfiRecoveryResult, FfiError> {
     // Decode the envelope FIRST so the wrong-seed / tampered-envelope
     // case fails before we touch the handle or the opened shares.
-    let contents = core_decode_backup(&backup_bytes_or_text, &seed_phrase)
-        .map_err(backup_into_ffi)?;
+    let contents =
+        core_decode_backup(&backup_bytes_or_text, &seed_phrase).map_err(backup_into_ffi)?;
 
     // Re-decode the wrapped_recovery wire form (schema || nonce ||
     // ciphertext) into a `WrappedVdkRecovery` via the existing
@@ -487,5 +486,202 @@ mod tests {
     fn fixed_bytes_rejects_wrong_length() {
         let r: Result<[u8; VAULT_ID_LEN], FfiError> = fixed_bytes(&[0u8; 31], "vault_id");
         assert!(matches!(r, Err(FfiError::Validation { ref kind, .. }) if kind == "argument"));
+    }
+
+    /// **FFI-LEVEL END-TO-END ROUND-TRIP (plan §1 deliverable; audit MEDIUM #2).**
+    ///
+    /// Drives the FULL recovery-backup lifecycle through the FFI surface
+    /// against a hermetically-onboarded vault:
+    ///
+    /// ```text
+    /// 1. Set up M=3 guardian vaults (each Active, exposes its DeviceKey
+    ///    seed to derive its X25519 SEALING pubkey under test-utilities).
+    /// 2. Create + unlock the main vault.
+    /// 3. vault_onboard_guardians(main, T=2, pubs) — real FFI onboard.
+    /// 4. vault_create_backup(main, master_pw) — get FfiBackup with
+    ///    bytes + text + 24 seed-phrase words.
+    /// 5. vault_decode_backup(bytes, words) — verify metadata round-trips
+    ///    (vault_id, epoch, threshold, guardian_count, pubkey set).
+    /// 6. vault_decode_backup(text-bytes, words) — verify text form also
+    ///    decodes to the same contents (cross-form invariance).
+    /// 7. Read the live sealed shares via
+    ///    __test_recovery_backup_material (the test affordance — host
+    ///    in production carries the sealed shares forward by some
+    ///    out-of-band means; #109 ships the WRAPPED material, not the
+    ///    shares themselves).
+    /// 8. T guardians open their shares via vault_guardian_open_share.
+    /// 9. Fresh "lost-everything" vault (Locked, never recovered).
+    /// 10. vault_recover_from_backup(fresh, bytes, words, opened_shares,
+    ///     new_pw) — drives composition::recover_from_shares against the
+    ///     decoded body. Asserts epoch advances + the NEW password
+    ///     unlocks the recovered vault.
+    /// ```
+    ///
+    /// The load-bearing joins this asserts: the store-side
+    /// `Vault::create_recovery_backup` produces bytes the FFI side
+    /// decodes 1:1; the wire-form `wrapped_recovery` round-trips
+    /// byte-identical through `decode_wrapped_recovery`; the BIP-39
+    /// seed-phrase wrap derives a key the decode can reproduce; the
+    /// composition driver consumes the reconstructed `WrappedVdkRecovery`
+    /// + opened shares + supplied roster and produces a usable vault.
+    #[test]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
+    fn ffi_e2e_create_decode_recover_round_trip() {
+        use crate::recovery_ffi::{vault_guardian_open_share, vault_onboard_guardians};
+        use pangolin_crypto::guardian::derive_x25519_sealing_key;
+        use pangolin_crypto::keys::DeviceKey;
+        use pangolin_store::{PinIdentityProof, PressYPresenceProof, Vault, VaultState};
+
+        const T: u8 = 2;
+        const M: u8 = 3;
+
+        // ---- 1. M guardian vaults ----
+        let g_dirs: Vec<TempDir> = (0..M).map(|_| TempDir::new().unwrap()).collect();
+        let (g_pubs, g_handles): (Vec<[u8; 32]>, Vec<Arc<VaultHandle>>) = g_dirs
+            .iter()
+            .enumerate()
+            .map(|(i, dir)| {
+                let path = dir
+                    .path()
+                    .join("guardian.pvf")
+                    .to_string_lossy()
+                    .into_owned();
+                let pw = SecretPassword::new(format!("guardian {i} pw").into_bytes());
+                vault_create(path.clone(), Arc::clone(&pw)).expect("guardian create");
+                let h = vault_open(path).expect("guardian open");
+                vault_unlock(Arc::clone(&h), Arc::clone(&pw), presence()).expect("guardian unlock");
+                let seed = {
+                    let mut g = h.lock_vault();
+                    let v = g.as_mut().unwrap();
+                    *v.device_key_secret_seed()
+                        .expect("active session exposes the seed (test-utilities)")
+                };
+                let device = DeviceKey::from_seed(seed);
+                let pubkey = *derive_x25519_sealing_key(&device).public_bytes();
+                (pubkey, h)
+            })
+            .unzip();
+
+        // ---- 2-3. Main vault + onboard guardians ----
+        let main_dir = TempDir::new().unwrap();
+        let main_h = unlocked_handle(&main_dir);
+        let main_vault_id: [u8; VAULT_ID_LEN] = {
+            let mut g = main_h.lock_vault();
+            g.as_mut().unwrap().vault_id()
+        };
+        let onboard = vault_onboard_guardians(
+            Arc::clone(&main_h),
+            T,
+            g_pubs.iter().map(|p| p.to_vec()).collect(),
+        )
+        .expect("vault_onboard_guardians");
+
+        // ---- 4. Create the backup ----
+        let backup = vault_create_backup(Arc::clone(&main_h), pwd()).expect("vault_create_backup");
+        assert_eq!(backup.seed_phrase_words.len(), 24, "24-word BIP-39 phrase");
+        assert!(!backup.bytes.is_empty(), "byte form is non-empty");
+        assert!(!backup.text.is_empty(), "text form is non-empty");
+        assert_eq!(backup.schema_version, RECOVERY_BACKUP_FFI_SCHEMA_VERSION);
+
+        // ---- 5. Decode bytes → contents ----
+        let decoded = vault_decode_backup(backup.bytes.clone(), backup.seed_phrase_words.clone())
+            .expect("vault_decode_backup (bytes)");
+        assert_eq!(
+            decoded.vault_id,
+            main_vault_id.to_vec(),
+            "vault id round-trips"
+        );
+        assert_eq!(decoded.threshold, T);
+        assert_eq!(decoded.guardian_count, M);
+        assert_eq!(decoded.epoch, onboard.epoch);
+        assert_eq!(decoded.guardian_x25519_pubs.len(), usize::from(M));
+        for (have, want) in decoded.guardian_x25519_pubs.iter().zip(&g_pubs) {
+            assert_eq!(have, &want.to_vec(), "guardian pubkey round-trips");
+        }
+
+        // ---- 6. Cross-form invariance: text decodes to the same contents ----
+        let decoded_text = vault_decode_backup(
+            backup.text.clone().into_bytes(),
+            backup.seed_phrase_words.clone(),
+        )
+        .expect("vault_decode_backup (text)");
+        assert_eq!(decoded_text.vault_id, decoded.vault_id);
+        assert_eq!(decoded_text.epoch, decoded.epoch);
+
+        // ---- 7. Read the live sealed shares (test-only affordance) ----
+        let sealed_shares: Vec<pangolin_crypto::escrow::SealedShare> = {
+            let mut g = main_h.lock_vault();
+            let (_wrapped, sealed) = g
+                .as_mut()
+                .unwrap()
+                .__test_recovery_backup_material()
+                .expect("read backup material")
+                .expect("escrow present");
+            sealed
+        };
+        assert_eq!(sealed_shares.len(), usize::from(M));
+
+        // ---- 8. T guardians open their shares through the FFI ----
+        let epoch_bytes_v: Vec<u8> = {
+            let mut e = [0u8; pangolin_crypto::escrow::EPOCH_LEN];
+            e[8..].copy_from_slice(&onboard.epoch.to_be_bytes());
+            e.to_vec()
+        };
+        let mut opened: Vec<Arc<FfiOpenedShare>> = Vec::new();
+        for (gh, sealed) in g_handles.iter().zip(&sealed_shares).take(usize::from(T)) {
+            let s = vault_guardian_open_share(
+                Arc::clone(gh),
+                sealed.as_bytes().to_vec(),
+                main_vault_id.to_vec(),
+                epoch_bytes_v.clone(),
+            )
+            .expect("vault_guardian_open_share");
+            opened.push(s);
+        }
+
+        // ---- 9. Fresh lost-everything vault (Locked, never recovered) ----
+        let fresh_dir = TempDir::new().unwrap();
+        let fresh_path = fresh_dir
+            .path()
+            .join("recovered.pvf")
+            .to_string_lossy()
+            .into_owned();
+        Vault::create(
+            std::path::Path::new(&fresh_path),
+            &pangolin_crypto::secret::SecretBytes::new(b"throwaway".to_vec()),
+        )
+        .unwrap();
+        let fresh_v = Vault::open(std::path::Path::new(&fresh_path)).unwrap();
+        let fresh_h = VaultHandle::from_vault(fresh_v);
+
+        // ---- 10. Recover from the backup + assert epoch advanced ----
+        let new_pw = SecretPassword::new(b"post-recovery master pw".to_vec());
+        let result = vault_recover_from_backup(
+            Arc::clone(&fresh_h),
+            backup.bytes,
+            backup.seed_phrase_words,
+            opened,
+            Arc::clone(&new_pw),
+        )
+        .expect("vault_recover_from_backup");
+        assert_eq!(
+            result.new_epoch,
+            onboard.epoch + 1,
+            "the re-split bumps the epoch on recover"
+        );
+
+        // The NEW password unlocks the recovered vault — the load-
+        // bearing proof that the whole pipeline produced a usable
+        // vault.
+        let mut g = fresh_h.lock_vault();
+        let v = g.as_mut().unwrap();
+        assert_eq!(v.state(), VaultState::Locked);
+        let presence_proof = PressYPresenceProof::confirmed();
+        let identity = PinIdentityProof::new(pangolin_crypto::secret::SecretBytes::new(
+            b"post-recovery master pw".to_vec(),
+        ));
+        v.unlock(&presence_proof, &identity)
+            .expect("NEW password unlocks the recovered vault");
+        assert_eq!(v.state(), VaultState::Active);
     }
 }

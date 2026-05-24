@@ -160,8 +160,7 @@ const BIP39_ENTROPY_BYTES: usize = 32;
 
 /// Length of the fixed-size plaintext outer wrapper (everything before
 /// the ciphertext + integrity hash).
-const OUTER_HEADER_LEN: usize =
-    DOMAIN.len() + 1 + 1 + 4 + 4 + 4 + SALT_LEN + NONCE_LEN + 8;
+const OUTER_HEADER_LEN: usize = DOMAIN.len() + 1 + 1 + 4 + 4 + 4 + SALT_LEN + NONCE_LEN + 8;
 
 /// Fixed-offset start of the schema_version byte.
 const OFFSET_SCHEMA_VERSION: usize = DOMAIN.len();
@@ -406,12 +405,21 @@ fn parse_outer_header(bytes: &[u8]) -> Result<(OuterHeader, &[u8]), BackupError>
             message: format!("unsupported backup KDF algorithm: {kdf_algo_id}"),
         });
     }
-    let memory_kib =
-        u32::from_be_bytes(bytes[OFFSET_KDF_MEMORY..OFFSET_KDF_MEMORY + 4].try_into().expect("4 B"));
-    let time_cost =
-        u32::from_be_bytes(bytes[OFFSET_KDF_TIME..OFFSET_KDF_TIME + 4].try_into().expect("4 B"));
-    let parallelism =
-        u32::from_be_bytes(bytes[OFFSET_KDF_PAR..OFFSET_KDF_PAR + 4].try_into().expect("4 B"));
+    let memory_kib = u32::from_be_bytes(
+        bytes[OFFSET_KDF_MEMORY..OFFSET_KDF_MEMORY + 4]
+            .try_into()
+            .expect("4 B"),
+    );
+    let time_cost = u32::from_be_bytes(
+        bytes[OFFSET_KDF_TIME..OFFSET_KDF_TIME + 4]
+            .try_into()
+            .expect("4 B"),
+    );
+    let parallelism = u32::from_be_bytes(
+        bytes[OFFSET_KDF_PAR..OFFSET_KDF_PAR + 4]
+            .try_into()
+            .expect("4 B"),
+    );
     // 5. Clamp BEFORE any KDF call (defends against hostile-KDF-params
     // DoS). Mirrors `export.rs`'s clamp; reject below floor at the
     // floor check inside `derive_key` (collapses to AuthenticationFailed
@@ -452,7 +460,11 @@ fn parse_outer_header(bytes: &[u8]) -> Result<(OuterHeader, &[u8]), BackupError>
     let nonce_arr: [u8; NONCE_LEN] = bytes[OFFSET_NONCE..OFFSET_NONCE + NONCE_LEN]
         .try_into()
         .expect("nonce slice length");
-    let ct_len = u64::from_be_bytes(bytes[OFFSET_CT_LEN..OFFSET_CT_LEN + 8].try_into().expect("8 B"));
+    let ct_len = u64::from_be_bytes(
+        bytes[OFFSET_CT_LEN..OFFSET_CT_LEN + 8]
+            .try_into()
+            .expect("8 B"),
+    );
     if ct_len > MAX_CIPHERTEXT_LEN {
         return Err(BackupError::Validation {
             kind: "argument",
@@ -575,22 +587,33 @@ const MAX_DISPLAY_NAME_LEN: usize = 4 * 1024;
 /// 1000 guardians is rejected before any allocation).
 const MAX_GUARDIAN_COUNT_DECODE: usize = 256;
 
-fn pull_bytes_capped(dec: &mut Dec<'_>, cap: usize, what: &'static str) -> Result<Vec<u8>, BackupError> {
+fn pull_bytes_capped(
+    dec: &mut Dec<'_>,
+    cap: usize,
+    what: &'static str,
+) -> Result<Vec<u8>, BackupError> {
     match pull(dec)? {
         Header::Bytes(Some(len)) => {
             if len > cap {
-                return Err(cbor_err(format!("backup CBOR: {what} too long ({len} > {cap})")));
+                return Err(cbor_err(format!(
+                    "backup CBOR: {what} too long ({len} > {cap})"
+                )));
             }
             let mut buf = vec![0u8; len];
             dec.read_exact(&mut buf)
                 .map_err(|_| cbor_err(format!("backup CBOR: truncated {what}")))?;
             Ok(buf)
         }
-        _ => Err(cbor_err(format!("backup CBOR: expected byte string ({what})"))),
+        _ => Err(cbor_err(format!(
+            "backup CBOR: expected byte string ({what})"
+        ))),
     }
 }
 
-fn pull_bytes_exact<const N: usize>(dec: &mut Dec<'_>, what: &'static str) -> Result<[u8; N], BackupError> {
+fn pull_bytes_exact<const N: usize>(
+    dec: &mut Dec<'_>,
+    what: &'static str,
+) -> Result<[u8; N], BackupError> {
     let v = pull_bytes_capped(dec, N, what)?;
     if v.len() != N {
         return Err(cbor_err(format!("backup CBOR: {what} wrong length")));
@@ -600,18 +623,27 @@ fn pull_bytes_exact<const N: usize>(dec: &mut Dec<'_>, what: &'static str) -> Re
     Ok(out)
 }
 
-fn pull_text_capped(dec: &mut Dec<'_>, cap: usize, what: &'static str) -> Result<String, BackupError> {
+fn pull_text_capped(
+    dec: &mut Dec<'_>,
+    cap: usize,
+    what: &'static str,
+) -> Result<String, BackupError> {
     match pull(dec)? {
         Header::Text(Some(len)) => {
             if len > cap {
-                return Err(cbor_err(format!("backup CBOR: {what} too long ({len} > {cap})")));
+                return Err(cbor_err(format!(
+                    "backup CBOR: {what} too long ({len} > {cap})"
+                )));
             }
             let mut buf = vec![0u8; len];
             dec.read_exact(&mut buf)
                 .map_err(|_| cbor_err(format!("backup CBOR: truncated {what}")))?;
-            String::from_utf8(buf).map_err(|_| cbor_err(format!("backup CBOR: invalid UTF-8 in {what}")))
+            String::from_utf8(buf)
+                .map_err(|_| cbor_err(format!("backup CBOR: invalid UTF-8 in {what}")))
         }
-        _ => Err(cbor_err(format!("backup CBOR: expected text string ({what})"))),
+        _ => Err(cbor_err(format!(
+            "backup CBOR: expected text string ({what})"
+        ))),
     }
 }
 
@@ -633,7 +665,10 @@ fn encode_body(contents: &BackupContents) -> Zeroizing<Vec<u8>> {
         put_bytes(&mut enc, &contents.vault_id);
         push(&mut enc, Header::Positive(contents.epoch));
         push(&mut enc, Header::Positive(u64::from(contents.threshold)));
-        push(&mut enc, Header::Positive(u64::from(contents.guardian_count)));
+        push(
+            &mut enc,
+            Header::Positive(u64::from(contents.guardian_count)),
+        );
         push(
             &mut enc,
             Header::Array(Some(contents.guardian_x25519_pubs.len())),
@@ -653,7 +688,8 @@ fn encode_body(contents: &BackupContents) -> Zeroizing<Vec<u8>> {
 fn decode_body(buf: &[u8]) -> Result<BackupContents, BackupError> {
     let mut dec = Decoder::from(buf);
     expect_array(&mut dec, 9)?;
-    let wrapped_recovery = pull_bytes_capped(&mut dec, MAX_WRAPPED_RECOVERY_LEN, "wrapped_recovery")?;
+    let wrapped_recovery =
+        pull_bytes_capped(&mut dec, MAX_WRAPPED_RECOVERY_LEN, "wrapped_recovery")?;
     let vault_id = pull_bytes_exact::<32>(&mut dec, "vault_id")?;
     let epoch = pull_uint(&mut dec)?;
     let threshold_u = pull_uint(&mut dec)?;
@@ -680,7 +716,8 @@ fn decode_body(buf: &[u8]) -> Result<BackupContents, BackupError> {
     for _ in 0..pubs_n {
         guardian_x25519_pubs.push(pull_bytes_exact::<32>(&mut dec, "guardian_x25519_pub")?);
     }
-    let vault_display_name = pull_text_capped(&mut dec, MAX_DISPLAY_NAME_LEN, "vault_display_name")?;
+    let vault_display_name =
+        pull_text_capped(&mut dec, MAX_DISPLAY_NAME_LEN, "vault_display_name")?;
     let created_at_unix = pull_uint(&mut dec)?;
     let inner_schema_u = pull_uint(&mut dec)?;
     let inner_schema = u8::try_from(inner_schema_u)
@@ -713,7 +750,8 @@ fn decode_body(buf: &[u8]) -> Result<BackupContents, BackupError> {
 /// ingress gate: 24 words × at least 3 chars per word + 23 separators.
 /// A real BIP-39 phrase joined by single spaces is ~190 bytes; this
 /// floor is the cheapest plausibility check before the KDF runs.
-const MIN_JOINED_SEED_PHRASE_BYTES: usize = SEED_PHRASE_WORD_COUNT * 3 + (SEED_PHRASE_WORD_COUNT - 1);
+const MIN_JOINED_SEED_PHRASE_BYTES: usize =
+    SEED_PHRASE_WORD_COUNT * 3 + (SEED_PHRASE_WORD_COUNT - 1);
 
 /// Build the joined seed-phrase bytes that feed the KDF. The phrase is
 /// joined with single ASCII spaces (the BIP-39 spec's canonical
@@ -793,17 +831,26 @@ fn bip39_words_from_entropy(entropy: &[u8]) -> Result<Zeroizing<Vec<String>>, Ba
     let checksum_byte = Sha256::digest(entropy)[0];
 
     // Concatenate entropy || checksum_byte (264 bits = 33 bytes).
-    let mut combined = [0u8; BIP39_ENTROPY_BYTES + 1];
+    // `combined` is held in `Zeroizing` because it carries the full
+    // raw entropy on the stack until `words` is built — without
+    // scrubbing it the entropy bytes would persist as a recoverable
+    // stack remnant post-return (L1 audit finding M3).
+    let mut combined = Zeroizing::new([0u8; BIP39_ENTROPY_BYTES + 1]);
     combined[..BIP39_ENTROPY_BYTES].copy_from_slice(entropy);
     combined[BIP39_ENTROPY_BYTES] = checksum_byte;
 
     // Walk the 264-bit stream 11 bits at a time → 24 words. We use a
     // little-bit-buffer rather than awkward byte/bit slicing because
-    // 11 doesn't divide 8 evenly.
+    // 11 doesn't divide 8 evenly. `buf` carries a sliding 11-bit
+    // window onto the entropy + checksum; zeroize it post-loop to
+    // scrub the residual high-bit window (the last meaningful value
+    // is the final word's 11-bit index, which is itself derivable
+    // from the public word, but scrubbing keeps the secret hot-path
+    // discipline uniform).
     let mut words = Vec::with_capacity(SEED_PHRASE_WORD_COUNT);
     let mut buf: u32 = 0;
     let mut bits: u32 = 0;
-    for &b in &combined {
+    for &b in combined.iter() {
         buf = (buf << 8) | u32::from(b);
         bits += 8;
         while bits >= 11 {
@@ -812,6 +859,8 @@ fn bip39_words_from_entropy(entropy: &[u8]) -> Result<Zeroizing<Vec<String>>, Ba
             words.push(BIP39_ENGLISH_WORDLIST[idx].to_string());
         }
     }
+    use zeroize::Zeroize;
+    buf.zeroize();
     debug_assert_eq!(words.len(), SEED_PHRASE_WORD_COUNT);
     Ok(Zeroizing::new(words))
 }
@@ -871,8 +920,7 @@ pub fn seal_backup(
     let ct_bytes = ct.into_vec();
     debug_assert_eq!(u64::try_from(ct_bytes.len()).unwrap_or(0), ct_len);
 
-    let mut out =
-        Vec::with_capacity(OUTER_HEADER_LEN + ct_bytes.len() + INTEGRITY_HASH_LEN);
+    let mut out = Vec::with_capacity(OUTER_HEADER_LEN + ct_bytes.len() + INTEGRITY_HASH_LEN);
     out.extend_from_slice(&aad);
     out.extend_from_slice(&ct_bytes);
     let hash = integrity_hash(&out);
@@ -926,12 +974,7 @@ fn decode_outer_into_ct(
     // are needed verbatim for the open call.
     let aad = bytes[..OUTER_HEADER_LEN].to_vec();
     let ct = ct_region.to_vec();
-    Ok((
-        aad,
-        ct,
-        header.kdf_params,
-        (header.salt, header.nonce),
-    ))
+    Ok((aad, ct, header.kdf_params, (header.salt, header.nonce)))
 }
 
 fn decode_backup_from_outer(
@@ -1245,7 +1288,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                BackupError::KdfParamOutOfRange { which: "memory_kib", .. }
+                BackupError::KdfParamOutOfRange {
+                    which: "memory_kib",
+                    ..
+                }
             ),
             "hostile memory_kib rejected, got {err:?}"
         );
@@ -1270,7 +1316,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                BackupError::KdfParamOutOfRange { which: "memory_time_product", .. }
+                BackupError::KdfParamOutOfRange {
+                    which: "memory_time_product",
+                    ..
+                }
             ),
             "hostile combined product rejected, got {err:?}"
         );
@@ -1286,7 +1335,13 @@ mod tests {
         blob[0] ^= 0x01;
         let err = decode_backup(&blob, &phrase).unwrap_err();
         assert!(
-            matches!(err, BackupError::Validation { kind: "argument", .. }),
+            matches!(
+                err,
+                BackupError::Validation {
+                    kind: "argument",
+                    ..
+                }
+            ),
             "domain mismatch rejected, got {err:?}"
         );
     }
@@ -1317,13 +1372,22 @@ mod tests {
     fn text_form_invalid_char_rejected() {
         // Uppercase outside base32 alphabet.
         let err = decode_text("ABCDEF").unwrap_err();
-        assert!(matches!(err, BackupError::TextInvalidEncoding), "got {err:?}");
+        assert!(
+            matches!(err, BackupError::TextInvalidEncoding),
+            "got {err:?}"
+        );
         // Empty string.
         let err = decode_text("").unwrap_err();
-        assert!(matches!(err, BackupError::TextInvalidEncoding), "got {err:?}");
+        assert!(
+            matches!(err, BackupError::TextInvalidEncoding),
+            "got {err:?}"
+        );
         // Digit '1' (not in `2-7`).
         let err = decode_text("abc1def").unwrap_err();
-        assert!(matches!(err, BackupError::TextInvalidEncoding), "got {err:?}");
+        assert!(
+            matches!(err, BackupError::TextInvalidEncoding),
+            "got {err:?}"
+        );
     }
 
     /// Malformed seed phrase: wrong word count.
@@ -1367,7 +1431,13 @@ mod tests {
         byte_short.extend_from_slice(b"\x01\x01");
         let err = decode_backup(&byte_short, &known_phrase()).unwrap_err();
         assert!(
-            matches!(err, BackupError::Validation { kind: "argument", .. }),
+            matches!(
+                err,
+                BackupError::Validation {
+                    kind: "argument",
+                    ..
+                }
+            ),
             "DOMAIN-prefixed truncated input must surface Validation, got {err:?}"
         );
 
@@ -1399,6 +1469,33 @@ mod tests {
         assert_eq!(BIP39_ENGLISH_WORDLIST.len(), 2048);
     }
 
+    /// **Wordlist canonical-content pin.** SHA-256 of the canonical
+    /// newline-joined-with-trailing-newline form of the embedded
+    /// list must equal the pinned hex literal (which is the SHA-256
+    /// of the upstream BIP-39 English reference file at
+    /// <https://github.com/bitcoin/bips/blob/master/bip-0039/english.txt>).
+    ///
+    /// This is the **mechanical guard against future wordlist drift**:
+    /// a single-character typo "fix" or an accidental reorder would
+    /// silently break the BIP-39 test vector + every prior backup;
+    /// this test fails fast at build time before any such change
+    /// reaches main.
+    #[test]
+    fn bip39_wordlist_is_canonical_sha256() {
+        use sha2::{Digest, Sha256};
+        let mut joined = String::with_capacity(BIP39_ENGLISH_WORDLIST.len() * 8);
+        for w in &BIP39_ENGLISH_WORDLIST {
+            joined.push_str(w);
+            joined.push('\n');
+        }
+        let hash = Sha256::digest(joined.as_bytes());
+        assert_eq!(
+            hex::encode(hash),
+            "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda",
+            "embedded BIP-39 wordlist drifted from the canonical reference",
+        );
+    }
+
     /// BIP-39 wordlist content pin: known reference vector. The
     /// 11-bit indices land on these exact words for the
     /// all-`[0u8; 32]` entropy vector. The official BIP-39 spec test
@@ -1408,9 +1505,12 @@ mod tests {
     ///      abandon abandon abandon abandon abandon abandon abandon
     ///      abandon abandon abandon abandon abandon abandon abandon
     ///      abandon abandon art"
-    /// (the 23 leading "abandon"s + a trailing "art" — the checksum
-    /// byte = SHA-256(0x00…00)[0] = 0x66; the last 11-bit index =
-    /// (0x66 << 3) & 0x07FF = 0x330 = 816 = "art" in the wordlist).
+    /// (the 23 leading "abandon"s + a trailing "art" — the trailing
+    /// word's 11-bit index is `(last_3_bits_of_entropy[31] << 8) |
+    /// checksum_byte` = `(0 << 8) | 0x66` = `102` = "art" in the
+    /// canonical wordlist; the audit-LOW about a misleading
+    /// `(0x66 << 3) & 0x07FF = 816` formulation in an earlier
+    /// revision of this comment is fixed here.)
     #[test]
     fn bip39_known_vector_all_zeros_is_abandon_x23_art() {
         let entropy = [0u8; BIP39_ENTROPY_BYTES];
@@ -1418,7 +1518,10 @@ mod tests {
         for w in words.iter().take(23) {
             assert_eq!(w, "abandon", "leading words must be 'abandon'");
         }
-        assert_eq!(words[23], "art", "trailing word must be 'art' (BIP-39 test vector)");
+        assert_eq!(
+            words[23], "art",
+            "trailing word must be 'art' (BIP-39 test vector)"
+        );
     }
 
     /// Domain prefix is exactly 28 bytes and distinct from every
