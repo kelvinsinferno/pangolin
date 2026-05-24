@@ -1,0 +1,24 @@
+[package]
+name = "design-tokens-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "design-tokens-gen — deterministic generator that reads apps/design-tokens/tokens.json and emits apps/design-tokens/dist/tokens.css + apps/design-tokens/src/lib.rs. Invoked explicitly (NOT a build.rs) so reviewers can eyeball the dist diff. See docs/issue-plans/mvp4-a-design-tokens.md."
+
+[[bin]]
+name = "design-tokens-gen"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# `serde_json` already pinned in [workspace.dependencies] at =1.0.133
+# (originally added for chaincli; the alloy 2.x transitive resolves to
+# the same version per Cargo.lock). We use only `Value` parsing — no
+# Serialize/Deserialize derives, no untrusted-input round-trips.
+serde_json = { workspace = true }
