@@ -45,6 +45,7 @@ pub mod multi_device;
 pub mod pending;
 pub mod publish;
 pub mod pull;
+pub mod recovery_backup;
 pub mod recovery_escrow;
 pub mod revision;
 pub mod session;

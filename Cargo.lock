@@ -3496,6 +3496,7 @@ dependencies = [
  "pangolin-totp",
  "proptest",
  "rusqlite",
+ "sha2",
  "static_assertions",
  "subtle",
  "tempfile",

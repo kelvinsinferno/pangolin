@@ -8102,6 +8102,90 @@ impl Vault {
         }))
     }
 
+    /// **MVP-3 issue #109: build a canonical encrypted recovery-backup
+    /// envelope sealed under a freshly-generated 24-word BIP-39 seed
+    /// phrase.**
+    ///
+    /// Reads the live recovery-escrow material engine-side (sourced
+    /// through `recovery_escrow::read_recovery_escrow` under the active
+    /// VDK's column-AEAD), packages it into a
+    /// [`crate::recovery_backup::BackupContents`] body, and seals the
+    /// envelope. The output is the ONE blob the host persists for the
+    /// user (file / cloud / paper-string) — unlocked later by the
+    /// seed phrase the user records out-of-band at backup time.
+    ///
+    /// `vault_display_name` is left empty here (the store doesn't carry
+    /// a per-vault user-visible label today; a future amendment can
+    /// thread it through). `created_at_unix` is derived from the meta
+    /// row's `created_at` (saturating to 0 if negative).
+    ///
+    /// Returns `Ok(None)` if no recovery escrow has been onboarded
+    /// (without an escrow there is nothing to back up).
+    ///
+    /// **Session-gated (Active)** — needs the active VDK's column-AEAD
+    /// to read the escrow. The `master_password` parameter is accepted
+    /// for surface symmetry with other chain-/recovery-class entry
+    /// points (so the FFI binding can take it behind `SecretPassword`);
+    /// the seal itself uses the seed phrase as the wrap authority, so
+    /// the master password is only consumed + zeroized.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] if no session is active;
+    /// [`StoreError::Sqlite`] / [`StoreError::Corrupted`] /
+    /// [`StoreError::AuthenticationFailed`] from the escrow read;
+    /// [`StoreError::RecoveryBackup`] (newly added) for any failure
+    /// inside [`crate::recovery_backup`] (KDF / AEAD / wire-format).
+    pub fn create_recovery_backup(
+        &self,
+        _master_password: &pangolin_crypto::secret::SecretBytes,
+    ) -> Result<Option<crate::recovery_backup::RecoveryBackupArtifacts>> {
+        let active = self.require_active()?;
+        let vault_id = self.meta.vault_id;
+        let escrow = crate::recovery_escrow::read_recovery_escrow(
+            &self.conn,
+            &vault_id,
+            active.vdk.aead_key(),
+        )?;
+        let Some(escrow) = escrow else {
+            return Ok(None);
+        };
+        let current_epoch = vdk_chain::read_current_epoch(&self.conn)?;
+        let created_at_unix = u64::try_from(self.meta.created_at).unwrap_or(0);
+
+        // Serialize `WrappedVdkRecovery` into the canonical wire form
+        // the recovery_ffi path already round-trips:
+        //   schema_version (1 B) || nonce (NONCE_LEN B) || ciphertext (rest)
+        // (mirrors `recovery_ffi::decode_wrapped_recovery` at the FFI
+        // boundary so a backup minted here decodes 1:1 there.)
+        let wrapped_recovery_bytes = {
+            let inner = escrow.wrapped_recovery.as_wrapped();
+            let mut buf = Vec::with_capacity(
+                1 + pangolin_crypto::aead::NONCE_LEN + inner.ciphertext().as_bytes().len(),
+            );
+            buf.push(inner.context().schema_version);
+            buf.extend_from_slice(inner.nonce().as_bytes());
+            buf.extend_from_slice(inner.ciphertext().as_bytes());
+            buf
+        };
+
+        let contents = crate::recovery_backup::BackupContents {
+            wrapped_recovery: wrapped_recovery_bytes,
+            vault_id,
+            epoch: current_epoch,
+            threshold: escrow.threshold,
+            guardian_count: escrow.guardian_count,
+            guardian_x25519_pubs: escrow.guardians.iter().map(|g| g.guardian_x25519_pub).collect(),
+            vault_display_name: String::new(),
+            created_at_unix,
+        };
+        let seed_phrase = crate::recovery_backup::generate_seed_phrase()
+            .map_err(StoreError::RecoveryBackup)?;
+        let bytes = crate::recovery_backup::seal_backup(&contents, seed_phrase.as_slice())
+            .map_err(StoreError::RecoveryBackup)?;
+        Ok(Some((seed_phrase, bytes)))
+    }
+
     /// **MVP-3 issue #106e-0: a guardian opens a share sealed to it.**
     ///
     /// The local device is acting as a GUARDIAN for some vault being
