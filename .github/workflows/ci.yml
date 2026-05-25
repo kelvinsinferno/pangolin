@@ -212,6 +212,70 @@ jobs:
         run: pnpm build
 
   # -----------------------------------------------------------------
+  # MVP-4-B: desktop shell (Tauri v2 + React 19 + Vite 6 + Cargo)
+  # -----------------------------------------------------------------
+  #
+  # Plan-LOCK: docs/issue-plans/mvp4-b-desktop-shell.md §1 + success
+  # criteria §7. Pre-builds the component-library (file: dep target),
+  # runs the four pnpm gates (typecheck / lint / test / build), then
+  # verifies the Rust side compiles via `cargo build -p pangolin-desktop`.
+  # Runs on `ubuntu-latest` only this slice (macOS + Windows production
+  # builds at release time, not every PR).
+  desktop:
+    name: desktop / scaffold
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Same v1 prefix the other Rust jobs use (cache hits across the
+          # workspace's overlapping dep tree).
+          prefix-key: "v1"
+          cache-bin: "false"
+      # pnpm 10 LTS: same pinning rationale as the extension job
+      # (Node 20.18 + pnpm 11 hit ERR_UNKNOWN_BUILTIN_MODULE).
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: 'apps/desktop/.nvmrc'
+          cache: 'pnpm'
+          cache-dependency-path: 'apps/desktop/pnpm-lock.yaml'
+      # Pre-build the component-library — apps/desktop's package.json
+      # uses a `file:../component-library` dep, so the `dist/` it
+      # imports must exist BEFORE `pnpm install --frozen-lockfile`
+      # runs in apps/desktop. Plan §6 fifth bullet.
+      - name: Pre-build component-library (file: dep target)
+        working-directory: apps/component-library
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - name: Install desktop deps (frozen lockfile)
+        working-directory: apps/desktop
+        run: pnpm install --frozen-lockfile
+      - name: TypeScript strict typecheck
+        working-directory: apps/desktop
+        run: pnpm typecheck
+      - name: ESLint
+        working-directory: apps/desktop
+        run: pnpm lint
+      - name: Vitest (invoke wrappers + screen RTL)
+        working-directory: apps/desktop
+        run: pnpm test
+      - name: Vite build
+        working-directory: apps/desktop
+        run: pnpm build
+      # Rust-side build verification. The full workspace test job
+      # already runs `cargo test --workspace` so the Rust side's unit
+      # tests are covered there; this step pins that pangolin-desktop
+      # builds cleanly with its Tauri + tauri-plugin-clipboard-manager
+      # deps wired up.
+      - name: Build pangolin-desktop (Rust side)
+        run: cargo build -p pangolin-desktop
+
+  # -----------------------------------------------------------------
   # P5-1: contracts pipeline
   # -----------------------------------------------------------------
 

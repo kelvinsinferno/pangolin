@@ -1,0 +1,13 @@
+# Tauri + Vite + Cargo build artifacts.
+dist/
+node_modules/
+target/
+gen/
+
+# pnpm + editor breadcrumbs.
+.pnpm-debug.log
+.vite/
+
+# Tauri-generated capability schemas (re-generated from tauri.conf.json
+# + capabilities/ on every build).
+gen/schemas/
