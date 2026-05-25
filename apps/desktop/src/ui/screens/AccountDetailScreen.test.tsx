@@ -28,7 +28,7 @@ describe('AccountDetailScreen', () => {
         account={sample}
         onBack={() => {}}
         onReveal={async () => ({ ok: true, password: 'pw' })}
-        onCopy={async () => ({ ok: true })}
+        onCopyPassword={async () => ({ ok: true })}
       />,
     );
     expect(screen.getByText('••••••••')).toBeInTheDocument();
@@ -41,7 +41,7 @@ describe('AccountDetailScreen', () => {
         account={sample}
         onBack={() => {}}
         onReveal={async () => ({ ok: true, password: 'correct horse' })}
-        onCopy={async () => ({ ok: true })}
+        onCopyPassword={async () => ({ ok: true })}
       />,
     );
     fireEvent.click(screen.getByTestId('reveal-button'));
@@ -60,7 +60,7 @@ describe('AccountDetailScreen', () => {
         account={sample}
         onBack={() => {}}
         onReveal={async () => ({ ok: true, password: 'correct horse' })}
-        onCopy={async () => ({ ok: true })}
+        onCopyPassword={async () => ({ ok: true })}
       />,
     );
     await act(async () => {
@@ -86,47 +86,55 @@ describe('AccountDetailScreen', () => {
         account={sample}
         onBack={onBack}
         onReveal={async () => ({ ok: true, password: 'pw' })}
-        onCopy={async () => ({ ok: true })}
+        onCopyPassword={async () => ({ ok: true })}
       />,
     );
     fireEvent.click(screen.getByTestId('back-button'));
     expect(onBack).toHaveBeenCalledTimes(1);
   });
 
-  test('Copy invokes onCopy with the revealed text', async () => {
-    const onCopy = vi.fn(async () => ({ ok: true as const }));
-    render(
-      <AccountDetailScreen
-        account={sample}
-        onBack={() => {}}
-        onReveal={async () => ({ ok: true, password: 'sekret' })}
-        onCopy={onCopy}
-      />,
-    );
-    // First reveal, then copy uses the cached plaintext.
-    fireEvent.click(screen.getByTestId('reveal-button'));
-    await screen.findByTestId('revealed-password');
-    fireEvent.click(screen.getByTestId('copy-button'));
-    await waitFor(() => {
-      expect(onCopy).toHaveBeenCalledWith('sekret');
-    });
-  });
-
-  test('Copy without prior reveal re-issues the reveal and copies', async () => {
-    const onReveal = vi.fn(async () => ({ ok: true as const, password: 'fresh' }));
-    const onCopy = vi.fn(async () => ({ ok: true as const }));
+  test('Copy invokes onCopyPassword (audit H-1: plaintext NEVER crosses V8)', async () => {
+    const onCopyPassword = vi.fn(async () => ({ ok: true as const }));
+    const onReveal = vi.fn(async () => ({ ok: true as const, password: 'sekret' }));
     render(
       <AccountDetailScreen
         account={sample}
         onBack={() => {}}
         onReveal={onReveal}
-        onCopy={onCopy}
+        onCopyPassword={onCopyPassword}
       />,
     );
+    // The Copy button does NOT trigger onReveal — the Rust-side
+    // command reads the password via FFI + writes to clipboard
+    // internally; the host never sees the plaintext.
     fireEvent.click(screen.getByTestId('copy-button'));
     await waitFor(() => {
-      expect(onReveal).toHaveBeenCalledTimes(1);
-      expect(onCopy).toHaveBeenCalledWith('fresh');
+      expect(onCopyPassword).toHaveBeenCalledTimes(1);
     });
+    expect(onReveal).not.toHaveBeenCalled();
+  });
+
+  test('Copy works even when user has already clicked Reveal', async () => {
+    const onCopyPassword = vi.fn(async () => ({ ok: true as const }));
+    const onReveal = vi.fn(async () => ({ ok: true as const, password: 'displayed' }));
+    render(
+      <AccountDetailScreen
+        account={sample}
+        onBack={() => {}}
+        onReveal={onReveal}
+        onCopyPassword={onCopyPassword}
+      />,
+    );
+    // First reveal (so the user can see the password), then copy.
+    // The Copy goes through onCopyPassword (Rust-side) — does NOT
+    // re-use the displayed plaintext as a JS-side string.
+    fireEvent.click(screen.getByTestId('reveal-button'));
+    await screen.findByTestId('revealed-password');
+    fireEvent.click(screen.getByTestId('copy-button'));
+    await waitFor(() => {
+      expect(onCopyPassword).toHaveBeenCalledTimes(1);
+    });
+    // Reveal fired exactly once (for the view), not twice.
+    expect(onReveal).toHaveBeenCalledTimes(1);
   });
 });

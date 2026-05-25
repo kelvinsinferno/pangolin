@@ -7,8 +7,12 @@ import type { AccountSummary } from '../lib/invoke';
 export interface AccountDetailScreenProps {
   account: AccountSummary;
   onBack: () => void;
+  /** Reveal-to-view: bytes cross V8 (L1 carve-out, 10s clear). */
   onReveal: () => Promise<{ ok: true; password: string } | { ok: false }>;
-  onCopy: (text: string) => Promise<{ ok: true } | { ok: false }>;
+  /** Copy-only: plaintext NEVER crosses V8 — Rust reads the password
+   *  via FFI + writes to the OS clipboard internally (audit H-1
+   *  hardening). The screen invokes this for the "Copy" button. */
+  onCopyPassword: () => Promise<{ ok: true } | { ok: false }>;
 }
 
 /**
@@ -25,7 +29,7 @@ export function AccountDetailScreen({
   account,
   onBack,
   onReveal,
-  onCopy,
+  onCopyPassword,
 }: AccountDetailScreenProps) {
   const [revealed, setRevealed] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
@@ -52,18 +56,21 @@ export function AccountDetailScreen({
     }
   };
 
+  // Audit H-1 hardening: the Copy button calls onCopyPassword() which
+  // routes through the new `copy_password_to_clipboard` Tauri command
+  // — Rust reads the password via FFI + writes to the clipboard plugin
+  // in the same `tauri::command` body. The plaintext NEVER crosses
+  // V8. The previously-revealed `revealed` state (if the user clicked
+  // Reveal first) is left untouched; it continues its 10s clear timer.
   const handleCopy = async () => {
-    if (revealed === null) {
-      // No revealed plaintext to copy: re-trigger the reveal first.
-      const result = await onReveal();
-      if (!result.ok) return;
-      await onCopy(result.password);
-      setRevealed(result.password);
-    } else {
-      await onCopy(revealed);
+    if (pending) return;
+    setPending(true);
+    const result = await onCopyPassword();
+    setPending(false);
+    if (result.ok) {
+      setCopyConfirmed(true);
+      setTimeout(() => setCopyConfirmed(false), 2000);
     }
-    setCopyConfirmed(true);
-    setTimeout(() => setCopyConfirmed(false), 2000);
   };
 
   return (

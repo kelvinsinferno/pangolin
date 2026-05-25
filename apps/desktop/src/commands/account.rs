@@ -202,34 +202,85 @@ pub async fn reveal_password(
     id: String,
     state: State<'_, VaultState>,
 ) -> Result<String, DesktopError> {
-    use zeroize::Zeroize as _;
-
     let account_id = account_id_from_hex(&id)?;
     let handle = state.require_open()?;
     let presence = cli_presence_proof();
     let revealed = pangolin_ffi::reveal::reveal_current_password(handle, account_id, presence)
         .map_err(DesktopError::from)?;
 
-    // `RevealedSecret` exposes the bytes via `expose_bytes_for_host()`
-    // (the MVP-4-B host-bytes accessor — additive 1.1-surface amendment;
-    // see `crates/pangolin-ffi/src/reveal.rs`). The returned `Vec<u8>`
-    // is a host-owned copy; we zero it after transcoding to UTF-8.
-    let mut bytes = revealed.expose_bytes_for_host();
-    let s = if let Ok(s) = std::str::from_utf8(&bytes) {
-        s.to_owned()
-    } else {
-        bytes.zeroize();
-        return Err(DesktopError::Internal(
-            "revealed password is not valid utf-8".into(),
-        ));
-    };
-    bytes.zeroize();
+    // `RevealedSecret::expose_bytes_for_host()` returns
+    // `Zeroizing<Vec<u8>>` (audit M-1 hardening); the buffer is
+    // type-system-zeroed on drop. We only need to transcode to UTF-8
+    // and return; the `bytes` binding drops at end-of-scope.
+    let bytes = revealed.expose_bytes_for_host();
+    let s = std::str::from_utf8(&bytes)
+        .map_err(|_| DesktopError::Internal("revealed password is not valid utf-8".into()))?
+        .to_owned();
     Ok(s)
 }
 
-/// Write `text` to the OS clipboard. Per Q-a (see module docstring) no
-/// host-side clear timer is wired this slice; the React side renders a
-/// one-time "password copied" toast.
+/// **Copy the current head-of-history plaintext password directly
+/// to the OS clipboard, NEVER crossing the FFI boundary back into
+/// JS.**
+///
+/// Audit HIGH H-1 hardening (2026-05-25). Before this command
+/// existed, the "copy password" flow went `reveal_password (FFI) →
+/// String → JS → invoke copy_to_clipboard (FFI) → String → Rust →
+/// clipboard` — the plaintext crossed V8 TWICE per copy click + sat
+/// in two JS strings until GC. This command collapses the path:
+/// the plaintext stays in Rust the entire time + the clipboard
+/// write happens in the same `tauri::command` body that holds the
+/// `Zeroizing` buffer. The plaintext never touches V8.
+///
+/// The reveal-to-view flow ([`reveal_password`]) still crosses the
+/// L1 carve-out boundary because the user has to SEE the password
+/// before copying isn't always the chosen action (sometimes they
+/// just want to verify the value). For the COPY intent, prefer this
+/// command; the React side wires this to the "Copy" button on
+/// `AccountDetailScreen` so the most common user action skips the
+/// JS round-trip entirely.
+///
+/// # Errors
+///
+/// As [`reveal_password`]'s underlying FFI: `Session` for a locked
+/// vault, `Store` for an unknown account, `Internal` for a UTF-8
+/// or clipboard-write failure.
+#[tauri::command]
+pub async fn copy_password_to_clipboard(
+    id: String,
+    state: State<'_, VaultState>,
+    app: tauri::AppHandle,
+) -> Result<(), DesktopError> {
+    let account_id = account_id_from_hex(&id)?;
+    let handle = state.require_open()?;
+    let presence = cli_presence_proof();
+    let revealed = pangolin_ffi::reveal::reveal_current_password(handle, account_id, presence)
+        .map_err(DesktopError::from)?;
+
+    // Transcode + write to clipboard entirely Rust-side; the
+    // `bytes` binding zeroes on drop at end-of-scope (Zeroizing).
+    // The clipboard plugin holds an owned `String` briefly while it
+    // delegates to the OS; that copy is outside our control but
+    // it is the SAME byte path as Q-b's "no host-side clipboard
+    // timer" trade-off — the OS clipboard already has the plaintext.
+    let bytes = revealed.expose_bytes_for_host();
+    let s = std::str::from_utf8(&bytes)
+        .map_err(|_| DesktopError::Internal("revealed password is not valid utf-8".into()))?
+        .to_owned();
+    app.clipboard()
+        .write_text(s)
+        .map_err(|e| DesktopError::Internal(format!("clipboard write failed: {e}")))?;
+    Ok(())
+}
+
+/// Write arbitrary `text` to the OS clipboard.
+///
+/// Retained for any non-secret string the host UI needs to copy
+/// (e.g. an account username); for password copy use
+/// [`copy_password_to_clipboard`] which never crosses the plaintext
+/// through V8 (audit H-1). Per Q-a no host-side clear timer is
+/// wired this slice; the React side renders a one-time
+/// "password copied" toast.
 ///
 /// # Errors
 ///

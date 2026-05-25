@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { useRef, useState } from 'react';
+import { useState } from 'react';
 import { Button, Card } from '@pangolin/component-library';
 
 export interface WelcomeScreenProps {
@@ -9,45 +9,23 @@ export interface WelcomeScreenProps {
 /**
  * Welcome screen — the entry surface when no vault is open.
  *
- * Uses a hidden `<input type="file">` driven by the `Open Vault` button
- * because Tauri's `dialog` plugin is NOT in the minimum first-surface
- * (per plan §0a). The file input gives us the path via the WebView's
- * `webkitRelativePath` / `name` plus a host-side hop through the
- * `vault_open` command, which the user-facing path here yields as the
- * raw file name. Production work in MVP-4 back-half will swap this for
- * `tauri-plugin-dialog`'s native picker.
+ * **No native file picker this slice.** The HTML `<input type="file">`
+ * picker was dropped because the WebView's `File` interface does NOT
+ * expose absolute paths in modern browsers (audit MEDIUM M-3 fix,
+ * 2026-05-25); the resulting `file.name` is just the basename and the
+ * Tauri `vault_open(path)` command requires an absolute path. The
+ * proper fix is `tauri-plugin-dialog`'s native picker, which lands at
+ * MVP-4-F as part of the back-half UX work.
+ *
+ * Until then: the user pastes the absolute path into the text input.
+ * Closed-beta users typed paths in CLI flags anyway; this is a
+ * temporary affordance that the MVP-4-F dialog plugin replaces with
+ * the proper native picker.
  */
 export function WelcomeScreen({ onOpen }: WelcomeScreenProps) {
-  const inputRef = useRef<HTMLInputElement>(null);
   const [pending, setPending] = useState(false);
-
-  const handlePick = () => {
-    inputRef.current?.click();
-  };
-
-  const handleChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file === undefined) return;
-    // The WebView's File interface exposes a `path` field via Tauri's
-    // file-drop integration on some platforms, but the most portable
-    // source is the file name; the user types the absolute path in a
-    // text input below as a fallback. For the minimum first surface
-    // we surface the name + let the user paste an absolute path.
-    setPending(true);
-    try {
-      // Tauri v2 exposes the absolute path via `File.path` when the file
-      // is selected via the dialog plugin; the HTML file input does not
-      // surface it. The MVP-4 back-half work swaps to dialog. For now,
-      // hand the name through so the user can copy-paste an absolute
-      // path if needed — production users will use the typed text
-      // input below.
-      await onOpen(file.name);
-    } finally {
-      setPending(false);
-    }
-  };
-
   const [pathDraft, setPathDraft] = useState('');
+
   const handleTextOpen = async () => {
     if (pathDraft.length === 0) return;
     setPending(true);
@@ -63,21 +41,8 @@ export function WelcomeScreen({ onOpen }: WelcomeScreenProps) {
       <Card elevation="md">
         <h1 id="welcome-title">Pangolin</h1>
         <p>Open a vault file to begin.</p>
-        <input
-          ref={inputRef}
-          type="file"
-          accept=".pvf"
-          style={{ display: 'none' }}
-          onChange={handleChange}
-          data-testid="vault-file-input"
-        />
-        <div className="welcome-screen__actions">
-          <Button onClick={handlePick} disabled={pending}>
-            Open Vault File...
-          </Button>
-        </div>
         <div className="welcome-screen__text-input">
-          <label htmlFor="path-input">Or paste a vault path:</label>
+          <label htmlFor="path-input">Vault file path:</label>
           <input
             id="path-input"
             type="text"
@@ -89,6 +54,10 @@ export function WelcomeScreen({ onOpen }: WelcomeScreenProps) {
           <Button onClick={handleTextOpen} disabled={pending || pathDraft.length === 0}>
             Open
           </Button>
+          <p className="welcome-screen__hint">
+            A native file picker lands in a later update. For now, paste
+            the absolute path to your <code>.pvf</code> vault file.
+          </p>
         </div>
       </Card>
     </main>

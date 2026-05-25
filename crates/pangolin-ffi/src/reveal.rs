@@ -32,7 +32,7 @@
 
 use std::sync::Arc;
 
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::FfiError;
 use crate::identity::{AccountId, PasswordHistoryEntry};
@@ -95,11 +95,11 @@ impl RevealedSecret {
     /// outside this crate; this `expose_bytes_for_host` method is the
     /// minimal public surface that gives the host shell what it needs.
     ///
-    /// The returned `Vec<u8>` is a copy of the internal buffer (the
-    /// caller MUST zero it before drop — see `apps/desktop/src/commands/
-    /// account.rs::reveal_password`'s `Zeroize` discipline). The
-    /// internal buffer continues to zero on drop via `SecretBuf`'s
-    /// `ZeroizeOnDrop`.
+    /// The returned `Zeroizing<Vec<u8>>` zeroes its buffer on `Drop`
+    /// — type-system-enforced (audit MEDIUM M-1 hardening, 2026-05-25).
+    /// The internal buffer ALSO continues to zero on drop via
+    /// `SecretBuf`'s `ZeroizeOnDrop`. Callers do not need to call
+    /// `zeroize()` manually; standard let-binding scope rules suffice.
     ///
     /// This entry is gated behind the same presence-fresh check the
     /// engine enforces in `reveal_current_password` / `reveal_notes` /
@@ -109,8 +109,8 @@ impl RevealedSecret {
     /// module pins the shape, not the freshness — freshness is the
     /// FFI's job).
     #[must_use]
-    pub fn expose_bytes_for_host(&self) -> Vec<u8> {
-        self.bytes.as_slice().to_vec()
+    pub fn expose_bytes_for_host(&self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(self.bytes.as_slice().to_vec())
     }
 }
 
@@ -302,7 +302,10 @@ mod tests {
         let bytes = b"plaintext-password-bytes".to_vec();
         let secret = RevealedSecret::new(bytes.clone());
         let out = secret.expose_bytes_for_host();
-        assert_eq!(out, bytes);
+        // `out` is `Zeroizing<Vec<u8>>` (audit M-1 hardening); compare
+        // via the inner slice. The Zeroizing wrapper zeroes on drop;
+        // structural equality is preserved.
+        assert_eq!(out.as_slice(), bytes.as_slice());
         // The length accessor still reports the same length.
         assert_eq!(secret.len() as usize, bytes.len());
     }

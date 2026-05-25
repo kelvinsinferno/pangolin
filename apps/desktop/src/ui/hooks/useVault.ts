@@ -21,7 +21,7 @@ import { useCallback, useState } from 'react';
 import {
   accountShow,
   accountsList,
-  copyToClipboard,
+  copyPasswordToClipboard,
   isDesktopError,
   revealPassword,
   vaultClose,
@@ -69,8 +69,10 @@ export interface VaultActions {
    *  account. Caller-managed lifetime: the AccountDetailScreen sets it
    *  via local state + clears within 10 s. */
   revealPasswordForSelected(): Promise<{ ok: true; password: string } | { ok: false; error: DesktopError }>;
-  /** Writes `text` to the OS clipboard. */
-  copy(text: string): Promise<{ ok: true } | { ok: false; error: DesktopError }>;
+  /** Copies the currently-selected account's password to the OS
+   *  clipboard via the Rust-side `copy_password_to_clipboard` command.
+   *  Plaintext NEVER crosses V8 — audit H-1 hardening. */
+  copySelectedPassword(): Promise<{ ok: true } | { ok: false; error: DesktopError }>;
 }
 
 function toDesktopError(e: unknown): DesktopError {
@@ -168,14 +170,23 @@ export function useVault(): { state: VaultState; actions: VaultActions } {
     }
   }, [state.selected]);
 
-  const copy = useCallback(async (text: string) => {
+  const copySelectedPassword = useCallback(async () => {
+    // Same id-capture discipline as revealPasswordForSelected — a
+    // racing backToList must not corrupt the FFI call.
+    const selectedId = state.selected?.id;
+    if (selectedId === undefined) {
+      return {
+        ok: false as const,
+        error: { kind: 'Internal' as const, message: 'no account selected' },
+      };
+    }
     try {
-      await copyToClipboard(text);
+      await copyPasswordToClipboard(selectedId);
       return { ok: true as const };
     } catch (e) {
       return { ok: false as const, error: toDesktopError(e) };
     }
-  }, []);
+  }, [state.selected]);
 
   return {
     state,
@@ -188,7 +199,7 @@ export function useVault(): { state: VaultState; actions: VaultActions } {
       showAccount,
       backToList,
       revealPasswordForSelected,
-      copy,
+      copySelectedPassword,
     },
   };
 }

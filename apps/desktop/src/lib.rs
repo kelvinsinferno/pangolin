@@ -58,6 +58,7 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::account::accounts_list,
             commands::account::account_show,
             commands::account::reveal_password,
+            commands::account::copy_password_to_clipboard,
             commands::account::copy_to_clipboard,
         ])
 }

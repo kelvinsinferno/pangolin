@@ -9,6 +9,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 import {
   accountShow,
   accountsList,
+  copyPasswordToClipboard,
   copyToClipboard,
   isDesktopError,
   revealPassword,
@@ -105,6 +106,17 @@ describe('typed invoke wrappers', () => {
     invokeMock.mockResolvedValue(undefined);
     await copyToClipboard('hello');
     expect(invokeMock).toHaveBeenCalledWith('copy_to_clipboard', { text: 'hello' });
+  });
+
+  test('copyPasswordToClipboard passes only the account id (audit H-1 — no plaintext crosses V8)', async () => {
+    invokeMock.mockResolvedValue(undefined);
+    await copyPasswordToClipboard('dd'.repeat(32));
+    expect(invokeMock).toHaveBeenCalledWith('copy_password_to_clipboard', { id: 'dd'.repeat(32) });
+    // Critical: the args carry only the id, NEVER the plaintext.
+    const args = invokeMock.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(args).toEqual({ id: 'dd'.repeat(32) });
+    expect(Object.keys(args)).not.toContain('text');
+    expect(Object.keys(args)).not.toContain('password');
   });
 
   test('invoke rejection surfaces the DesktopError envelope as a thrown value', async () => {

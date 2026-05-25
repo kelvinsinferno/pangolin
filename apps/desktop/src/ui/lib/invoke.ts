@@ -146,7 +146,23 @@ export async function revealPassword(id: string): Promise<string> {
   return tauriInvoke<string>('reveal_password', { id });
 }
 
-/** Write `text` to the OS clipboard. */
+/** Write `text` to the OS clipboard. For PASSWORD copies prefer
+ *  {@link copyPasswordToClipboard} — it keeps the plaintext entirely
+ *  Rust-side, never crossing it through V8. This wrapper stays for
+ *  non-secret strings (e.g. an account username). */
 export async function copyToClipboard(text: string): Promise<void> {
   await tauriInvoke<void>('copy_to_clipboard', { text });
+}
+
+/** **Copy the head-of-history plaintext password directly to the OS
+ *  clipboard** — the plaintext NEVER crosses the FFI boundary back
+ *  into V8 (audit HIGH H-1 hardening, 2026-05-25). The Rust side
+ *  reads the password via FFI + writes to the clipboard plugin in
+ *  the same `tauri::command` body that holds the zeroizing buffer.
+ *
+ *  Use this for the AccountDetailScreen's "Copy" button. For the
+ *  reveal-to-view flow (the user wants to SEE the password before
+ *  deciding to copy) use {@link revealPassword}. */
+export async function copyPasswordToClipboard(id: string): Promise<void> {
+  await tauriInvoke<void>('copy_password_to_clipboard', { id });
 }

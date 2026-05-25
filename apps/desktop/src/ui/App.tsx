@@ -52,8 +52,10 @@ export function App() {
     }
     return { ok: true as const, password: r.password };
   };
-  const onCopy = async (text: string) => {
-    const r = await actions.copy(text);
+  const onCopyPassword = async () => {
+    // Routes through the new copy_password_to_clipboard Tauri command
+    // (audit H-1 hardening) — plaintext never crosses V8.
+    const r = await actions.copySelectedPassword();
     if (r.ok) {
       toastActions.success('Password copied to clipboard');
     } else {
@@ -83,7 +85,7 @@ export function App() {
           account={state.selected}
           onBack={actions.backToList}
           onReveal={onReveal}
-          onCopy={onCopy}
+          onCopyPassword={onCopyPassword}
         />
       )}
       <div className="toast-region" aria-live="polite">
