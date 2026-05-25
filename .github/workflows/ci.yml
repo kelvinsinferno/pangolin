@@ -104,10 +104,19 @@ jobs:
       # committed, the dist files drifted from tokens.json — fail
       # CI with a clear message that points at the fix.
       - name: Assert dist files are up to date
+        # `--quiet` is the documented git-diff equivalent of
+        # `--exit-status` and is what we actually want here: silent
+        # output, exit 1 on diff. `--exit-status` is documented but
+        # genuinely rejected by git 2.54.0 in both Ubuntu's apt-git
+        # and the Windows-MSYS git build (caught when the b70a259
+        # CI failed with `error: invalid option: --exit-status` even
+        # though there was no real content drift). `--quiet` works
+        # everywhere git diff does.
         run: |
-          if ! git diff --exit-status apps/design-tokens/dist apps/design-tokens/src/lib.rs; then
+          if ! git diff --quiet apps/design-tokens/dist apps/design-tokens/src/lib.rs; then
             echo "::error::design-tokens dist artifacts are out of date."
             echo "::error::Re-run: cargo run -p design-tokens-gen && commit apps/design-tokens/dist + apps/design-tokens/src/lib.rs"
+            git --no-pager diff apps/design-tokens/dist apps/design-tokens/src/lib.rs
             exit 1
           fi
 
