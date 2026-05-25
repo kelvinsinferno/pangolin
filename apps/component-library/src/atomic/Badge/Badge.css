@@ -1,0 +1,39 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+.pcl-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-full);
+  font-family: var(--font-family-sans);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--font-line-height-tight);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.pcl-badge--neutral {
+  background: var(--color-surface-elevated);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+}
+
+.pcl-badge--success {
+  background: var(--color-success);
+  color: var(--color-surface);
+}
+
+.pcl-badge--warning {
+  background: var(--color-warning);
+  color: var(--color-surface);
+}
+
+.pcl-badge--danger {
+  background: var(--color-danger);
+  color: var(--color-surface);
+}
+
+.pcl-badge--accent {
+  background: var(--color-accent-primary);
+  color: var(--color-surface);
+}

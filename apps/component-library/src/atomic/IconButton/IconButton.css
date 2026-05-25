@@ -1,0 +1,36 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+.pcl-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  color: var(--color-text);
+  cursor: pointer;
+  transition:
+    background var(--motion-duration-fast) var(--motion-easing-standard),
+    color var(--motion-duration-fast) var(--motion-easing-standard);
+}
+
+.pcl-icon-button:hover:not(:disabled) {
+  background: var(--color-surface-elevated);
+}
+
+.pcl-icon-button:focus-visible {
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: 2px;
+}
+
+.pcl-icon-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.pcl-icon-button--md {
+  padding: var(--space-2);
+}
+
+.pcl-icon-button--sm {
+  padding: var(--space-1);
+}

@@ -18,6 +18,7 @@
   --color-neutral-700: #BABAC2;
   --color-neutral-800: #DADAE2;
   --color-neutral-900: #FAFAFB;
+  --color-scrim: rgba(0, 0, 0, 0.4);
   --color-success: #1F9D55;
   --color-surface: #FFFFFF;
   --color-surface-elevated: #F7F7F8;
@@ -75,6 +76,7 @@
 [data-theme="dark"] {
   --color-border: #2A2A30;
   --color-danger: #F25555;
+  --color-scrim: rgba(0, 0, 0, 0.6);
   --color-success: #3BD27F;
   --color-surface: #141416;
   --color-surface-elevated: #1F1F23;

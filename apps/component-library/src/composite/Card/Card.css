@@ -1,0 +1,25 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+.pcl-card {
+  background: var(--color-surface);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  font-family: var(--font-family-sans);
+}
+
+.pcl-card--elev-none {
+  box-shadow: var(--shadow-none);
+}
+
+.pcl-card--elev-sm {
+  box-shadow: var(--shadow-sm);
+}
+
+.pcl-card--elev-md {
+  box-shadow: var(--shadow-md);
+}
+
+.pcl-card--elev-lg {
+  box-shadow: var(--shadow-lg);
+}
