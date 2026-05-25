@@ -247,7 +247,7 @@ jobs:
       # uses a `file:../component-library` dep, so the `dist/` it
       # imports must exist BEFORE `pnpm install --frozen-lockfile`
       # runs in apps/desktop. Plan §6 fifth bullet.
-      - name: Pre-build component-library (file: dep target)
+      - name: "Pre-build component-library (file: dep target)"
         working-directory: apps/component-library
         run: |
           pnpm install --frozen-lockfile
