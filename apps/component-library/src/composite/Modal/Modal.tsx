@@ -29,17 +29,32 @@ export function Modal({
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const lastActiveElementRef = useRef<HTMLElement | null>(null);
 
+  // Stable ref over `onClose` so the open-effect below can read the
+  // latest callback identity WITHOUT re-running on every render. Without
+  // this, an inline `onClose={() => setOpen(false)}` (the most-common
+  // consumer pattern) would re-run the effect each render, snapshotting
+  // `document.activeElement` AFTER focus had already moved into the
+  // dialog — focus-restore-on-close then lands on a Modal-internal node
+  // instead of the original trigger (audit MEDIUM M2).
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
   useEffect(() => {
     if (!open) {
       return;
     }
-    // Remember the element to restore focus to.
+    // Capture the focus-restoration target ONCE when `open` flips true.
+    // Effect deps are `[open]` only, so this assignment runs exactly
+    // once per open cycle — never re-snapshotting after focus has
+    // moved into the dialog.
     lastActiveElementRef.current = document.activeElement as HTMLElement | null;
 
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.stopPropagation();
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (e.key === 'Tab' && dialogRef.current !== null) {
@@ -68,7 +83,7 @@ export function Modal({
 
     window.addEventListener('keydown', handleKey);
 
-    // Move focus into the dialog (close button as default landing).
+    // Move focus into the dialog (first focusable element by default).
     queueMicrotask(() => {
       if (dialogRef.current === null) {
         return;
@@ -84,13 +99,15 @@ export function Modal({
 
     return () => {
       window.removeEventListener('keydown', handleKey);
-      // Restore focus.
+      // Restore focus to the captured target + clear the ref so the
+      // next open cycle captures fresh.
       const prev = lastActiveElementRef.current;
+      lastActiveElementRef.current = null;
       if (prev !== null && typeof prev.focus === 'function') {
         prev.focus();
       }
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) {
     return null;
