@@ -12,6 +12,7 @@ members = [
     "crates/pangolin-kdbx",
     "apps/cli",
     "apps/design-tokens",
+    "apps/desktop",
     "tools/chaincli",
     "tools/design-tokens-gen",
     "services/funder",

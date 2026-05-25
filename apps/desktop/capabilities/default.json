@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability — the explicit allow-list of Tauri commands the Pangolin desktop shell exposes to its frontend. Mirrors apps/desktop/src/lib.rs's invoke_handler registry; principle-of-least-authority per the MVP-4-B plan §3.5 (L4). Audit MEDIUM M-2 hardening (2026-05-25): the prior `core:default` umbrella transitively included `core:event:default`, which is NOT part of the minimum first surface. Replaced with the minimal explicit subset: `core:app:default` (app metadata + version) + `core:window:default` (the managed window). No `core:event:*`, no `core:webview:*`, no `core:tray:*` — they expand later sub-issues' scope, not this slice's.",
+  "windows": ["main"],
+  "permissions": [
+    "core:app:default",
+    "core:window:default",
+    "clipboard-manager:allow-write-text"
+  ]
+}

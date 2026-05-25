@@ -1,0 +1,75 @@
+[package]
+name = "pangolin-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "pangolin-desktop — Tauri v2 desktop shell hosting the closed-beta UX. Bridges the React 19 frontend (apps/desktop/src/ui/) to the `pangolin-ffi` surface via `tauri::command` handlers. See docs/issue-plans/mvp4-b-desktop-shell.md."
+
+[lib]
+name = "pangolin_desktop_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pangolin-desktop"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Workspace-internal: the FFI surface this shell wraps + the design-token
+# constants exposed to the Rust side (the React side reads the CSS-var
+# mirror via `@pangolin/component-library`'s bundled tokens.css).
+pangolin-ffi = { path = "../../crates/pangolin-ffi" }
+pangolin-design-tokens = { path = "../design-tokens" }
+
+# Tauri v2.x desktop shell + the clipboard-manager plugin (the single
+# host-controlled affordance the minimum surface uses, per plan §3.2).
+# Pinned to the latest 2.x patch at the time of the MVP-4-B build per
+# plan §5 Q-b (= 2.11.2 for `tauri`, = 2.3.2 for the plugin). Bump in
+# lockstep with cargo-deny advisories.
+tauri = { version = "=2.11.2", default-features = false, features = ["wry"] }
+tauri-plugin-clipboard-manager = "=2.3.2"
+
+# Workspace-pinned deps. `tokio` powers Tauri's async runtime + the
+# `tauri::command` async handlers; `zeroize` is the discipline tool for
+# any local password buffer the host side touches (we forward immediately
+# to `pangolin-ffi`'s `SecretPassword`, but the JS-string-to-Rust hop
+# still benefits from the zeroizing wrap).
+tokio = { workspace = true }
+zeroize = { workspace = true }
+# `thiserror` derives `Display` for the local `DesktopError`; the FFI
+# side already pulls it so the dep tree shape is unchanged.
+thiserror = { workspace = true }
+# `serde` powers the `tauri::command` argument/return serialization —
+# Tauri's `invoke()` bridge uses serde under the hood. Note this dep
+# does NOT reach `pangolin-crypto`'s tree: the desktop crate depends on
+# `pangolin-ffi` (which already has serde as a transitive via uniffi) +
+# `pangolin-design-tokens` (a zero-dep generated crate). HIGH-1 is
+# preserved because the dep arrow is `desktop -> ffi`, never the reverse.
+serde = { version = "=1.0.228", features = ["derive"] }
+
+[build-dependencies]
+# Tauri v2 emits resource files + Info.plist / manifest assets through
+# its build script. Required even for a minimum-surface build.
+tauri-build = { version = "=2.6.2", features = [] }
+
+[dev-dependencies]
+# Hermetic Rust-side tests use an on-disk vault built via `pangolin-ffi`'s
+# real-path vault_create + vault_open + vault_unlock surface (per plan
+# §1 hermetic-test requirements). `tempfile` is the workspace-standard
+# tmpdir helper.
+tempfile = { workspace = true }
+# `pangolin-store`'s `test-utilities` feature is already enabled across
+# the workspace's `cargo test --workspace` build (mirrors the
+# `crates/pangolin-ffi/Cargo.toml` dev-dep pattern); no new surface.
+pangolin-store = { path = "../../crates/pangolin-store", features = ["test-utilities"] }
+pangolin-crypto = { path = "../../crates/pangolin-crypto" }
+pangolin-core = { path = "../../crates/pangolin-core" }
+# Used by the typed-envelope serialization tests in src/error.rs. Same
+# workspace pin the rest of the workspace shares; dev-dep only.
+serde_json = { workspace = true }

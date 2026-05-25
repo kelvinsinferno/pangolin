@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Pangolin",
+  "version": "0.0.0",
+  "identifier": "studio.kelvinsinferno.pangolin",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build:ui"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Pangolin",
+        "width": 1024,
+        "height": 720,
+        "minWidth": 640,
+        "minHeight": 480,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "category": "Utility",
+    "shortDescription": "Pangolin password manager",
+    "longDescription": "Pangolin — closed-beta desktop password manager.",
+    "icon": []
+  }
+}
