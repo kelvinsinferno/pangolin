@@ -66,9 +66,15 @@ ignore = [
     # when Tauri publishes a release that targets gtk4 / adwaita
     # primarily. The same three IDs are also `--ignore`d in the
     # cargo-audit CI job invocation.
-    { id = "RUSTSEC-2024-0412", reason = "Unmaintained (not vulnerable). gtk-rs GTK3 binding, transitive of Tauri v2 Linux build chain via pangolin-desktop. Tauri itself is well-maintained; the gtk-rs bindings will be replaced when Tauri upgrades to gtk4." },
-    { id = "RUSTSEC-2024-0413", reason = "Unmaintained (not vulnerable). gtk-rs GTK3 binding, same root as -0412. Re-evaluate at Tauri's gtk4 migration." },
-    { id = "RUSTSEC-2024-0416", reason = "Unmaintained (not vulnerable). gtk-rs GTK3 binding, same root as -0412. Re-evaluate at Tauri's gtk4 migration." },
+    { id = "RUSTSEC-2024-0411", reason = "Unmaintained (not vulnerable). gtk-rs GTK3 binding family, transitive of Tauri v2 Linux build chain via pangolin-desktop. Tauri itself is well-maintained; the gtk-rs bindings will be replaced when Tauri upgrades to gtk4 / libadwaita." },
+    { id = "RUSTSEC-2024-0412", reason = "Unmaintained (not vulnerable). gtk-rs GTK3 binding, same root as -0411." },
+    { id = "RUSTSEC-2024-0413", reason = "Unmaintained (not vulnerable). gtk-rs GTK3 binding, same root as -0411." },
+    { id = "RUSTSEC-2024-0415", reason = "Unmaintained (not vulnerable). gtk-rs GTK3 binding, same root as -0411." },
+    { id = "RUSTSEC-2024-0416", reason = "Unmaintained (not vulnerable). gtk-rs GTK3 binding, same root as -0411." },
+    { id = "RUSTSEC-2024-0418", reason = "Unmaintained (not vulnerable). gtk-rs GTK3 binding, same root as -0411." },
+    { id = "RUSTSEC-2024-0419", reason = "Unmaintained (not vulnerable). gtk-rs GTK3 binding, same root as -0411." },
+    { id = "RUSTSEC-2024-0420", reason = "Unmaintained (not vulnerable). gtk-rs GTK3 binding, same root as -0411." },
+    { id = "RUSTSEC-2024-0429", reason = "Unmaintained (not vulnerable). gtk-rs GTK3 binding, same root as -0411." },
 ]
 
 [licenses]
@@ -93,6 +99,14 @@ allow = [
     "Zlib",
     "MPL-2.0",
     "CC0-1.0",
+    # MVP-4-B (2026-05-25): Tauri v2's Linux build chain pulls in
+    # crates that ship under the Boost Software License 1.0 (e.g.
+    # `xmlparser`). BSL-1.0 is a permissive, attribution-not-
+    # required, non-copyleft license — semantically a superset of
+    # MIT for permissiveness. It is well-known compatible with
+    # AGPL distribution. Narrow attribution scoped to the Tauri
+    # transitives that need it.
+    "BSL-1.0",
     # `unicode-ident` ships under Unicode-DFS-2016 OR (Apache-2.0 WITH
     # LLVM-exception) — covered above. No additional entries needed.
     #
