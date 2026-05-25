@@ -56,6 +56,19 @@ ignore = [
     # MUST be added back. Tracked at
     # https://github.com/EmbarkStudios/cargo-deny/issues (search
     # "unmaintained-as-hard-failure").
+    #
+    # MVP-4-B (2026-05-25): the Tauri v2 Linux build pulls in gtk-rs's
+    # GTK3 bindings (gtk3, gdk, glib4-sys, etc.) which were marked
+    # unmaintained on the rustsec advisory database when gtk-rs
+    # moved focus to GTK4 / libadwaita. They are NOT vulnerable —
+    # only unmaintained. Tauri v2 still targets GTK3 on Linux; the
+    # whole desktop ecosystem is in slow-cycle migration. Re-evaluate
+    # when Tauri publishes a release that targets gtk4 / adwaita
+    # primarily. The same three IDs are also `--ignore`d in the
+    # cargo-audit CI job invocation.
+    { id = "RUSTSEC-2024-0412", reason = "Unmaintained (not vulnerable). gtk-rs GTK3 binding, transitive of Tauri v2 Linux build chain via pangolin-desktop. Tauri itself is well-maintained; the gtk-rs bindings will be replaced when Tauri upgrades to gtk4." },
+    { id = "RUSTSEC-2024-0413", reason = "Unmaintained (not vulnerable). gtk-rs GTK3 binding, same root as -0412. Re-evaluate at Tauri's gtk4 migration." },
+    { id = "RUSTSEC-2024-0416", reason = "Unmaintained (not vulnerable). gtk-rs GTK3 binding, same root as -0412. Re-evaluate at Tauri's gtk4 migration." },
 ]
 
 [licenses]

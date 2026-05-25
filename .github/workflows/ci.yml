@@ -58,7 +58,13 @@ jobs:
           # and should not be touched by the cache layer.
           prefix-key: "v1"
           cache-bin: "false"
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # `pangolin-desktop` is excluded because it pulls in Tauri's
+      # transitive gtk-rs / glib-sys deps which need Linux system
+      # packages (libwebkit2gtk-4.1-dev, libgtk-3-dev, etc.) to even
+      # compile their build scripts. Those deps are installed only in
+      # the dedicated `desktop` job below; bringing them into the
+      # workspace clippy run would cascade-fail every Ubuntu CI run.
+      - run: cargo clippy --workspace --exclude pangolin-desktop --all-targets -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -74,8 +80,14 @@ jobs:
         with:
           prefix-key: "v1"
           cache-bin: "false"
-      - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace --all-targets
+      # `pangolin-desktop` is excluded for the same reason as the
+      # clippy job above — Tauri's gtk-rs transitives need Linux
+      # system packages on Ubuntu and the Tauri proc-macro panics
+      # at build time on macOS. The dedicated `desktop` job below
+      # runs pangolin-desktop's build + tests with the right deps
+      # installed.
+      - run: cargo build --workspace --exclude pangolin-desktop --all-targets
+      - run: cargo test --workspace --exclude pangolin-desktop --all-targets
 
   # -----------------------------------------------------------------
   # MVP-4-A: design-tokens up-to-date gate
@@ -226,6 +238,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Tauri v2's Linux build needs webkit2gtk + glib-2.0 + gtk-3 +
+      # soup-3.0 + libxdo (xdotool runtime) + librsvg2 + ayatana-
+      # appindicator. Without these the `glib-sys` build script fails
+      # at pkg-config time (caught when the b43f575 CI hit
+      # "Package glib-2.0 was not found in the pkg-config search path").
+      # Install BEFORE the Rust toolchain step so the cargo cache key
+      # (Swatinem/rust-cache) doesn't restore a poisoned cache from a
+      # run that lacked these libs.
+      - name: "Install Tauri Linux system deps (apt)"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -596,7 +628,12 @@ jobs:
         # in `deny.toml` for `cargo deny check`. Remove the ignore flags
         # as soon as alloy bumps past these transitives.
         # See `cargo audit --help` for `--ignore` semantics.
-        run: cargo audit --deny warnings --ignore RUSTSEC-2024-0388 --ignore RUSTSEC-2024-0436
+        # The three RUSTSEC-2024-04{12,13,16} ignores were added when
+        # MVP-4-B's Tauri v2 deps brought in gtk-rs GTK3 bindings
+        # (gtk3, gdk, glib transitives) which are unmaintained but
+        # not vulnerable. Tauri itself is well-maintained; the gtk-rs
+        # bindings stay until Tauri upgrades to gtk4 or libadwaita.
+        run: cargo audit --deny warnings --ignore RUSTSEC-2024-0388 --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2024-0412 --ignore RUSTSEC-2024-0413 --ignore RUSTSEC-2024-0416
 
   # Dependency policy. Enforces the crypto-crate allowlist + serde ban
   # and license / source / advisory rules defined in deny.toml.
