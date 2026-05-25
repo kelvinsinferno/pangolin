@@ -125,12 +125,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # pnpm 11 matches the version pnpm-workspace.yaml's `allowBuilds`
-      # block targets (introduced in pnpm 11). Bump in lockstep when
-      # local dev moves.
+      # pnpm 10 is the LTS that works cleanly on the .nvmrc-pinned
+      # Node 20.18.0. pnpm 11.x switched some internals to
+      # node:builtin modules that don't exist in Node 20.18 (CI
+      # failure on b70a259 was `ERR_UNKNOWN_BUILTIN_MODULE` from
+      # pnpm 11.3.0). The `onlyBuiltDependencies:` esbuild
+      # approval in pnpm-workspace.yaml is the canonical pnpm 10+
+      # mechanism + works fine here. Bump pnpm + Node in lockstep
+      # in a future cycle (Node 22 LTS + pnpm 11).
       - uses: pnpm/action-setup@v4
         with:
-          version: 11
+          version: 10
       - uses: actions/setup-node@v4
         with:
           node-version-file: 'apps/extension/.nvmrc'

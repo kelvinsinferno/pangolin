@@ -1,4 +1,8 @@
+# pnpm 10+ canonical mechanism for approving esbuild's postinstall
+# build step (defeats the pnpm 10 default "ignored builds" warning
+# that the extension's vite + storybook deps cascade into). The
+# `allowBuilds:` block that lived here originally was a pnpm 11-
+# only key that produced the same effect; removed when CI rolled
+# back to pnpm 10 (Node 20.18 + pnpm 11 hit ERR_UNKNOWN_BUILTIN_MODULE).
 onlyBuiltDependencies:
   - esbuild
-allowBuilds:
-  esbuild: true
