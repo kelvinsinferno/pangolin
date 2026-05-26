@@ -33,6 +33,16 @@ pub mod error;
 pub mod ipc;
 pub mod state;
 
+// MVP-4-F: feature-gated test-hook module + `__test__*` commands.
+// The module's own `#![cfg(feature = "test-hooks")]` attribute compiles
+// the body out of release builds; this `pub mod` line is feature-gated
+// in lockstep so a stray reference in non-test-hooks code is a build
+// error (defence in depth).
+//
+// Plan-LOCK: docs/issue-plans/mvp4-f-desktop-e2e.md §3.2.
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks;
+
 pub use error::DesktopError;
 pub use state::VaultState;
 
@@ -48,7 +58,7 @@ pub use state::VaultState;
 /// command requires both (a) registering it here and (b) listing its
 /// permission slug in `capabilities/`.
 pub fn build_app() -> tauri::Builder<tauri::Wry> {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(VaultState::default())
         // MVP-4-E: spawn the IPC server task that the native-
@@ -68,8 +78,35 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             let app_handle = app.handle().clone();
             ipc::spawn_with_app_handle(app_handle);
             Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
+        });
+
+    // MVP-4-F: invoke-handler registration is feature-split because
+    // `tauri::generate_handler!` is a compile-time macro that needs the
+    // full handler list as a single argument. The two arms register
+    // the same production-command set; the `test-hooks` arm appends
+    // the two `__test__*` debugging commands so the WebDriverIO suite
+    // can read the in-process invocation log. Plan-LOCK §3.2.
+    #[cfg(feature = "test-hooks")]
+    {
+        builder.invoke_handler(tauri::generate_handler![
+            commands::vault::vault_open,
+            commands::vault::vault_unlock,
+            commands::vault::vault_lock,
+            commands::vault::vault_close,
+            commands::account::accounts_list,
+            commands::account::account_show,
+            commands::account::reveal_password,
+            commands::account::copy_password_to_clipboard,
+            commands::account::copy_to_clipboard,
+            commands::install_native_host::install_native_host,
+            commands::install_native_host::uninstall_native_host,
+            test_hooks::__test__commands_invoked,
+            test_hooks::__test__clear_invocations,
+        ])
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    {
+        builder.invoke_handler(tauri::generate_handler![
             commands::vault::vault_open,
             commands::vault::vault_unlock,
             commands::vault::vault_lock,
@@ -82,6 +119,7 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::install_native_host::install_native_host,
             commands::install_native_host::uninstall_native_host,
         ])
+    }
 }
 
 #[cfg(test)]

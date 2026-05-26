@@ -1,0 +1,3 @@
+.fixture-path
+node_modules/
+wdio-logs/

@@ -102,26 +102,39 @@ export function AccountDetailScreen({
                 ••••••••
               </span>
             ) : (
-              <code data-testid="revealed-password">{revealed}</code>
+              // MVP-4-F E2E gate: wrapper carries `revealed-password-text`
+              // (plan §3.4); inner `<code>` keeps the Vitest contract
+              // (`data-testid="revealed-password"`). Plan §3.4.
+              <span data-testid="revealed-password-text">
+                <code data-testid="revealed-password">{revealed}</code>
+              </span>
             )}
           </dd>
         </dl>
         <div className="account-detail-screen__actions">
-          <Button
-            onClick={handleReveal}
-            disabled={pending || revealed !== null}
-            data-testid="reveal-button"
-          >
-            {revealed === null ? 'Reveal Password' : 'Password revealed (auto-clears)'}
-          </Button>
-          <Button
-            variant="secondary"
-            onClick={handleCopy}
-            disabled={pending}
-            data-testid="copy-button"
-          >
-            {copyConfirmed ? 'Copied!' : 'Copy'}
-          </Button>
+          {/* MVP-4-F E2E gate: wrappers carry the plan's stable IDs
+              (`reveal-password-button`, `copy-password-button`); the
+              inner Buttons keep the existing Vitest contract
+              (`reveal-button`, `copy-button`). Plan §3.4. */}
+          <span data-testid="reveal-password-button">
+            <Button
+              onClick={handleReveal}
+              disabled={pending || revealed !== null}
+              data-testid="reveal-button"
+            >
+              {revealed === null ? 'Reveal Password' : 'Password revealed (auto-clears)'}
+            </Button>
+          </span>
+          <span data-testid="copy-password-button">
+            <Button
+              variant="secondary"
+              onClick={handleCopy}
+              disabled={pending}
+              data-testid="copy-button"
+            >
+              {copyConfirmed ? 'Copied!' : 'Copy'}
+            </Button>
+          </span>
         </div>
       </Card>
     </main>
