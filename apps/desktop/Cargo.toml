@@ -26,6 +26,36 @@ workspace = true
 # mirror via `@pangolin/component-library`'s bundled tokens.css).
 pangolin-ffi = { path = "../../crates/pangolin-ffi" }
 pangolin-design-tokens = { path = "../design-tokens" }
+# MVP-4-E: the native-messaging-host crate exposes the shared
+# manifest/paths/auth helpers used by the install-native-host CLI
+# subcommand. The desktop side does NOT execute the host's main()
+# (Chrome spawns it as a subprocess) — only the helper modules are
+# imported. The CI job `desktop` builds this transitively.
+pangolin-native-messaging-host = { path = "../native-messaging-host" }
+# MVP-4-E: pangolin-crypto's rng + zeroize for the handshake-token
+# generation in `install_native_host`. The plan §3.4 spec calls for
+# `pangolin_crypto::rng::fill_random` directly so the host token
+# uses the SAME OsRng-chokepoint as the rest of the workspace.
+pangolin-crypto = { path = "../../crates/pangolin-crypto" }
+# MVP-4-E: cross-platform OS keychain for storing the handshake
+# token. Same crate + same feature set as the host crate, so the
+# desktop installs to the same backend the host reads from.
+keyring = { version = "=3.6.3", default-features = false, features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+    "crypto-rust",
+] }
+# MVP-4-E: interprocess for the desktop's IPC server task (binds
+# the per-user pipe/socket the host connects to).
+interprocess = { version = "=2.2.3", features = ["tokio"] }
+# MVP-4-E: serde_json for the IPC dispatch path (JSON-RPC parse +
+# response serialization).
+serde_json = { workspace = true }
+# MVP-4-E: base64 for the handshake-token wire-form encoding.
+# Already in the workspace lock as a transitive of alloy 2.0; this
+# direct pin keeps the dep arrow explicit.
+base64 = "=0.22.1"
 
 # Tauri v2.x desktop shell + the clipboard-manager plugin (the single
 # host-controlled affordance the minimum surface uses, per plan §3.2).
@@ -68,8 +98,6 @@ tempfile = { workspace = true }
 # the workspace's `cargo test --workspace` build (mirrors the
 # `crates/pangolin-ffi/Cargo.toml` dev-dep pattern); no new surface.
 pangolin-store = { path = "../../crates/pangolin-store", features = ["test-utilities"] }
-pangolin-crypto = { path = "../../crates/pangolin-crypto" }
 pangolin-core = { path = "../../crates/pangolin-core" }
-# Used by the typed-envelope serialization tests in src/error.rs. Same
-# workspace pin the rest of the workspace shares; dev-dep only.
-serde_json = { workspace = true }
+# (pangolin-crypto + serde_json are also prod-deps as of MVP-4-E;
+# the dev-dep entries collapse via cargo's dep-table unification.)

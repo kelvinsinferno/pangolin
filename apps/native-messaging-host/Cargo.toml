@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# `pangolin-native-messaging-host` — Rust binary bridging the
+# Chromium MV3 extension to the Tauri desktop process via Chrome's
+# native-messaging protocol.
+#
+# See `docs/issue-plans/mvp4-e-native-messaging-host.md` for the full
+# plan. `publish = false`: the binary ships alongside the desktop app's
+# installer, not via crates.io.
+#
+# Dep budget (locked per §0a + §5 of the plan):
+#   - tokio (workspace) — async stdio + IPC.
+#   - serde_json (workspace) — JSON-RPC body encode/decode.
+#   - keyring 3.x — cross-platform OS keychain (Q-a; pinned to =3.6.3,
+#     the latest stable at build time + zero RUSTSEC advisories).
+#   - interprocess 2.x — cross-platform named-pipe / Unix-domain-socket
+#     (Q-b; the standard Rust crate for the abstraction; ~3x less per-OS
+#     code than hand-rolled `tokio::net::*`. Used by tower / lapin /
+#     dozens of others; pinned to =2.2.3).
+#   - pangolin-crypto (path) — for `subtle::ConstantTimeEq` +
+#     `Zeroizing` discipline on the handshake token.
+#   - zeroize (workspace) — drop-time zeroing of the loaded token.
+#   - thiserror (workspace) — typed `HostError` enum.
+
+[package]
+name = "pangolin-native-messaging-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "pangolin-native-messaging-host — Chrome native-messaging bridge from the MV3 extension to the Tauri desktop. See docs/issue-plans/mvp4-e-native-messaging-host.md."
+
+[[bin]]
+name = "pangolin-native-messaging-host"
+path = "src/main.rs"
+
+[lib]
+name = "pangolin_native_messaging_host"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Workspace-internal: the constant-time + zeroizing primitives the
+# handshake-token path leans on. No FFI surface; just trait imports.
+pangolin-crypto = { path = "../../crates/pangolin-crypto" }
+
+# Workspace-pinned. Tokio drives stdin/stdout + the IPC channel; the
+# native host is a tiny single-task async program. `io-util` powers
+# `AsyncReadExt::read_exact` for the 4-byte frame prefix; `io-std`
+# wires async stdin/stdout; `net` is required for `interprocess`'s
+# tokio integration.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "sync", "io-util", "io-std", "net"] }
+serde_json = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+# `subtle` is already in the workspace pin set (used by pangolin-crypto)
+# but we name it directly so the constant-time-compare imports are not
+# load-bearing on a transitive re-export from pangolin-crypto.
+subtle = { workspace = true }
+
+# Cross-platform OS keychain. v3.6 ships per-OS native backends but
+# none of them by default — they're opt-in via features. We enable:
+#   - `apple-native` (macOS Keychain Services via security-framework),
+#   - `windows-native` (Windows Credential Manager via windows-sys),
+#   - `sync-secret-service` + `crypto-rust` (Linux libsecret via DBus;
+#     `crypto-rust` uses RustCrypto AES instead of the openssl FFI
+#     backend so we do NOT introduce `openssl`/`openssl-sys` into the
+#     dep tree — both are denied by `deny.toml` for the workspace).
+# Pin rationale (Q-a): 3.6.3 is the latest 3.x release with zero
+# RUSTSEC advisories at build time (4.0.1 exists but ships under a
+# different repo + author + MSRV; staying on the 3.x line keeps the
+# plan-pinned `=3.x` shape).
+keyring = { version = "=3.6.3", default-features = false, features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+    "crypto-rust",
+] }
+
+# Cross-platform local IPC abstraction. Named pipes on Windows;
+# Unix-domain sockets on Linux + macOS. `tokio` feature wires the
+# tokio integration. `interprocess` itself ships zero unsafe code in
+# its public API (the wrapper crate boundary IS the safety perimeter
+# per plan §6).
+interprocess = { version = "=2.2.3", features = ["tokio"] }
+
+# Base64 encoding for the handshake-token wire form. The `=0.22.x`
+# pin matches the alloy-tree transitives already in the lock (alloy
+# 2.0 pulls base64 0.22 as a transitive of alloy-rpc-types), so adding
+# our own pin does not split the dep tree.
+base64 = "=0.22.1"
+
+# Audit H-1 hardening (2026-05-26): the IPC EUID owner check now
+# calls `rustix::process::geteuid()` instead of reading `$UID` from
+# the environment (which is a shell builtin, not a POSIX env-var, and
+# is NOT reliably inherited when Chrome is launched from a desktop
+# session manager / systemd-user service / xdg-open). `rustix` ships
+# a zero-unsafe public API + is already in the workspace transitively
+# (`cargo tree | grep rustix` confirms 1.1.4); we name it directly
+# under `cfg(unix)` so the Windows build doesn't see it.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.4", default-features = false, features = ["process"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "io-std", "net", "time", "sync"] }
