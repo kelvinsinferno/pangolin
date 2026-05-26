@@ -369,8 +369,17 @@ jobs:
         with:
           prefix-key: "v1"
           cache-bin: "false"
+      # `tauri-driver` ships TWO release lines: `0.1.x` for Tauri v1
+      # (legacy) and `2.0.x` for Tauri v2 (the current release line that
+      # Pangolin runs against — see apps/desktop/Cargo.toml). Pinned at
+      # 2.0.6 (current stable as of the plan-LOCK); matches the
+      # `cargo install tauri-driver --locked` floating-stable command
+      # the official Tauri v2 docs recommend at
+      # https://v2.tauri.app/develop/tests/webdriver/. Installing the
+      # `0.1.x` line against a v2 binary fails at WebDriver session
+      # init because the WebDriver shim expects v1 lifecycle hooks.
       - name: "Install tauri-driver"
-        run: cargo install --locked --version =0.1.4 tauri-driver
+        run: cargo install --locked --version =2.0.6 tauri-driver
       - uses: pnpm/action-setup@v4
         with:
           version: 10
