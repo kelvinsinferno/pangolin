@@ -1,0 +1,7 @@
+.fixture-path
+node_modules/
+wdio-logs/
+# corepack's packed-tarball artifact (when running `corepack prepare`
+# locally outside a system-pnpm install). Not load-bearing; never
+# committed.
+corepack.tgz
