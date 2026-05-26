@@ -238,14 +238,6 @@ pub async fn reveal_password(
     id: String,
     state: State<'_, VaultState>,
 ) -> Result<String, DesktopError> {
-    // MVP-4-F: feature-gated invocation log so the WebDriverIO E2E
-    // suite (scenarios `reveal_password_for_account` +
-    // `copy_password_via_rust_command`) can assert which Rust path
-    // ran. Compiles out entirely in production (`test-hooks` flag is
-    // off). Plan-LOCK §3.2; L7 — records the command NAME only.
-    #[cfg(feature = "test-hooks")]
-    crate::test_hooks::record("reveal_password");
-
     let account_id = account_id_from_hex(&id)?;
     let handle = state.require_open()?;
     let presence = cli_presence_proof();
@@ -334,13 +326,6 @@ pub async fn copy_password_to_clipboard(
     state: State<'_, VaultState>,
     app: tauri::AppHandle,
 ) -> Result<(), DesktopError> {
-    // MVP-4-F: feature-gated invocation log — scenario 5
-    // (`copy_password_via_rust_command`) asserts on this line firing,
-    // which proves the H-1 invariant (the Rust-side path was taken;
-    // plaintext never crossed V8). Plan-LOCK §3.2; L7 — name only.
-    #[cfg(feature = "test-hooks")]
-    crate::test_hooks::record("copy_password_to_clipboard");
-
     copy_password_via(&state, id, |s| {
         app.clipboard()
             .write_text(s)

@@ -45,34 +45,25 @@ export function UnlockScreen({ onUnlock, onClose }: UnlockScreenProps) {
       <Card elevation="md">
         <h1 id="unlock-title">Unlock</h1>
         <form onSubmit={handleSubmit}>
-          {/* MVP-4-F E2E gate: the wrapper carries `master-password-input`
-              so WebDriverIO can locate the unlock surface independent of
-              the component-library's internal DOM shape (the `<Input>`
-              element's `data-testid="password-input"` is the Vitest
-              contract; the wrapper is the E2E contract). Plan §3.4. */}
-          <div data-testid="master-password-input">
-            <Input
-              label="Master Password"
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              autoFocus
-              data-testid="password-input"
-              aria-invalid={authFailed}
-              aria-describedby={authFailed ? 'password-error' : undefined}
-            />
-          </div>
+          <Input
+            label="Master Password"
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoFocus
+            data-testid="password-input"
+            aria-invalid={authFailed}
+            aria-describedby={authFailed ? 'password-error' : undefined}
+          />
           {authFailed && (
-            <div data-testid="unlock-error-banner">
-              <p
-                id="password-error"
-                role="alert"
-                className="unlock-screen__error"
-                data-testid="auth-failed-inline"
-              >
-                The master password is not correct. Try again.
-              </p>
-            </div>
+            <p
+              id="password-error"
+              role="alert"
+              className="unlock-screen__error"
+              data-testid="auth-failed-inline"
+            >
+              The master password is not correct. Try again.
+            </p>
           )}
           <div className="unlock-screen__actions">
             <Button

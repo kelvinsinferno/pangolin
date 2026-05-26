@@ -20,8 +20,8 @@ Stand up the first end-to-end UX gate for the Tauri desktop shell (MVP-4-B). A n
 - **Fixture vault = generated at test setup**, not committed. A `apps/desktop/e2e/setup/build-fixture-vault.ts` script invokes the existing `cargo run -p pangolin-cli -- vault create` + `vault add-account` flow under a `tempfile::TempDir` HOME to produce a deterministic fixture with 3 known accounts (GitHub / Gmail / Twitter; password `test-password-123!`; weak deliberately so Argon2 finishes in <1s for the test). Rebuilt at every test run from the canonical CLI, so when the PVF format evolves the fixture follows. No committed binary blob.
 - **Headless display on Linux = `xvfb-run`.** Standard headless-X harness; works on `ubuntu-latest` with `sudo apt-get install -y xvfb` (cheap; the runner image ships it on every recent Ubuntu LTS, but the job declares the install to stay reproducible). The Tauri WebKitGTK WebView renders into the xvfb display; WebDriverIO talks to `tauri-driver` via localhost.
 - **Test runner = pnpm script in `apps/desktop/package.json`.** New script `pnpm test:e2e` orchestrates: (a) build the fixture vault via the CLI, (b) build `pangolin-desktop` in debug mode (debug is fast + a real bug there fails differently than the production build only on optimizer-induced behavior, which is rare), (c) start `tauri-driver`, (d) run WebDriverIO against it, (e) teardown. Single pnpm command for the local dev loop + CI.
-- **`tauri-driver` install = `cargo install --locked --version =2.0.6 tauri-driver`.** `tauri-driver` ships TWO release lines: `0.1.x` for Tauri v1 (legacy) and `2.0.x` for Tauri v2 (current). Pangolin is on Tauri v2 (see `apps/desktop/Cargo.toml`) so the `2.0.x` line is the correct match — installing `0.1.4` against a v2 binary fails at session start because the WebDriver shim expects the Tauri v1 lifecycle hooks. 2.0.6 is the current stable; matches the `cargo install tauri-driver --locked` floating-stable command the official Tauri v2 docs recommend (<https://v2.tauri.app/develop/tests/webdriver/>). Verified clean against `cargo audit` (no RUSTSEC advisories on `tauri-driver` itself). Installed in the CI job via the existing Swatinem cache layer (lands in `~/.cargo/bin`).
-- **WebDriverIO version pin = `=9.27.2`**. The latest coordinated 9.x release across the whole `webdriverio` + `@wdio/*` monorepo as of build time. The `@wdio/types` sub-package skipped intermediate 9.x versions (jumped 9.0 → 9.27), so an earlier 9.4-era plan draft that pinned `=9.4.5` for everything was unbuildable. Pinned in `apps/desktop/e2e/package.json` (split from the main desktop package.json — see §1) to keep the heavy dev deps out of the production build's pnpm-lock + audit surface.
+- **`tauri-driver` install = `cargo install tauri-driver --version =0.1.4`.** Pinned latest as of build time; verified clean against `cargo audit` (no RUSTSEC advisories on `tauri-driver` itself). Installed in the CI job via the existing Swatinem cache layer (lands in `~/.cargo/bin`).
+- **WebDriverIO version pin = `=9.4.x`**. The current Tauri-docs-blessed pair with `tauri-driver` 0.1.x. Pinned in `apps/desktop/e2e/package.json` (split from the main desktop package.json — see §1) to keep the heavy dev deps out of the production build's pnpm-lock + audit surface.
 - **`@wdio/mocha-framework` for the spec runner.** Mocha syntax (`describe` / `it`) is the WebDriverIO default + matches the test-shape already familiar from the desktop's Vitest suite. No Jest. No Cucumber / Gherkin.
 - **No visual regression tests this slice.** Chromatic / Percy / Playwright-screenshots are deferred (budget + flake-rate concerns); the WebDriverIO assertions are DOM-content + ARIA-role-based, not pixel-based.
 - **No flakiness retries.** WebDriverIO defaults to zero retries; we keep that. A retry policy hides genuine timing bugs that the renderer + FFI surface are the most likely to introduce; better to fail loudly + fix the underlying race.
@@ -46,7 +46,7 @@ Stand up the first end-to-end UX gate for the Tauri desktop shell (MVP-4-B). A n
 **Built in MVP-4-F:**
 
 - `apps/desktop/e2e/` (NEW directory at the desktop crate root, sibling to `src/`).
-- `apps/desktop/e2e/package.json` — pnpm-managed, `private: true`. Deps: `webdriverio = "=9.27.2"`, `@wdio/cli = "=9.27.2"`, `@wdio/local-runner = "=9.27.2"`, `@wdio/mocha-framework = "=9.27.2"`, `@wdio/spec-reporter = "=9.27.2"`, `@wdio/types = "=9.27.2"`, `@wdio/globals = "=9.27.2"`, `mocha`, `chai`, `@types/mocha`, `@types/chai`, `typescript`, `tsx` (for the fixture-build script). Pinned via `pnpm-lock.yaml`.
+- `apps/desktop/e2e/package.json` — pnpm-managed, `private: true`. Deps: `webdriverio = "=9.4.x"`, `@wdio/cli`, `@wdio/local-runner`, `@wdio/mocha-framework`, `@wdio/spec-reporter`, `mocha`, `chai`, `@types/mocha`, `@types/chai`, `typescript`, `tsx` (for the fixture-build script). Pinned via `pnpm-lock.yaml`.
 - `apps/desktop/e2e/pnpm-lock.yaml` (committed).
 - `apps/desktop/e2e/tsconfig.json` (strict TS, `module: "esnext"`).
 - `apps/desktop/e2e/wdio.conf.ts` — WebDriverIO config: `tauri-driver` capabilities, spec glob `specs/**/*.test.ts`, mocha framework, before-suite hook that ensures the fixture vault + Tauri binary are present, after-suite hook that kills `tauri-driver`.
@@ -62,7 +62,7 @@ Stand up the first end-to-end UX gate for the Tauri desktop shell (MVP-4-B). A n
 - `apps/desktop/package.json` (TOUCHED) — new `"test:e2e"` script that delegates to `apps/desktop/e2e/`. Also a `"build:debug"` script (`cargo build -p pangolin-desktop`) the e2e suite invokes.
 - `apps/desktop/src/test_hooks.rs` (NEW Rust module, `#[cfg(any(test, feature = "test-hooks"))]`) — exposes a `record_command_invocation(name: &str)` hook that pushes the invoked command name onto a `Mutex<Vec<String>>` accessible from a new `__test__commands_invoked` Tauri command. The Tauri commands `copy_password_to_clipboard` and `reveal_password` push their name when this feature is active. Compiled out of release builds.
 - `apps/desktop/Cargo.toml` (TOUCHED) — new `[features] test-hooks = []` block. CI's `desktop-e2e` job compiles with `--features test-hooks`.
-- `.github/workflows/ci.yml` (TOUCHED) — new `desktop-e2e` job: `runs-on: ubuntu-latest`, depends on the same apt installs as the existing `desktop` job (`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `xvfb`, etc.), additionally installs `tauri-driver` via `cargo install --locked --version =2.0.6 tauri-driver`, runs `pnpm install --frozen-lockfile` under `apps/desktop/e2e/`, runs `xvfb-run --auto-servernum pnpm test:e2e`. Uploads `wdio-logs/` as an artifact on failure for debug.
+- `.github/workflows/ci.yml` (TOUCHED) — new `desktop-e2e` job: `runs-on: ubuntu-latest`, depends on the same apt installs as the existing `desktop` job (`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `xvfb`, etc.), additionally installs `tauri-driver` via `cargo install --version =0.1.4 tauri-driver`, runs `pnpm install --frozen-lockfile` under `apps/desktop/e2e/`, runs `xvfb-run --auto-servernum pnpm test:e2e`. Uploads `wdio-logs/` as an artifact on failure for debug.
 - Hermetic verification: the suite drives the real binary; no FFI mock, no Tauri `MockRuntime`, no fake commands. Real React, real WebView, real Rust commands, real `pangolin-ffi`.
 
 **Deferred (NOT this slice):** per §0b.
@@ -108,7 +108,7 @@ The fixture-build harness + the WebDriverIO config + the test-hook Rust module +
 
 Lifecycle:
 
-1. CI job `desktop-e2e` checks out the repo, installs apt deps (matches the existing `desktop` job plus xvfb), installs Rust + pnpm + Node, runs `cargo install --locked --version =2.0.6 tauri-driver` (Tauri v2 line; `0.1.x` is Tauri v1 legacy).
+1. CI job `desktop-e2e` checks out the repo, installs apt deps (matches the existing `desktop` job plus xvfb), installs Rust + pnpm + Node, runs `cargo install --version =0.1.4 tauri-driver`.
 2. `pnpm install --frozen-lockfile` under `apps/desktop/e2e/` pulls WebDriverIO + the test deps.
 3. The `pnpm test:e2e` script:
    - Runs `tsx setup/build-fixture-vault.ts` → invokes `cargo run -p pangolin-cli -- vault create` + `vault add-account` 3× under a fresh `TempDir`, writes the path to `.fixture-path`.
@@ -262,7 +262,7 @@ desktop-e2e:
         prefix-key: "v1"
         cache-bin: "false"
     - name: "Install tauri-driver"
-      run: cargo install --locked --version =2.0.6 tauri-driver
+      run: cargo install --locked --version =0.1.4 tauri-driver
     - uses: pnpm/action-setup@v4
       with:
         version: 10
@@ -293,7 +293,7 @@ Reused libdbus-1-dev install (from the MVP-4-E hotfix); reuses pnpm 10 + Node `.
 - **L1 zero-secret-crosses-FFI** still holds. The fixture passwords (`github-fixture-pw-1` etc.) are NOT real secrets; they're test fixtures generated fresh per run. The H-1 invariant from MVP-4-B (`copy_password_to_clipboard` is Rust-side; plaintext never crosses V8 except in the deliberate `reveal_password` carve-out) is the load-bearing assertion of scenario 5 — that's exactly what the test-hooks log proves.
 - **L2 no new atomic surface.** The E2E suite drives existing Tauri commands; no new state machines.
 - **L3 fail-closed.** Test-hook commands are gated behind a feature flag; production builds cannot see them. The `__test__*` commands return empty / clear-only outputs that carry no privileged data even if accidentally exposed.
-- **L5 new external deps:** `webdriverio = "=9.27.2"` + the full `@wdio/{cli,types,globals,local-runner,mocha-framework,spec-reporter} = "=9.27.2"` set (latest coordinated 9.x release), `mocha`, `chai`, `tsx`, `tauri-driver` (Cargo, pinned `=2.0.6` — Tauri v2 line). All scoped to `apps/desktop/e2e/`; do NOT enter the production lockfile or the workspace audit / deny surface. Verified separately by the new job; advisories run inside the E2E job too.
+- **L5 new external deps:** `webdriverio = "=9.4.x"`, `@wdio/{cli,local-runner,mocha-framework,spec-reporter}`, `mocha`, `chai`, `tsx`, `tauri-driver` (Cargo, pinned `=0.1.4`). All scoped to `apps/desktop/e2e/`; do NOT enter the production lockfile or the workspace audit / deny surface. Verified separately by the new job; advisories run inside the E2E job too.
 - **L6 testnet-only / D-011.** This slice does not touch chain code.
 - **L7 errors carry no secret.** Test-hook log records command NAMES only; no params, no return values. Even with the feature flag accidentally on in a release build, no secret material leaks.
 - **L8 tests:** the slice IS the test layer.
@@ -327,7 +327,7 @@ All other decisions are locked per §0a.
 - `xvfb-run --auto-servernum pnpm test:e2e` ✓ locally on Linux (in the CI image's environment) — all 5 scenarios pass.
 - New CI job `desktop-e2e` green on `ubuntu-latest`.
 - The existing `desktop` job still passes WITHOUT the `test-hooks` feature (regression-catch on the feature-gate hygiene).
-- `cargo audit --deny warnings <existing --ignore set>` ✓ (no new advisories from `tauri-driver` 2.0.6).
+- `cargo audit --deny warnings <existing --ignore set>` ✓ (no new advisories from `tauri-driver` 0.1.4).
 - `cargo deny check advisories bans licenses sources` ✓.
 - Cardinal invariants still 0/0/0.
 

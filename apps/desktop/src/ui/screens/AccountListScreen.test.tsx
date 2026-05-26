@@ -39,11 +39,8 @@ describe('AccountListScreen', () => {
     );
     expect(screen.getByText('Acme')).toBeInTheDocument();
     expect(screen.getByText('Bank')).toBeInTheDocument();
-    // MVP-4-F E2E gate consolidated the per-row testid onto the
-    // index-based form (single source of truth for both this Vitest
-    // suite + the WebDriverIO specs). Audit M-3.
-    expect(screen.getByTestId('account-row-0')).toBeInTheDocument();
-    expect(screen.getByTestId('account-row-1')).toBeInTheDocument();
+    expect(screen.getByTestId(`account-row-${sample[0]!.id}`)).toBeInTheDocument();
+    expect(screen.getByTestId(`account-row-${sample[1]!.id}`)).toBeInTheDocument();
   });
 
   test('clicking a row fires onSelect with the id', async () => {
@@ -55,7 +52,7 @@ describe('AccountListScreen', () => {
         onLock={async () => {}}
       />,
     );
-    fireEvent.click(screen.getByTestId('account-row-0'));
+    fireEvent.click(screen.getByTestId(`account-row-${sample[0]!.id}`));
     await waitFor(() => {
       expect(onSelect).toHaveBeenCalledWith(sample[0]!.id);
     });

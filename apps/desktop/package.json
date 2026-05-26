@@ -12,11 +12,9 @@
     "dev": "vite",
     "build": "vite build",
     "build:ui": "vite build",
-    "build:debug": "cargo build -p pangolin-desktop --features test-hooks",
     "typecheck": "tsc --noEmit",
     "lint": "eslint \"src/**/*.{ts,tsx}\"",
-    "test": "vitest run",
-    "test:e2e": "cd e2e && pnpm run e2e"
+    "test": "vitest run"
   },
   "dependencies": {
     "react": "^19.0.0",
