@@ -95,6 +95,17 @@ interprocess = { version = "=2.2.3", features = ["tokio"] }
 # our own pin does not split the dep tree.
 base64 = "=0.22.1"
 
+# Audit H-1 hardening (2026-05-26): the IPC EUID owner check now
+# calls `rustix::process::geteuid()` instead of reading `$UID` from
+# the environment (which is a shell builtin, not a POSIX env-var, and
+# is NOT reliably inherited when Chrome is launched from a desktop
+# session manager / systemd-user service / xdg-open). `rustix` ships
+# a zero-unsafe public API + is already in the workspace transitively
+# (`cargo tree | grep rustix` confirms 1.1.4); we name it directly
+# under `cfg(unix)` so the Windows build doesn't see it.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.4", default-features = false, features = ["process"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "io-std", "net", "time", "sync"] }

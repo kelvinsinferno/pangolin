@@ -84,6 +84,35 @@ pub fn install(
     allowed_extension_ids: &[&str],
     home_override: Option<&Path>,
 ) -> Result<InstallReport, DesktopError> {
+    // Audit MEDIUM M-1 fix (2026-05-26): Windows install is non-
+    // functional this slice — Chrome reads native-messaging host
+    // locations from `HKCU\Software\<Vendor>\<Product>\
+    // NativeMessagingHosts\<host-name>` (registry value), not from
+    // disk paths. Writing the manifest JSON file under %APPDATA% is
+    // a no-op without the corresponding registry entry. Adding a
+    // `winreg` dep + writing the four browsers' registry paths is
+    // not in MVP-4-E scope (deferred to MVP-4-G's per-OS installer
+    // experience work).
+    //
+    // Until then: fail fast on Windows with a clear error rather than
+    // silently writing dead manifests. This matches the audit's
+    // recommended "explicit Internal error" path; closed-beta on
+    // Windows is BLOCKED until MVP-4-G ships the registry-write.
+    #[cfg(target_os = "windows")]
+    {
+        // The `home_override` path is taken only by tests; allow
+        // the test path through so the round-trip test still
+        // exercises the per-platform path resolution code.
+        if home_override.is_none() {
+            return Err(DesktopError::Internal(
+                "Windows install not yet supported — MVP-4-G adds the \
+                 Chrome registry write (HKCU\\Software\\...\\NativeMessagingHosts). \
+                 Use Linux or macOS for closed beta."
+                    .into(),
+            ));
+        }
+    }
+
     // Generate random 32-byte token via the workspace OsRng
     // chokepoint.
     let mut raw = [0u8; TOKEN_LEN];

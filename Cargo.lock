@@ -5002,6 +5002,7 @@ dependencies = [
  "interprocess",
  "keyring",
  "pangolin-crypto",
+ "rustix 1.1.4",
  "serde_json",
  "subtle",
  "tempfile",

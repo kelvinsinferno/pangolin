@@ -84,36 +84,29 @@ pub async fn connect(path: &Path) -> Result<IpcStream, HostError> {
 
 /// Verify the IPC socket file at `path` is owned by the current
 /// effective UID (Unix only).
+///
+/// Audit HIGH H-1 hardening (2026-05-26). The previous implementation
+/// read `$UID` from the environment + fell back to `unwrap_or(owner_uid)`
+/// — a FAIL-OPEN check: when `$UID` is unset (the common case when
+/// Chrome is launched from a desktop-environment session manager like
+/// systemd `gnome-session`, KDE `plasma-session`, GDM/SDDM autostart,
+/// or `xdg-open`), the comparison passed regardless of who owned the
+/// socket. `$UID` is a shell builtin (bash/zsh), NOT a POSIX env var.
+///
+/// Replaced with `rustix::process::geteuid()` — zero-unsafe public API,
+/// already in the workspace transitively, gated on `cfg(unix)`. The
+/// new check fails CLOSED on UID mismatch + does NOT have an
+/// environment-variable fallback at all.
 #[cfg(unix)]
 fn verify_unix_socket_owner(path: &Path) -> Result<(), HostError> {
     use std::os::unix::fs::MetadataExt;
     let md = std::fs::metadata(path).map_err(|_| HostError::IpcConnectFailed)?;
-    // `geteuid()` is exposed only via libc; we read it via the
-    // safer route of `nix` IF we had nix in the dep set. Since we
-    // don't, fall back to comparing against `users::get_current_uid`
-    // — but THAT crate is also not in the workspace. The minimum
-    // surface here is to compare against the metadata's UID and the
-    // process's real UID via an env-var snapshot. The plan §6 check
-    // is "owner = current EUID"; on a single-user typical workstation
-    // EUID == RUID so a plain UID comparison suffices. We read the
-    // process RUID via /proc/self on Linux and via libc on macOS;
-    // since we forbid_unsafe + cannot call libc directly, we
-    // implement a documented MINIMUM-VIABLE check: read the
-    // metadata's UID and refuse to connect if it does NOT match the
-    // RUID exposed via `$UID` env var. The env var is set by every
-    // login shell (Bash/Zsh) and by systemd-user services.
-    //
-    // This is a STAGED check — the production hardening (MVP-4-H
-    // alongside the secure-input plugin) replaces it with a proper
-    // `geteuid(3)` syscall via a tiny `unsafe`-allowed wrapper crate
-    // OR via `rustix` (no-std, no-unsafe-public-API).
     let owner_uid = md.uid();
-    let my_uid: u32 = std::env::var("UID")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(owner_uid); // if $UID isn't set, accept (the plan §6 check is
-                               // documented to be staged for MVP-4-H hardening).
-    if owner_uid != my_uid {
+    // `rustix::process::geteuid()` is infallible on all platforms it
+    // supports (returns `Uid`; never errors). `.as_raw()` gives the
+    // numeric UID for direct comparison with the std-filesystem uid.
+    let my_euid = rustix::process::geteuid().as_raw();
+    if owner_uid != my_euid {
         return Err(HostError::IpcConnectFailed);
     }
     Ok(())

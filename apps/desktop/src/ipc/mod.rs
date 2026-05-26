@@ -159,9 +159,23 @@ async fn run(app: tauri::AppHandle, path: PathBuf) -> Result<(), IpcServerError>
         .create_tokio()
         .map_err(|e| IpcServerError::BindFailed(e.to_string()))?;
 
-    // Single-host slot: when a new connection arrives, abort the
-    // previous handler's task (drop its JoinHandle which also drops
-    // the connection — tokio's cancel-by-drop semantics).
+    // Single-host slot: FIRST-WINS arbitration (audit M-2 hardening,
+    // 2026-05-26). When a new connection arrives WHILE the prior
+    // handler is still running, drop the new connection immediately —
+    // the prior handler keeps its grip on the desktop state. The
+    // earlier implementation aborted the prior handler at the next
+    // .await point, which could interrupt a `vault.copy_password`
+    // between the FFI plaintext-read and the clipboard write (no
+    // secret leak — plaintext stays Rust-side under Zeroizing — but
+    // a UX hazard: clipboard ended up with whichever account's
+    // copy_password finished last, not the one the user last clicked).
+    //
+    // First-wins makes the semantics deterministic: a second popup
+    // click that races a slow first call gets a clean "host busy"
+    // rejection and Chrome surfaces it as a connection error; the
+    // user retries after the first call completes. The slot clears
+    // automatically when the active handler returns (the inner
+    // `slot.take()` after `handle_connection` does the cleanup).
     let current: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
     loop {
@@ -170,11 +184,22 @@ async fn run(app: tauri::AppHandle, path: PathBuf) -> Result<(), IpcServerError>
             continue;
         };
 
-        // Cancel the previous handler if still running.
+        // First-wins gate: if the prior handler is still running,
+        // refuse the new connection without disturbing it.
         {
             let mut slot = current.lock().await;
-            if let Some(prev) = slot.take() {
-                prev.abort();
+            if let Some(prev) = slot.as_ref() {
+                if !prev.is_finished() {
+                    // Drop `conn` immediately so the new peer sees an
+                    // EOF on read; the host translates that into an
+                    // `ipc_disconnect` JSON-RPC error and Chrome
+                    // surfaces it to the popup.
+                    drop(conn);
+                    continue;
+                }
+                // Prior handler finished — clear the slot so this new
+                // connection can take ownership.
+                slot.take();
             }
         }
 
@@ -182,12 +207,10 @@ async fn run(app: tauri::AppHandle, path: PathBuf) -> Result<(), IpcServerError>
         let slot_clone = Arc::clone(&current);
         let handle = tokio::spawn(async move {
             handle_connection(app_clone, conn).await;
-            // Clear our own slot when finished.
+            // Clear our own slot when finished. We're the only writer
+            // (the accept loop only enters this block after confirming
+            // the previous slot is finished), so a simple take is safe.
             let mut slot = slot_clone.lock().await;
-            // Only clear if WE are still the current handler.
-            // (If a newer connection already replaced us, leave it.)
-            // We can't compare JoinHandles, so we just take whatever's
-            // there; the worst case is a benign race on shutdown.
             slot.take();
         });
         let mut slot = current.lock().await;
