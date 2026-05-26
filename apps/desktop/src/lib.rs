@@ -80,46 +80,34 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             Ok(())
         });
 
-    // MVP-4-F: invoke-handler registration is feature-split because
-    // `tauri::generate_handler!` is a compile-time macro that needs the
-    // full handler list as a single argument. The two arms register
-    // the same production-command set; the `test-hooks` arm appends
-    // the two `__test__*` debugging commands so the WebDriverIO suite
-    // can read the in-process invocation log. Plan-LOCK §3.2.
-    #[cfg(feature = "test-hooks")]
-    {
-        builder.invoke_handler(tauri::generate_handler![
-            commands::vault::vault_open,
-            commands::vault::vault_unlock,
-            commands::vault::vault_lock,
-            commands::vault::vault_close,
-            commands::account::accounts_list,
-            commands::account::account_show,
-            commands::account::reveal_password,
-            commands::account::copy_password_to_clipboard,
-            commands::account::copy_to_clipboard,
-            commands::install_native_host::install_native_host,
-            commands::install_native_host::uninstall_native_host,
-            test_hooks::__test__commands_invoked,
-            test_hooks::__test__clear_invocations,
-        ])
-    }
-    #[cfg(not(feature = "test-hooks"))]
-    {
-        builder.invoke_handler(tauri::generate_handler![
-            commands::vault::vault_open,
-            commands::vault::vault_unlock,
-            commands::vault::vault_lock,
-            commands::vault::vault_close,
-            commands::account::accounts_list,
-            commands::account::account_show,
-            commands::account::reveal_password,
-            commands::account::copy_password_to_clipboard,
-            commands::account::copy_to_clipboard,
-            commands::install_native_host::install_native_host,
-            commands::install_native_host::uninstall_native_host,
-        ])
-    }
+    // MVP-4-F: invoke-handler registration uses per-entry `#[cfg]`
+    // attributes on the test-hook command paths so the production
+    // command list appears ONCE, not duplicated across two cfg arms.
+    // Audit M-2 hardening (2026-05-26): the earlier two-arm shape
+    // could silently drift if a new production command was added to
+    // one arm but not the other. `tauri::generate_handler!` is a
+    // proc-macro that accepts standard Rust attributes on its
+    // path-list elements (verified at build time); the two
+    // `#[cfg(feature = "test-hooks")]`-gated lines compile out of
+    // release builds, matching the prior two-arm semantics exactly
+    // without the duplication risk.
+    builder.invoke_handler(tauri::generate_handler![
+        commands::vault::vault_open,
+        commands::vault::vault_unlock,
+        commands::vault::vault_lock,
+        commands::vault::vault_close,
+        commands::account::accounts_list,
+        commands::account::account_show,
+        commands::account::reveal_password,
+        commands::account::copy_password_to_clipboard,
+        commands::account::copy_to_clipboard,
+        commands::install_native_host::install_native_host,
+        commands::install_native_host::uninstall_native_host,
+        #[cfg(feature = "test-hooks")]
+        test_hooks::__test__commands_invoked,
+        #[cfg(feature = "test-hooks")]
+        test_hooks::__test__clear_invocations,
+    ])
 }
 
 #[cfg(test)]

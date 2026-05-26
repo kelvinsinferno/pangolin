@@ -4,8 +4,11 @@
 //
 // Plan-LOCK: docs/issue-plans/mvp4-f-desktop-e2e.md §1 + §3.1.
 //
-// `tauri-driver` is installed via `cargo install --version =0.1.4
-// tauri-driver` (lands in `~/.cargo/bin/`). The binary takes no args;
+// `tauri-driver` is installed via `cargo install --locked --version
+// =2.0.6 tauri-driver` (lands in `~/.cargo/bin/`). MUST be a 2.0.x
+// release — the 0.1.x line is the legacy Tauri v1 driver and fails
+// at WebDriver session init against the Pangolin Tauri v2 binary.
+// The binary takes no args;
 // it binds to port 4444 by default and proxies W3C WebDriver requests
 // to the Tauri WebView the spec drives. The helper:
 //

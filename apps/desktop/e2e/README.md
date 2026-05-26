@@ -48,7 +48,10 @@ Prerequisites:
   `libayatana-appindicator3-dev`, `librsvg2-dev`, `libdbus-1-dev`,
   `pkg-config`).
 - `xvfb` (`sudo apt-get install -y xvfb`).
-- `tauri-driver` 0.1.4 (`cargo install --version =0.1.4 tauri-driver`).
+- `tauri-driver` 2.0.6 (`cargo install --locked --version =2.0.6 tauri-driver`).
+  The `0.1.x` line is the LEGACY Tauri v1 driver and will NOT work
+  against the Pangolin Tauri v2 binary — installing it fails at
+  WebDriver session init. Always pin a `2.0.x` release.
 - pnpm 10 + Node 20.18 (per `.nvmrc` and the `extension` / `desktop`
   CI jobs).
 
@@ -78,7 +81,7 @@ The `wdio.conf.ts` `onPrepare` hook spawns `tauri-driver` on port
 
 CI runs the same orchestration via the `desktop-e2e` job in
 `.github/workflows/ci.yml`. The job installs the same apt deps + the
-same pinned `tauri-driver` 0.1.4, then runs `xvfb-run --auto-servernum
+same pinned `tauri-driver` 2.0.6, then runs `xvfb-run --auto-servernum
 pnpm e2e` under `apps/desktop/e2e/`. Failed runs upload
 `wdio-logs/` as an artifact for debug.
 

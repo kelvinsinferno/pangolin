@@ -262,7 +262,7 @@ desktop-e2e:
         prefix-key: "v1"
         cache-bin: "false"
     - name: "Install tauri-driver"
-      run: cargo install --locked --version =0.1.4 tauri-driver
+      run: cargo install --locked --version =2.0.6 tauri-driver
     - uses: pnpm/action-setup@v4
       with:
         version: 10
@@ -327,7 +327,7 @@ All other decisions are locked per §0a.
 - `xvfb-run --auto-servernum pnpm test:e2e` ✓ locally on Linux (in the CI image's environment) — all 5 scenarios pass.
 - New CI job `desktop-e2e` green on `ubuntu-latest`.
 - The existing `desktop` job still passes WITHOUT the `test-hooks` feature (regression-catch on the feature-gate hygiene).
-- `cargo audit --deny warnings <existing --ignore set>` ✓ (no new advisories from `tauri-driver` 0.1.4).
+- `cargo audit --deny warnings <existing --ignore set>` ✓ (no new advisories from `tauri-driver` 2.0.6).
 - `cargo deny check advisories bans licenses sources` ✓.
 - Cardinal invariants still 0/0/0.
 

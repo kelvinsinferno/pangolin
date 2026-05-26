@@ -7,6 +7,23 @@
 // Unlock the fixture vault, click into the first account, click
 // Reveal, assert the plaintext renders. This is the documented L1
 // carve-out from MVP-4-B (the ≤10s reveal window).
+//
+// ##############################################################
+// # DO NOT POINT THIS SPEC AT A REAL VAULT.                    #
+// #                                                            #
+// # On assertion failure WebDriverIO writes the actual DOM     #
+// # text (including the revealed plaintext) into `wdio-logs/`, #
+// # which the new `desktop-e2e` CI job uploads as a 7-day      #
+// # artifact on failure (see .github/workflows/ci.yml +        #
+// # audit M-4). The fixture passwords here are deliberately    #
+// # fake test material; reusing this spec against a real .pvf  #
+// # WILL leak that vault's plaintext into CI logs. If a future #
+// # cycle ever needs to test against a non-fixture vault,      #
+// # FIRST add a custom WDIO reporter that scrubs               #
+// # `[data-testid="revealed-password-text"]` from the captured #
+// # transcript, OR drop the plaintext content assertion in     #
+// # favor of asserting only that the element became visible.   #
+// ##############################################################
 
 import { expect } from 'chai';
 

@@ -25,7 +25,7 @@
 // canonical path before re-building.
 
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -51,9 +51,35 @@ const ACCOUNTS: readonly AccountFixture[] = [
 ];
 
 /**
+ * Redact the value following a `--vault-password` flag in an argv
+ * array — used when formatting the argv into a user-facing error
+ * string. Audit HIGH H-1 hardening (2026-05-26): the prior error
+ * formatter passed `args.join(' ')` straight through, leaking the
+ * fixture master password into CI logs on any `account add` failure.
+ * Fixture passwords are test material, but the same code path could
+ * be reused (or extended) against a real vault in the future, so we
+ * scrub the flag value before it ever reaches an error string. Other
+ * fixture-only secrets (per-account passwords) flow via stdin and
+ * never enter the argv at all.
+ */
+function redactArgs(args: readonly string[]): string {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i]!;
+    out.push(a);
+    if (a === '--vault-password' && i + 1 < args.length) {
+      out.push('<REDACTED>');
+      i += 1;
+    }
+  }
+  return out.join(' ');
+}
+
+/**
  * Run `cargo run -p pangolin-cli -- <args>` from the workspace root
- * with the given stdin. Throws on non-zero exit; stdout + stderr
- * pass through for debug visibility.
+ * with the given stdin. Throws on non-zero exit (with the
+ * `--vault-password` value redacted from the error string — see
+ * `redactArgs`). Stdout + stderr pass through for debug visibility.
  */
 function runCli(args: readonly string[], stdin: string): void {
   const result = spawnSync(
@@ -67,7 +93,7 @@ function runCli(args: readonly string[], stdin: string): void {
   );
   if (result.status !== 0) {
     throw new Error(
-      `pangolin-cli ${args.join(' ')} exited with status ${result.status ?? 'null'}`,
+      `pangolin-cli ${redactArgs(args)} exited with status ${result.status ?? 'null'}`,
     );
   }
 }
@@ -78,8 +104,7 @@ function main(): void {
   // leave temp dirs around but the OS reaps them on reboot.
   if (existsSync(FIXTURE_PATH_FILE)) {
     try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const previousPath = require('node:fs').readFileSync(FIXTURE_PATH_FILE, 'utf8').trim();
+      const previousPath = readFileSync(FIXTURE_PATH_FILE, 'utf8').trim();
       if (previousPath.length > 0 && existsSync(previousPath)) {
         const previousDir = path.dirname(previousPath);
         rmSync(previousDir, { recursive: true, force: true });
@@ -90,43 +115,58 @@ function main(): void {
   }
 
   const fixtureDir = mkdtempSync(path.join(tmpdir(), 'pangolin-e2e-fixture-'));
-  const vaultPath = path.join(fixtureDir, 'vault.pvf');
 
-  process.stdout.write(`[build-fixture-vault] creating ${vaultPath}\n`);
+  // Audit M-5 hardening (2026-05-26): if the CLI invocation chain
+  // fails partway through (e.g., on the third `account add` after the
+  // vault file is already half-populated), we must remove `fixtureDir`
+  // before re-throwing — otherwise the script leaks the tempdir +
+  // leaves `.fixture-path` pointing at the prior run's stale path.
+  // The try/finally pattern keeps the cleanup unconditional regardless
+  // of throw site.
+  try {
+    const vaultPath = path.join(fixtureDir, 'vault.pvf');
 
-  // 1. Create a fresh vault with the master password via stdin.
-  runCli(
-    ['vault', 'create', '--path', vaultPath, '--password-stdin'],
-    `${MASTER_PASSWORD}\n`,
-  );
+    process.stdout.write(`[build-fixture-vault] creating ${vaultPath}\n`);
 
-  // 2-4. Add the three known accounts. `--vault-password` is the
-  //      documented CI-leaky path the CLI exposes for scripted use
-  //      (see cli.rs::AccountAddArgs::vault_password); fixture
-  //      passwords are test material only.
-  for (const account of ACCOUNTS) {
+    // 1. Create a fresh vault with the master password via stdin.
     runCli(
-      [
-        'account',
-        'add',
-        '--vault-path',
-        vaultPath,
-        '--vault-password',
-        MASTER_PASSWORD,
-        '--name',
-        account.name,
-        '--username',
-        account.username,
-        '--password-stdin',
-        '--no-totp',
-      ],
-      `${account.password}\n`,
+      ['vault', 'create', '--path', vaultPath, '--password-stdin'],
+      `${MASTER_PASSWORD}\n`,
     );
-  }
 
-  // Write the absolute fixture path for the spec files to read.
-  writeFileSync(FIXTURE_PATH_FILE, `${vaultPath}\n`, 'utf8');
-  process.stdout.write(`[build-fixture-vault] wrote ${FIXTURE_PATH_FILE}\n`);
+    // 2-4. Add the three known accounts. `--vault-password` is the
+    //      documented CI-leaky path the CLI exposes for scripted use
+    //      (see cli.rs::AccountAddArgs::vault_password); fixture
+    //      passwords are test material only. The `--vault-password`
+    //      flag value is redacted from any error message via
+    //      `redactArgs` (audit HIGH H-1 hardening).
+    for (const account of ACCOUNTS) {
+      runCli(
+        [
+          'account',
+          'add',
+          '--vault-path',
+          vaultPath,
+          '--vault-password',
+          MASTER_PASSWORD,
+          '--name',
+          account.name,
+          '--username',
+          account.username,
+          '--password-stdin',
+          '--no-totp',
+        ],
+        `${account.password}\n`,
+      );
+    }
+
+    // Write the absolute fixture path for the spec files to read.
+    writeFileSync(FIXTURE_PATH_FILE, `${vaultPath}\n`, 'utf8');
+    process.stdout.write(`[build-fixture-vault] wrote ${FIXTURE_PATH_FILE}\n`);
+  } catch (err) {
+    rmSync(fixtureDir, { recursive: true, force: true });
+    throw err;
+  }
 }
 
 main();
