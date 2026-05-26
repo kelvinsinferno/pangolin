@@ -3,7 +3,7 @@
 //!
 //! Compiled in under the `test-hooks` feature (CI's `desktop-e2e` job
 //! enables it; production release builds DO NOT). Records the name of
-//! every privileged Tauri command that fires so the WebDriverIO suite
+//! every privileged Tauri command that fires so the `WebDriverIO` suite
 //! can assert that scenario 5 (`copy_password_via_rust_command`) took
 //! the Rust-side clipboard path instead of routing plaintext through
 //! V8 (the H-1 invariant from MVP-4-B).
@@ -47,20 +47,26 @@ pub fn record(command_name: &'static str) {
 /// since the process started (or since the last
 /// `__test__clear_invocations()` call).
 ///
-/// Exposed as a Tauri command so the WebDriverIO spec can read the log
+/// Exposed as a Tauri command so the `WebDriverIO` spec can read the log
 /// via `invoke('__test__commands_invoked')` from the renderer side.
+///
+/// The double-underscore prefix is a deliberate sentinel marking this
+/// as a TEST-ONLY surface — `non_snake_case` is allowed here because
+/// the JS-side invoke string is what the spec authors against, and
+/// renaming to a single-underscore form would silently break the
+/// `WebDriverIO` specs the moment the feature gate is misconfigured.
+#[allow(non_snake_case)]
 #[tauri::command]
 pub fn __test__commands_invoked() -> Vec<String> {
-    INVOCATIONS
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default()
+    INVOCATIONS.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
 /// Clear the invocation log.
 ///
 /// Used by specs that need to assert on a fresh window of activity
 /// (e.g. "after I click Copy, exactly one new invocation appears").
+/// Same `non_snake_case` rationale as `__test__commands_invoked`.
+#[allow(non_snake_case)]
 #[tauri::command]
 pub fn __test__clear_invocations() {
     if let Ok(mut g) = INVOCATIONS.lock() {

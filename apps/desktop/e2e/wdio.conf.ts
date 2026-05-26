@@ -17,7 +17,6 @@
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { Options } from '@wdio/types';
 
 import { startTauriDriver, stopTauriDriver } from './setup/start-tauri-driver.js';
 
@@ -41,7 +40,12 @@ const PANGOLIN_DESKTOP_BINARY = path.join(
 // `tauri-driver` process handle here so the after-hook can reap it.
 let tauriDriverHandle: { kill: () => void } | null = null;
 
-export const config: Options.Testrunner = {
+// `WebdriverIO.Config` (introduced in 9.x) is the canonical type for
+// wdio.conf.ts in 9.27.x — it extends `Options.Testrunner` with the
+// capabilities-requesting fields the runner reads. Earlier 9.4-era
+// drafts used `Options.Testrunner` directly; that type alone lacks the
+// `capabilities` field and triggers TS2353.
+export const config: WebdriverIO.Config = {
   runner: 'local',
   framework: 'mocha',
   specs: [path.join(__dirname, 'specs', '**', '*.test.ts')],
