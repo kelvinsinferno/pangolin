@@ -43,6 +43,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # `libdbus-1-dev` + `pkg-config` are needed by `libdbus-sys`, a
+      # transitive of the `dbus-secret-service` crate that `keyring`'s
+      # `sync-secret-service` Linux backend pulls in for the native-
+      # messaging-host's OS-keychain access. Without them
+      # `libdbus-sys`'s build script panics at pkg-config time
+      # (caught when the 949d5f0 CI failed for the MVP-4-E merge —
+      # the workspace clippy compiles pangolin-native-messaging-host
+      # too). Install BEFORE the Rust toolchain step so a poisoned
+      # Swatinem cache from a run that lacked the libs doesn't
+      # short-circuit the dep header lookup.
+      - name: "Install native-messaging-host Linux deps (apt)"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -75,6 +89,15 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+      # Same libdbus-1-dev rationale as the clippy job above, but gated
+      # on `matrix.os == 'ubuntu-latest'` because the test matrix also
+      # runs on Windows + macOS where the keyring backend uses
+      # Win Credential Manager + Apple Keychain Services (no dbus).
+      - name: "Install native-messaging-host Linux deps (apt)"
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -334,18 +357,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # `keyring` v3.6's `sync-secret-service` Linux backend pulls
+      # `dbus-secret-service`, which depends on `libdbus-sys`. The
+      # `libdbus-sys` build script REQUIRES the system `libdbus-1-dev`
+      # headers + `pkg-config` to compile — the earlier assumption
+      # (build-script-only DBus, no apt needed) was wrong. The CI
+      # run for the MVP-4-E merge (949d5f0) panicked here at
+      # pkg-config time. Install BEFORE the Rust toolchain step so a
+      # cache from a run that lacked the libs doesn't short-circuit
+      # the dep header lookup. Runtime secret-service interaction is
+      # still only exercised in production; the hermetic tests skip
+      # the keychain entirely via the `home_override` path.
+      - name: "Install native-messaging-host Linux deps (apt)"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1"
           cache-bin: "false"
-      # `keyring` v3.6's `sync-secret-service` Linux backend pulls
-      # `dbus-secret-service`, which talks DBus directly (no native
-      # libsecret dep). The crate compiles fine on a vanilla Ubuntu
-      # runner — no apt install needed for the build. The runtime
-      # secret-service interaction is only exercised in production;
-      # the hermetic tests skip the keychain entirely (`home_override`
-      # path) so no DBus is required.
       - name: Build pangolin-native-messaging-host
         run: cargo build -p pangolin-native-messaging-host
       - name: Test pangolin-native-messaging-host
