@@ -60,10 +60,18 @@ export const config: WebdriverIO.Config = {
       // capability — the absolute path to the Tauri binary it should
       // spawn. Anything else in `tauri:options` is documented at
       // https://v2.tauri.app/develop/tests/webdriver/.
+      //
+      // The 0.1.x line accepted `browserName: 'wry'` as a marker; the
+      // 2.0.x line REJECTS the session with `Failed to match
+      // capabilities` when ANY `browserName` is set (caught when CI
+      // run 26466211815 surfaced the rejection after the
+      // webkit2gtk-driver hotfix landed). The Tauri v2 docs' canonical
+      // example at
+      // https://v2.tauri.app/develop/tests/webdriver/example/webdriverio/
+      // omits `browserName` entirely; we mirror that shape.
       'tauri:options': {
         application: PANGOLIN_DESKTOP_BINARY,
       },
-      browserName: 'wry',
     } as WebdriverIO.Capabilities,
   ],
   logLevel: 'info',
