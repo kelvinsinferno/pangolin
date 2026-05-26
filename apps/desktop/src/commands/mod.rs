@@ -16,4 +16,5 @@
 #![forbid(unsafe_code)]
 
 pub mod account;
+pub mod install_native_host;
 pub mod vault;

@@ -119,6 +119,17 @@ allow = [
     # AGPL distribution. Narrow attribution scoped to the Tauri
     # transitives that need it.
     "BSL-1.0",
+    # MVP-4-E (2026-05-26): `interprocess 2.2.3` (the cross-platform
+    # named-pipe / Unix-domain-socket abstraction used by
+    # `pangolin-native-messaging-host` + the desktop's IPC server)
+    # pulls in `doctest-file v1.1.1` and `recvmsg v1.0.0` as
+    # transitives, both shipped under the `0BSD` (BSD Zero-Clause)
+    # license. 0BSD is the most permissive OSI-approved license —
+    # equivalent to public-domain dedication, NO attribution
+    # required. It is fully compatible with AGPL distribution
+    # (incoming permissive → outgoing copyleft is the standard one-
+    # way dep arrow). Scoped to the two `interprocess` transitives.
+    "0BSD",
     # `unicode-ident` ships under Unicode-DFS-2016 OR (Apache-2.0 WITH
     # LLVM-exception) — covered above. No additional entries needed.
     #

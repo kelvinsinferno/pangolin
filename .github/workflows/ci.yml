@@ -306,6 +306,50 @@ jobs:
       # deps wired up.
       - name: Build pangolin-desktop (Rust side)
         run: cargo build -p pangolin-desktop
+      # MVP-4-E: smoke-test the install-native-host CLI subcommand's
+      # logic by running the desktop crate's
+      # `commands::install_native_host::tests::` battery, which covers
+      # `install_round_trip_lands_manifests_and_token`,
+      # `uninstall_removes_token_and_manifests_and_is_idempotent`,
+      # `two_installs_produce_different_tokens`, and the Chrome-shape
+      # `manifest_has_chrome_required_fields` pin. All use `TempDir`
+      # `home_override` so no real per-user paths are touched.
+      - name: "Native-host install/uninstall smoke (temp HOME)"
+        run: cargo test -p pangolin-desktop install_native_host
+
+  # -----------------------------------------------------------------
+  # MVP-4-E: native-messaging-host (apps/native-messaging-host/)
+  # -----------------------------------------------------------------
+  #
+  # Plan-LOCK: docs/issue-plans/mvp4-e-native-messaging-host.md §7. The
+  # host crate is INCLUDED in workspace clippy/test (no Tauri deps), so
+  # the workspace test job already covers it; this dedicated job is the
+  # belt-and-braces gate that also runs an isolated `-p`-scoped build +
+  # test on `ubuntu-latest` so a regression in the host's deps (keyring
+  # secret-service backend, interprocess UDS namespacing) surfaces
+  # against a clean Linux runner — the platform Chrome's native-
+  # messaging will most often spawn the host on.
+  native-messaging-host:
+    name: native-messaging-host
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1"
+          cache-bin: "false"
+      # `keyring` v3.6's `sync-secret-service` Linux backend pulls
+      # `dbus-secret-service`, which talks DBus directly (no native
+      # libsecret dep). The crate compiles fine on a vanilla Ubuntu
+      # runner — no apt install needed for the build. The runtime
+      # secret-service interaction is only exercised in production;
+      # the hermetic tests skip the keychain entirely (`home_override`
+      # path) so no DBus is required.
+      - name: Build pangolin-native-messaging-host
+        run: cargo build -p pangolin-native-messaging-host
+      - name: Test pangolin-native-messaging-host
+        run: cargo test -p pangolin-native-messaging-host
 
   # -----------------------------------------------------------------
   # P5-1: contracts pipeline

@@ -30,6 +30,7 @@
 
 pub mod commands;
 pub mod error;
+pub mod ipc;
 pub mod state;
 
 pub use error::DesktopError;
@@ -50,6 +51,24 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(VaultState::default())
+        // MVP-4-E: spawn the IPC server task that the native-
+        // messaging host bridge connects to. The server holds a
+        // clone of the Tauri `AppHandle`; per-request dispatch
+        // looks up `VaultState` via `app.state()` (coherent with
+        // the Tauri command path) and reaches the OS clipboard via
+        // `app.clipboard()` (the H-1 L1 carve-out path; the
+        // plaintext NEVER crosses the IPC channel — only an OK or
+        // typed-error signal does).
+        //
+        // Bind failures are logged to stderr; they do NOT prevent
+        // the desktop UI from coming up. The extension popup will
+        // surface "Desktop not connected" until the user re-runs
+        // the install wizard.
+        .setup(|app| {
+            let app_handle = app.handle().clone();
+            ipc::spawn_with_app_handle(app_handle);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::vault::vault_open,
             commands::vault::vault_unlock,
@@ -60,6 +79,8 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::account::reveal_password,
             commands::account::copy_password_to_clipboard,
             commands::account::copy_to_clipboard,
+            commands::install_native_host::install_native_host,
+            commands::install_native_host::uninstall_native_host,
         ])
 }
 

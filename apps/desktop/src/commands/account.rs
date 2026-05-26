@@ -98,6 +98,16 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Public alias of [`account_id_from_hex`] for the IPC dispatch path
+/// in `crate::ipc::dispatch`. Identical body; exists only so the
+/// crate-private helper stays out of the Tauri-command-only surface
+/// while the IPC dispatch can reuse the validation.
+pub(crate) fn account_id_from_hex_for_ipc(
+    hex: &str,
+) -> Result<pangolin_ffi::identity::AccountId, DesktopError> {
+    account_id_from_hex(hex)
+}
+
 /// Decode a 64-character lowercase-hex string into a 32-byte
 /// `AccountId`. Wraps the validation as `DesktopError::Validation` so
 /// the React side surfaces a typed toast.
@@ -140,6 +150,26 @@ fn cli_presence_proof() -> pangolin_ffi::PresenceProof {
     }
 }
 
+/// Inner accounts-list helper.
+///
+/// Bodies of the `#[tauri::command]` wrapper [`accounts_list`] AND
+/// the IPC dispatch path (`crate::ipc::dispatch::vault_list_accounts`)
+/// share the SAME pure-async function. Keeps the two surfaces in lock-
+/// step so a future change to the FFI binding choice only edits one
+/// place.
+///
+/// # Errors
+///
+/// `DesktopError::Session` for a locked / closed vault.
+pub(crate) async fn accounts_list_inner(
+    state: &VaultState,
+) -> Result<Vec<AccountSummaryDto>, DesktopError> {
+    let handle = state.require_open()?;
+    let snapshots = pangolin_ffi::identity::account_search(handle, String::new())
+        .map_err(DesktopError::from)?;
+    Ok(snapshots.into_iter().map(AccountSummaryDto::from).collect())
+}
+
 /// List every account in the open vault.
 ///
 /// Wraps `pangolin_ffi::identity::account_search("")` (the empty-query
@@ -154,10 +184,20 @@ fn cli_presence_proof() -> pangolin_ffi::PresenceProof {
 pub async fn accounts_list(
     state: State<'_, VaultState>,
 ) -> Result<Vec<AccountSummaryDto>, DesktopError> {
+    accounts_list_inner(&state).await
+}
+
+/// Inner account-show helper shared by the Tauri command + IPC
+/// dispatch. See [`accounts_list_inner`] for the rationale.
+pub(crate) async fn account_show_inner(
+    state: &VaultState,
+    id: String,
+) -> Result<AccountSummaryDto, DesktopError> {
+    let account_id = account_id_from_hex(&id)?;
     let handle = state.require_open()?;
-    let snapshots = pangolin_ffi::identity::account_search(handle, String::new())
-        .map_err(DesktopError::from)?;
-    Ok(snapshots.into_iter().map(AccountSummaryDto::from).collect())
+    let snap =
+        pangolin_ffi::identity::account_get(handle, account_id).map_err(DesktopError::from)?;
+    Ok(snap.into())
 }
 
 /// Fetch a single account's metadata.
@@ -172,11 +212,7 @@ pub async fn account_show(
     id: String,
     state: State<'_, VaultState>,
 ) -> Result<AccountSummaryDto, DesktopError> {
-    let account_id = account_id_from_hex(&id)?;
-    let handle = state.require_open()?;
-    let snap =
-        pangolin_ffi::identity::account_get(handle, account_id).map_err(DesktopError::from)?;
-    Ok(snap.into())
+    account_show_inner(&state, id).await
 }
 
 /// Reveal the current head-of-history plaintext password for an
@@ -219,6 +255,45 @@ pub async fn reveal_password(
     Ok(s)
 }
 
+/// Inner copy-password helper.
+///
+/// Performs the reveal + clipboard-write entirely Rust-side; the
+/// `bytes` binding is `Zeroizing<Vec<u8>>` and zeroes on drop. Used
+/// by BOTH the Tauri command wrapper [`copy_password_to_clipboard`]
+/// AND the IPC dispatch path
+/// (`crate::ipc::dispatch::vault_copy_password`). The generic
+/// `clipboard_write` closure abstracts over the two concrete
+/// clipboard backends:
+///
+/// - Tauri command path: `app.clipboard().write_text(s)` via the
+///   `tauri-plugin-clipboard-manager` plugin.
+/// - IPC dispatch path: same plugin via a held `tauri::AppHandle`
+///   (the IPC server holds the handle from the `setup` callback).
+///
+/// L1: the `revealed` plaintext NEVER leaves Rust. The clipboard
+/// path is the documented H-1 carve-out from MVP-4-B; this slice
+/// preserves it verbatim.
+pub(crate) async fn copy_password_via<F>(
+    state: &VaultState,
+    id: String,
+    clipboard_write: F,
+) -> Result<(), DesktopError>
+where
+    F: FnOnce(String) -> Result<(), DesktopError>,
+{
+    let account_id = account_id_from_hex(&id)?;
+    let handle = state.require_open()?;
+    let presence = cli_presence_proof();
+    let revealed = pangolin_ffi::reveal::reveal_current_password(handle, account_id, presence)
+        .map_err(DesktopError::from)?;
+
+    let bytes = revealed.expose_bytes_for_host();
+    let s = std::str::from_utf8(&bytes)
+        .map_err(|_| DesktopError::Internal("revealed password is not valid utf-8".into()))?
+        .to_owned();
+    clipboard_write(s)
+}
+
 /// **Copy the current head-of-history plaintext password directly
 /// to the OS clipboard, NEVER crossing the FFI boundary back into
 /// JS.**
@@ -251,26 +326,12 @@ pub async fn copy_password_to_clipboard(
     state: State<'_, VaultState>,
     app: tauri::AppHandle,
 ) -> Result<(), DesktopError> {
-    let account_id = account_id_from_hex(&id)?;
-    let handle = state.require_open()?;
-    let presence = cli_presence_proof();
-    let revealed = pangolin_ffi::reveal::reveal_current_password(handle, account_id, presence)
-        .map_err(DesktopError::from)?;
-
-    // Transcode + write to clipboard entirely Rust-side; the
-    // `bytes` binding zeroes on drop at end-of-scope (Zeroizing).
-    // The clipboard plugin holds an owned `String` briefly while it
-    // delegates to the OS; that copy is outside our control but
-    // it is the SAME byte path as Q-b's "no host-side clipboard
-    // timer" trade-off — the OS clipboard already has the plaintext.
-    let bytes = revealed.expose_bytes_for_host();
-    let s = std::str::from_utf8(&bytes)
-        .map_err(|_| DesktopError::Internal("revealed password is not valid utf-8".into()))?
-        .to_owned();
-    app.clipboard()
-        .write_text(s)
-        .map_err(|e| DesktopError::Internal(format!("clipboard write failed: {e}")))?;
-    Ok(())
+    copy_password_via(&state, id, |s| {
+        app.clipboard()
+            .write_text(s)
+            .map_err(|e| DesktopError::Internal(format!("clipboard write failed: {e}")))
+    })
+    .await
 }
 
 /// Write arbitrary `text` to the OS clipboard.
