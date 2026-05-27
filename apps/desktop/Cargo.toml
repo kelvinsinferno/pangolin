@@ -20,6 +20,40 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# MVP-4-F: end-to-end UX gate feature flag.
+#
+# When enabled, the `src/test_hooks.rs` module is compiled in + the
+# two `__test__*` Tauri commands (`__test__commands_invoked`,
+# `__test__clear_invocations`) are registered in `lib.rs::build_app`.
+# Privileged-secret command bodies (`reveal_password`,
+# `copy_password_to_clipboard`) push their NAME (no params, no values)
+# onto a process-global log so the WebDriverIO suite can assert that
+# the H-1 invariant — "the Rust-side clipboard command fired, not a
+# JS-side copy" — held.
+#
+# CI's `desktop-e2e` job sets this flag (`cargo build -p
+# pangolin-desktop --features test-hooks`). Production release builds
+# DO NOT set it; the existing `desktop` CI job continues to build
+# without the flag as a regression-catch on the feature-gate hygiene.
+#
+# Plan-LOCK: docs/issue-plans/mvp4-f-desktop-e2e.md §3.2 + §6.
+test-hooks = []
+
+# Forward Tauri's `custom-protocol` feature so the E2E build loads the
+# embedded `frontendDist` assets instead of trying to fetch the Vite
+# devUrl (http://localhost:5173). Tauri v2's `tauri-codegen` selects
+# dev vs production frontend at compile time via
+# `cfg!(not(feature = "custom-protocol"))` on the `tauri` crate (see
+# `tauri-codegen-2.6.2/src/context.rs:155` + the `tauri` Cargo.toml's
+# `custom-protocol = ["tauri-macros/custom-protocol"]` entry). The
+# Tauri CLI's `tauri build` injects this feature automatically — but
+# the E2E gate runs `cargo build` directly (no CLI involvement) so we
+# forward it ourselves. The `test-hooks` build path enables both flags
+# (`cargo build --features test-hooks` does NOT imply this; both must
+# be passed). See plan-LOCK §3.2.
+custom-protocol = ["tauri/custom-protocol"]
+
 [dependencies]
 # Workspace-internal: the FFI surface this shell wraps + the design-token
 # constants exposed to the Rust side (the React side reads the CSS-var
