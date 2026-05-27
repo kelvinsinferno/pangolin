@@ -142,12 +142,12 @@ mod tests {
             std::process::id()
         ));
         // Silence the unused-variable warning on Windows where `tmp`
-        // is unused once the path is synthesized. Same pattern as
-        // `connect_to_missing_path_is_ipc_connect_failed` below. The
-        // underscore-prefix form (`_tmp`) trips clippy's
-        // `used_underscore_binding` lint on Linux (CI runner image
-        // clippy 1.94.0, caught on 2026-05-26 MVP-4-F runs), so we
-        // use a plain name + the reference self-drop.
+        // is unused once the path is synthesized — mirrors the same
+        // pattern in `connect_to_missing_path_is_ipc_connect_failed`
+        // below. The `_tmp` underscore-prefix form trips clippy's
+        // `used_underscore_binding` lint on Linux (CI runner image,
+        // 2026-05-26), so we use a plain name + the reference
+        // self-drop.
         let _ = &tmp;
 
         // Bind the fake desktop side.

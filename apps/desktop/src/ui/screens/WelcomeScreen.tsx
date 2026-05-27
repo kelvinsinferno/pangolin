@@ -41,7 +41,7 @@ export function WelcomeScreen({ onOpen }: WelcomeScreenProps) {
       <Card elevation="md">
         <h1 id="welcome-title">Pangolin</h1>
         <p>Open a vault file to begin.</p>
-        <div className="welcome-screen__text-input">
+        <div className="welcome-screen__text-input" data-testid="vault-file-picker">
           <label htmlFor="path-input">Vault file path:</label>
           <input
             id="path-input"
