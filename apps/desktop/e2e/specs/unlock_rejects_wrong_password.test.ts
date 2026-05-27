@@ -17,9 +17,16 @@ describe('unlock_rejects_wrong_password', () => {
     await openFixtureVault();
     await typeUnlockPassword('definitely-not-the-correct-password');
 
-    // The error banner renders.
+    // The error banner renders. Timeout bumped to 30s because the
+    // Argon2 KDF on the wrong-password path runs to completion (it
+    // doesn't short-circuit until the derived key fails to decrypt
+    // the vault header) and CI runners can be 2-3× slower than the
+    // WSL reference. Flake observed on CI run 26521343396 (commit
+    // c84e747) timed out at exactly 10s; the parallel run 26521342425
+    // on the same SHA passed in ~6s. 30s gives 3× headroom over the
+    // slowest reproducible local run.
     const banner = await $('[data-testid="unlock-error-banner"]');
-    await banner.waitForExist({ timeout: 10_000 });
+    await banner.waitForExist({ timeout: 30_000 });
     expect(await banner.isDisplayed()).to.equal(true);
 
     // The accounts list does NOT render.
