@@ -63,7 +63,6 @@ export const config: WebdriverIO.Config = {
       'tauri:options': {
         application: PANGOLIN_DESKTOP_BINARY,
       },
-      browserName: 'wry',
     } as WebdriverIO.Capabilities,
   ],
   logLevel: 'info',

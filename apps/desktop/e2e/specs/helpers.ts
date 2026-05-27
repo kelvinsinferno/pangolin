@@ -4,7 +4,7 @@
 //
 // Plan-LOCK: docs/issue-plans/mvp4-f-desktop-e2e.md §3.4.
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -13,6 +13,32 @@ const __dirname = path.dirname(__filename);
 
 /** Path the build-fixture-vault.ts script writes the absolute vault path to. */
 const FIXTURE_PATH_FILE = path.resolve(__dirname, '..', '.fixture-path');
+
+/**
+ * Remove SQLite WAL + lock sidecars that a prior spec may have left
+ * behind. tauri-driver SIGTERMs the Tauri instance between specs and
+ * Rust does NOT run `Drop` on statics, so `pangolin-store::Vault`'s
+ * `.lock` sidecar file persists. The next spec's `vault_open` then
+ * fails with `StoreError::AlreadyOpen` (a `Store` DesktopError that
+ * shows up as a toast but never transitions the React state machine
+ * out of the welcome stage — hence the `master-password-input`
+ * selector wait times out). Scrubbing the sidecars before each Open
+ * makes the specs hermetic across the maxInstances=1 spec serialisation.
+ * Plan-LOCK §3.4.
+ */
+function scrubVaultSidecars(vaultPath: string): void {
+  for (const suffix of ['.lock', '-shm', '-wal']) {
+    const sidecar = `${vaultPath}${suffix}`;
+    if (existsSync(sidecar)) {
+      try {
+        rmSync(sidecar, { force: true });
+      } catch {
+        // best-effort; the vault_open path surfaces a `Store` error
+        // upstream if the lock can't be cleared
+      }
+    }
+  }
+}
 
 /** The deterministic master password used by `setup/build-fixture-vault.ts`. */
 export const MASTER_PASSWORD = 'test-password-123!';
@@ -43,6 +69,9 @@ export function readFixturePath(): string {
  */
 export async function openFixtureVault(): Promise<void> {
   const vaultPath = readFixturePath();
+  // Scrub sidecars left by a prior spec's Tauri SIGTERM (see helper
+  // comment above scrubVaultSidecars).
+  scrubVaultSidecars(vaultPath);
   const picker = await $('[data-testid="vault-file-picker"]');
   await picker.waitForExist({ timeout: 15_000 });
   const input = await picker.$('[data-testid="vault-path-input"]');

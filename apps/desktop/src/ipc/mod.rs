@@ -99,7 +99,18 @@ pub fn ipc_channel_path() -> PathBuf {
 /// the platform's native logging — out of scope for this slice).
 pub fn spawn_with_app_handle(app: tauri::AppHandle) {
     let path = ipc_channel_path();
-    tokio::spawn(async move {
+    // MVP-4-F follow-up (2026-05-26): use `tauri::async_runtime::spawn`
+    // instead of a bare `tokio::spawn`. `Builder::setup` runs from a
+    // non-async context BEFORE Tauri enters its event loop, so a bare
+    // `tokio::spawn` panics with "there is no reactor running, must be
+    // called from the context of a Tokio 1.x runtime". Tauri's
+    // `async_runtime` is tokio-backed (see the tauri crate's
+    // `async_runtime.rs`) and routes spawns through its global runtime
+    // handle, which IS live at `setup` time. The inner per-connection
+    // `tokio::spawn`s in `run()` are fine — they execute INSIDE this
+    // outer task, which IS on the tokio runtime, so the reactor is in
+    // scope by then.
+    tauri::async_runtime::spawn(async move {
         if let Err(e) = run(app, path).await {
             eprintln!("[pangolin-desktop] IPC server stopped: {e}");
         }
