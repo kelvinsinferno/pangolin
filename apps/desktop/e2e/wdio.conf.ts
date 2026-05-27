@@ -73,12 +73,28 @@ export const config: WebdriverIO.Config = {
   hostname: 'localhost',
   port: 4444,
   waitforTimeout: 15_000,
-  connectionRetryTimeout: 30_000,
+  // `connectionRetryTimeout` is the WebDriver HTTP-request timeout
+  // (per `@wdio/types/Options.d.ts:87` — default 120_000). An earlier
+  // draft pinned this to 30s; CI runners (GitHub `ubuntu-latest`,
+  // 2-core + software-only EGL because xvfb lacks DRI3) take >30s
+  // for the session-create chain (tauri-driver → WebKitWebDriver →
+  // Tauri binary spawn → WebView ready), so undici fired
+  // `UND_ERR_HEADERS_TIMEOUT` exactly at the 30s mark and the spec
+  // failed before the binary was even ready. WSL completes the same
+  // chain in ~6s with WSLg's accelerated rendering. Restored to the
+  // 120s default. Diagnosed from CI run 26524775058 / job 78125715255
+  // on 2026-05-27.
+  connectionRetryTimeout: 120_000,
   connectionRetryCount: 3,
   reporters: ['spec'],
   mochaOpts: {
     ui: 'bdd',
-    timeout: 60_000,
+    // CI runners are slower than WSL; bump the per-spec mocha budget
+    // from 60s to 180s so a slow tauri-driver session-create (~30-60s
+    // on CI) plus the actual test (~6s on WSL, possibly 20-30s on CI)
+    // never gets cut short at 60s. Same diagnosis as the
+    // connectionRetryTimeout bump above.
+    timeout: 180_000,
   },
 
   /**
