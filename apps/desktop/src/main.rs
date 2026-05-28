@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Binary entry for .
+//! Binary entry for `pangolin-desktop`.
 //!
 //! Thin shim that dispatches between:
 //!
 //! - the regular Tauri UI launch (no subcommand, the default),
-//! - the  CLI subcommand which writes the
+//! - the `install-native-host` CLI subcommand which writes the
 //!   native-messaging manifests + token AND prints the token to
 //!   stdout for the user to paste into the extension popup (per
 //!   MVP-4-G plan-LOCK section 3.2 Q-a Option 1),
-//! - the  CLI subcommand which reverses the
+//! - the `uninstall-native-host` CLI subcommand which reverses the
 //!   install path.
 //!
-//! The
-//! attribute keeps a release build from popping a console window on
-//! Windows for the Tauri UI launch; the CLI subcommands always run
-//! against a debug build (-spawned) so the subsystem
-//! attribute does not constrain stdout there either.
+//! The `windows_subsystem = "windows"` attribute keeps a release
+//! build from popping a console window on Windows for the Tauri UI
+//! launch; the CLI subcommands always run against a debug build
+//! (`cargo`-spawned) so the subsystem attribute does not constrain
+//! stdout there either.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]

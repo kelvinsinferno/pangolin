@@ -17,6 +17,6 @@
     "allowSyntheticDefaultImports": true,
     "types": ["node", "mocha", "chai", "chrome"]
   },
-  "include": ["specs/**/*.ts", "setup/**/*.ts", "register-tsx.ts"],
+  "include": ["specs/**/*.ts", "setup/**/*.ts"],
   "exclude": ["node_modules"]
 }
