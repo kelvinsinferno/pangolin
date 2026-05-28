@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build:fixture": "tsx setup/build-fixture-vault.ts",
-    "build:desktop": "cargo build -p pangolin-desktop --features test-hooks,custom-protocol && cargo build -p pangolin-native-messaging-host --features test-hooks",
+    "build:desktop": "cargo build -p pangolin-desktop --features test-hooks,custom-protocol && cargo build -p pangolin-native-messaging-host",
     "build:extension": "cd ../ && pnpm build",
     "test:e2e": "mocha",
     "e2e": "pnpm build:desktop && pnpm build:extension && pnpm test:e2e",

@@ -478,11 +478,16 @@ jobs:
   # --load-extension dev-loaded extensions, so the automated gate
   # injects a stdio host-bridge into the real popup-side
   # NativeHostClient and drives the real pangolin-native-messaging-host
-  # binary → real pangolin-desktop IPC. No Chrome, no xvfb — pure Node
-  # + the Rust binaries. The real-Chrome transport is covered by the
-  # §9 manual smoke test. Needs the producer jobs green first
-  # (desktop + native-messaging-host supply the binaries; the libdbus
-  # dep is needed because the desktop/host link the keyring chain).
+  # binary → real pangolin-desktop IPC. No Chrome — the real-Chrome
+  # transport is covered by the §9 manual smoke test. BUT xvfb IS
+  # required: pangolin-desktop is a Tauri/GTK app whose IPC server only
+  # comes up once its event loop initializes, which needs an X display
+  # (a displayless run never binds the socket). The desktop build also
+  # embeds apps/desktop/dist via the custom-protocol feature, so the
+  # frontend dist must be built first. Needs the producer jobs green
+  # first (desktop + native-messaging-host supply the binaries; the
+  # libdbus dep is needed because the desktop/host link the keyring
+  # chain).
   extension-e2e:
     name: extension-e2e
     runs-on: ubuntu-latest
@@ -490,15 +495,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # Tauri + keyring Linux deps so pangolin-desktop +
-      # pangolin-native-messaging-host link + run. No Chrome, no xvfb
-      # (the gate is headless Node, not a browser).
-      - name: "Install Tauri + keyring Linux deps (apt)"
+      # pangolin-native-messaging-host link + run, PLUS xvfb so the
+      # desktop's GTK event loop (and therefore its IPC server) comes
+      # up — a displayless run never binds the socket. No Chrome (the
+      # gate injects a stdio host-bridge, not a browser).
+      - name: "Install Tauri + keyring + xvfb Linux deps (apt)"
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libxdo-dev \
             libssl-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev \
-            pkg-config
+            pkg-config xvfb
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -512,10 +519,30 @@ jobs:
           node-version-file: 'apps/extension/.nvmrc'
           cache: 'pnpm'
           cache-dependency-path: 'apps/extension/e2e/pnpm-lock.yaml'
-      - name: "Build desktop + host with test-hooks (+ custom-protocol)"
+      # The custom-protocol desktop build embeds apps/desktop/dist
+      # (frontendDist) at compile time, so the UI must be built first.
+      # apps/desktop's package.json uses a file:../component-library
+      # dep, so build the component-library dist first (mirrors the
+      # desktop-e2e job).
+      - name: "Pre-build component-library (file: dep target)"
+        working-directory: apps/component-library
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - name: "Build desktop frontend dist (frontendDist for custom-protocol)"
+        working-directory: apps/desktop
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build:ui
+      # Desktop gets test-hooks (invocation side-channel) + custom-protocol
+      # (embed the dist). The host gets NEITHER: it has no test-hooks
+      # feature (it only relays framed bytes), so passing --features
+      # test-hooks here fails the build and leaves a stale host binary —
+      # which then mismatches the freshly-built desktop's IPC handshake.
+      - name: "Build desktop (test-hooks+custom-protocol) + host (plain)"
         run: |
           cargo build -p pangolin-desktop --features test-hooks,custom-protocol
-          cargo build -p pangolin-native-messaging-host --features test-hooks
+          cargo build -p pangolin-native-messaging-host
       - name: "Install extension-e2e deps (frozen lockfile)"
         working-directory: apps/extension/e2e
         run: pnpm install --frozen-lockfile
@@ -525,9 +552,10 @@ jobs:
       - name: "ESLint (extension-e2e)"
         working-directory: apps/extension/e2e
         run: pnpm lint
-      - name: "Run extension-e2e integration gate (framing + 5 scenarios)"
+      # xvfb-run: the desktop needs an X display to bind its IPC server.
+      - name: "Run extension-e2e integration gate under xvfb (framing + 5 scenarios)"
         working-directory: apps/extension/e2e
-        run: pnpm test:e2e
+        run: xvfb-run --auto-servernum pnpm test:e2e
 
   # P5-1: contracts pipeline
   # -----------------------------------------------------------------
