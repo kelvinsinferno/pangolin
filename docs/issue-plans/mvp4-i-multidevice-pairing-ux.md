@@ -366,6 +366,12 @@ These are forced engineering details with one coherent answer; the builder resol
 - **Automated two-device desktop E2E against a live/anvil chain.** Heavy (two app instances + a chain); the FFI
   flow is already proven by `anvil_pairing_e2e.rs`. Revisit if pairing regressions recur.
 - **Relay-mediated (remote) pairing** — online pairing without a shared physical moment.
+- **Linux/WebKitGTK camera-permission handler (follow-up).** The camera-scan affordance uses `getUserMedia` +
+  `jsqr` and degrades cleanly to paste when the camera is unsupported/denied (L3). No OS webview media-permission
+  handler is wired this slice, so on WebKitGTK (the Linux/CI target) `getUserMedia` is likely auto-denied and the
+  scan affordance falls back to paste; on macOS/Windows it typically prompts + works. Wiring a per-OS webview
+  media-permission grant + recording the §9 manual real-device camera screencast is a follow-up before relying on
+  the scan path in beta. The paste + QR-display channels are fully functional today.
 - **In-app gas funding / faucet integration.**
 - **Recovery UX, sync-status UX** — separate back-half slices.
 - **Mainnet pairing** — hard-gated behind D-011 (testnet-only until then).

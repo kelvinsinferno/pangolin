@@ -37,10 +37,13 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
-  "dependencies": {},
+  "dependencies": {
+    "qrcode-generator": "=1.4.4"
+  },
   "devDependencies": {
     "@storybook/addon-a11y": "^8.4.7",
     "@storybook/addon-essentials": "^8.4.7",
+    "@types/qrcode-generator": "=1.0.6",
     "@storybook/react": "^8.4.7",
     "@storybook/react-vite": "^8.4.7",
     "@testing-library/jest-dom": "^6.6.3",

@@ -5,6 +5,7 @@ import { useToast } from './hooks/useToast';
 import { useVault, type UnlockResult } from './hooks/useVault';
 import { AccountDetailScreen } from './screens/AccountDetailScreen';
 import { AccountListScreen } from './screens/AccountListScreen';
+import { DevicesScreen } from './screens/DevicesScreen';
 import { UnlockScreen } from './screens/UnlockScreen';
 import { WelcomeScreen } from './screens/WelcomeScreen';
 import type { DesktopError } from './lib/invoke';
@@ -77,6 +78,19 @@ export function App() {
           onLock={async () => {
             const r = await actions.lockVault();
             if (!r.ok) showError(r.error);
+          }}
+          onDevices={actions.goToDevices}
+        />
+      )}
+      {state.stage === 'devices' && (
+        <DevicesScreen
+          onClose={actions.backToList}
+          onError={(msg) => toastActions.danger(msg)}
+          onJoined={async (newPassword) => {
+            const r = await actions.unlockVault(newPassword);
+            if (!r.ok && !r.authenticationFailed) {
+              showError(r.error);
+            }
           }}
         />
       )}

@@ -23,7 +23,8 @@
     "react-dom": "^19.0.0",
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-clipboard-manager": "^2.2.1",
-    "@pangolin/component-library": "file:../component-library"
+    "@pangolin/component-library": "file:../component-library",
+    "jsqr": "=1.4.0"
   },
   "devDependencies": {
     "@testing-library/dom": "^10.4.0",

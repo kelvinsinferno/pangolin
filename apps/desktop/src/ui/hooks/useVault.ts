@@ -32,7 +32,7 @@ import {
   type DesktopError,
 } from '../lib/invoke';
 
-export type VaultStage = 'welcome' | 'locked' | 'active' | 'detail';
+export type VaultStage = 'welcome' | 'locked' | 'active' | 'detail' | 'devices';
 
 export interface VaultState {
   stage: VaultStage;
@@ -65,6 +65,8 @@ export interface VaultActions {
   showAccount(id: string): Promise<{ ok: true } | { ok: false; error: DesktopError }>;
   /** Closes the detail screen and returns to the account list. */
   backToList(): void;
+  /** Opens the Devices (multi-device pairing) screen. */
+  goToDevices(): void;
   /** Reveals the head-of-history password for the currently-selected
    *  account. Caller-managed lifetime: the AccountDetailScreen sets it
    *  via local state + clears within 10 s. */
@@ -152,6 +154,10 @@ export function useVault(): { state: VaultState; actions: VaultActions } {
     setState((prev) => ({ ...prev, stage: 'active', selected: null }));
   }, []);
 
+  const goToDevices = useCallback(() => {
+    setState((prev) => ({ ...prev, stage: 'devices', selected: null }));
+  }, []);
+
   const revealPasswordForSelected = useCallback(async () => {
     // Capture the id at call time so a concurrent backToList does not
     // race past us.
@@ -198,6 +204,7 @@ export function useVault(): { state: VaultState; actions: VaultActions } {
       listAccounts,
       showAccount,
       backToList,
+      goToDevices,
       revealPasswordForSelected,
       copySelectedPassword,
     },
