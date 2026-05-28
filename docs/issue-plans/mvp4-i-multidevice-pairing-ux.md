@@ -2,11 +2,14 @@
 
 # MVP-4-I — Multi-device pairing UX (desktop "Devices" flow) — plan-gate DRAFT
 
-**Status: DRAFT — awaiting Kelvin sign-off on Q-a (transport channel) + Q-b (revocation scope).**
-All other engineering choices self-locked (§0a RESOLVED + §5 builder carve-outs). The full pairing
-crypto + on-chain handshake is already built + audited at the FFI layer (8 functions in
-`crates/pangolin-ffi/src/pairing.rs`, proven end-to-end in `crates/pangolin-ffi/tests/anvil_pairing_e2e.rs`);
-this slice builds ONLY the desktop UI + the thin Tauri-command layer that wires that surface to a human flow.
+**Status: LOCKED — Kelvin sign-off 2026-05-28.** Q-a resolved: **Option 3** (copy-paste text + QR render +
+camera scan). Q-b resolved: **Option 1 — SPLIT** (this slice = add-a-device + join-a-vault + a read-only
+device list; device *removal* is its own follow-up slice **MVP-4-J**, which must FIRST build + adversarially
+audit a net-new `vault_remove_device` engine entry point — see §0a Q-b + §8). All other engineering choices
+self-locked (§0a RESOLVED + §5 builder carve-outs). The full pairing crypto + on-chain handshake is already
+built + audited at the FFI layer (8 functions in `crates/pangolin-ffi/src/pairing.rs`, proven end-to-end in
+`crates/pangolin-ffi/tests/anvil_pairing_e2e.rs`); this **add** slice builds ONLY the desktop UI + the thin
+Tauri-command layer that wires that finished surface to a human flow — NO new engine/crypto code.
 
 > Lettering note: `MVP-4-H` is reserved for the pre-mainnet **secure-input** slice (native-Rust input
 > widget, lands alongside the D-011 audit — see `pangolin_secure_input` memory). This pairing-UX slice is
@@ -29,36 +32,32 @@ envelope, sets its own new master password, and unlocks the now-shared vault. No
 
 ## 0a. Decisions
 
-### OPEN — need Kelvin (resolve at sign-off)
+### RESOLVED — Kelvin sign-off 2026-05-28
 
-**Q-a — Transport channel for the desktop MVP. (THE big one.)**
+**Q-a — Transport channel = Option 3: copy-paste TEXT + QR RENDER + CAMERA SCAN.**
 The pairing handshake moves ~3 small blobs between the two devices (B→A payload, A→B payload, A→B sealed
-envelope). Each blob has two equivalent forms the engine already emits: a **QR image** (the bytes, ~137 bytes —
-fits a QR trivially) and a **copy-paste text string** (base32 + checksum, ~142 chars). The Rust layer is
-transport-agnostic; the UI owns how the bytes actually cross. The realistic "other device" in MVP-4 is
-**another desktop** (mobile is MVP-5), and desktops mostly can't reliably scan a QR (needs a webcam + a
-camera/scan library + camera permissions in the webview — fragile). Options:
+envelope). Each blob has two equivalent forms the engine already emits: a **QR image** (the bytes — the pinned
+`PAYLOAD_LEN`, fits a QR trivially) and a **copy-paste text string** (base32 + checksum, ~142 chars). The Rust
+layer is transport-agnostic; the UI owns how the bytes cross. This slice ships ALL THREE input/output affordances:
+- **Copy-paste text** — the universal fallback (works on any machine, no camera). Each displayed blob has a Copy
+  button; each ingest step accepts a pasted string.
+- **QR render** — every outgoing blob is also shown as a QR (R-6 `QRCode` component).
+- **Camera scan** — every ingest step also offers "scan with camera": `getUserMedia` in the Tauri webview feeds
+  frames to a JS QR-decode lib (§5), decoded bytes go straight into `pairing_decode`. Requires a camera
+  capability/permission (§6) + graceful fallback to paste when no camera / permission denied (§6, L3).
 
-| Option | What the user does | Build cost | Notes |
-|---|---|---|---|
-| **1. Text-string only** | Copy a ~142-char code from one app, paste into the other, 3× | Low | Reliable everywhere, no camera. Tedious but checksum-guarded; typos rejected. |
-| **2. Text + QR *render* (Recommended)** | Same copy-paste fallback, PLUS each blob also shows a QR a camera-equipped device (future mobile) can scan | Low–med (add a QR-render component; **no** scanning) | Best foundation: desktop↔desktop uses paste; a future mobile joiner can scan. Render-only is cheap. |
-| **3. Text + QR render + camera scan** | Point one app's webcam at the other's QR | High | Full QR UX but the webcam-scan-on-desktop path is fragile + a large dep; better deferred to when mobile (with a real camera) lands. |
-
-Recommendation: **Option 2** — copy-paste text as the universal primary, QR *render* for the future mobile
-joiner, camera scanning deferred to MVP-5 / a follow-up. This avoids the fragile desktop-webcam path while
-keeping the protocol's QR affordance.
-
-**Q-b — Does this slice include device *revocation* UX, or only *add* + a read-only list?**
-The "remove a device" flow triggers an on-chain `DeviceRemoved` + a full **VDK rotation** (re-wrap the vault
-key so the removed device can no longer open it) — all built (#106b-2 / #106d) but heavier UX (a destructive,
-irreversible, gas-costing action with its own confirm + rotation-progress surface). Options:
-
-- **Option 1 (Recommended): add-only this slice.** Ship the two pairing wizards + a **read-only** list of
-  paired devices. Revocation UX is a dedicated follow-up slice. Keeps this slice focused + testable.
-- **Option 2: add + revoke in one slice.** One bigger slice; more surface to audit at once.
-
-Recommendation: **Option 1** — add-only + read-only list now; revocation as MVP-4-J follow-up.
+**Q-b — Add-only this slice; device REMOVAL split to MVP-4-J (Option 1 — split).**
+**Correction to the original draft:** removal is NOT "all built at the FFI layer." Listing devices (`device_list`)
+and *completing* a rotation (`vault_pending_rotations` + `vault_complete_rotation`) ARE exposed, but the act of
+*removing* a device — signing the EIP-712 `RemoveDevice` authorization engine-side + broadcasting the on-chain
+`DeviceRemoved` — exists only as `pangolin_chain::remove_device_v2`, **called by tests only, with NO `#[uniffi::export]`
+wrapper**. So "remove" is a net-new, security-sensitive, on-chain engine entry point (`vault_remove_device`,
+mirroring `vault_add_device`'s shape) that needs its own build + adversarial audit. Bundling it would turn this
+clean UI slice into a UI + engine-crypto slice. Therefore:
+- **MVP-4-I (this slice):** add-a-device + join-a-vault wizards + a **read-only** paired-device list. Pure UI on a
+  finished engine; NO new engine/crypto.
+- **MVP-4-J (next slice, §8):** build + adversarially audit `vault_remove_device`, then the destructive
+  removal-+-VDK-rotation UX (irreversible confirm + rotation-progress, driving `vault_complete_rotation`).
 
 ### RESOLVED — self-locked
 
@@ -83,8 +82,10 @@ Recommendation: **Option 1** — add-only + read-only list now; revocation as MV
 - **R-5 — Bootstrap is detected, not blindly attempted.** A vault must be `bootstrapVault`-ed on-chain exactly
   once before its first `addDevice`. The wizard detects bootstrap state and only bootstraps when needed
   (mechanism = §5 carve-out). The bootstrap tx is surfaced as its own progress step (it is a separate gas tx).
-- **R-6 — QR render (if Q-a picks Option 2/3) lives in the component library** as a new `QRCode` component, not
-  ad-hoc in the desktop app — the design system is load-bearing on every MVP-4 PR. (Dep choice = §5 carve-out.)
+- **R-6 — QR render lives in the component library** as a new `QRCode` component, not ad-hoc in the desktop app
+  — the design system is load-bearing on every MVP-4 PR. The **camera-scan** affordance (`getUserMedia` + a JS
+  QR-decode lib) lives in the desktop app (it needs the Tauri camera capability + frame loop), not the library;
+  it presents decoded bytes to `pairing_decode`. Both dep choices = §5 carve-out.
 - **R-7 — Testing = Vitest (wizard state machine + invoke wrappers, mocked Tauri) + Rust command-handler unit
   tests + a documented MANUAL two-device smoke test (§9).** The full automated two-device-against-a-live-chain
   E2E is explicitly OUT of scope (§8) — the FFI flow is already proven by `anvil_pairing_e2e.rs`; a desktop
@@ -94,8 +95,8 @@ Recommendation: **Option 1** — add-only + read-only list now; revocation as MV
 
 ## 0b. What NOT to ship in this slice
 
-- **Device revocation / removal UX** (unless Q-b = Option 2). Triggers VDK rotation; dedicated follow-up.
-- **Camera / webcam QR *scanning*** (unless Q-a = Option 3). Deferred to MVP-5 (mobile) or a follow-up.
+- **Device revocation / removal UX** (Q-b = split). MVP-4-J — needs the net-new `vault_remove_device` engine
+  entry point built + audited FIRST, then the destructive removal + VDK-rotation UX.
 - **Recovery UX** (guardian setup, recover-from-shares, backup-phrase). Separate back-half slice (#108/#109 FFI
   is ready; its UX is its own plan-gate).
 - **Sync-status UX** (publish/read revisions, pending-change indicators). Separate back-half slice.
@@ -116,7 +117,9 @@ device open it — end to end, on Base Sepolia testnet.
 
 **Built in MVP-4-I:**
 1. A new **`Devices`** screen reachable from the unlocked `AccountListScreen` (a "Devices" header button).
-   Shows a read-only list of paired devices (Q-b Option 1) + two entry actions: *Add a device* / *Join a vault*.
+   Shows a **read-only** list of paired devices (via `device_list -> Vec<DeviceInfo>`, with `device_current` to
+   mark "this device"; `device_set_label` is available for a rename affordance — builder's call whether to
+   include rename in this slice or defer) + two entry actions: *Add a device* / *Join a vault*.
 2. **A-side "Add a device" wizard** (this device = manager): bootstrap-if-needed → ingest B's payload → show
    A's payload → show SAS + "do the codes match on both screens?" confirm → publish `addDevice` (progress) →
    show the sealed envelope for B to ingest → done.
@@ -125,8 +128,10 @@ device open it — end to end, on Base Sepolia testnet.
 4. **~8 thin `#[tauri::command]` handlers** in a new `apps/desktop/src/commands/pairing.rs` wrapping the FFI,
    registered in `lib.rs` `generate_handler!` + the `capabilities/default.json` allow-list.
 5. **Typed `invoke.ts` wrappers** for each command + the DTOs.
-6. A new **`QRCode`** component in `@pangolin/component-library` (if Q-a = Option 2/3) + a **code/text-input**
-   affordance for pasting payloads (reuse `Input`; add a paste-and-validate pattern).
+6. A new **`QRCode`** render component in `@pangolin/component-library`, a **camera-scan** affordance in the
+   desktop app (`getUserMedia` + a JS QR-decode lib → `pairing_decode`), and a **paste-and-validate** affordance
+   (reuse `Input`). All three feed the same `pairing_decode` validation; camera/permission failure falls back to
+   paste (L3).
 7. **Stage additions** to `useVault.ts` (`'devices'` stage + the wizard sub-state) + `App.tsx` routing.
 8. Persistent **testnet banner** on the `Devices` screen.
 
@@ -219,10 +224,14 @@ The pure-decode/SAS commands are session-tolerant; the handle-bearing ones are L
 
 ### 3.4 New / reused components
 
-- **New: `QRCode`** in `@pangolin/component-library` (Q-a Option 2/3) — render-only, takes bytes/string, sizes
-  via tokens. Dep choice = §5.
-- **New: a "scan/paste payload" affordance** — for the MVP this is `Input` + a "Paste & validate" button that
-  calls `pairing_decode` and shows a green/`Check` "valid payload for vault …" or a `Warning` on a bad checksum.
+- **New: `QRCode`** in `@pangolin/component-library` — render-only, takes bytes/string, sizes via tokens.
+  Dep choice = §5. Every outgoing blob (B's payload, A's payload, A's sealed envelope) renders both a QR and the
+  copy-paste `string_form`.
+- **New: a payload-ingest affordance (desktop app)** with three inputs that all funnel into `pairing_decode`:
+  (a) **camera scan** — `getUserMedia` → a `<video>` frame loop → JS QR-decode lib → decoded bytes; (b) **paste**
+  — `Input` + "Paste & validate" button; (c) implicit on both, a green `Check` "valid payload for vault …" or a
+  `Warning` on bad checksum / version / camera-denied. Camera is offered when available + permitted; otherwise
+  the UI silently falls back to paste (L3) — never blocks the flow on a missing camera.
 - **Reused:** `Card`, `Button`, `IconButton` (`Copy`, `Check`, `Warning`, `Chevron`), `Modal` (confirm-SAS,
   confirm-publish), `Toast` (errors), `PasswordMeter` (B's new password), `Badge`/`Tag` (device-list rows),
   `Spinner` (chain waits), `ListRow` (paired-device rows), `Code` (render the SAS + the text blobs in mono).
@@ -264,8 +273,11 @@ otherwise attempt `vault_bootstrap_chain` and treat the contract's `VaultAlready
   silently proceeds or fabricates success.
 - **L4 — session-gated.** All handle-bearing commands require an Active (unlocked) vault — enforced FFI-side;
   the UI only reaches the wizards from the unlocked `AccountListScreen`.
-- **L5 — new external deps are scoped + minimal.** Any QR-render dep (R-6) lives in the component library, not
-  the desktop bundle directly, and renders only (no scanner, no network). No new Rust deps (the FFI is done).
+- **L5 — new external deps are scoped + minimal.** The QR-*render* dep (R-6) lives in the component library and
+  renders only (no network). The QR-*decode* dep + the `getUserMedia` camera path live in the desktop app and are
+  local-only (no frame ever leaves the device; the camera stream is decoded in-process and discarded). Both are
+  JS-side, scoped to the desktop/library bundles. No new Rust deps (the FFI is done). The camera capability is
+  added to `capabilities/default.json` narrowly (pairing screens only, builder's scoping).
 - **L7 — errors carry no secret.** `DesktopError` envelopes carry kind + a non-secret message; never the
   password, the VDK, the seal, or signer key material.
 
@@ -278,8 +290,11 @@ These are forced engineering details with one coherent answer; the builder resol
 
 - **Byte wire-form** (hex string vs number array) for the non-`string_form` blobs across `invoke` — builder
   picks the cleaner of the two against the existing `invoke.ts` DTO conventions.
-- **QR-render dep** (if Q-a = Option 2/3) — a vetted, render-only, dependency-light lib (e.g. a `qrcode`-class
-  encoder feeding a `<canvas>`/SVG) wrapped as the `QRCode` component. Builder picks; justify in the PR.
+- **QR-render dep** — a vetted, render-only, dependency-light encoder (e.g. a `qrcode`-class lib feeding a
+  `<canvas>`/SVG) wrapped as the `QRCode` component. Builder picks; justify in the PR.
+- **QR-decode dep** — a vetted JS QR-decoder (e.g. `jsqr` / a `zxing`-wasm) fed by `getUserMedia` frames in the
+  desktop app. Local-only, no network. Builder picks the lightest credible option; justify in the PR + confirm
+  it carries no surprise transitive deps (cargo-deny equivalent on the JS side = the lockfile review).
 - **Bootstrap detection mechanism** (R-5) — read-status-if-available else attempt-and-catch
   `VaultAlreadyBootstrapped`. Builder verifies which the FFI/contract actually supports.
 - **`epoch` for `pairing_open_and_join`** — `vault_add_device` seals at `epoch=0` for a first pairing (per
@@ -311,6 +326,13 @@ These are forced engineering details with one coherent answer; the builder resol
   feed `pairing_decode` whatever the user supplies (it accepts both forms).
 - **Stale-QR / replay** is already defended (freshness nonce + on-chain `deviceNonce`); the UI should still
   expire an in-flight wizard on Cancel/timeout so a screenshotted payload is not reused blindly.
+- **Camera permission is a first-class failure path, not an afterthought.** `getUserMedia` can be: unsupported
+  (no camera), denied (user/OS), or revoked mid-session. EVERY scan affordance must degrade to paste without
+  wedging the wizard (L3), and must stop the camera track on step-change/Cancel/unmount (no hot webcam left
+  running). Confirm the Tauri webview actually grants `getUserMedia` on each target OS (it is NOT guaranteed by
+  default — may need a `tauri.conf.json`/capability + an OS-level permission prompt) — this is the single most
+  likely thing to "work on my machine, fail in the build"; the builder MUST verify camera capture end-to-end on
+  at least one real desktop before claiming the scan path done (the screencast in §9 is the proof).
 
 ---
 
@@ -318,8 +340,10 @@ These are forced engineering details with one coherent answer; the builder resol
 
 - `apps/desktop`: `pnpm typecheck` ✓ + `pnpm lint` ✓ + `pnpm test` (Vitest: wizard state machine + new invoke
   wrappers + paste-validate) ✓ + `pnpm build` ✓.
-- `apps/component-library`: typecheck/lint/Vitest/Storybook/build ✓, incl. the new `QRCode` component + a story
-  (if Q-a = Option 2/3).
+- `apps/component-library`: typecheck/lint/Vitest/Storybook/build ✓, incl. the new `QRCode` component + a story.
+- The camera-scan path degrades cleanly: no camera / denied permission falls back to paste (Vitest mocks
+  `getUserMedia`); the camera track is stopped on Cancel/step-change/unmount. End-to-end camera capture verified
+  on at least one real desktop (the §9 screencast is the proof — it is NOT exercised in CI).
 - Rust: `cargo fmt --check` ✓ + `cargo clippy -p pangolin-desktop --all-targets -- -D warnings` ✓ +
   `cargo test -p pangolin-desktop` (new `commands/pairing.rs` unit tests) ✓ + full-workspace gate green.
 - `cargo audit` / `cargo deny` ✓; cardinal invariants 0/0/0/0.
@@ -333,11 +357,14 @@ These are forced engineering details with one coherent answer; the builder resol
 
 ## 8. Out of scope (filed for follow-up)
 
-- **Device revocation / removal UX** (Q-b Option 1 → MVP-4-J): on-chain `DeviceRemoved` + VDK rotation +
-  rotation-progress surface + "this is irreversible" confirm.
+- **MVP-4-J — Device revocation / removal (NEXT slice).** Two parts: (1) **build + adversarially audit** a
+  net-new `vault_remove_device` `#[uniffi::export]` (signs EIP-712 `RemoveDevice` engine-side, broadcasts
+  `DeviceRemoved` via `pangolin_chain::remove_device_v2`, queues the local rotation-pending row) — this is a
+  security-sensitive engine slice, NOT UI; (2) the removal UX: an irreversible-action confirm + the VDK-rotation
+  progress surface driving the already-exposed `vault_complete_rotation` (with `vault_pending_rotations` to show
+  what's outstanding).
 - **Automated two-device desktop E2E against a live/anvil chain.** Heavy (two app instances + a chain); the FFI
   flow is already proven by `anvil_pairing_e2e.rs`. Revisit if pairing regressions recur.
-- **Camera / webcam QR scanning** (Q-a Option 1/2 → follow-up / MVP-5 mobile).
 - **Relay-mediated (remote) pairing** — online pairing without a shared physical moment.
 - **In-app gas funding / faucet integration.**
 - **Recovery UX, sync-status UX** — separate back-half slices.
