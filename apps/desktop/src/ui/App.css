@@ -120,3 +120,116 @@ body {
 .toast-region > * {
   pointer-events: auto;
 }
+
+/* ---- MVP-4-I multi-device pairing ---- */
+
+.account-list-screen__header-actions {
+  display: flex;
+  gap: var(--spacing-sm);
+}
+
+.devices-screen {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-md);
+  max-width: 640px;
+  margin: 0 auto;
+}
+
+.devices-screen__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+}
+
+.devices-screen__testnet {
+  background: var(--color-surface-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: var(--spacing-sm);
+  font-size: 0.9rem;
+  color: var(--color-text-muted);
+  margin: 0;
+}
+
+.devices-screen__list ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.devices-screen__empty {
+  color: var(--color-text-muted);
+}
+
+.devices-screen__actions,
+.devices-wizard__actions {
+  display: flex;
+  gap: var(--spacing-sm);
+  margin-top: var(--spacing-sm);
+}
+
+.devices-wizard__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-sm);
+}
+
+.devices-wizard__step {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.code-ingest,
+.code-display {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.code-ingest__label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.code-ingest__input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--spacing-sm);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-family-mono);
+  resize: vertical;
+}
+
+.code-ingest__actions {
+  display: flex;
+  gap: var(--spacing-sm);
+}
+
+.code-ingest__error {
+  color: var(--color-danger);
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+.code-ingest__camera {
+  width: 100%;
+  max-width: 320px;
+  border-radius: var(--radius-sm);
+  background: #000;
+}
+
+.code-ingest__camera-note {
+  color: var(--color-text-muted);
+  font-size: 0.9rem;
+  margin: 0;
+}

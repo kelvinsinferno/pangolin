@@ -122,6 +122,16 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         commands::account::copy_to_clipboard,
         commands::install_native_host::install_native_host,
         commands::install_native_host::uninstall_native_host,
+        // MVP-4-I: multi-device pairing (add-device) command surface.
+        commands::pairing::pairing_begin_new_device,
+        commands::pairing::pairing_decode_string,
+        commands::pairing::pairing_decode_bytes,
+        commands::pairing::pairing_local_payload,
+        commands::pairing::pairing_derive_sas,
+        commands::pairing::pairing_open_and_join,
+        commands::pairing::pairing_device_list,
+        commands::pairing::pairing_chain_bootstrap,
+        commands::pairing::pairing_add_device,
         #[cfg(feature = "test-hooks")]
         test_hooks::__test__commands_invoked,
         #[cfg(feature = "test-hooks")]

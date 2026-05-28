@@ -17,4 +17,5 @@
 
 pub mod account;
 pub mod install_native_host;
+pub mod pairing;
 pub mod vault;

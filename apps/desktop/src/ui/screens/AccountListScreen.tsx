@@ -7,6 +7,7 @@ export interface AccountListScreenProps {
   accounts: AccountSummary[];
   onSelect: (id: string) => Promise<void>;
   onLock: () => Promise<void>;
+  onDevices: () => void;
 }
 
 /**
@@ -16,14 +17,24 @@ export interface AccountListScreenProps {
  *
  * No search this slice (per plan §0b — deferred to MVP-4 back-half).
  */
-export function AccountListScreen({ accounts, onSelect, onLock }: AccountListScreenProps) {
+export function AccountListScreen({
+  accounts,
+  onSelect,
+  onLock,
+  onDevices,
+}: AccountListScreenProps) {
   return (
     <main className="account-list-screen" aria-labelledby="account-list-title">
       <header className="account-list-screen__header">
         <h1 id="account-list-title">Accounts</h1>
-        <Button variant="ghost" onClick={onLock} data-testid="lock-button">
-          Lock
-        </Button>
+        <div className="account-list-screen__header-actions">
+          <Button variant="ghost" onClick={onDevices} data-testid="devices-button">
+            Devices
+          </Button>
+          <Button variant="ghost" onClick={onLock} data-testid="lock-button">
+            Lock
+          </Button>
+        </div>
       </header>
       {accounts.length === 0 ? (
         <p className="account-list-screen__empty">No accounts in this vault.</p>

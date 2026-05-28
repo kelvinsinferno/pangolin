@@ -7,6 +7,10 @@ settings:
 importers:
 
   .:
+    dependencies:
+      qrcode-generator:
+        specifier: '=1.4.4'
+        version: 1.4.4
     devDependencies:
       '@storybook/addon-a11y':
         specifier: ^8.4.7
@@ -32,6 +36,9 @@ importers:
       '@types/node':
         specifier: ^20.17.10
         version: 20.19.41
+      '@types/qrcode-generator':
+        specifier: '=1.0.6'
+        version: 1.0.6
       '@types/react':
         specifier: ^19.0.0
         version: 19.2.15
@@ -901,6 +908,10 @@ packages:
 
   '@types/node@20.19.41':
     resolution: {integrity: sha512-ECymXOukMnOoVkC2bb1Vc/w/836DXncOg5m8Xj1RH7xSHZJWNYY6Zh7EH477vcnD5egKNNfy2RpNOmuChhFPgQ==}
+
+  '@types/qrcode-generator@1.0.6':
+    resolution: {integrity: sha512-XasuPjhHBC4hyOJ/pHaUNTj+tNxA1SyZpXaS/FOUxEVX03D1gFM8UmMKSIs+pPHLAmRZpU6j9KYxvo+lfsvhKw==}
+    deprecated: This is a stub types definition for qrcode-generator (https://github.com/kazuhikoarase/qrcode-generator). qrcode-generator provides its own type definitions, so you don't need @types/qrcode-generator installed!
 
   '@types/react-dom@19.2.3':
     resolution: {integrity: sha512-jp2L/eY6fn+KgVVQAOqYItbF0VY/YApe5Mz2F0aykSO8gx31bYCZyvSeYxCHKvzHG5eZjc+zyaS5BrBWya2+kQ==}
@@ -2123,6 +2134,9 @@ packages:
   punycode@2.3.1:
     resolution: {integrity: sha512-vYt7UD1U9Wg6138shLtLOvdAu+8DsC/ilFtEVHcH+wydcSpNE20AfSOduf6MkRFahL5FY7X1oU7nKVZFtfq8Fg==}
     engines: {node: '>=6'}
+
+  qrcode-generator@1.4.4:
+    resolution: {integrity: sha512-HM7yY8O2ilqhmULxGMpcHSF1EhJJ9yBj8gvDEuZ6M+KGJ0YY2hKpnXvRD+hZPLrDVck3ExIGhmPtSdcjC+guuw==}
 
   quansync@0.2.11:
     resolution: {integrity: sha512-AifT7QEbW9Nri4tAwR5M/uzpBuqfZf+zwaEM/QkzEjj7NBuFD2rBuy0K3dE+8wltbezDV7JMA0WfnCPYRSYbXA==}
@@ -3479,6 +3493,10 @@ snapshots:
   '@types/node@20.19.41':
     dependencies:
       undici-types: 6.21.0
+
+  '@types/qrcode-generator@1.0.6':
+    dependencies:
+      qrcode-generator: 1.4.4
 
   '@types/react-dom@19.2.3(@types/react@19.2.15)':
     dependencies:
@@ -4863,6 +4881,8 @@ snapshots:
   process@0.11.10: {}
 
   punycode@2.3.1: {}
+
+  qrcode-generator@1.4.4: {}
 
   quansync@0.2.11: {}
 

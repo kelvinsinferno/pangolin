@@ -166,3 +166,170 @@ export async function copyToClipboard(text: string): Promise<void> {
 export async function copyPasswordToClipboard(id: string): Promise<void> {
   await tauriInvoke<void>('copy_password_to_clipboard', { id });
 }
+
+// ---- Pairing DTOs (mirror of Rust commands::pairing) -----------------
+// MVP-4-I multi-device pairing (add-device). Every field below is
+// non-secret (the pairing payload + sealed envelope are exactly what a QR
+// exposes; the SAS is shown to the human). The only secrets are the
+// master passwords, which cross via the same direct-invoke path as
+// `vaultUnlock` — see plan §4 L1.
+
+/** The non-secret pairing payload, in the shapes the wizard needs. */
+export interface PairingPayload {
+  /** Length-strict payload byte-form (for the QR render + to pass back to
+   *  the byte-taking commands). */
+  bytes: number[];
+  /** Copy-pasteable base32 + checksum text form (also what the QR
+   *  encodes, so a scan round-trips through `pairingDecodeString`). */
+  stringForm: string;
+  /** 64-char lowercase hex of the 32-byte vault id this payload joins
+   *  (device B passes this to `pairingOpenAndJoin`). */
+  vaultId: string;
+  /** 64-char lowercase hex of the 32-byte device id. */
+  deviceId: string;
+  /** 40-char lowercase hex of the 20-byte EVM signer address. */
+  signer: string;
+}
+
+/** The non-secret sealed-VDK envelope (manager → new device). */
+export interface SealedEnvelope {
+  bytes: number[];
+  stringForm: string;
+}
+
+/** One paired device (read-only list). */
+export interface DeviceInfo {
+  /** 64-char lowercase hex of the 32-byte device id. */
+  id: string;
+  label: string;
+  isCurrent: boolean;
+  registeredAt: number;
+  /** Lowercase hex of the 20-byte per-device EVM address ('' until
+   *  back-filled on first unlock). */
+  evmAddress: string;
+}
+
+interface PairingPayloadWire {
+  bytes: number[];
+  string_form: string;
+  vault_id: string;
+  device_id: string;
+  signer: string;
+}
+
+interface SealedEnvelopeWire {
+  bytes: number[];
+  string_form: string;
+}
+
+interface DeviceInfoWire {
+  id: string;
+  label: string;
+  is_current: boolean;
+  registered_at: number;
+  evm_address: string;
+}
+
+function payloadFromWire(w: PairingPayloadWire): PairingPayload {
+  return {
+    bytes: w.bytes,
+    stringForm: w.string_form,
+    vaultId: w.vault_id,
+    deviceId: w.device_id,
+    signer: w.signer,
+  };
+}
+
+function envelopeFromWire(w: SealedEnvelopeWire): SealedEnvelope {
+  return { bytes: w.bytes, stringForm: w.string_form };
+}
+
+function deviceFromWire(w: DeviceInfoWire): DeviceInfo {
+  return {
+    id: w.id,
+    label: w.label,
+    isCurrent: w.is_current,
+    registeredAt: w.registered_at,
+    evmAddress: w.evm_address,
+  };
+}
+
+// ---- Pairing command wrappers ----------------------------------------
+
+/** **NEW device, step 1.** Generate this device's pairing payload. */
+export async function pairingBeginNewDevice(): Promise<PairingPayload> {
+  return payloadFromWire(
+    await tauriInvoke<PairingPayloadWire>('pairing_begin_new_device'),
+  );
+}
+
+/** Validate + decode a pasted (text-form) payload. Also how device B
+ *  learns the manager's `vaultId`. */
+export async function pairingDecodeString(text: string): Promise<PairingPayload> {
+  return payloadFromWire(
+    await tauriInvoke<PairingPayloadWire>('pairing_decode_string', { text }),
+  );
+}
+
+/** Validate + decode a scanned (byte-form) payload. */
+export async function pairingDecodeBytes(bytes: number[]): Promise<PairingPayload> {
+  return payloadFromWire(
+    await tauriInvoke<PairingPayloadWire>('pairing_decode_bytes', { bytes }),
+  );
+}
+
+/** **MANAGER, step 2.** Build the manager's mirror payload, re-bound to
+ *  device B's freshness nonce. `theirBytes` is B's payload byte-form. */
+export async function pairingLocalPayload(theirBytes: number[]): Promise<PairingPayload> {
+  return payloadFromWire(
+    await tauriInvoke<PairingPayloadWire>('pairing_local_payload', { theirBytes }),
+  );
+}
+
+/** **Both roles.** Derive the 6-digit SAS over the two payload byte-forms
+ *  (canonical-symmetric). */
+export async function pairingDeriveSas(
+  aBytes: number[],
+  bBytes: number[],
+): Promise<string> {
+  return tauriInvoke<string>('pairing_derive_sas', { aBytes, bBytes });
+}
+
+/** **NEW device, FINAL step.** Open the sealed envelope, install the VDK
+ *  under a NEW master password, adopt the manager's vault id. Leaves the
+ *  vault Locked — follow with {@link vaultUnlock}. */
+export async function pairingOpenAndJoin(args: {
+  sealedBytes: number[];
+  vaultId: string;
+  epoch: number;
+  newPassword: string;
+}): Promise<void> {
+  await tauriInvoke<void>('pairing_open_and_join', args);
+}
+
+/** Read the read-only paired-device list. */
+export async function pairingDeviceList(): Promise<DeviceInfo[]> {
+  const list = await tauriInvoke<DeviceInfoWire[]>('pairing_device_list');
+  return list.map(deviceFromWire);
+}
+
+/** **MANAGER.** Bootstrap the vault's on-chain device set (once per
+ *  vault, before the first add-device). */
+export async function pairingChainBootstrap(password: string): Promise<void> {
+  await tauriInvoke<void>('pairing_chain_bootstrap', { password });
+}
+
+/** **MANAGER, FINAL CONFIRMATION.** After the human confirms the SAS,
+ *  authorize device B on-chain + return the sealed envelope. `theirBytes`
+ *  is B's payload byte-form. */
+export async function pairingAddDevice(
+  theirBytes: number[],
+  password: string,
+): Promise<SealedEnvelope> {
+  return envelopeFromWire(
+    await tauriInvoke<SealedEnvelopeWire>('pairing_add_device', {
+      theirBytes,
+      password,
+    }),
+  );
+}

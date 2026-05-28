@@ -58,5 +58,8 @@ export type { SeedPhraseGridProps } from './composite/SeedPhraseGrid/SeedPhraseG
 export { Card } from './composite/Card/Card';
 export type { CardProps, CardElevation } from './composite/Card/Card';
 
+export { QRCode } from './composite/QRCode/QRCode';
+export type { QRCodeProps } from './composite/QRCode/QRCode';
+
 // Icons.
 export * from './icons';
