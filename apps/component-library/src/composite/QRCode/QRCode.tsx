@@ -37,10 +37,24 @@ export function QRCode({
   className,
   ...rest
 }: QRCodeProps) {
+  // `qrcode-generator` throws synchronously if `value` exceeds the
+  // version-40 capacity. Catch it so an oversized blob degrades to an
+  // inline note rather than crashing the React subtree.
+  let count: number;
   const qr = qrcode(0, 'M');
-  qr.addData(value, 'Byte');
-  qr.make();
-  const count = qr.getModuleCount();
+  try {
+    qr.addData(value, 'Byte');
+    qr.make();
+    count = qr.getModuleCount();
+  } catch {
+    return (
+      <div className={['pcl-qrcode', className].filter(Boolean).join(' ')} {...rest}>
+        <p className="pcl-qrcode__error" role="status">
+          Code too large to display as a QR — use the copy-paste form.
+        </p>
+      </div>
+    );
+  }
   const total = count + margin * 2;
 
   // Build one path string for every dark module (1 unit = 1 module; the

@@ -267,22 +267,14 @@ pub async fn pairing_begin_new_device(
     Ok(payload.into())
 }
 
-/// Validate + decode a payload the user pasted (text form).
+/// Validate + decode a payload the user scanned or pasted.
 ///
 /// Used by both roles to validate a peer payload before advancing, and by
 /// device B to learn the manager's `vault_id` (needed for
 /// `pairing_open_and_join`). No handle / no session needed (pure decode).
-///
-/// # Errors
-/// `DesktopError::Validation { kind = "argument" }` on a bad
-/// checksum / version / encoding.
-#[tauri::command]
-pub async fn pairing_decode_string(text: String) -> Result<PairingPayloadDto, DesktopError> {
-    let payload = pangolin_ffi::pairing::pairing_decode_string(text).map_err(DesktopError::from)?;
-    Ok(payload.into())
-}
-
-/// Validate + decode a payload the user scanned (byte form, from a QR).
+/// The desktop UI moves blobs as base64 of these bytes (the QR encodes the
+/// base64 text, the paste field accepts it), so the byte form is the only
+/// decode entry the UI needs.
 ///
 /// # Errors
 /// `DesktopError::Validation { kind = "argument" }` on a bad

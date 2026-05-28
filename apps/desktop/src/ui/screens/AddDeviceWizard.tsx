@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Button, Card, Code, Input, Spinner } from '@pangolin/component-library';
 
 import { CodeDisplay } from '../components/CodeDisplay';
@@ -53,6 +53,10 @@ export function AddDeviceWizard({ onError, onClose }: AddDeviceWizardProps) {
   const [sas, setSas] = useState<string | null>(null);
   const [envelope, setEnvelope] = useState<SealedEnvelope | null>(null);
   const [busy, setBusy] = useState(false);
+  // Re-entry guard: a second click before the 'publishing' re-render must
+  // never fire a second on-chain addDevice (defense-in-depth on top of the
+  // contract's deviceNonce, which would already revert a duplicate).
+  const publishGuard = useRef(false);
 
   const cancel = () => {
     setPassword('');
@@ -94,7 +98,8 @@ export function AddDeviceWizard({ onError, onClose }: AddDeviceWizardProps) {
   // Driven directly from the confirm click (NOT an effect) so a parent
   // re-render can never re-fire the on-chain transaction.
   const confirmAndPublish = async () => {
-    if (theirBytes === null) return;
+    if (theirBytes === null || publishGuard.current) return;
+    publishGuard.current = true;
     setStep('publishing');
     try {
       const env = await pairingAddDevice(theirBytes, password);
@@ -102,6 +107,7 @@ export function AddDeviceWizard({ onError, onClose }: AddDeviceWizardProps) {
       setStep('envelope');
     } catch (e) {
       onError(errMessage(e));
+      publishGuard.current = false;
       setStep('sas');
     }
   };

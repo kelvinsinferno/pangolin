@@ -263,15 +263,9 @@ export async function pairingBeginNewDevice(): Promise<PairingPayload> {
   );
 }
 
-/** Validate + decode a pasted (text-form) payload. Also how device B
- *  learns the manager's `vaultId`. */
-export async function pairingDecodeString(text: string): Promise<PairingPayload> {
-  return payloadFromWire(
-    await tauriInvoke<PairingPayloadWire>('pairing_decode_string', { text }),
-  );
-}
-
-/** Validate + decode a scanned (byte-form) payload. */
+/** Validate + decode a scanned/pasted payload (byte form). The UI moves
+ *  blobs as base64 of these bytes, so this is the only decode the UI needs.
+ *  Also how device B learns the manager's `vaultId`. */
 export async function pairingDecodeBytes(bytes: number[]): Promise<PairingPayload> {
   return payloadFromWire(
     await tauriInvoke<PairingPayloadWire>('pairing_decode_bytes', { bytes }),

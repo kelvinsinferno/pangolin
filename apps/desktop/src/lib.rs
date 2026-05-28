@@ -124,7 +124,6 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         commands::install_native_host::uninstall_native_host,
         // MVP-4-I: multi-device pairing (add-device) command surface.
         commands::pairing::pairing_begin_new_device,
-        commands::pairing::pairing_decode_string,
         commands::pairing::pairing_decode_bytes,
         commands::pairing::pairing_local_payload,
         commands::pairing::pairing_derive_sas,

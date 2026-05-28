@@ -55,6 +55,8 @@ export function JoinVaultWizard({ onError, onClose, onJoined }: JoinVaultWizardP
   onErrorRef.current = onError;
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+  // Re-entry guard so a double-click can't drive two open-and-join attempts.
+  const joinGuard = useRef(false);
 
   const cancel = () => {
     setNewPassword('');
@@ -97,7 +99,8 @@ export function JoinVaultWizard({ onError, onClose, onJoined }: JoinVaultWizardP
   };
 
   const finish = async () => {
-    if (theirPayload === null || sealedBytes === null) return;
+    if (theirPayload === null || sealedBytes === null || joinGuard.current) return;
+    joinGuard.current = true;
     setBusy(true);
     try {
       await pairingOpenAndJoin({
@@ -111,6 +114,7 @@ export function JoinVaultWizard({ onError, onClose, onJoined }: JoinVaultWizardP
       await onJoined(pw);
     } catch (e) {
       onError(errMessage(e));
+      joinGuard.current = false;
       setBusy(false);
     }
   };
