@@ -1,11 +1,18 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 # MVP-4-G — Extension E2E UX gate (popup ⇄ native-messaging host ⇄ desktop) — plan-gate LOCKED
 
-**Status: LOCKED — Kelvin sign-off 2026-05-27.** Q-a resolved: Option 1 (manual paste at first connection). All other engineering choices self-locked per the no-fake-decision-gates discipline. Decisions captured in §0a.
+**Status: LOCKED — Kelvin sign-off 2026-05-27; AMENDED 2026-05-28 (Q-c: E2E transport boundary).** Q-a resolved: Option 1 (manual paste at first connection). Q-c resolved: the automated E2E gate uses an **injected stdio host-bridge** against the real `pangolin-native-messaging-host` binary + real desktop, NOT Chrome's `chrome.runtime.connectNative`, because Chrome for Testing 138+ refuses to spawn native-messaging hosts for `--load-extension` dev-loaded extensions (diagnosed via strace 2026-05-28; see §0a Q-c). The real-Chrome transport path is covered by a documented MANUAL smoke test (§9) run before closed beta. All other engineering choices self-locked. Decisions in §0a.
 
 ## 0. One-paragraph summary
 
-Wire the Chromium MV3 extension popup (MVP-4-C scaffold) to actually talk to the running Tauri desktop via the native-messaging host (MVP-4-E), and stand up the second end-to-end UX gate to prove the full extension→host→desktop chain works. The popup connects via `chrome.runtime.connectNative('studio.kelvinsinferno.pangolin.host')`, performs the auth handshake with the desktop-generated token, calls `session.status` + `vault.list_accounts` + `vault.copy_password`, and renders the account list with copy buttons. The new `extension-e2e` CI job runs Puppeteer (or WDIO + ChromeDriver) against a real Chrome with the unpacked extension loaded + the desktop binary running in background, all under `xvfb-run` on `ubuntu-latest`. The H-1 invariant assertion mirrors MVP-4-F scenario-5: the extension's "Copy" routes through Rust-side `copy_password_to_clipboard`, NOT through V8 plaintext crossing. Reuses MVP-4-F's fixture-vault builder + test-hooks Rust feature.
+Wire the Chromium MV3 extension popup (MVP-4-C scaffold) to actually talk to the running Tauri desktop via the native-messaging host (MVP-4-E), and stand up the second end-to-end UX gate to prove the full popup-client→host→desktop chain works. In production the popup connects via `chrome.runtime.connectNative('studio.kelvinsinferno.pangolin.host')`, performs the auth handshake with the desktop-generated token, calls `session.status` + `vault.list_accounts` + `vault.copy_password`, and renders the account list with copy buttons. The H-1 invariant: the extension's "Copy" routes through Rust-side `copy_password_to_clipboard`, NOT through V8 plaintext crossing.
+
+**Test-coverage split (Q-c, amended 2026-05-28):**
+- **Popup UI + state machine** (provisioning → connecting → connected → error, token paste, copy click): covered by **Vitest** (`apps/extension/src/popup/*.test.tsx`) with a mocked connector — fast, hermetic, already green.
+- **Cross-process data path** (the real `NativeHostClient` → real `pangolin-native-messaging-host` binary → real `pangolin-desktop` IPC → `pangolin-ffi`), including the H-1 `copy_password_to_clipboard` assertion: covered by a **Node integration gate** (`apps/extension/e2e/`) that injects a stdio host-bridge connector into the real `NativeHostClient`, spawns the actual host binary, and frames stdin/stdout with byte-identical native-messaging framing (4-byte LE length + UTF-8 JSON — the EXACT protocol the host expects). This exercises every line of OUR code end-to-end against the real binaries; only Chrome's `connectNative` transport (Google's code) is replaced.
+- **Real-Chrome transport** (`chrome.runtime.connectNative` + Chrome's `allowed_origins` enforcement): covered by a **manual smoke test** (§9), run by a human before closed beta. Automated real-Chrome testing is blocked by a Chrome-for-Testing platform restriction (§0a Q-c).
+
+Reuses MVP-4-F's fixture-vault builder + test-hooks Rust feature.
 
 ## 0a. RESOLVED decisions
 
@@ -13,9 +20,20 @@ Wire the Chromium MV3 extension popup (MVP-4-C scaffold) to actually talk to the
 
 - **Q-a (token provisioning) = Option 1 (manual paste at first connection).** Desktop's `install-native-host` command prints the generated 32-byte handshake token to stdout (in addition to writing the OS keychain + sibling file). The extension popup's provisioning view shows on first open with no stored token; user pastes; extension stores in `chrome.storage.local` (encrypted at rest by Chrome's profile key). Future popup opens skip provisioning. Token rotation via `uninstall-native-host` causes the next popup open's `chrome.runtime.connectNative` to fail with `auth_failed`; popup clears the stored token + reverts to provisioning. Trade-off accepted: one-time manual step on install, justified by zero-new-IPC-surface + the user gesture (typing the install command) being its own trust anchor. Option 2 (deep-link) deferred to MVP-4 back-half polish if closed-beta feedback wants it.
 
-**Self-locked:**
+**Kelvin-approved AMENDMENT (2026-05-28):**
 
-- **E2E framework = Puppeteer.** Puppeteer has first-class MV3 extension support (`--load-extension`, `--disable-extensions-except`, the `chromiumOptions.extensions: ['...']` capability for service-worker driving). WebDriverIO 9.27's `wdio-chromedriver-service` works with extensions too but is more brittle for MV3 service workers + popup contexts. Puppeteer is the canonical Chrome extension testing harness and matches what the WebExtensions community uses. Lives in a new `apps/extension/e2e/` directory (sibling to `apps/desktop/e2e/`).
+- **Q-c (E2E transport boundary) = injected stdio host-bridge + manual real-Chrome smoke test.** The original plan (below) called for Puppeteer driving a real Chrome with the unpacked extension. During the build cycle this proved impossible: **Chrome for Testing 138 (and Chrome stable 137+) refuse to spawn native-messaging hosts for `--load-extension` dev-loaded extensions.** Diagnosed empirically on 2026-05-28 — the manifest was byte-correct + in all four browser config dirs (`google-chrome`, `google-chrome-for-testing`, `chromium`, brave) with the right `name`, `allowed_origins`, and an absolute `path` to an existing binary; `strace -f -e openat` showed Chrome made **zero** `NativeMessagingHosts` filesystem accesses before returning `Unchecked runtime.lastError: Specified native messaging host not found`. Chrome short-circuits the lookup for dev-loaded extensions — a platform restriction, not a Pangolin bug.
+
+  **Resolution (decided after weighing security + product-foundation):**
+  - The automated CI gate (`apps/extension/e2e/`) becomes a **Node integration test** (not Puppeteer/Chrome). It injects a connector into the real `NativeHostClient` that spawns the actual `pangolin-native-messaging-host` binary and pipes its stdin/stdout with **byte-identical native-messaging framing** (4-byte LE length + UTF-8 JSON, the same protocol `frame.rs` implements). The real desktop runs in the background. This verifies 100% of OUR security-relevant code end-to-end: the handshake-token gate (INNER lock), the JSON-RPC relay, the `copy_password_to_clipboard` Rust-side path (H-1), the host's framing + error mapping.
+  - What this does NOT verify: Chrome's `allowed_origins` enforcement (the OUTER lock) + Chrome's actual `connectNative` transport. Those are Google's code — we configure the manifest correctly (and DO test the manifest GENERATION: name, allowed_origins, absolute path), but cannot meaningfully unit-test Google's honoring of it.
+  - **Why this is the most secure ACHIEVABLE option**: it tests every security property that is Pangolin's responsibility against the real binaries. The real-Chrome path is the OUTER lock, covered by the §9 manual smoke test before closed beta (mirrors the MVP-3 pattern of hermetic tests + a human-run live check; env-quirk #14).
+  - **Why this is the best product foundation**: it gives a stable, fast, CI-friendly harness that every future popup↔desktop feature (recovery UX, multi-device UX, autofill) inherits, without being hostage to Chrome's ever-tightening dev-mode native-messaging restrictions. Pinning an old Chrome-for-Testing (the alternative) is a ticking time bomb — Google prunes old CfT builds + it validates against a browser real users don't run.
+  - **Framing fidelity is mandatory**: the injected connector MUST replicate Chrome's native-messaging stdio framing exactly (4-byte little-endian length prefix + UTF-8 JSON body, ≤1 MB/frame). A divergent framing would make the test pass on a protocol production rejects. The connector spawns the REAL host binary, so the host does its own framing on its side; the connector must match it on the popup side.
+
+**Self-locked (original — Puppeteer approach SUPERSEDED by Q-c above; retained for context):**
+
+- ~~**E2E framework = Puppeteer.**~~ Superseded by Q-c. Puppeteer's `--load-extension` MV3 support is real, but Chrome-for-Testing's native-messaging restriction makes the popup→host hop untestable through Chrome. The `apps/extension/e2e/` directory still exists but holds the Node integration gate, not a Puppeteer suite.
 - **The popup actually wires up to native-messaging this slice.** MVP-4-C left it as a placeholder hard-coded "Desktop not connected" view; MVP-4-G replaces that with the real `chrome.runtime.connectNative` flow, the JSON-RPC client, and the account-list UI. NO autofill, NO content-script wiring beyond a token-state ping — just the popup.
 - **Reuse MVP-4-F's fixture-vault build script** (`apps/desktop/e2e/setup/build-fixture-vault.ts`). The same `test-password-123!` master + 3 GitHub/Gmail/Twitter accounts. MVP-4-G's e2e setup imports the script + builds the same fixture (different TempDir HOME).
 - **Reuse MVP-4-F's `test-hooks` Cargo feature on `pangolin-desktop`.** The `__test__commands_invoked` log is the same H-1 oracle — scenario 4 reads it via the desktop's IPC server (the extension can't reach it directly; the test harness's own desktop-side WDIO connection does).
@@ -230,31 +248,32 @@ All other decisions are locked per §0a.
 
 ## 6. Places that need care
 
-- **Test-hooks side channel for the H-1 assertion (scenario 4).** Puppeteer drives the POPUP, which can't reach the desktop's internal `__test__commands_invoked` Tauri command directly (the popup talks to the host, not the desktop). The harness needs a SEPARATE channel: a tiny tokio-based reader on the desktop side (gated by `cfg(feature = "test-hooks")`) that exposes the log over a Unix-domain-socket at a predictable path. The spec opens that socket + reads the log. Alternative: dispatch the read via the same native-messaging chain (extension → host → desktop's IPC dispatcher → `__test__commands_invoked`), but that contaminates the production wire with test-only commands. The side-channel is cleaner.
-- **`__test__force_unlock` Tauri command (NEW).** The desktop starts locked. To run the e2e against an unlocked vault, the harness needs to programmatically unlock it (the popup has no master-password input). Adds a `#[cfg(feature = "test-hooks")] #[tauri::command] __test__force_unlock(password: String)` that bypasses the normal `vault_unlock` flow. Production builds compile it out. L7-safe (the password is the fixture string, not real material).
-- **Chrome extension ID stability.** The `manifest.json` `key` field MUST be committed and MUST derive the same extension ID across all CI runs (otherwise the native-messaging manifest's `allowed_origins` becomes useless). Verify at e2e startup that the loaded extension's ID matches the expected one; fail-loud if not.
-- **`--headless=new` is mandatory.** Legacy headless (`--headless`) doesn't support MV3 service workers. The extension's service worker MUST initialize successfully or the popup can't `chrome.runtime.connectNative`.
-- **Native-messaging manifest path resolution under TempDir HOME.** The desktop's `install_native_host` writes manifests at `~/.config/google-chrome/NativeMessagingHosts/...`. Setting `HOME=$TempDir` ALSO needs to propagate to the spawned Chrome process so Chrome reads from the SAME `~/.config/google-chrome/NativeMessagingHosts/`. The harness sets `HOME` on both the install command + the Chrome launch.
-- **Chrome's native-messaging stderr swallowing.** Chrome captures the host's stderr to its log; if the host crashes silently the popup just sees a disconnect. The harness MUST start the host BOTH via Chrome (the real path) AND log a separate copy of the host's stderr to disk for debug.
-- **Puppeteer's MV3 service-worker access.** Puppeteer 23+ has `browser.targets()` filtering for service workers (`type: 'service_worker'`); use it to attach + drive the worker if specs need to assert on background state. Most specs just need the popup window via `browser.newPage()` navigating to `chrome-extension://<id>/src/popup/popup.html`.
-- **Sidecar `.lock` scrubbing.** Carries the MVP-4-F LOW-1 workaround until issue #3 is fixed. The harness's teardown deletes `.lock`/`-shm`/`-wal` so the next CI run starts clean.
-- **Don't auto-connect on extension install.** The extension's service worker MUST NOT call `chrome.runtime.connectNative` until the popup is opened — auto-connect would spawn the host process at browser startup + persist a connection for the lifetime of the browser, ruining the explicit "open-popup → connect → use" UX. Verify the service-worker's MV3 lifecycle handlers don't do this.
-- **`forbid(unsafe_code)`** on every new Rust file (only `install_native_host.rs` is touched; existing already has it).
+Per the Q-c amendment, the automated gate is a Node integration test (no Puppeteer/Chrome). The care-points below are updated accordingly; the original Chrome-harness notes are struck where superseded.
+
+- **Framing fidelity is the load-bearing correctness property (Q-c).** The injected stdio connector MUST frame messages to/from the spawned `pangolin-native-messaging-host` exactly as Chrome's native-messaging protocol does: a 4-byte little-endian `u32` length prefix followed by the UTF-8 JSON body, ≤1 MB per frame. The host binary does its side via `frame.rs`; the connector must match byte-for-byte. A divergent connector framing makes the test pass on a protocol production rejects. Prefer reusing/porting the exact `frame.rs` constants; add a round-trip test asserting a known JSON object frames + reframes identically across the connector ↔ host boundary.
+- **Test-hooks side channel for the H-1 assertion.** The integration test drives the `NativeHostClient` (popup-side) directly, but to assert `copy_password_to_clipboard` fired Rust-side it reads the desktop's `__test__commands_invoked` log. Use the file-based side channel the MVP-4-F harness already established (`PANGOLIN_TEST_HOOKS_LOG_PATH` env var → the desktop appends each invocation; the test reads the file). Do NOT route the read through the native-messaging chain (contaminates the production wire with test-only commands).
+- **`__test__force_unlock` Tauri command (NEW).** The desktop starts locked. The integration test needs an unlocked vault (the popup has no master-password input). Adds a `#[cfg(feature = "test-hooks")] #[tauri::command] __test__force_unlock(password: String)` that bypasses the normal `vault_unlock` flow, OR reuse MVP-4-F's auto-unlock-at-startup env-var path (`PANGOLIN_TEST_AUTO_UNLOCK_PATH` / `_PASSWORD`) if that already exists. Production builds compile it out. L7-safe (fixture password).
+- **Extension `key` field stability (still required).** Even though the automated gate no longer loads the extension in Chrome, the manifest GENERATION test (Rust side: `install-native-host` writes `allowed_origins` with the dev extension ID) + the §9 manual smoke test BOTH depend on a deterministic dev extension ID. Keep the committed `key` field + a README breadcrumb.
+- **Sidecar `.lock` scrubbing.** Carries the MVP-4-F LOW-1 workaround until issue #3 is fixed. The harness's teardown deletes `.lock`/`-shm`/`-wal` so the next run starts clean.
+- **Don't auto-connect on extension install.** The extension's service worker MUST NOT call `chrome.runtime.connectNative` until the popup is opened. (Still a production-correctness property; verified by the Vitest service-worker test + the §9 manual smoke, not the Node gate.)
+- ~~`--headless=new` / Puppeteer MV3 service-worker access / Chrome native-messaging stderr swallowing / manifest path under TempDir HOME~~ — SUPERSEDED by Q-c (no Chrome in the automated gate). These move to the §9 manual smoke-test concerns.
+- **`forbid(unsafe_code)`** on every new Rust file.
 - **AGPL SPDX header** on every new `.ts` / `.tsx` / `.json` (via `"license"`) / `.md` / `.sh` file.
 
 ## 7. Success criteria
 
 - `cargo build -p pangolin-desktop --features test-hooks,custom-protocol` clean.
-- `cargo test -p pangolin-desktop --features test-hooks` ✓ (new `__test__force_unlock` test).
+- `cargo test -p pangolin-desktop --features test-hooks` ✓ (new `__test__force_unlock` test + the install-native-host manifest-generation test asserting `name` / `allowed_origins` / absolute `path`).
 - `cargo clippy --workspace --exclude pangolin-desktop --all-targets -- -D warnings` ✓.
 - `cargo audit --deny warnings <17 RUSTSEC ignores>` ✓.
 - `cargo deny check advisories bans licenses sources` ✓.
 - Cardinal invariants 0/0/0/0.
-- `apps/extension`: `pnpm typecheck` ✓ + `pnpm lint` ✓ + `pnpm test` ✓ (Vitest including the new popup state-machine + native-host client tests).
-- `apps/extension/e2e`: `pnpm typecheck` ✓ + `pnpm lint` ✓.
-- `xvfb-run pnpm e2e` ✓ (5/5 scenarios pass locally on WSL Ubuntu + in CI).
-- The new `extension-e2e` CI job green on `ubuntu-latest`.
+- `apps/extension`: `pnpm typecheck` ✓ + `pnpm lint` ✓ + `pnpm test` ✓ (Vitest: popup state-machine + `native-host` client + `token-store` + `account-list` units, with the e2e dir excluded from Vitest discovery).
+- `apps/extension/e2e`: `pnpm typecheck` ✓ + `pnpm lint` ✓ + the **Node integration gate** passes — the real `NativeHostClient` (via the injected stdio connector) → real `pangolin-native-messaging-host` → real `pangolin-desktop` chain: handshake succeeds, `session.status` returns unlocked, `list_accounts` returns the 3 fixture accounts, `copy_password` fires `copy_password_to_clipboard` Rust-side (asserted via the test-hooks log) and does NOT fire `reveal_password`, and a desktop-kill surfaces a typed disconnect error.
+- A **framing round-trip test** asserts the connector's native-messaging framing is byte-identical to the host's.
+- The new `extension-e2e` CI job green on `ubuntu-latest` (no Chrome / no xvfb needed — pure Node + the Rust binaries).
 - The existing `extension` (Vitest) + `desktop-e2e` jobs still pass — regression-catch.
+- §9 manual real-Chrome smoke test: NOT a CI gate; run + recorded before closed beta.
 
 ## 8. Out of scope (filed for follow-up)
 
@@ -267,3 +286,19 @@ All other decisions are locked per §0a.
 - The 3 MVP-4-F follow-up issues (#1 IPC race, #2 withGlobalTauri feature-gate, #3 vault .lock SIGTERM). Tracked separately.
 - Visual regression / screenshot tests of the popup. Defer.
 - Multiple-vault UX (the popup shows accounts from a single open vault). Post-launch.
+
+## 9. Manual real-Chrome smoke test (run before closed beta)
+
+The automated gate (§0a Q-c) covers the popup-client → host → desktop data path against the real binaries but stubs Chrome's `connectNative` transport. The real-Chrome path + Chrome's `allowed_origins` OUTER lock are verified by this manual checklist, run by a human on a real desktop OS (NOT Chrome-for-Testing) before the closed-beta cut. Mirrors the MVP-3 discipline of hermetic tests + a documented human-run live check (env-quirk #14).
+
+**Pre-req**: real Google Chrome (or Chromium/Brave/Edge) installed; `pangolin-desktop` + `pangolin-native-messaging-host` release binaries built.
+
+1. Run `pangolin-desktop install-native-host <abs-path-to-host> --allowed-extension-id <real-extension-id>`. Confirm it prints `EXTENSION_TOKEN=...` and reports "wrote token … and N manifests".
+2. Load the unpacked extension in Chrome (`chrome://extensions` → Developer mode → Load unpacked → `apps/extension/dist`). Confirm the loaded extension ID matches the `key`-derived ID baked into `manifest.json`.
+3. Start `pangolin-desktop`, unlock the vault.
+4. Open the extension popup. Paste the `EXTENSION_TOKEN` into the provisioning view. Save.
+5. **PASS criteria**: popup transitions to "Connected", lists the vault's accounts. Click Copy on an account → confirm the OS clipboard holds the password (paste into a scratch buffer) AND `reveal_password` did NOT fire (the plaintext never rendered in the popup DOM).
+6. **OUTER-lock check**: edit the native-messaging manifest's `allowed_origins` to a DIFFERENT extension ID, reload, retry the popup connect. Confirm Chrome refuses with "Specified native messaging host not found" / access denied — proving Chrome enforces `allowed_origins`.
+7. Record the Chrome version + OS + result in the PR / DEVLOG. Re-run whenever the native-messaging manifest format or the host's handshake protocol changes.
+
+This checklist is NOT automated in CI (Chrome-for-Testing can't run it; real Chrome on a CI runner is a separate, heavier infra investment deferred to release-time). The §0a Q-c automated gate is the per-PR safety net; this manual test is the pre-beta + on-protocol-change gate.
