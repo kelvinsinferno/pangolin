@@ -85,5 +85,12 @@ export default defineConfig({
     environment: 'jsdom',
     globals: true,
     setupFiles: ['./src/test-setup.ts'],
+    // Exclude the Puppeteer e2e specs from Vitest discovery — they
+    // use Mocha syntax (this.timeout(...)) and are driven separately
+    // by apps/extension/e2e/ via its own pnpm e2e script. Without
+    // this exclusion Vitest tries to load them + crashes with
+    // Cannot read properties of undefined (reading timeout)
+    // (Mochas this is undefined under Vitest).
+    exclude: ['node_modules/**', 'dist/**', 'e2e/**'],
   },
 });

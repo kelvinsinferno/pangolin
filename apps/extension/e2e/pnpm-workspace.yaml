@@ -1,0 +1,16 @@
+# Marks apps/extension/e2e as its OWN pnpm workspace root so a
+# `pnpm install` here does NOT attach to the parent apps/extension
+# workspace. This keeps the e2e gate's dev deps (mocha, chai, tsx,
+# typescript, eslint, @types/*) OUT of the shipped extension's
+# pnpm-lock.yaml — the extension is a distributable artifact and its
+# lockfile should carry only what the extension ships. Mirrors the
+# standalone-lockfile model MVP-4-F used for apps/desktop/e2e (which
+# needs no workspace file only because apps/desktop has none to
+# inherit; apps/extension DOES have one, for esbuild's build-approval,
+# so e2e must shadow it here).
+#
+# Plan-LOCK: docs/issue-plans/mvp4-g-extension-e2e.md §1 + §0a.
+packages:
+  - .
+onlyBuiltDependencies:
+  - esbuild

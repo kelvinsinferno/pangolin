@@ -1,0 +1,9 @@
+{
+  "spec": ["specs/**/*.test.ts"],
+  "extensions": ["ts"],
+  "timeout": 180000,
+  "reporter": "spec",
+  "color": true,
+  "bail": false,
+  "node-option": ["import=tsx/esm"]
+}

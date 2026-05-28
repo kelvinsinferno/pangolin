@@ -1,0 +1,33 @@
+{
+  "name": "@pangolin/extension-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "description": "Pangolin extension end-to-end gate -- Node integration test (injected stdio host-bridge) + Mocha + Chai. See docs/issue-plans/mvp4-g-extension-e2e.md (Q-c).",
+  "engines": {
+    "node": ">=20.18.0 <23"
+  },
+  "scripts": {
+    "build:fixture": "tsx setup/build-fixture-vault.ts",
+    "build:desktop": "cargo build -p pangolin-desktop --features test-hooks,custom-protocol && cargo build -p pangolin-native-messaging-host --features test-hooks",
+    "build:extension": "cd ../ && pnpm build",
+    "test:e2e": "mocha",
+    "e2e": "pnpm build:desktop && pnpm build:extension && pnpm test:e2e",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint \"specs/**/*.ts\" \"setup/**/*.ts\""
+  },
+  "devDependencies": {
+    "@types/chai": "=5.0.1",
+    "@types/chrome": "=0.0.287",
+    "@types/mocha": "=10.0.10",
+    "@types/node": "=20.17.10",
+    "@typescript-eslint/eslint-plugin": "=8.18.0",
+    "@typescript-eslint/parser": "=8.18.0",
+    "chai": "=5.1.2",
+    "eslint": "=9.17.0",
+    "mocha": "=11.0.1",
+    "tsx": "=4.19.2",
+    "typescript": "=5.7.2"
+  }
+}
