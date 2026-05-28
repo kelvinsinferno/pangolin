@@ -76,6 +76,25 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         // the install wizard.
         .setup(|app| {
             let app_handle = app.handle().clone();
+            #[cfg(feature = "test-hooks")]
+            {
+                // `Manager` brings `app.state::<T>()` into scope; only
+                // the test-hooks auto-unlock path needs it, so the
+                // import is gated to avoid an unused-import error in
+                // production builds.
+                use tauri::Manager;
+                if let (Ok(vault_path), Ok(password)) = (
+                    std::env::var("PANGOLIN_TEST_AUTO_UNLOCK_PATH"),
+                    std::env::var("PANGOLIN_TEST_AUTO_UNLOCK_PASSWORD"),
+                ) {
+                    if !vault_path.is_empty() && !password.is_empty() {
+                        let state = app.state::<VaultState>();
+                        if let Err(e) = auto_unlock_for_e2e(&state, vault_path, password) {
+                            eprintln!("[pangolin-desktop] auto-unlock failed: {e:?}");
+                        }
+                    }
+                }
+            }
             ipc::spawn_with_app_handle(app_handle);
             Ok(())
         });
@@ -107,7 +126,29 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         test_hooks::__test__commands_invoked,
         #[cfg(feature = "test-hooks")]
         test_hooks::__test__clear_invocations,
+        #[cfg(feature = "test-hooks")]
+        test_hooks::__test__force_unlock,
     ])
+}
+
+#[cfg(feature = "test-hooks")]
+fn auto_unlock_for_e2e(
+    state: &VaultState,
+    vault_path: String,
+    password: String,
+) -> Result<(), DesktopError> {
+    use pangolin_ffi::{PresenceProof, SecretPassword};
+    use std::sync::Arc;
+    let handle = pangolin_ffi::session::vault_open(vault_path).map_err(DesktopError::from)?;
+    state.install(Arc::clone(&handle))?;
+    let secret = SecretPassword::new(password.into_bytes());
+    let presence = PresenceProof {
+        schema_version: 1,
+        bytes: Vec::new(),
+    };
+    let _ = pangolin_ffi::session::vault_unlock(Arc::clone(&handle), secret, presence)
+        .map_err(DesktopError::from)?;
+    Ok(())
 }
 
 #[cfg(test)]

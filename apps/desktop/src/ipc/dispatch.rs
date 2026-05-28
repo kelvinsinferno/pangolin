@@ -171,6 +171,16 @@ async fn vault_copy_password(
     clipboard: Option<&ClipboardFn>,
     params: &Value,
 ) -> Result<Value, DesktopError> {
+    // MVP-4-G: feature-gated invocation log so the Puppeteer-driven
+    // extension-e2e suite can assert that the Rust-side clipboard
+    // path fired when the popup-side vault.copy_password request
+    // arrives over the native-messaging channel. Mirrors the same
+    // record() call inside the production Tauri command body so
+    // both suites see the same canonical name. L7 -- records the
+    // command NAME only.
+    #[cfg(feature = "test-hooks")]
+    crate::test_hooks::record("copy_password_to_clipboard");
+
     let id = params
         .get("id")
         .and_then(Value::as_str)

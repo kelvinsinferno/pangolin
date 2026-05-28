@@ -3,6 +3,7 @@
   "name": "Pangolin",
   "version": "0.0.0",
   "description": "Pangolin password vault — desktop-connected browser extension.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3rnm7ODrJW1MozRqcKzfyYBMC9jQLCvVOJj4vtM6k5yvFWi/kXgCWuLqmHkRLclZvEH8fsX8gvoz0nSnV8ouhF2seGwUIGSBpbtogJTK/JHhTqpYRciQ46i+dTeP0pa+jb/xP9btDq4apN1BDeLhG26J9+0wz0/esSKL9TDNa+7J7RFrFTbatft0bqgGgW75S8kpyLPmVAjA29J2edOXKi9ahVQCJjnxjC5Hsg8tiX+z++OBhVvEw3wYoOipW0dEmQJ1lvXeYznI8qqXVCKy3Z32u/BJLWWU4MJ3OPGCKjYOYnS8+MihNZ9qlyxDDsyvDUnZ1d4PqJ+5efDdFaarPwIDAQAB",
   "action": {
     "default_popup": "src/popup/popup.html",
     "default_icon": {

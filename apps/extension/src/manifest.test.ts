@@ -6,6 +6,7 @@ import { resolve } from 'node:path';
 interface MV3Manifest {
   manifest_version: number;
   name: string;
+  key?: string;
   version: string;
   description: string;
   action: { default_popup: string };
