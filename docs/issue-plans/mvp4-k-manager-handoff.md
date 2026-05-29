@@ -2,7 +2,9 @@
 
 # MVP-4-K — Manager handoff / promotion (desktop) — plan-gate DRAFT
 
-**Status: DRAFT — awaiting Kelvin sign-off on Q-a (scope: promotion-only vs + guided "leave the vault").**
+**Status: LOCKED — Kelvin sign-off 2026-05-29.** Q-a resolved: **Option 1 (promotion-only)** — ship
+propose/finalize/veto + the pending-promotion UX; "leave the vault" = this handoff + the successor removing the
+departing device via the existing MVP-4-J flow (a guided wrapper + "delete my local vault" is a follow-up).
 Everything else self-locked (§0a RESOLVED + §5 carve-outs). Like MVP-4-J this adds **net-new,
 security-sensitive engine code** (it signs + broadcasts an on-chain authorization), so it gets a dedicated
 adversarial audit gated on `test` green. Follows MVP-4-J (device removal). The contract + chain broadcasts
@@ -30,23 +32,12 @@ banner → veto).
 
 ## 0a. Decisions
 
-### OPEN — need Kelvin (resolve at sign-off)
+### RESOLVED — Kelvin sign-off 2026-05-29
 
-**Q-a — Scope: promotion-only, or also a guided "leave the vault" flow?**
-"Leave the vault" is a composition: promote a successor (this slice, cross-device + 48h) → the successor (now
-manager) removes the departing device (the EXISTING MVP-4-J `removeDevice` flow, run on the successor's
-device). Options:
-
-- **Option 1 (Recommended): promotion-only.** Ship propose / finalize / veto + the pending-promotion UX. A
-  manager who wants to leave hands off here, then asks the new manager to remove them (MVP-4-J, on the new
-  manager's device). Keeps the slice focused on the one new primitive + its audit.
-- **Option 2: promotion + a guided "leave" wrapper.** Add a "Leave this vault" flow on the departing device
-  that explains the steps, links to handoff, and optionally offers "delete my local vault" once this device's
-  signer has dropped from the on-chain set. More hand-holding; more surface; the actual removal still happens
-  on the successor's device (the contract gives no self-remove), so the wrapper is mostly explanatory UX.
-
-Recommendation: **Option 1** — "leave" is K + J composed; a guided wrapper is a nice-to-have that doesn't add a
-new capability. (If chosen, the "delete my local vault" affordance is its own small follow-up.)
+**Q-a — Scope = Option 1 (promotion-only).** Ship propose / finalize / veto + the pending-promotion UX. "Leave
+the vault" is the composition: promote a successor (this slice, cross-device + 48h) → the successor (now
+manager) removes the departing device via the EXISTING MVP-4-J `removeDevice` flow (run on the successor's
+device). A guided "leave" wrapper + "delete my local vault" affordance is a follow-up (§8), not this slice.
 
 ### RESOLVED — self-locked (from the research + contract semantics)
 
