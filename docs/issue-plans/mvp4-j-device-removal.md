@@ -2,10 +2,12 @@
 
 # MVP-4-J — Device removal + VDK rotation (desktop) — plan-gate DRAFT
 
-**Status: DRAFT — awaiting Kelvin sign-off on Q-a (rotation-completion flow) + Q-b (manager-only scope).**
-Everything else self-locked (§0a RESOLVED + §5 carve-outs). Unlike MVP-4-I (pure UI), this slice adds
-**net-new, security-sensitive engine code** — it must get a dedicated adversarial audit of the new FFI/chain
-path, gated on `test` green (per the autonomy directive). Follows MVP-4-I (the add-device slice).
+**Status: LOCKED — Kelvin sign-off 2026-05-28.** Q-a resolved: **Option 1** (single guided flow — remove →
+prompt master password → broadcast → immediately re-key, with a resumable pending-rotation banner as the crash
+safety net). Q-b resolved: **Option 1** (manager-removes-peers only; manager handoff/promotion/self-removal
+defers to **MVP-4-K**). Everything else self-locked (§0a RESOLVED + §5 carve-outs). Unlike MVP-4-I (pure UI),
+this slice adds **net-new, security-sensitive engine code** — it must get a dedicated adversarial audit of the
+new FFI/chain path, gated on `test` green (per the autonomy directive). Follows MVP-4-I (the add-device slice).
 
 ---
 
@@ -25,38 +27,22 @@ crypto (#106b-2 / #106c / #106d).
 
 ## 0a. Decisions
 
-### OPEN — need Kelvin (resolve at sign-off)
+### RESOLVED — Kelvin sign-off 2026-05-28
 
-**Q-a — How forcefully does the UX drive the mandatory VDK rotation after a removal?**
-`removeDevice` (on-chain) and the VDK rotation (local re-key, needs the master password) are two separate engine
-ops. Between them there is a **forward-secrecy gap**: the removed device is out of the on-chain set immediately
-(its future *publishes* are unhonored — #106d read-gate), but it still physically holds the old VDK, so it can
-still *decrypt* new data until the rotation completes. The engine deliberately supports a **resumable,
-crash-durable "rotation-pending" state** (#106c) so the user *can* defer. Options:
+**Q-a — Rotation-completion flow = Option 1 (single guided flow).** `removeDevice` (on-chain) and the VDK
+rotation (local re-key, needs the master password) are two separate engine ops with a **forward-secrecy gap**
+between them: the removed device is out of the on-chain set immediately (its future *publishes* are unhonored —
+#106d read-gate), but it still physically holds the old VDK, so it can still *decrypt* new data until the
+rotation completes. The UX drives remove→rotate as ONE uninterrupted action ("Remove device" → confirm → enter
+master password → broadcast `removeDevice` → immediately complete rotation → re-unlock → done) to minimize that
+gap, with the resumable, crash-durable "rotation pending" banner (#106c) as the SAFETY NET if the app dies
+mid-flow (built regardless — L2). Matches "revoke prompts for the master password" (LOCKED #106b-2).
 
-| Option | Flow | Forward-secrecy gap | Notes |
-|---|---|---|---|
-| **1. Single guided flow (Recommended)** | "Remove device" → confirm → enter master password → broadcast `removeDevice` → **immediately** complete rotation → done. A resumable "rotation pending" banner is the SAFETY NET if the app dies mid-flow. | Minimal (seconds) | Best forward secrecy; one uninterrupted action. Matches "revoke prompts for the master password" (LOCKED #106b-2). |
-| **2. Two explicit steps** | "Remove device" broadcasts + queues → a persistent "Rotation pending — finish to fully lock out the removed device" surface the user completes later. | Wider (until the user returns) | More flexible; leans on the engine's resumable model; larger window where the removed device can still read new data. |
-
-Recommendation: **Option 1** — drive remove→rotate as one flow to minimize the gap, with the resumable
-pending-rotation banner as a crash safety net (built either way). Q-a is really "is deferral a first-class path
-or just a recovery path?"
-
-**Q-b — Manager-only scope: handle manager handoff now, or defer promotion to a later slice?**
-The contract allows ONLY the current **manager** to remove a device, and it CANNOT remove itself or the last
-device (`ErrWouldBrickVault`) — a manager who wants to leave must first **promote a successor**
-(`proposePromotion`/`finalizePromotion`), which is a separate crypto-chain surface that is ALSO not exposed via
-FFI. Options:
-
-- **Option 1 (Recommended): manager-removes-peers only.** This slice = the manager removes other devices. A
-  non-manager device shows a read-only device list + "Only the manager device can remove devices." Manager
-  handoff / self-removal / promotion is a dedicated future slice (MVP-4-K). Keeps the audit surface to the
-  remove+rotate path.
-- **Option 2: also build promotion/handoff.** Add the promotion FFI + UX so a manager can transfer the role and
-  leave. Much larger; two security-sensitive chain flows in one audit.
-
-Recommendation: **Option 1** — promotion is its own unexposed surface; bundling it doubles the new-crypto audit.
+**Q-b — Manager-only scope = Option 1 (manager-removes-peers only).** This slice = the manager removes other
+devices. A non-manager device shows a read-only device list + "Only the manager device can remove devices."
+Manager handoff / self-removal / promotion (`proposePromotion`/`finalizePromotion` — a separate crypto-chain
+surface that is ALSO not exposed via FFI; a manager cannot remove itself or the last device per the contract's
+`ErrWouldBrickVault`) is a dedicated future slice **MVP-4-K** (§8).
 
 ### RESOLVED — self-locked (from the research + LOCKED #106b-2/#106c/#106d decisions)
 
