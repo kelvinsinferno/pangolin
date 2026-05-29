@@ -587,6 +587,104 @@ pub async fn pairing_complete_rotation(
     Ok(result.into())
 }
 
+// ---------------------------------------------------------------------------
+// MVP-4-K: manager handoff / promotion
+// ---------------------------------------------------------------------------
+
+/// An in-flight manager promotion (candidate + ready time).
+#[derive(Debug, Clone, Serialize)]
+pub struct PromotionPendingDto {
+    /// 40-char hex of the candidate's 20-byte EVM signer.
+    pub candidate: String,
+    /// Unix-second timestamp the 48h delay elapses (finalize becomes valid).
+    pub ready_at: u64,
+}
+
+impl From<pangolin_ffi::FfiPendingPromotion> for PromotionPendingDto {
+    fn from(p: pangolin_ffi::FfiPendingPromotion) -> Self {
+        Self {
+            candidate: hex_encode(&p.candidate),
+            ready_at: p.ready_at,
+        }
+    }
+}
+
+/// **CANDIDATE-INITIATED.** Propose THIS device as the vault's next manager
+/// (self-signed `Promote` → broadcast `proposePromotion`, starting the 48h
+/// delay). Chain write → `spawn_blocking`.
+///
+/// # Errors
+/// `DesktopError::Session` (locked) / `DesktopError::Chain` (RPC/tx, incl.
+/// `ErrPromotionPending` / `ErrNotSetMember`).
+#[tauri::command]
+pub async fn pairing_propose_promotion(
+    state: State<'_, VaultState>,
+) -> Result<PromotionPendingDto, DesktopError> {
+    let handle = state.require_open()?;
+    let config = chain_config()?;
+    let pending =
+        tokio::task::spawn_blocking(move || pangolin_ffi::vault_propose_promotion(handle, config))
+            .await
+            .map_err(|e| {
+                DesktopError::Internal(format!("propose-promotion task join failed: {e}"))
+            })?
+            .map_err(DesktopError::from)?;
+    Ok(pending.into())
+}
+
+/// **PERMISSIONLESS.** Finalize a pending promotion after its 48h delay —
+/// rotates the on-chain manager to the candidate. Chain write →
+/// `spawn_blocking`.
+///
+/// # Errors
+/// `DesktopError::Session` (locked) / `DesktopError::Chain` (incl.
+/// `ErrPromotionDelayNotElapsed` / `ErrNoPromotionPending`).
+#[tauri::command]
+pub async fn pairing_finalize_promotion(state: State<'_, VaultState>) -> Result<(), DesktopError> {
+    let handle = state.require_open()?;
+    let config = chain_config()?;
+    tokio::task::spawn_blocking(move || pangolin_ffi::vault_finalize_promotion(handle, config))
+        .await
+        .map_err(|e| DesktopError::Internal(format!("finalize-promotion task join failed: {e}")))?
+        .map_err(DesktopError::from)
+}
+
+/// **MANAGER-ONLY.** Veto a pending promotion (`cancelPromotion`). Only
+/// succeeds on the current manager's device. Chain write → `spawn_blocking`.
+///
+/// # Errors
+/// `DesktopError::Session` (locked) / `DesktopError::Chain` (incl.
+/// `ErrNotAuthorizedToCancel` / `ErrNoPromotionPending`).
+#[tauri::command]
+pub async fn pairing_cancel_promotion(state: State<'_, VaultState>) -> Result<(), DesktopError> {
+    let handle = state.require_open()?;
+    let config = chain_config()?;
+    tokio::task::spawn_blocking(move || pangolin_ffi::vault_cancel_promotion(handle, config))
+        .await
+        .map_err(|e| DesktopError::Internal(format!("cancel-promotion task join failed: {e}")))?
+        .map_err(DesktopError::from)
+}
+
+/// Read the in-flight manager promotion, if any (drives the banner +
+/// countdown + veto gating). Chain read → `spawn_blocking`.
+///
+/// # Errors
+/// `DesktopError::Session` (locked) / `DesktopError::Chain` (read failure).
+#[tauri::command]
+pub async fn pairing_pending_promotion(
+    state: State<'_, VaultState>,
+) -> Result<Option<PromotionPendingDto>, DesktopError> {
+    let handle = state.require_open()?;
+    let config = chain_config()?;
+    let pending = tokio::task::spawn_blocking(move || {
+        pangolin_ffi::vault_read_pending_promotion(handle, config)
+    })
+    .await
+    .map_err(|e| DesktopError::Internal(format!("pending-promotion task join failed: {e}")))?
+    .map_err(DesktopError::from)?;
+    Ok(pending.map(PromotionPendingDto::from))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,6 +840,18 @@ mod tests {
         let dto: RotationResultDto = ffi.into();
         assert_eq!(dto.new_epoch, 7);
         assert_eq!(dto.unknown_survivors, vec!["ab".repeat(20)]);
+    }
+
+    #[test]
+    fn promotion_pending_dto_projects_candidate_and_ready_at() {
+        let ffi = pangolin_ffi::FfiPendingPromotion {
+            schema_version: 1,
+            candidate: vec![0xab; 20],
+            ready_at: 1_700_000_000,
+        };
+        let dto: PromotionPendingDto = ffi.into();
+        assert_eq!(dto.candidate, "ab".repeat(20));
+        assert_eq!(dto.ready_at, 1_700_000_000);
     }
 
     #[test]

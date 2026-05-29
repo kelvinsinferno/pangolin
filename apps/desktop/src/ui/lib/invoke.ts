@@ -406,3 +406,47 @@ export async function pairingCompleteRotation(password: string): Promise<Rotatio
   const w = await tauriInvoke<RotationResultWire>('pairing_complete_rotation', { password });
   return { newEpoch: w.new_epoch, unknownSurvivors: w.unknown_survivors };
 }
+
+// ---- MVP-4-K: manager handoff / promotion ----
+
+/** An in-flight manager promotion. */
+export interface PromotionPending {
+  /** 40-char hex of the candidate's EVM signer. */
+  candidate: string;
+  /** Unix-second timestamp the 48h delay elapses. */
+  readyAt: number;
+}
+
+interface PromotionPendingWire {
+  candidate: string;
+  ready_at: number;
+}
+
+function promotionFromWire(w: PromotionPendingWire): PromotionPending {
+  return { candidate: w.candidate, readyAt: w.ready_at };
+}
+
+/** **CANDIDATE-INITIATED.** Propose THIS device as the vault's next manager
+ *  (starts the 48h delay). Returns the pending promotion. */
+export async function pairingProposePromotion(): Promise<PromotionPending> {
+  return promotionFromWire(
+    await tauriInvoke<PromotionPendingWire>('pairing_propose_promotion'),
+  );
+}
+
+/** **PERMISSIONLESS.** Finalize a pending promotion after its 48h delay. */
+export async function pairingFinalizePromotion(): Promise<void> {
+  await tauriInvoke<void>('pairing_finalize_promotion');
+}
+
+/** **MANAGER-ONLY.** Veto a pending promotion. */
+export async function pairingCancelPromotion(): Promise<void> {
+  await tauriInvoke<void>('pairing_cancel_promotion');
+}
+
+/** Read the in-flight manager promotion, if any (drives the banner +
+ *  countdown + veto). */
+export async function pairingPendingPromotion(): Promise<PromotionPending | null> {
+  const w = await tauriInvoke<PromotionPendingWire | null>('pairing_pending_promotion');
+  return w === null ? null : promotionFromWire(w);
+}

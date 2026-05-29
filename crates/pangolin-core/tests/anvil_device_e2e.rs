@@ -33,8 +33,10 @@
 
 use pangolin_chain::evm::derive_evm_wallet;
 use pangolin_chain::{
-    add_device_v2, bootstrap_vault_v2, build_signed_device_auth, read_authorized_device_v2,
-    read_device_nonce_v2, remove_device_v2, test_env, DeviceAuthFields, DeviceAuthKind, EvmWallet,
+    add_device_v2, bootstrap_vault_v2, build_signed_device_auth, cancel_promotion_v2,
+    finalize_promotion_v2, propose_promotion_v2, read_authorized_device_v2,
+    read_current_manager_v2, read_device_nonce_v2, read_pending_promotion_v2, remove_device_v2,
+    test_env, DeviceAuthFields, DeviceAuthKind, EvmWallet,
 };
 use pangolin_core::device_add::{
     device_id_from_device_key, open_vdk_for_new_device, seal_vdk_to_new_device, NewDeviceHandshake,
@@ -588,6 +590,291 @@ fn anvil_fund(rpc_url: &str, addr: pangolin_chain::Address) {
         out.status.success(),
         "anvil_setBalance failed: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Fast-forward the local anvil clock by `secs` + mine a block, so a test
+/// can cross the `PROMOTION_DELAY` (48h) without waiting. Fail-closed.
+fn anvil_warp(rpc_url: &str, secs: u64) {
+    let inc = std::process::Command::new("cast")
+        .args([
+            "rpc",
+            "evm_increaseTime",
+            &secs.to_string(),
+            "--rpc-url",
+            rpc_url,
+        ])
+        .output()
+        .expect("invoke cast rpc evm_increaseTime");
+    assert!(
+        inc.status.success(),
+        "evm_increaseTime failed: {}",
+        String::from_utf8_lossy(&inc.stderr)
+    );
+    let mine = std::process::Command::new("cast")
+        .args(["rpc", "evm_mine", "--rpc-url", rpc_url])
+        .output()
+        .expect("invoke cast rpc evm_mine");
+    assert!(
+        mine.status.success(),
+        "evm_mine failed: {}",
+        String::from_utf8_lossy(&mine.stderr)
+    );
+}
+
+/// **MVP-4-K — the manager-promotion handoff E2E.**
+///
+/// Drives the candidate-initiated, 48h-delayed promotion against the live
+/// `RevisionLogV2` bytecode, exercising the new chain-client glue
+/// (`propose_promotion_v2` / `finalize_promotion_v2` /
+/// `read_pending_promotion_v2`) + the `DeviceAuthKind::Promote` self-sign:
+///
+/// ```text
+/// bootstrapVault(A) + addDevice(B)        — A manager, B member
+/// B self-signs Promote(candidate=B) → proposePromotion   — B's key, NOT A's
+///   → pendingPromotion == (B, readyAt); currentManager still A
+/// finalize before delay → ErrPromotionDelayNotElapsed     — the 48h gate holds
+/// warp +48h + mine → finalizePromotion (permissionless)   — manager rotates to B
+///   → currentManager == B; pendingPromotion cleared
+/// ```
+#[tokio::test]
+#[ignore = "live-RPC test; requires PANGOLIN_CHAIN_ENV=dev + local anvil (scripts/anvil-ci.sh)"]
+#[allow(clippy::too_many_lines)] // one linear propose→warp→finalize sequence
+async fn promotion_handoff_e2e_against_anvil() {
+    let env = test_env::target_chain_env();
+    if !test_env::is_dev_mode()
+        && !test_env::require_or_fail("MVP-4-K promotion E2E needs dev anvil")
+    {
+        return;
+    }
+    let rpc_url = test_env::rpc_url();
+    let chain_id = test_env::resolve_signing_chain_id(env, &rpc_url)
+        .await
+        .expect("resolve signing chain id");
+    let contract = pangolin_chain::load_deployed_address(env, "RevisionLogV2")
+        .expect("RevisionLogV2 in dev.json");
+
+    let a_device = device_a();
+    let a_wallet = wallet_for(&a_device);
+    let a_signer = a_wallet.address();
+    let b_device = DeviceKey::from_seed([0x7B; 32]);
+    let b_wallet = wallet_for(&b_device);
+    let b_signer = b_wallet.address();
+    // B broadcasts proposePromotion → B needs gas (A is harness-funded).
+    anvil_fund(&rpc_url, b_signer);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut vault_id = [0u8; 32];
+    vault_id[..8].copy_from_slice(&now.to_be_bytes());
+    vault_id[31] = 0x4B;
+
+    // bootstrap A + add B.
+    let bootstrap_sig = build_signed_device_auth(
+        a_wallet.signer(),
+        DeviceAuthFields {
+            kind: DeviceAuthKind::AddDevice,
+            vault_id,
+            subject: a_signer,
+            nonce: 0,
+            schema_version: 1,
+        },
+        contract,
+        chain_id,
+    )
+    .expect("sign genesis AddDevice");
+    bootstrap_vault_v2(&a_wallet, a_signer, &bootstrap_sig, env, &rpc_url)
+        .await
+        .expect("bootstrapVault");
+    let nonce1 = read_device_nonce_v2(env, &rpc_url, vault_id).await.unwrap();
+    let add_sig = build_signed_device_auth(
+        a_wallet.signer(),
+        DeviceAuthFields {
+            kind: DeviceAuthKind::AddDevice,
+            vault_id,
+            subject: b_signer,
+            nonce: nonce1,
+            schema_version: 1,
+        },
+        contract,
+        chain_id,
+    )
+    .expect("manager signs AddDevice(B)");
+    add_device_v2(&a_wallet, b_signer, &add_sig, env, &rpc_url)
+        .await
+        .expect("addDevice(B)");
+
+    // B self-signs Promote(candidate=B) — the candidate's key, not A's.
+    let nonce2 = read_device_nonce_v2(env, &rpc_url, vault_id).await.unwrap();
+    let promote_sig = build_signed_device_auth(
+        b_wallet.signer(),
+        DeviceAuthFields {
+            kind: DeviceAuthKind::Promote,
+            vault_id,
+            subject: b_signer,
+            nonce: nonce2,
+            schema_version: 1,
+        },
+        contract,
+        chain_id,
+    )
+    .expect("candidate B self-signs Promote");
+    propose_promotion_v2(&b_wallet, b_signer, &promote_sig, env, &rpc_url)
+        .await
+        .expect("proposePromotion accepted (candidate self-sign)");
+
+    let pending = read_pending_promotion_v2(env, &rpc_url, vault_id)
+        .await
+        .expect("read pending");
+    let (cand, ready_at) = pending.expect("a promotion is pending");
+    assert_eq!(cand, b_signer, "pending candidate is B");
+    assert!(ready_at > now, "readyAt is in the future (48h delay)");
+    assert_eq!(
+        read_current_manager_v2(env, &rpc_url, vault_id)
+            .await
+            .unwrap(),
+        a_signer,
+        "manager is still A before finalize"
+    );
+
+    // Finalize before the delay → reverts.
+    assert!(
+        finalize_promotion_v2(&b_wallet, vault_id, env, &rpc_url)
+            .await
+            .is_err(),
+        "finalize before the 48h delay must revert (ErrPromotionDelayNotElapsed)"
+    );
+
+    // Warp past the delay (+1h slop) + finalize (permissionless — B submits).
+    anvil_warp(&rpc_url, 48 * 60 * 60 + 3600);
+    finalize_promotion_v2(&b_wallet, vault_id, env, &rpc_url)
+        .await
+        .expect("finalizePromotion after the delay");
+    assert_eq!(
+        read_current_manager_v2(env, &rpc_url, vault_id)
+            .await
+            .unwrap(),
+        b_signer,
+        "manager rotated to B after finalize"
+    );
+    assert!(
+        read_pending_promotion_v2(env, &rpc_url, vault_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "pending promotion cleared after finalize"
+    );
+}
+
+/// **MVP-4-K — the manager's veto.** A proposes-then-vetoes: after B
+/// self-proposes, the current manager A `cancelPromotion`s it (msg.sender
+/// gated), clearing the pending state; the manager stays A.
+#[tokio::test]
+#[ignore = "live-RPC test; requires PANGOLIN_CHAIN_ENV=dev + local anvil (scripts/anvil-ci.sh)"]
+async fn promotion_veto_e2e_against_anvil() {
+    let env = test_env::target_chain_env();
+    if !test_env::is_dev_mode() && !test_env::require_or_fail("MVP-4-K veto E2E needs dev anvil") {
+        return;
+    }
+    let rpc_url = test_env::rpc_url();
+    let chain_id = test_env::resolve_signing_chain_id(env, &rpc_url)
+        .await
+        .unwrap();
+    let contract = pangolin_chain::load_deployed_address(env, "RevisionLogV2").unwrap();
+
+    let a_wallet = wallet_for(&device_a());
+    let a_signer = a_wallet.address();
+    let b_device = DeviceKey::from_seed([0x7C; 32]);
+    let b_wallet = wallet_for(&b_device);
+    let b_signer = b_wallet.address();
+    anvil_fund(&rpc_url, b_signer);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut vault_id = [0u8; 32];
+    vault_id[..8].copy_from_slice(&now.to_be_bytes());
+    vault_id[31] = 0x4C;
+
+    let bootstrap_sig = build_signed_device_auth(
+        a_wallet.signer(),
+        DeviceAuthFields {
+            kind: DeviceAuthKind::AddDevice,
+            vault_id,
+            subject: a_signer,
+            nonce: 0,
+            schema_version: 1,
+        },
+        contract,
+        chain_id,
+    )
+    .unwrap();
+    bootstrap_vault_v2(&a_wallet, a_signer, &bootstrap_sig, env, &rpc_url)
+        .await
+        .unwrap();
+    let n1 = read_device_nonce_v2(env, &rpc_url, vault_id).await.unwrap();
+    let add_sig = build_signed_device_auth(
+        a_wallet.signer(),
+        DeviceAuthFields {
+            kind: DeviceAuthKind::AddDevice,
+            vault_id,
+            subject: b_signer,
+            nonce: n1,
+            schema_version: 1,
+        },
+        contract,
+        chain_id,
+    )
+    .unwrap();
+    add_device_v2(&a_wallet, b_signer, &add_sig, env, &rpc_url)
+        .await
+        .unwrap();
+
+    let n2 = read_device_nonce_v2(env, &rpc_url, vault_id).await.unwrap();
+    let promote_sig = build_signed_device_auth(
+        b_wallet.signer(),
+        DeviceAuthFields {
+            kind: DeviceAuthKind::Promote,
+            vault_id,
+            subject: b_signer,
+            nonce: n2,
+            schema_version: 1,
+        },
+        contract,
+        chain_id,
+    )
+    .unwrap();
+    propose_promotion_v2(&b_wallet, b_signer, &promote_sig, env, &rpc_url)
+        .await
+        .unwrap();
+    assert!(
+        read_pending_promotion_v2(env, &rpc_url, vault_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "promotion pending after propose"
+    );
+
+    // A (the manager) vetoes — msg.sender == currentManager.
+    cancel_promotion_v2(&a_wallet, vault_id, env, &rpc_url)
+        .await
+        .expect("manager A cancels the pending promotion");
+    assert!(
+        read_pending_promotion_v2(env, &rpc_url, vault_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "pending cleared after the manager's veto"
+    );
+    assert_eq!(
+        read_current_manager_v2(env, &rpc_url, vault_id)
+            .await
+            .unwrap(),
+        a_signer,
+        "manager stays A after veto"
     );
 }
 
