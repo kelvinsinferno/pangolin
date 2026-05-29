@@ -196,8 +196,9 @@ pub use recovery_lifecycle::{
 // sealed envelope cross.
 pub use pairing::{
     pairing_begin_new_device, pairing_decode_bytes, pairing_decode_string, pairing_derive_sas,
-    pairing_local_payload, pairing_open_and_join, vault_add_device, FfiPairingPayload,
-    FfiSealedVdkEnvelope, PAIRING_FFI_SCHEMA_VERSION,
+    pairing_local_payload, pairing_open_and_join, vault_add_device, vault_list_authorized_devices,
+    vault_remove_device, FfiAuthorizedDevice, FfiPairingPayload, FfiSealedVdkEnvelope,
+    PAIRING_FFI_SCHEMA_VERSION,
 };
 // MVP-2 issue 5.4: sync orchestrator FFI surface — `vault_sync_status`
 // + `FfiSyncStatus` enum + `FfiSyncMode` mirror + the host-supplied

@@ -327,3 +327,82 @@ export async function pairingAddDevice(
     }),
   );
 }
+
+// ---- MVP-4-J: device removal + authorized-set / manager / rotation ----
+
+/** One device in the vault's live on-chain authorized set. */
+export interface AuthorizedDevice {
+  /** 40-char hex of the 20-byte EVM signer (pass to {@link pairingRemoveDevice}). */
+  signer: string;
+  isCurrent: boolean;
+  isManager: boolean;
+  /** 64-char hex device id if known locally, else ''. */
+  deviceId: string;
+}
+
+/** An outstanding VDK rotation owed after a removal. */
+export interface RotationPending {
+  removedSigner: string;
+  observedEpoch: number;
+}
+
+/** The outcome of a completed rotation. */
+export interface RotationResult {
+  newEpoch: number;
+  unknownSurvivors: string[];
+}
+
+interface AuthorizedDeviceWire {
+  signer: string;
+  is_current: boolean;
+  is_manager: boolean;
+  device_id: string;
+}
+
+interface RotationPendingWire {
+  removed_signer: string;
+  observed_epoch: number;
+}
+
+interface RotationResultWire {
+  new_epoch: number;
+  unknown_survivors: string[];
+}
+
+function authorizedFromWire(w: AuthorizedDeviceWire): AuthorizedDevice {
+  return {
+    signer: w.signer,
+    isCurrent: w.is_current,
+    isManager: w.is_manager,
+    deviceId: w.device_id,
+  };
+}
+
+/** List the vault's LIVE on-chain authorized devices (the removable list). */
+export async function pairingListAuthorizedDevices(): Promise<AuthorizedDevice[]> {
+  const list = await tauriInvoke<AuthorizedDeviceWire[]>('pairing_list_authorized_devices');
+  return list.map(authorizedFromWire);
+}
+
+/** **MANAGER-ONLY.** Remove a device (broadcast removeDevice + queue the
+ *  rotation). MUST be followed by {@link pairingCompleteRotation}. */
+export async function pairingRemoveDevice(signer: string): Promise<void> {
+  await tauriInvoke<void>('pairing_remove_device', { signer });
+}
+
+/** Read outstanding rotation-pending rows (non-empty ⇒ a removal's re-key
+ *  is not yet finished). */
+export async function pairingPendingRotations(): Promise<RotationPending[]> {
+  const list = await tauriInvoke<RotationPendingWire[]>('pairing_pending_rotations');
+  return list.map((w) => ({
+    removedSigner: w.removed_signer,
+    observedEpoch: w.observed_epoch,
+  }));
+}
+
+/** Complete the VDK rotation owed after a removal (re-key survivors, advance
+ *  the epoch). Leaves the vault Locked — follow with {@link vaultUnlock}. */
+export async function pairingCompleteRotation(password: string): Promise<RotationResult> {
+  const w = await tauriInvoke<RotationResultWire>('pairing_complete_rotation', { password });
+  return { newEpoch: w.new_epoch, unknownSurvivors: w.unknown_survivors };
+}
