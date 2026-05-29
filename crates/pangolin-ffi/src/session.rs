@@ -598,6 +598,24 @@ pub fn session_status(handle: Arc<VaultHandle>) -> SessionInfo {
     )
 }
 
+/// Read the open vault's own 32-byte vault id (MVP-4-L).
+///
+/// Non-secret — the vault id is the on-chain identifier + the value
+/// embedded in pairing payloads. The recovery-health panel needs it to
+/// query THIS vault's own on-chain authority / recovery status. Works on a
+/// loaded vault (Locked or Active); no unlock required.
+///
+/// # Errors
+///
+/// [`FfiError::Session`] if the handle has no vault loaded (placeholder).
+#[allow(clippy::significant_drop_tightening)]
+#[uniffi::export]
+pub fn vault_current_vault_id(handle: Arc<VaultHandle>) -> Result<Vec<u8>, FfiError> {
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    Ok(vault.vault_id().to_vec())
+}
+
 /// Extend the active session's idle timer — the single-proof
 /// "maintain" leg of the session invariant.
 ///

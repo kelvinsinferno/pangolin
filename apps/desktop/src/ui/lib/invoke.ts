@@ -450,3 +450,63 @@ export async function pairingPendingPromotion(): Promise<PromotionPending | null
   const w = await tauriInvoke<PromotionPendingWire | null>('pairing_pending_promotion');
   return w === null ? null : promotionFromWire(w);
 }
+
+// ---- MVP-4-L (L-D): recovery backup + health panel ----
+
+/** A freshly-created recovery backup. The seed phrase is the ONE secret —
+ *  recorded offline, never stored. The backup ALWAYS requires guardians to
+ *  actually recover (it is an aid to the guardian flow, not a standalone
+ *  key). */
+export interface Backup {
+  /** The 24 BIP-39 words, shown ONCE. */
+  seedPhraseWords: string[];
+  /** The encrypted envelope, byte form (save to a file). */
+  bytes: number[];
+  /** The encrypted envelope, copy-paste text form. */
+  text: string;
+}
+
+/** Read-only recovery-health summary for this vault. */
+export interface RecoveryHealth {
+  /** 40-char hex of the current on-chain vault authority ('' / zeros if
+   *  none). */
+  authority: string;
+  /** 0=None, 1=Pending, 2=Finalized, 3=Canceled. */
+  recoveryStatus: number;
+  /** 40-char hex of an in-flight recovery's proposed authority ('' if
+   *  none). */
+  proposedAuthority: string;
+  attemptNonce: number;
+}
+
+interface BackupWire {
+  seed_phrase_words: string[];
+  bytes: number[];
+  text: string;
+}
+
+interface RecoveryHealthWire {
+  authority: string;
+  recovery_status: number;
+  proposed_authority: string;
+  attempt_nonce: number;
+}
+
+/** Create a recovery backup (24-word phrase + envelope). Requires guardians
+ *  to have been onboarded first. The phrase is shown once + never stored. */
+export async function recoveryCreateBackup(password: string): Promise<Backup> {
+  const w = await tauriInvoke<BackupWire>('recovery_create_backup', { password });
+  return { seedPhraseWords: w.seed_phrase_words, bytes: w.bytes, text: w.text };
+}
+
+/** Read this vault's recovery health (current authority + any in-flight
+ *  recovery). Throws if the vault isn't set up on-chain for recovery. */
+export async function recoveryHealth(): Promise<RecoveryHealth> {
+  const w = await tauriInvoke<RecoveryHealthWire>('recovery_health');
+  return {
+    authority: w.authority,
+    recoveryStatus: w.recovery_status,
+    proposedAuthority: w.proposed_authority,
+    attemptNonce: w.attempt_nonce,
+  };
+}

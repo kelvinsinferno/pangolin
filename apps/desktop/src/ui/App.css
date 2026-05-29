@@ -260,3 +260,53 @@ body {
   font-size: 0.9rem;
   margin: 0;
 }
+
+/* ---- MVP-4-L recovery ---- */
+
+.recovery-screen {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-md);
+  max-width: 640px;
+  margin: 0 auto;
+}
+
+.recovery-screen__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+}
+
+.recovery-screen__testnet {
+  background: var(--color-surface-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: var(--spacing-sm);
+  font-size: 0.9rem;
+  color: var(--color-text-muted);
+  margin: 0;
+}
+
+.recovery-screen__section,
+.recovery-screen__health {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.recovery-screen__actions {
+  display: flex;
+  gap: var(--spacing-sm);
+  margin-top: var(--spacing-sm);
+}
+
+.recovery-screen__muted {
+  color: var(--color-text-muted);
+  font-size: 0.9rem;
+}
+
+.recovery-screen__warning {
+  color: var(--color-danger);
+  font-weight: 500;
+}

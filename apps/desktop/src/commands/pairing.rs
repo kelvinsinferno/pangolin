@@ -251,7 +251,7 @@ fn build_chain_config(
 /// `PANGOLIN_DEPLOYMENT_PATH` (required). Testnet-only: the FFI hardcodes
 /// `ChainEnv::BaseSepolia` (D-011 gates mainnet), so this only supplies
 /// the RPC URL + deployment file path.
-fn chain_config() -> Result<FfiChainConfig, DesktopError> {
+pub(crate) fn chain_config() -> Result<FfiChainConfig, DesktopError> {
     let rpc_url = std::env::var("PANGOLIN_RPC_URL").unwrap_or_else(|_| DEFAULT_RPC_URL.to_owned());
     let deployment_path = std::env::var("PANGOLIN_DEPLOYMENT_PATH")
         .ok()

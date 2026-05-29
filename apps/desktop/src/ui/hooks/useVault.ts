@@ -32,7 +32,7 @@ import {
   type DesktopError,
 } from '../lib/invoke';
 
-export type VaultStage = 'welcome' | 'locked' | 'active' | 'detail' | 'devices';
+export type VaultStage = 'welcome' | 'locked' | 'active' | 'detail' | 'devices' | 'recovery';
 
 export interface VaultState {
   stage: VaultStage;
@@ -67,6 +67,8 @@ export interface VaultActions {
   backToList(): void;
   /** Opens the Devices (multi-device pairing) screen. */
   goToDevices(): void;
+  /** Opens the Recovery (backup + health) screen. */
+  goToRecovery(): void;
   /** Reveals the head-of-history password for the currently-selected
    *  account. Caller-managed lifetime: the AccountDetailScreen sets it
    *  via local state + clears within 10 s. */
@@ -158,6 +160,10 @@ export function useVault(): { state: VaultState; actions: VaultActions } {
     setState((prev) => ({ ...prev, stage: 'devices', selected: null }));
   }, []);
 
+  const goToRecovery = useCallback(() => {
+    setState((prev) => ({ ...prev, stage: 'recovery', selected: null }));
+  }, []);
+
   const revealPasswordForSelected = useCallback(async () => {
     // Capture the id at call time so a concurrent backToList does not
     // race past us.
@@ -205,6 +211,7 @@ export function useVault(): { state: VaultState; actions: VaultActions } {
       showAccount,
       backToList,
       goToDevices,
+      goToRecovery,
       revealPasswordForSelected,
       copySelectedPassword,
     },
