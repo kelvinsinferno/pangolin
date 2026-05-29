@@ -38,6 +38,13 @@ pub mod composition;
 pub mod device;
 pub mod device_add;
 pub mod error;
+/// **MVP-4-L L-0b (gap G-2).** The guardian-invite TRANSPORT codec — the
+/// shareable payload a guardian's device exports so a vault owner can collect
+/// the guardian's X25519 sealing pubkey + EVM address for onboarding. Mirrors
+/// `pairing_transport`'s zero-serde / fixed-layout / version-gated discipline
+/// and re-uses its public text codec. The FFI surface in
+/// `pangolin-ffi::guardian_identity` is a thin wrapper.
+pub mod guardian_invite;
 pub mod identity;
 /// **MVP-3 issue #106e-2.** The pairing-payload TRANSPORT codec (the byte
 /// form the host renders as a QR + the copy-pasteable text form). Zero

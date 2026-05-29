@@ -8319,6 +8319,30 @@ impl Vault {
         Ok(*pangolin_crypto::pairing::derive_x25519_pairing_key(&active.device_key).public_bytes())
     }
 
+    /// **L-0b guardian-onboarding role.** The active session's 32-byte
+    /// X25519 GUARDIAN SEALING PUBKEY — the key a vault owner seals this
+    /// device's recovery share to at onboarding (NOT the device-pairing
+    /// key; see [`Self::device_pairing_pubkey`]).
+    ///
+    /// Session-gated (Active). Derived deterministically from the active
+    /// session's `DeviceKey` via
+    /// [`pangolin_crypto::guardian::derive_x25519_sealing_key`] — the same
+    /// derivation [`Self::guardian_open_sealed_share`] uses to OPEN a share;
+    /// the SECRET scalar stays inside the derivation and never crosses out.
+    /// Returns the non-secret pubkey bytes (safe to publish in a guardian
+    /// invite).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotUnlocked`] if no session is active.
+    pub fn guardian_sealing_pubkey(&self) -> Result<[u8; 32]> {
+        let active = self.require_active()?;
+        Ok(
+            *pangolin_crypto::guardian::derive_x25519_sealing_key(&active.device_key)
+                .public_bytes(),
+        )
+    }
+
     /// **#106e-2 NEW-device role.** The active session's stable
     /// `device_id` (the 32-byte Ed25519 verifying-key bytes — GAP B). The
     /// SAME value the seal header binds.
