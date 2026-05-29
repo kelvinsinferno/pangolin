@@ -4,12 +4,17 @@ import { Badge, Button, Input, ListRow } from '@pangolin/component-library';
 
 import {
   isDesktopError,
+  pairingCancelPromotion,
   pairingCompleteRotation,
   pairingDeviceList,
+  pairingFinalizePromotion,
   pairingListAuthorizedDevices,
+  pairingPendingPromotion,
   pairingPendingRotations,
+  pairingProposePromotion,
   type AuthorizedDevice,
   type DeviceInfo,
+  type PromotionPending,
   type RotationPending,
 } from '../lib/invoke';
 import { AddDeviceWizard } from './AddDeviceWizard';
@@ -48,10 +53,12 @@ export function DevicesScreen({ onClose, onError, onJoined, onRekeyed }: Devices
   const [authorized, setAuthorized] = useState<AuthorizedDevice[] | null>(null);
   const [localDevices, setLocalDevices] = useState<DeviceInfo[]>([]);
   const [pending, setPending] = useState<RotationPending[]>([]);
+  const [promotion, setPromotion] = useState<PromotionPending | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<string | null>(null);
   const [rekeyPassword, setRekeyPassword] = useState('');
   const rekeyGuard = useRef(false);
+  const promoGuard = useRef(false);
 
   const refresh = () => {
     setLoaded(false);
@@ -62,15 +69,16 @@ export function DevicesScreen({ onClose, onError, onJoined, onRekeyed }: Devices
       } catch (e) {
         onError(errMessage(e));
       }
-      // The authorized set is an on-chain read; it fails for a vault that
-      // is not yet bootstrapped / has no chain config. Fall back to the
-      // local device list (read-only) in that case.
+      // The authorized set + pending promotion are on-chain reads; they fail
+      // for a vault not yet bootstrapped / with no chain config. Fall back to
+      // the local device list (read-only) in that case.
       try {
         setAuthorized(await pairingListAuthorizedDevices());
+        setPromotion(await pairingPendingPromotion());
       } catch {
-        // On-chain read failed (vault not bootstrapped / no chain config) —
-        // fall back to the local device list (read-only).
+        // On-chain read failed — fall back to the local device list.
         setAuthorized(null);
+        setPromotion(null);
         try {
           setLocalDevices(await pairingDeviceList());
         } catch {
@@ -92,6 +100,31 @@ export function DevicesScreen({ onClose, onError, onJoined, onRekeyed }: Devices
 
   const thisIsManager =
     authorized !== null && authorized.some((d) => d.isCurrent && d.isManager);
+  const thisSigner = authorized?.find((d) => d.isCurrent)?.signer ?? null;
+  // This device is an authorized non-manager device that could take over.
+  const canProposeSelf =
+    authorized !== null && !thisIsManager && thisSigner !== null && promotion === null;
+  const promotionIsForThisDevice =
+    promotion !== null && thisSigner !== null && promotion.candidate === thisSigner;
+  const promotionReadyNow =
+    promotion !== null && Date.now() / 1000 >= promotion.readyAt;
+
+  // Run a promotion lifecycle action through a shared re-entry guard, then
+  // refresh the on-chain state.
+  const runPromo = (action: () => Promise<void>) => {
+    if (promoGuard.current) return;
+    promoGuard.current = true;
+    void (async () => {
+      try {
+        await action();
+      } catch (e) {
+        onError(errMessage(e));
+      } finally {
+        promoGuard.current = false;
+        refresh();
+      }
+    })();
+  };
 
   const completePendingRekey = async () => {
     if (rekeyGuard.current) return;
@@ -158,6 +191,43 @@ export function DevicesScreen({ onClose, onError, onJoined, onRekeyed }: Devices
           <Button onClick={() => setMode('rekey')} data-testid="rotation-complete">
             Finish re-key
           </Button>
+        </section>
+      )}
+
+      {promotion !== null && mode === 'landing' && (
+        <section className="devices-screen__pending" role="note" data-testid="promotion-pending-banner">
+          {promotionIsForThisDevice ? (
+            <>
+              <p>
+                This device is proposed as the vault&apos;s next manager. The
+                transfer can be finalized after the 48-hour safety delay
+                {promotionReadyNow ? ' — ready now.' : '.'}
+              </p>
+              <Button
+                onClick={() => runPromo(pairingFinalizePromotion)}
+                disabled={!promotionReadyNow}
+                data-testid="promotion-finalize"
+              >
+                {promotionReadyNow ? 'Finalize — become manager' : 'Waiting for the 48h delay'}
+              </Button>
+            </>
+          ) : thisIsManager ? (
+            <>
+              <p>
+                A device (0x{promotion.candidate.slice(0, 12)}…) has asked to
+                become this vault&apos;s manager. If you did not expect this,
+                veto it before the 48-hour delay elapses.
+              </p>
+              <Button onClick={() => runPromo(pairingCancelPromotion)} data-testid="promotion-veto">
+                Veto this promotion
+              </Button>
+            </>
+          ) : (
+            <p>
+              A manager promotion (0x{promotion.candidate.slice(0, 12)}…) is
+              pending; it can be finalized after the 48-hour delay.
+            </p>
+          )}
         </section>
       )}
 
@@ -257,6 +327,17 @@ export function DevicesScreen({ onClose, onError, onJoined, onRekeyed }: Devices
           <Button variant="secondary" onClick={() => setMode('join')} data-testid="devices-join">
             Join a vault
           </Button>
+          {canProposeSelf && (
+            <Button
+              variant="ghost"
+              onClick={() => runPromo(async () => {
+                await pairingProposePromotion();
+              })}
+              data-testid="promotion-propose"
+            >
+              Become this vault&apos;s manager
+            </Button>
+          )}
         </div>
       )}
     </main>

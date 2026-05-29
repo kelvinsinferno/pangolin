@@ -182,8 +182,8 @@ pub use revisionlog_v2_client::{
     add_device_v2, bootstrap_vault_v2, cancel_promotion_v2, decode_device_mgmt_events,
     finalize_promotion_v2, propose_promotion_v2, publish_revision_v2,
     read_authorized_device_count_v2, read_authorized_device_v2, read_authorized_set_v2,
-    read_bootstrapped_v2, read_current_manager_v2, read_device_nonce_v2, remove_device_v2,
-    DeviceLifecycleAnchorV2, DeviceMgmtEvent, REVISIONLOG_V2_CONTRACT_NAME,
+    read_bootstrapped_v2, read_current_manager_v2, read_device_nonce_v2, read_pending_promotion_v2,
+    remove_device_v2, DeviceLifecycleAnchorV2, DeviceMgmtEvent, REVISIONLOG_V2_CONTRACT_NAME,
 };
 pub use revisionlog_v2_signing::{
     build_domain_revisionlog_v2, build_signed_device_auth, build_signed_revision_v2,

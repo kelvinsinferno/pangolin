@@ -141,6 +141,7 @@ pub mod revisionlog_v2_binding {
             function authorizedDevice(bytes32 vaultId, address signer) external view returns (bool);
             function authorizedDeviceCount(bytes32 vaultId) external view returns (uint32);
             function bootstrapped(bytes32 vaultId) external view returns (bool);
+            function pendingPromotion(bytes32 vaultId) external view returns (address candidate, uint64 readyAt);
 
             function hashAddDevice(
                 bytes32 vaultId, address newSigner, uint64 nonce, uint16 schemaVersion
@@ -304,6 +305,35 @@ pub async fn read_current_manager_v2(
         .call()
         .await
         .map_err(|e| ChainError::Rpc(format!("currentManager view: {e}")))
+}
+
+/// Read the in-flight manager promotion for `vault_id`, if any (MVP-4-K).
+///
+/// Returns `Some((candidate, ready_at))` when a promotion is pending
+/// (`readyAt != 0`), else `None`. `ready_at` is the unix-second timestamp
+/// the 48h delay elapses (when `finalizePromotion` becomes valid). Used by
+/// the host to render the pending banner + countdown + gate the veto.
+///
+/// # Errors
+///
+/// [`ChainError::Rpc`] on the view-call failure (fail-closed — the host
+/// never fabricates a pending state).
+pub async fn read_pending_promotion_v2(
+    env: ChainEnv,
+    rpc_url: &str,
+    vault_id: [u8; 32],
+) -> Result<Option<(Address, u64)>, ChainError> {
+    let bound = bind_read(env, rpc_url).await?;
+    let ret = bound
+        .pendingPromotion(vault_id.into())
+        .call()
+        .await
+        .map_err(|e| ChainError::Rpc(format!("pendingPromotion view: {e}")))?;
+    if ret.readyAt == 0 {
+        Ok(None)
+    } else {
+        Ok(Some((ret.candidate, ret.readyAt)))
+    }
 }
 
 /// Read whether `vault_id` has been bootstrapped.

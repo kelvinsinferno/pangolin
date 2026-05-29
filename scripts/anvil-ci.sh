@@ -403,6 +403,32 @@ do_run() {
       revocation_honor_gate_remove_then_read_e2e_against_anvil \
       -- --ignored --nocapture
 
+  # MVP-4-K manager-promotion handoff E2E. Candidate-initiated, 48h-delayed
+  # promotion against the LIVE RevisionLogV2: bootstrapVault(A) ->
+  # addDevice(B) -> B self-signs Promote(candidate=B) -> proposePromotion
+  # (B's key, NOT A's — the contract's recovered==candidate check) ->
+  # pendingPromotion==(B,readyAt); manager still A -> finalize-before-delay
+  # reverts -> warp +48h + mine -> finalizePromotion (permissionless) ->
+  # currentManager==B; pending cleared. Negatives are in-test assertions, so
+  # a regression turns this RED. B is funded by the test (anvil_setBalance)
+  # to pay gas for its own propose/finalize. Run as its OWN invocation (it
+  # warps the global anvil clock; a parallel runner would bleed that warp).
+  PANGOLIN_CHAIN_ENV=dev \
+  BASE_SEPOLIA_RPC_URL="$RPC_URL" \
+    cargo test -p pangolin-core --features integration-tests \
+      --test anvil_device_e2e \
+      promotion_handoff_e2e_against_anvil \
+      -- --ignored --nocapture
+
+  # MVP-4-K manager-veto E2E: B self-proposes, then manager A cancelPromotion's
+  # it (msg.sender-gated) -> pending cleared; manager stays A.
+  PANGOLIN_CHAIN_ENV=dev \
+  BASE_SEPOLIA_RPC_URL="$RPC_URL" \
+    cargo test -p pangolin-core --features integration-tests \
+      --test anvil_device_e2e \
+      promotion_veto_e2e_against_anvil \
+      -- --ignored --nocapture
+
   echo "==> all in-scope tests passed against anvil"
 }
 

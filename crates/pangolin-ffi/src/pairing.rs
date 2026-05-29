@@ -58,8 +58,9 @@
 use std::sync::Arc;
 
 use pangolin_chain::{
-    add_device_v2, bootstrap_vault_v2, build_signed_device_auth, load_deployed_address,
-    read_authorized_set_v2, read_current_manager_v2, read_device_nonce_v2, remove_device_v2,
+    add_device_v2, bootstrap_vault_v2, build_signed_device_auth, cancel_promotion_v2,
+    finalize_promotion_v2, load_deployed_address, propose_promotion_v2, read_authorized_set_v2,
+    read_current_manager_v2, read_device_nonce_v2, read_pending_promotion_v2, remove_device_v2,
     Address, DeviceAuthFields, DeviceAuthKind,
 };
 use pangolin_core::pairing_transport::{
@@ -946,8 +947,9 @@ pub fn vault_list_authorized_devices(
 /// The signer of the authorization MUST be the current manager or the
 /// contract reverts (`ErrNotDeviceManager`); the manager cannot remove
 /// itself or the last device (`ErrWouldBrickVault`). The host pre-checks
-/// these via [`vault_current_manager`] + [`vault_list_authorized_devices`]
-/// to fail fast, but the contract is the source of truth.
+/// these via [`vault_list_authorized_devices`] (whose rows carry the
+/// `is_manager` / `is_current` markers) to fail fast, but the contract is
+/// the source of truth.
 ///
 /// # Errors
 ///
@@ -1014,6 +1016,206 @@ pub fn vault_remove_device(
         .process_device_removed_trigger(&new_set, &[remove_arr], observed_epoch)
         .map_err(store_into_ffi)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// MVP-4-K: manager handoff / promotion (candidate-initiated, 48h, vetoable)
+// ---------------------------------------------------------------------------
+
+/// An in-flight manager promotion (MVP-4-K). All non-secret.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiPendingPromotion {
+    /// Schema-version slot.
+    pub schema_version: u16,
+    /// 20-byte EVM signer of the candidate being promoted to manager.
+    pub candidate: Vec<u8>,
+    /// Unix-second timestamp the 48h delay elapses (when finalize becomes
+    /// valid).
+    pub ready_at: u64,
+}
+
+/// **MVP-4-K. CANDIDATE-INITIATED.** Propose THIS device as the vault's next
+/// manager: self-sign a `Promote` authorization (the contract requires the
+/// signature to recover to the candidate — the manager CANNOT do this) and
+/// broadcast `proposePromotion`, starting the 48h delay. Returns the pending
+/// promotion (candidate + `ready_at`) read back from chain.
+///
+/// Mirrors [`vault_remove_device`]'s spine but: `kind = Promote`, `subject =
+/// THIS device's own signer` (self-proposal), broadcast `propose_promotion_v2`,
+/// and NO store follow-up (promotion changes no key material — it is a pure
+/// on-chain authority-pointer change; the candidate already holds its VDK).
+/// Takes no master password (the session signer suffices).
+///
+/// # Errors
+///
+/// [`FfiError::Session`] for a locked vault; [`FfiError::Chain`] for an
+/// RPC/tx failure (incl. `ErrPromotionPending` / `ErrNotSetMember` /
+/// `ErrBadNonce`); [`FfiError::Internal`] if the broadcast did not register
+/// a pending promotion (should not happen).
+#[allow(clippy::significant_drop_tightening)]
+#[uniffi::export]
+pub fn vault_propose_promotion(
+    handle: Arc<VaultHandle>,
+    config: FfiChainConfig,
+) -> Result<FfiPendingPromotion, FfiError> {
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    if vault.state() != pangolin_store::VaultState::Active {
+        return Err(FfiError::Session {
+            message: "vault is not unlocked".to_owned(),
+        });
+    }
+    let vault_id = vault.vault_id();
+    let wallet_obj = vault.evm_wallet().map_err(store_into_ffi)?;
+    let signer = wallet_obj.signer().clone();
+    let self_addr: Address = wallet_obj.address();
+
+    let pending = block_on_local(async {
+        let (env, chain_id) = crate::chain_config::ffi_chain_env_and_id(&config.rpc_url)
+            .await
+            .map_err(chain_into_ffi)?;
+        let contract = load_deployed_address(env, "RevisionLogV2").map_err(chain_into_ffi)?;
+        let nonce = read_device_nonce_v2(env, &config.rpc_url, vault_id)
+            .await
+            .map_err(chain_into_ffi)?;
+        let fields = DeviceAuthFields {
+            kind: DeviceAuthKind::Promote,
+            vault_id,
+            subject: self_addr,
+            nonce,
+            schema_version: REVISIONLOG_V2_SCHEMA_VERSION,
+        };
+        let signed_auth = build_signed_device_auth(&signer, fields, contract, chain_id)
+            .map_err(chain_into_ffi)?;
+        let wallet = pangolin_chain::EvmWallet::from_signer(signer.clone());
+        propose_promotion_v2(&wallet, self_addr, &signed_auth, env, &config.rpc_url)
+            .await
+            .map_err(chain_into_ffi)?;
+        read_pending_promotion_v2(env, &config.rpc_url, vault_id)
+            .await
+            .map_err(chain_into_ffi)
+    })??;
+
+    match pending {
+        Some((candidate, ready_at)) => Ok(FfiPendingPromotion {
+            schema_version: PAIRING_FFI_SCHEMA_VERSION,
+            candidate: candidate.into_array().to_vec(),
+            ready_at,
+        }),
+        None => Err(FfiError::Internal {
+            message: "proposePromotion broadcast did not register a pending promotion".to_owned(),
+        }),
+    }
+}
+
+/// **MVP-4-K. PERMISSIONLESS.** Finalize a pending manager promotion after
+/// its 48h delay has elapsed — rotates the on-chain manager pointer to the
+/// candidate. Any device may submit it (the candidate, the old manager, or a
+/// relayer). The tx is sent from THIS device's session wallet (gas).
+///
+/// # Errors
+///
+/// [`FfiError::Session`] for a locked vault; [`FfiError::Chain`] for an
+/// RPC/tx failure (incl. `ErrNoPromotionPending` / `ErrPromotionDelayNotElapsed`).
+#[allow(clippy::significant_drop_tightening)]
+#[uniffi::export]
+pub fn vault_finalize_promotion(
+    handle: Arc<VaultHandle>,
+    config: FfiChainConfig,
+) -> Result<(), FfiError> {
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    if vault.state() != pangolin_store::VaultState::Active {
+        return Err(FfiError::Session {
+            message: "vault is not unlocked".to_owned(),
+        });
+    }
+    let vault_id = vault.vault_id();
+    let signer = vault.evm_wallet().map_err(store_into_ffi)?.signer().clone();
+    block_on_local(async {
+        let (env, _chain_id) = crate::chain_config::ffi_chain_env_and_id(&config.rpc_url)
+            .await
+            .map_err(chain_into_ffi)?;
+        let wallet = pangolin_chain::EvmWallet::from_signer(signer.clone());
+        finalize_promotion_v2(&wallet, vault_id, env, &config.rpc_url)
+            .await
+            .map_err(chain_into_ffi)?;
+        Ok::<(), FfiError>(())
+    })?
+}
+
+/// **MVP-4-K. MANAGER-ONLY.** Veto a pending manager promotion
+/// (`cancelPromotion`). The contract gates this on `msg.sender ==
+/// currentManager`, and the tx is sent from THIS device's session wallet —
+/// so it only succeeds on the current manager's device. The host gates the
+/// affordance behind `is_manager`; a non-manager attempt fails-closed
+/// (`ErrNotAuthorizedToCancel`).
+///
+/// # Errors
+///
+/// [`FfiError::Session`] for a locked vault; [`FfiError::Chain`] for an
+/// RPC/tx failure (incl. `ErrNotAuthorizedToCancel` / `ErrNoPromotionPending`).
+#[allow(clippy::significant_drop_tightening)]
+#[uniffi::export]
+pub fn vault_cancel_promotion(
+    handle: Arc<VaultHandle>,
+    config: FfiChainConfig,
+) -> Result<(), FfiError> {
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    if vault.state() != pangolin_store::VaultState::Active {
+        return Err(FfiError::Session {
+            message: "vault is not unlocked".to_owned(),
+        });
+    }
+    let vault_id = vault.vault_id();
+    let signer = vault.evm_wallet().map_err(store_into_ffi)?.signer().clone();
+    block_on_local(async {
+        let (env, _chain_id) = crate::chain_config::ffi_chain_env_and_id(&config.rpc_url)
+            .await
+            .map_err(chain_into_ffi)?;
+        let wallet = pangolin_chain::EvmWallet::from_signer(signer.clone());
+        cancel_promotion_v2(&wallet, vault_id, env, &config.rpc_url)
+            .await
+            .map_err(chain_into_ffi)?;
+        Ok::<(), FfiError>(())
+    })?
+}
+
+/// **MVP-4-K.** Read the in-flight manager promotion, if any. Drives the
+/// pending banner + countdown + veto gating. Fail-closed (L3).
+///
+/// # Errors
+///
+/// [`FfiError::Session`] for a locked vault; [`FfiError::Chain`] on a
+/// chain-read failure.
+#[allow(clippy::significant_drop_tightening)]
+#[uniffi::export]
+pub fn vault_read_pending_promotion(
+    handle: Arc<VaultHandle>,
+    config: FfiChainConfig,
+) -> Result<Option<FfiPendingPromotion>, FfiError> {
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    if vault.state() != pangolin_store::VaultState::Active {
+        return Err(FfiError::Session {
+            message: "vault is not unlocked".to_owned(),
+        });
+    }
+    let vault_id = vault.vault_id();
+    let pending = block_on_local(async {
+        let (env, _chain_id) = crate::chain_config::ffi_chain_env_and_id(&config.rpc_url)
+            .await
+            .map_err(chain_into_ffi)?;
+        read_pending_promotion_v2(env, &config.rpc_url, vault_id)
+            .await
+            .map_err(chain_into_ffi)
+    })??;
+    Ok(pending.map(|(candidate, ready_at)| FfiPendingPromotion {
+        schema_version: PAIRING_FFI_SCHEMA_VERSION,
+        candidate: candidate.into_array().to_vec(),
+        ready_at,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1499,6 +1701,68 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let h = unlocked_handle(&dir, "v.pvf");
         let err = vault_list_authorized_devices(h, bogus_config()).unwrap_err();
+        assert!(matches!(err, FfiError::Chain { .. }));
+    }
+
+    // ---- MVP-4-K: promotion ----
+
+    #[test]
+    fn propose_promotion_rejects_placeholder() {
+        let empty = VaultHandle::new_placeholder();
+        let err = vault_propose_promotion(empty, bogus_config()).unwrap_err();
+        assert!(matches!(err, FfiError::Session { .. }));
+    }
+
+    #[test]
+    fn propose_promotion_fail_closed_on_bad_rpc() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "v.pvf");
+        let err = vault_propose_promotion(h, bogus_config()).unwrap_err();
+        assert!(matches!(err, FfiError::Chain { .. }));
+    }
+
+    #[test]
+    fn finalize_promotion_rejects_placeholder() {
+        let empty = VaultHandle::new_placeholder();
+        let err = vault_finalize_promotion(empty, bogus_config()).unwrap_err();
+        assert!(matches!(err, FfiError::Session { .. }));
+    }
+
+    #[test]
+    fn finalize_promotion_fail_closed_on_bad_rpc() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "v.pvf");
+        let err = vault_finalize_promotion(h, bogus_config()).unwrap_err();
+        assert!(matches!(err, FfiError::Chain { .. }));
+    }
+
+    #[test]
+    fn cancel_promotion_rejects_placeholder() {
+        let empty = VaultHandle::new_placeholder();
+        let err = vault_cancel_promotion(empty, bogus_config()).unwrap_err();
+        assert!(matches!(err, FfiError::Session { .. }));
+    }
+
+    #[test]
+    fn cancel_promotion_fail_closed_on_bad_rpc() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "v.pvf");
+        let err = vault_cancel_promotion(h, bogus_config()).unwrap_err();
+        assert!(matches!(err, FfiError::Chain { .. }));
+    }
+
+    #[test]
+    fn read_pending_promotion_rejects_placeholder() {
+        let empty = VaultHandle::new_placeholder();
+        let err = vault_read_pending_promotion(empty, bogus_config()).unwrap_err();
+        assert!(matches!(err, FfiError::Session { .. }));
+    }
+
+    #[test]
+    fn read_pending_promotion_fail_closed_on_bad_rpc() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "v.pvf");
+        let err = vault_read_pending_promotion(h, bogus_config()).unwrap_err();
         assert!(matches!(err, FfiError::Chain { .. }));
     }
 }
