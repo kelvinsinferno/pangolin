@@ -94,6 +94,8 @@ describe('DevicesScreen (MVP-4-J)', () => {
     });
     render(<DevicesScreen {...noop} />);
     expect(await screen.findByTestId('auth-fallback-note')).toBeInTheDocument();
+    // The fallback has no authoritative set → it must offer NO removal.
+    expect(screen.queryByTestId(`remove-${PEER}`)).not.toBeInTheDocument();
   });
 
   it('Back fires onClose', async () => {

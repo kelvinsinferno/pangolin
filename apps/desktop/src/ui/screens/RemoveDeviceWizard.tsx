@@ -18,7 +18,7 @@ export interface RemoveDeviceWizardProps {
   onRekeyed: (password: string) => Promise<void>;
 }
 
-type Step = 'confirm' | 'password' | 'working';
+type Step = 'confirm' | 'password' | 'working' | 'rekey-retry';
 
 function errMessage(e: unknown): string {
   if (isDesktopError(e)) {
@@ -44,6 +44,10 @@ export function RemoveDeviceWizard({
   const [step, setStep] = useState<Step>('confirm');
   const [password, setPassword] = useState('');
   const guard = useRef(false);
+  // Once the on-chain removal succeeds, the device is OUT of the set —
+  // re-broadcasting it would revert (ErrNotAuthorized). So a later failure
+  // (the re-key) must retry ONLY the rotation, never the removal.
+  const removed = useRef(false);
 
   const cancel = () => {
     setPassword('');
@@ -55,7 +59,10 @@ export function RemoveDeviceWizard({
     guard.current = true;
     setStep('working');
     try {
-      await pairingRemoveDevice(signer);
+      if (!removed.current) {
+        await pairingRemoveDevice(signer);
+        removed.current = true;
+      }
       await pairingCompleteRotation(password);
       const pw = password;
       setPassword('');
@@ -63,7 +70,11 @@ export function RemoveDeviceWizard({
     } catch (e) {
       onError(errMessage(e));
       guard.current = false;
-      setStep('password');
+      // If the removal already landed on-chain, only the re-key remains —
+      // route to the rotation-only retry (re-broadcasting would revert and
+      // would leave the forward-secrecy gap open). Otherwise it is safe to
+      // retry the whole flow from the password step.
+      setStep(removed.current ? 'rekey-retry' : 'password');
     }
   };
 
@@ -122,6 +133,31 @@ export function RemoveDeviceWizard({
         <div className="devices-wizard__step" data-testid="step-working">
           <Spinner />
           <p>Removing the device and re-keying the vault on Base Sepolia…</p>
+        </div>
+      )}
+
+      {step === 'rekey-retry' && (
+        <div className="devices-wizard__step" data-testid="step-rekey-retry">
+          <p>
+            The device was removed on-chain, but re-keying the vault did not
+            finish. Until you complete it, the removed device can still read
+            newly-added data. Re-enter your master password and retry — this
+            only finishes the re-key (the device is already removed).
+          </p>
+          <Input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="Master password"
+            data-testid="rekey-retry-password"
+          />
+          <Button
+            onClick={() => void run()}
+            disabled={password === ''}
+            data-testid="rekey-retry-run"
+          >
+            Retry re-key
+          </Button>
         </div>
       )}
     </Card>

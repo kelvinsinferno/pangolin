@@ -53,6 +53,40 @@ describe('RemoveDeviceWizard', () => {
     });
   });
 
+  it('after removal succeeds but the re-key fails, the retry does NOT re-broadcast removal', async () => {
+    vi.mocked(pairingRemoveDevice).mockResolvedValue(undefined);
+    vi.mocked(pairingCompleteRotation)
+      .mockRejectedValueOnce({ kind: 'Chain', message: 'rpc blip' })
+      .mockResolvedValueOnce({ newEpoch: 2, unknownSurvivors: [] });
+    const onRekeyed = vi.fn(async () => {});
+    render(
+      <RemoveDeviceWizard
+        signer={TARGET}
+        onError={() => {}}
+        onClose={() => {}}
+        onRekeyed={onRekeyed}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('remove-confirm'));
+    fireEvent.change(await screen.findByTestId('remove-password'), {
+      target: { value: 'pw' },
+    });
+    fireEvent.click(screen.getByTestId('remove-run'));
+
+    // Removal landed once; the re-key failed → rotation-only retry step.
+    expect(await screen.findByTestId('step-rekey-retry')).toBeInTheDocument();
+    expect(pairingRemoveDevice).toHaveBeenCalledTimes(1);
+
+    // Retry: this must re-run ONLY the rotation, never re-broadcast removal
+    // (which would revert ErrNotAuthorized + leave the gap open).
+    fireEvent.click(screen.getByTestId('rekey-retry-run'));
+    await waitFor(() => {
+      expect(onRekeyed).toHaveBeenCalled();
+    });
+    expect(pairingRemoveDevice).toHaveBeenCalledTimes(1);
+    expect(pairingCompleteRotation).toHaveBeenCalledTimes(2);
+  });
+
   it('cancel fires onClose without removing', () => {
     const onClose = vi.fn();
     render(
