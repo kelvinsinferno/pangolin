@@ -63,6 +63,13 @@ pub mod capture_authority;
 pub mod chain_config;
 pub mod device;
 pub mod error;
+/// **MVP-4-L L-0b (gap G-2).** Guardian-identity export FFI — a guardian
+/// device produces its shareable invite (X25519 sealing pubkey + EVM address)
+/// for a vault owner to collect during recovery onboarding. Pure decode
+/// counterparts for the owner side. Thin wrapper over
+/// [`pangolin_core::guardian_invite`]; the X25519 sealing SECRET +
+/// `DeviceKey` stay engine-side (L1).
+pub mod guardian_identity;
 pub mod identity;
 mod identity_bridge;
 pub mod kdbx;
@@ -187,6 +194,13 @@ pub use recovery_lifecycle::{
     vault_initiate_recovery, vault_read_recovery_status, vault_read_vault_authority,
     vault_set_guardian_set, FfiRecoveryStatus, FfiTxOutcome, FfiVaultAuthority,
     RECOVERY_LIFECYCLE_FFI_SCHEMA_VERSION,
+};
+// MVP-4-L L-0b (gap G-2): guardian-identity export FFI — `vault_export_guardian_identity`
+// + the two pure decoders. Thin wrapper over `pangolin_core::guardian_invite`;
+// the sealing SECRET + DeviceKey stay engine-side (L1).
+pub use guardian_identity::{
+    guardian_invite_decode_bytes, guardian_invite_decode_string, vault_export_guardian_identity,
+    FfiGuardianInvite, GUARDIAN_IDENTITY_FFI_SCHEMA_VERSION,
 };
 // MVP-3 issue #106e-2: device-add pairing FFI surface — pairing-payload
 // codec + SAS derivation + `vault_add_device` / `pairing_open_and_join`.
