@@ -2,14 +2,22 @@
 
 # MVP-4-L — Social-recovery UX (decomposition + gap analysis) — plan-gate DRAFT
 
-**Status: DRAFT — awaiting Kelvin sign-off on Q-a (first slice / sequencing), Q-b (the opened-share cross-device
-transport — the crux), and Q-c (is a solo backup-only recovery path intended).** Unlike MVP-4-I/J/K, recovery is
-NOT "thin UX over finished FFI": the crypto + lifecycle are built (#102/#103/#104a/#104b/#105/#106e/#108/#109)
-and recovery is end-to-end *in-process* on testnet, but the **cross-device, multi-party** UX exposes real
-FFI/engine gaps (§0c) — the biggest being that a guardian's opened share has no transport off their device. This
-plan-gate decomposes recovery into shippable slices, documents the gaps, and asks for the scoping decisions
-needed before any UX is built. **The whole recovery system stays TESTNET-ONLY until the D-011 external audit
-(recovery is the most audit-critical surface in the product).**
+**Status: LOCKED — Kelvin sign-off 2026-05-29.** Q-a = **Option 1**: this slice ships **L-D (backup-phrase
+create + a read-only recovery-health panel)** — the only gap-free, solo, demonstrable-now piece. Q-b = **Option
+1**: the opened-share cross-device transport (G-1, the crux) gets its **own dedicated crypto design plan-gate**
+(+ in-house adversarial audit) — it is NOT bolted onto a UX slice; the multi-party guardian UX (L-A/L-C/L-B)
+waits on its outcome. Q-c = **Option 1**: a recovery backup ALWAYS requires guardians — the phrase is an aid to
+the guardian flow, never a standalone key; L-D is messaged accordingly. Unlike MVP-4-I/J/K, recovery is NOT
+"thin UX over finished FFI" — the crypto + lifecycle are built (#102/#103/#104a/#104b/#105/#106e/#108/#109) and
+end-to-end *in-process* on testnet, but the cross-device, multi-party guardian path exposes real FFI/engine gaps
+(§0c). **The whole recovery system stays TESTNET-ONLY until the D-011 external audit (recovery is the most
+audit-critical surface in the product).**
+
+> **This slice (L-D) builds ONLY:** `vault_create_backup` UX (generate the 24-word phrase + envelope, show the
+> words once, save the envelope) + a read-only recovery-health panel (`vault_read_vault_authority` +
+> `vault_read_recovery_status`). NO guardian onboarding, NO recovery wizard, NO new crypto — those are deferred
+> (§1 + §3). L-D's copy makes clear the backup *helps your guardians recover you* (Q-c), and that you must set up
+> guardians separately (a later slice) for it to be usable.
 
 ---
 
@@ -101,37 +109,20 @@ everything + must be last.
 
 ---
 
-## 2. Open decisions — need Kelvin
+## 2. Decisions — RESOLVED (Kelvin sign-off 2026-05-29)
 
-**Q-a — What does THIS slice ship first?**
-- **Option 1 (Recommended): L-D backup-create + a read-only recovery-health panel.** Zero gaps, fully
-  testable solo, demonstrable now, and it's the artifact a user should make BEFORE relying on guardians. The
-  multi-party guardian flows (A/C/B) wait behind the L-0 gap-fill (which gets its own plan-gate, esp. for the
-  G-1 transport design). Honest + unblocks something real immediately.
-- **Option 2: do L-0 (gap-fill) first, as an engine slice, then come back for the UX.** Front-loads the hard
-  crypto/FFI (esp. G-1) before any recovery UX. Slower to any user-visible result, but unblocks the whole
-  guardian track.
-- **Option 3: attempt the full guardian onboarding+recovery UX now**, designing the G-1 transport inline. NOT
-  recommended — G-1 is external-audit-critical net-new crypto that shouldn't be rushed inside a UX slice.
-
-**Q-b — The G-1 opened-share cross-device transport (the crux). How to resolve it?** Today an opened share can't
-leave the guardian's device. Options (this likely needs its own dedicated crypto plan-gate + D-011 attention,
-not a snap decision):
-- **Option 1: re-seal the opened share to the recovering user's ephemeral pubkey** for transport (the guardian
-  opens, then re-seals to the requester; the requester unseals locally). Keeps "no plaintext share crosses a
-  channel," but adds a recipient-pubkey handshake (like pairing) + a new sealed-transport codec.
-- **Option 2: the recovering user holds the sealed shares (from the backup) + each guardian releases only their
-  X25519 unseal capability** against a transported sealed blob. Different trust/data-flow; may simplify the
-  backup's role.
-- **Option 3: defer — spike a dedicated "recovery share transport" design plan-gate** before committing. Given
-  the audit-criticality, this is the safe default.
-
-**Q-c — Is a true SOLO backup-only recovery intended (recover with just the phrase, no guardians)?** Today it's
-impossible (shares always required). A real single-secret path would be net-new crypto (e.g., the phrase itself
-is a guardian-equivalent escrow). Options: (1) NO — guardians are always required; the phrase only aids the
-guardian flow (frame L-D's messaging accordingly); (2) YES — design a phrase-as-escrow path (net-new crypto, a
-separate plan-gate). This affects how L-D is messaged ("this backup helps your guardians recover you" vs "this
-backup alone can recover you").
+- **Q-a = Option 1 — ship L-D first** (backup-phrase create + read-only recovery-health panel). Zero gaps,
+  solo, testable, demonstrable now. The multi-party guardian flows (L-A/L-C/L-B) wait behind the share-transport
+  design (Q-b).
+- **Q-b = spike a dedicated crypto design plan-gate for the G-1 opened-share cross-device transport.** It is the
+  audit-critical crux that gates the entire guardian track; it gets its own focused design cycle + in-house
+  adversarial audit, NOT a rushed inline decision inside a UX slice. (The two candidate approaches — re-seal to
+  the recovering user's ephemeral pubkey, or recovering-user-holds-sealed-shares + guardian-releases-unseal —
+  are inputs to that plan-gate, not decided here.)
+- **Q-c = guardians are ALWAYS required.** The backup phrase is an aid to the guardian flow (it carries the
+  wrapped-recovery + roster, never the shares), NOT a standalone key. L-D's copy says "this backup helps your
+  guardians recover you — set up guardians (coming soon) to make it usable." A true phrase-alone recovery would
+  be net-new crypto + is explicitly out of scope.
 
 ---
 
