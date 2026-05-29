@@ -131,6 +131,11 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         commands::pairing::pairing_device_list,
         commands::pairing::pairing_chain_bootstrap,
         commands::pairing::pairing_add_device,
+        // MVP-4-J: device removal + authorized-set / rotation.
+        commands::pairing::pairing_list_authorized_devices,
+        commands::pairing::pairing_remove_device,
+        commands::pairing::pairing_pending_rotations,
+        commands::pairing::pairing_complete_rotation,
         #[cfg(feature = "test-hooks")]
         test_hooks::__test__commands_invoked,
         #[cfg(feature = "test-hooks")]

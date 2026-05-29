@@ -92,6 +92,14 @@ export function App() {
               showError(r.error);
             }
           }}
+          onRekeyed={async (password) => {
+            // The vault is Locked after a rotation; re-unlock + land on the
+            // account list.
+            const r = await actions.unlockVault(password);
+            if (!r.ok && !r.authenticationFailed) {
+              showError(r.error);
+            }
+          }}
         />
       )}
       {state.stage === 'detail' && state.selected !== null && (

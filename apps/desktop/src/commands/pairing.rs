@@ -175,33 +175,45 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Decode a 64-char lowercase/uppercase-hex 32-byte vault id (the form
-/// `PairingPayloadDto.vault_id` round-trips). Surfaces a typed
-/// `Validation` error so the React side renders a toast.
-fn vault_id_from_hex(hex: &str) -> Result<Vec<u8>, DesktopError> {
-    if hex.len() != 64 {
+/// Decode an exactly-`n_bytes` lowercase/uppercase-hex string. Surfaces a
+/// typed `Validation` error (with the caller's `kind`) so the React side
+/// renders a toast.
+fn hex_decode_exact(hex: &str, n_bytes: usize, kind: &str) -> Result<Vec<u8>, DesktopError> {
+    if hex.len() != n_bytes * 2 {
         return Err(DesktopError::Validation {
-            kind: "vault_id".into(),
-            message: "vault id must be 64 hex characters".into(),
+            kind: kind.to_owned(),
+            message: format!("{kind} must be {} hex characters", n_bytes * 2),
         });
     }
-    let mut bytes = Vec::with_capacity(32);
+    let mut bytes = Vec::with_capacity(n_bytes);
     for chunk in hex.as_bytes().chunks_exact(2) {
-        let hi = decode_nibble(chunk[0])?;
-        let lo = decode_nibble(chunk[1])?;
+        let hi = decode_nibble(chunk[0], kind)?;
+        let lo = decode_nibble(chunk[1], kind)?;
         bytes.push((hi << 4) | lo);
     }
     Ok(bytes)
 }
 
-fn decode_nibble(b: u8) -> Result<u8, DesktopError> {
+/// Decode a 64-char hex 32-byte vault id (what `PairingPayloadDto.vault_id`
+/// round-trips).
+fn vault_id_from_hex(hex: &str) -> Result<Vec<u8>, DesktopError> {
+    hex_decode_exact(hex, 32, "vault_id")
+}
+
+/// Decode a 40-char hex 20-byte EVM signer address (what
+/// `AuthorizedDeviceDto.signer` round-trips → `vault_remove_device`).
+fn signer_from_hex(hex: &str) -> Result<Vec<u8>, DesktopError> {
+    hex_decode_exact(hex, 20, "signer")
+}
+
+fn decode_nibble(b: u8, kind: &str) -> Result<u8, DesktopError> {
     match b {
         b'0'..=b'9' => Ok(b - b'0'),
         b'a'..=b'f' => Ok(b - b'a' + 10),
         b'A'..=b'F' => Ok(b - b'A' + 10),
         _ => Err(DesktopError::Validation {
-            kind: "vault_id".into(),
-            message: "vault id contains a non-hex character".into(),
+            kind: kind.to_owned(),
+            message: format!("{kind} contains a non-hex character"),
         }),
     }
 }
@@ -424,6 +436,157 @@ pub async fn pairing_add_device(
     Ok(envelope.into())
 }
 
+// ---------------------------------------------------------------------------
+// MVP-4-J: device removal + the authorized-set / manager / rotation surface
+// ---------------------------------------------------------------------------
+
+/// One device in the vault's live on-chain authorized set (the removable
+/// list). All non-secret.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthorizedDeviceDto {
+    /// 40-char lowercase hex of the 20-byte EVM signer (pass back to
+    /// `pairing_remove_device`).
+    pub signer: String,
+    /// `true` iff this is this device's own signer.
+    pub is_current: bool,
+    /// `true` iff this is the vault's current manager.
+    pub is_manager: bool,
+    /// 64-char hex device id if known locally, else "".
+    pub device_id: String,
+}
+
+impl From<pangolin_ffi::FfiAuthorizedDevice> for AuthorizedDeviceDto {
+    fn from(d: pangolin_ffi::FfiAuthorizedDevice) -> Self {
+        Self {
+            signer: hex_encode(&d.signer),
+            is_current: d.is_current,
+            is_manager: d.is_manager,
+            device_id: hex_encode(&d.device_id),
+        }
+    }
+}
+
+/// An outstanding VDK rotation owed after a removal.
+#[derive(Debug, Clone, Serialize)]
+pub struct RotationPendingDto {
+    /// 40-char hex of the removed signer.
+    pub removed_signer: String,
+    /// The vault epoch observed when the removal was detected.
+    pub observed_epoch: u64,
+}
+
+impl From<pangolin_ffi::FfiRotationPending> for RotationPendingDto {
+    fn from(p: pangolin_ffi::FfiRotationPending) -> Self {
+        Self {
+            removed_signer: hex_encode(&p.removed_signer),
+            observed_epoch: p.observed_epoch,
+        }
+    }
+}
+
+/// The outcome of a completed rotation.
+#[derive(Debug, Clone, Serialize)]
+pub struct RotationResultDto {
+    /// The advanced shared per-vault epoch the rotation landed at.
+    pub new_epoch: u64,
+    /// Hex signers in the live set that this device had no local directory
+    /// entry for (surfaced for diagnostics; the rotation still re-keyed to
+    /// the full live set).
+    pub unknown_survivors: Vec<String>,
+}
+
+impl From<pangolin_ffi::FfiRotationResult> for RotationResultDto {
+    fn from(r: pangolin_ffi::FfiRotationResult) -> Self {
+        Self {
+            new_epoch: r.new_epoch,
+            unknown_survivors: r.unknown_survivors.iter().map(|s| hex_encode(s)).collect(),
+        }
+    }
+}
+
+/// List the vault's live on-chain authorized devices (the removable list).
+/// Chain read → `spawn_blocking`.
+///
+/// # Errors
+/// `DesktopError::Session` (locked) / `DesktopError::Chain` (read failure).
+#[tauri::command]
+pub async fn pairing_list_authorized_devices(
+    state: State<'_, VaultState>,
+) -> Result<Vec<AuthorizedDeviceDto>, DesktopError> {
+    let handle = state.require_open()?;
+    let config = chain_config()?;
+    let list = tokio::task::spawn_blocking(move || {
+        pangolin_ffi::vault_list_authorized_devices(handle, config)
+    })
+    .await
+    .map_err(|e| DesktopError::Internal(format!("list-authorized-devices task join failed: {e}")))?
+    .map_err(DesktopError::from)?;
+    Ok(list.into_iter().map(AuthorizedDeviceDto::from).collect())
+}
+
+/// **MANAGER-ONLY.** Remove a device (broadcast `removeDevice` + queue the
+/// rotation-pending row). The host MUST follow with
+/// `pairing_complete_rotation` to close the forward-secrecy gap. Chain
+/// write → `spawn_blocking`.
+///
+/// # Errors
+/// `DesktopError::Validation` (bad signer hex) / `DesktopError::Session`
+/// (locked) / `DesktopError::Chain` (not-manager / would-brick / RPC).
+#[tauri::command]
+pub async fn pairing_remove_device(
+    signer: String,
+    state: State<'_, VaultState>,
+) -> Result<(), DesktopError> {
+    let handle = state.require_open()?;
+    let signer_bytes = signer_from_hex(&signer)?;
+    let config = chain_config()?;
+    tokio::task::spawn_blocking(move || {
+        pangolin_ffi::vault_remove_device(handle, config, signer_bytes)
+    })
+    .await
+    .map_err(|e| DesktopError::Internal(format!("remove-device task join failed: {e}")))?
+    .map_err(DesktopError::from)
+}
+
+/// Read outstanding rotation-pending rows (a non-empty result means a
+/// removal's VDK rotation has not been completed). Local read; no chain.
+///
+/// # Errors
+/// `DesktopError::Session` for a locked vault.
+#[tauri::command]
+pub async fn pairing_pending_rotations(
+    state: State<'_, VaultState>,
+) -> Result<Vec<RotationPendingDto>, DesktopError> {
+    let handle = state.require_open()?;
+    let pending = pangolin_ffi::vault_pending_rotations(handle).map_err(DesktopError::from)?;
+    Ok(pending.into_iter().map(RotationPendingDto::from).collect())
+}
+
+/// Complete the VDK rotation owed after a removal: re-key to the live
+/// surviving set, advance the epoch, re-point the guardian escrow. Reads
+/// the live set fail-closed; leaves the vault Locked (the host re-unlocks).
+/// Chain read + local re-key → `spawn_blocking`.
+///
+/// # Errors
+/// `DesktopError::Session` (locked) / `DesktopError::Chain` (set-read
+/// failure) / `DesktopError::Store` / `DesktopError::Crypto`.
+#[tauri::command]
+pub async fn pairing_complete_rotation(
+    password: String,
+    state: State<'_, VaultState>,
+) -> Result<RotationResultDto, DesktopError> {
+    let handle = state.require_open()?;
+    let config = chain_config()?;
+    let pw = SecretPassword::new(password.into_bytes());
+    let result = tokio::task::spawn_blocking(move || {
+        pangolin_ffi::vault_complete_rotation(handle, pw, config)
+    })
+    .await
+    .map_err(|e| DesktopError::Internal(format!("complete-rotation task join failed: {e}")))?
+    .map_err(DesktopError::from)?;
+    Ok(result.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,5 +681,79 @@ mod tests {
         let dto: SealedEnvelopeDto = ffi.into();
         assert_eq!(dto.bytes, vec![9, 8, 7]);
         assert_eq!(dto.string_form, "zzz");
+    }
+
+    // ---- MVP-4-J ----
+
+    #[test]
+    fn signer_from_hex_accepts_40_chars() {
+        let s = signer_from_hex(&"ab".repeat(20)).expect("40 hex chars");
+        assert_eq!(s.len(), 20);
+        assert_eq!(s[0], 0xab);
+    }
+
+    #[test]
+    fn signer_from_hex_rejects_wrong_length() {
+        let err =
+            signer_from_hex(&"ab".repeat(32)).expect_err("64 chars is a vault id, not a signer");
+        match err {
+            DesktopError::Validation { kind, .. } => assert_eq!(kind, "signer"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authorized_device_dto_projects_markers_and_hex() {
+        let ffi = pangolin_ffi::FfiAuthorizedDevice {
+            schema_version: 1,
+            signer: vec![0x11; 20],
+            is_current: true,
+            is_manager: false,
+            device_id: vec![0x22; 32],
+        };
+        let dto: AuthorizedDeviceDto = ffi.into();
+        assert_eq!(dto.signer, "11".repeat(20));
+        assert!(dto.is_current);
+        assert!(!dto.is_manager);
+        assert_eq!(dto.device_id, "22".repeat(32));
+    }
+
+    #[test]
+    fn authorized_device_dto_empty_device_id_stays_empty() {
+        let ffi = pangolin_ffi::FfiAuthorizedDevice {
+            schema_version: 1,
+            signer: vec![0x33; 20],
+            is_current: false,
+            is_manager: true,
+            device_id: Vec::new(),
+        };
+        let dto: AuthorizedDeviceDto = ffi.into();
+        assert_eq!(dto.device_id, "");
+        assert!(dto.is_manager);
+    }
+
+    #[test]
+    fn rotation_result_dto_hex_encodes_unknown_survivors() {
+        let ffi = pangolin_ffi::FfiRotationResult {
+            schema_version: 1,
+            new_epoch: 7,
+            unknown_survivors: vec![vec![0xab; 20]],
+        };
+        let dto: RotationResultDto = ffi.into();
+        assert_eq!(dto.new_epoch, 7);
+        assert_eq!(dto.unknown_survivors, vec!["ab".repeat(20)]);
+    }
+
+    #[test]
+    fn rotation_pending_dto_projects_signer_and_epoch() {
+        let ffi = pangolin_ffi::FfiRotationPending {
+            schema_version: 1,
+            removed_signer: vec![0xcd; 20],
+            observed_epoch: 3,
+            observed_at: 1_700_000_000,
+        };
+        let dto: RotationPendingDto = ffi.into();
+        assert_eq!(dto.removed_signer, "cd".repeat(20));
+        assert_eq!(dto.observed_epoch, 3);
     }
 }

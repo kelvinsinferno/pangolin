@@ -8059,6 +8059,19 @@ impl Vault {
         crate::multi_device::read_directory(&self.conn)
     }
 
+    /// **MVP-4-J.** Read the current shared per-vault VDK epoch (non-secret
+    /// chain metadata). Used by the device-removal FFI to tag the
+    /// rotation-pending row's `observed_epoch`. Reads the
+    /// `vdk_chain_state.current_epoch` pointer directly (no active session
+    /// required — the epoch is non-secret metadata).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] on a DB error.
+    pub fn current_vdk_epoch(&self) -> Result<u64> {
+        vdk_chain::read_current_epoch(&self.conn)
+    }
+
     /// **MVP-3 issue #106e-0: the NON-secret recovery-escrow parameters a
     /// rotation needs, read store-side WITHOUT exposing the active VDK.**
     ///

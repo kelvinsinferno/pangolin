@@ -59,7 +59,8 @@ use std::sync::Arc;
 
 use pangolin_chain::{
     add_device_v2, bootstrap_vault_v2, build_signed_device_auth, load_deployed_address,
-    read_device_nonce_v2, Address, DeviceAuthFields, DeviceAuthKind,
+    read_authorized_set_v2, read_current_manager_v2, read_device_nonce_v2, remove_device_v2,
+    Address, DeviceAuthFields, DeviceAuthKind,
 };
 use pangolin_core::pairing_transport::{
     decode_bytes as decode_payload_bytes, decode_string as decode_payload_string, encode_bytes,
@@ -833,6 +834,189 @@ pub fn pairing_open_and_join(
 }
 
 // ---------------------------------------------------------------------------
+// MVP-4-J: device removal + the authorized-set / manager reads
+// ---------------------------------------------------------------------------
+
+/// One device in the vault's LIVE on-chain authorized set (MVP-4-J).
+///
+/// Every field is non-secret: the 20-byte signer is the on-chain set key,
+/// and the role markers are derived from public chain reads. `device_id`
+/// is filled from the local survivor directory when known (peers added on
+/// THIS device), else empty — peer device LABELS live in each peer's own
+/// `.pvf` and are not available cross-device.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAuthorizedDevice {
+    /// Schema-version slot.
+    pub schema_version: u16,
+    /// 20-byte secp256k1 EVM signer (the on-chain authorized-set key + the
+    /// value `vault_remove_device` takes).
+    pub signer: Vec<u8>,
+    /// `true` iff this signer is THIS device's own signer.
+    pub is_current: bool,
+    /// `true` iff this signer is the vault's current manager (the only
+    /// device allowed to remove others).
+    pub is_manager: bool,
+    /// 32-byte stable device id if known from the local directory, else
+    /// empty.
+    pub device_id: Vec<u8>,
+}
+
+/// **MVP-4-J.** List the vault's LIVE on-chain authorized devices, joined
+/// with the local survivor directory for any known device ids + role
+/// markers (`is_current`, `is_manager`). The host renders this as the
+/// removable-device list (vs the LOCAL-only `device_list`, which cannot
+/// enumerate peers).
+///
+/// Reads the live set + manager FAIL-CLOSED (L3): a chain-read error
+/// aborts; the host never sees a stale/guessed set.
+///
+/// # Errors
+///
+/// [`FfiError::Session`] for a locked vault; [`FfiError::Chain`] on a
+/// chain-read failure.
+#[allow(clippy::significant_drop_tightening)]
+#[uniffi::export]
+pub fn vault_list_authorized_devices(
+    handle: Arc<VaultHandle>,
+    config: FfiChainConfig,
+) -> Result<Vec<FfiAuthorizedDevice>, FfiError> {
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    if vault.state() != pangolin_store::VaultState::Active {
+        return Err(FfiError::Session {
+            message: "vault is not unlocked".to_owned(),
+        });
+    }
+    let vault_id = vault.vault_id();
+    let my_addr: [u8; 20] = vault
+        .evm_wallet()
+        .map_err(store_into_ffi)?
+        .address()
+        .into_array();
+    let directory = vault.device_directory().map_err(store_into_ffi)?;
+
+    let (set, manager) = block_on_local(async {
+        let (env, _chain_id) = crate::chain_config::ffi_chain_env_and_id(&config.rpc_url)
+            .await
+            .map_err(chain_into_ffi)?;
+        let set = read_authorized_set_v2(env, &config.rpc_url, vault_id, 0)
+            .await
+            .map_err(chain_into_ffi)?;
+        let manager = read_current_manager_v2(env, &config.rpc_url, vault_id)
+            .await
+            .map_err(chain_into_ffi)?;
+        Ok::<_, FfiError>((set, manager))
+    })??;
+
+    let manager_arr: [u8; 20] = manager.into_array();
+    let out = set
+        .into_iter()
+        .map(|addr| {
+            let arr: [u8; 20] = addr.into_array();
+            let device_id = directory
+                .iter()
+                .find(|d| d.signer == arr)
+                .map(|d| d.device_id.to_vec())
+                .unwrap_or_default();
+            FfiAuthorizedDevice {
+                schema_version: PAIRING_FFI_SCHEMA_VERSION,
+                signer: arr.to_vec(),
+                is_current: arr == my_addr,
+                is_manager: arr == manager_arr,
+                device_id,
+            }
+        })
+        .collect();
+    Ok(out)
+}
+
+/// **MVP-4-J. MANAGER-ONLY.** Remove a device from the vault: sign an
+/// EIP-712 `RemoveDevice` authorization engine-side, broadcast the
+/// on-chain `removeDevice`, then queue the local rotation-pending row so
+/// the host can drive the mandatory VDK rotation
+/// ([`vault_complete_rotation`]) that closes the forward-secrecy gap.
+///
+/// Mirrors [`vault_add_device`]'s spine (L4 gate → engine signer →
+/// `block_on_local` → `read_device_nonce_v2` → `build_signed_device_auth`
+/// → broadcast) but with `DeviceAuthKind::RemoveDevice`, no VDK seal, and
+/// no directory write. Takes NO master password — the removal broadcast is
+/// signed by the active session's signer; the password is needed only for
+/// the SEPARATE [`vault_complete_rotation`] step the host calls next.
+///
+/// The signer of the authorization MUST be the current manager or the
+/// contract reverts (`ErrNotDeviceManager`); the manager cannot remove
+/// itself or the last device (`ErrWouldBrickVault`). The host pre-checks
+/// these via [`vault_current_manager`] + [`vault_list_authorized_devices`]
+/// to fail fast, but the contract is the source of truth.
+///
+/// # Errors
+///
+/// [`FfiError::Validation`] for a malformed `signer_to_remove`;
+/// [`FfiError::Session`] for a locked vault; [`FfiError::Chain`] for an
+/// RPC/tx failure (incl. `ErrNotDeviceManager` / `ErrWouldBrickVault` /
+/// `ErrBadNonce`); [`FfiError::Store`] if the rotation-pending queue write
+/// fails.
+#[allow(clippy::significant_drop_tightening)]
+#[uniffi::export]
+pub fn vault_remove_device(
+    handle: Arc<VaultHandle>,
+    config: FfiChainConfig,
+    signer_to_remove: Vec<u8>,
+) -> Result<(), FfiError> {
+    let remove_arr = fixed_bytes::<20>(&signer_to_remove, "signer_to_remove")?;
+
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    if vault.state() != pangolin_store::VaultState::Active {
+        return Err(FfiError::Session {
+            message: "vault is not unlocked".to_owned(),
+        });
+    }
+    let active_vault_id = vault.vault_id();
+    let signer = vault.evm_wallet().map_err(store_into_ffi)?.signer().clone();
+    let observed_epoch = vault.current_vdk_epoch().map_err(store_into_ffi)?;
+    let remove_addr: Address = Address::from(remove_arr);
+
+    // Broadcast removeDevice, then read the POST-removal authorized set so
+    // the rotation-pending trigger sees the removed signer is gone.
+    let new_set: Vec<[u8; 20]> = block_on_local(async {
+        let (env, chain_id) = crate::chain_config::ffi_chain_env_and_id(&config.rpc_url)
+            .await
+            .map_err(chain_into_ffi)?;
+        let contract = load_deployed_address(env, "RevisionLogV2").map_err(chain_into_ffi)?;
+        let nonce = read_device_nonce_v2(env, &config.rpc_url, active_vault_id)
+            .await
+            .map_err(chain_into_ffi)?;
+        let fields = DeviceAuthFields {
+            kind: DeviceAuthKind::RemoveDevice,
+            vault_id: active_vault_id,
+            subject: remove_addr,
+            nonce,
+            schema_version: REVISIONLOG_V2_SCHEMA_VERSION,
+        };
+        let signed_auth = build_signed_device_auth(&signer, fields, contract, chain_id)
+            .map_err(chain_into_ffi)?;
+        let wallet = pangolin_chain::EvmWallet::from_signer(signer.clone());
+        remove_device_v2(&wallet, remove_addr, &signed_auth, env, &config.rpc_url)
+            .await
+            .map_err(chain_into_ffi)?;
+        let set = read_authorized_set_v2(env, &config.rpc_url, active_vault_id, 0)
+            .await
+            .map_err(chain_into_ffi)?;
+        Ok::<Vec<[u8; 20]>, FfiError>(set.into_iter().map(Address::into_array).collect())
+    })??;
+
+    // Queue the rotation-pending row (the gap MVP-4-J closes — nothing
+    // else writes it). The removed signer is now absent from `new_set`, so
+    // the trigger persists exactly one pending row for it. NEVER auto-
+    // rotates (L3) — the host drives `vault_complete_rotation` next.
+    vault
+        .process_device_removed_trigger(&new_set, &[remove_arr], observed_epoch)
+        .map_err(store_into_ffi)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests — the LOAD-BEARING ones for the #106e-2 audit
 // ---------------------------------------------------------------------------
 
@@ -1261,5 +1445,60 @@ mod tests {
             .expect("B unlocks under its new master password");
             assert_eq!(v.state(), pangolin_store::VaultState::Active);
         }
+    }
+
+    // ---- MVP-4-J: device removal + authorized-set / manager reads ----
+
+    /// `vault_remove_device` validates the signer length BEFORE touching
+    /// the vault/chain → a non-20-byte signer is `Validation`.
+    #[test]
+    fn remove_device_rejects_bad_signer_length() {
+        let empty = VaultHandle::new_placeholder();
+        let err = vault_remove_device(empty, bogus_config(), vec![0x11; 10]).unwrap_err();
+        match err {
+            FfiError::Validation { kind, .. } => assert_eq!(kind, "argument"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// `vault_remove_device` on a placeholder (no vault) → Session, before
+    /// any chain primitive.
+    #[test]
+    fn remove_device_rejects_placeholder() {
+        let empty = VaultHandle::new_placeholder();
+        let err = vault_remove_device(empty, bogus_config(), vec![0x11; 20]).unwrap_err();
+        assert!(matches!(err, FfiError::Session { .. }));
+    }
+
+    /// **§0a L3 fail-closed.** `vault_remove_device` against a bogus RPC
+    /// (unreachable) maps to `Chain` — the broadcast never silently
+    /// proceeds. An Active vault is required to reach the chain primitive.
+    #[test]
+    fn remove_device_fail_closed_on_bad_rpc_maps_to_chain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "v.pvf");
+        let err = vault_remove_device(h, bogus_config(), vec![0x11; 20]).unwrap_err();
+        assert!(
+            matches!(err, FfiError::Chain { .. }),
+            "bad-rpc removal must fail-closed to Chain, got {err:?}"
+        );
+    }
+
+    /// `vault_list_authorized_devices` on a placeholder → Session.
+    #[test]
+    fn list_authorized_devices_rejects_placeholder() {
+        let empty = VaultHandle::new_placeholder();
+        let err = vault_list_authorized_devices(empty, bogus_config()).unwrap_err();
+        assert!(matches!(err, FfiError::Session { .. }));
+    }
+
+    /// **L3 fail-closed.** `vault_list_authorized_devices` against a bogus
+    /// RPC maps to `Chain` (never a stale/guessed set).
+    #[test]
+    fn list_authorized_devices_fail_closed_on_bad_rpc() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "v.pvf");
+        let err = vault_list_authorized_devices(h, bogus_config()).unwrap_err();
+        assert!(matches!(err, FfiError::Chain { .. }));
     }
 }
