@@ -6,6 +6,7 @@ import { useVault, type UnlockResult } from './hooks/useVault';
 import { AccountDetailScreen } from './screens/AccountDetailScreen';
 import { AccountListScreen } from './screens/AccountListScreen';
 import { DevicesScreen } from './screens/DevicesScreen';
+import { RecoveryScreen } from './screens/RecoveryScreen';
 import { UnlockScreen } from './screens/UnlockScreen';
 import { WelcomeScreen } from './screens/WelcomeScreen';
 import type { DesktopError } from './lib/invoke';
@@ -80,6 +81,13 @@ export function App() {
             if (!r.ok) showError(r.error);
           }}
           onDevices={actions.goToDevices}
+          onRecovery={actions.goToRecovery}
+        />
+      )}
+      {state.stage === 'recovery' && (
+        <RecoveryScreen
+          onClose={actions.backToList}
+          onError={(msg) => toastActions.danger(msg)}
         />
       )}
       {state.stage === 'devices' && (

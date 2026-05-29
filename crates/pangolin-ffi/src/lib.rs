@@ -151,9 +151,9 @@ pub use revision::{
     RevisionMeta,
 };
 pub use session::{
-    vault_lock_with_drain, PasswordPolicy, PasswordStrength, PlaintextExportConfirmation,
-    PresenceProof, SecretPassword, SessionInfo, UnixTimestamp, VaultHandle,
-    PASSWORD_POLICY_SCHEMA_VERSION,
+    vault_current_vault_id, vault_lock_with_drain, PasswordPolicy, PasswordStrength,
+    PlaintextExportConfirmation, PresenceProof, SecretPassword, SessionInfo, UnixTimestamp,
+    VaultHandle, PASSWORD_POLICY_SCHEMA_VERSION,
 };
 // MVP-3 issue #106e-1: recovery / guardian-open / onboarding FFI surface —
 // the thin uniffi layer over the merged #106e-0 / #106e-0b composition

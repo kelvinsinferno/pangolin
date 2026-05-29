@@ -141,6 +141,9 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         commands::pairing::pairing_finalize_promotion,
         commands::pairing::pairing_cancel_promotion,
         commands::pairing::pairing_pending_promotion,
+        // MVP-4-L (L-D): recovery backup create + health panel.
+        commands::recovery::recovery_create_backup,
+        commands::recovery::recovery_health,
         #[cfg(feature = "test-hooks")]
         test_hooks::__test__commands_invoked,
         #[cfg(feature = "test-hooks")]
