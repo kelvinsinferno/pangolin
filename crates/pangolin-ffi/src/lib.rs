@@ -167,9 +167,10 @@ pub use session::{
 // methods. The opened guardian `Share` crosses out ONLY behind the opaque
 // `FfiOpenedShare` Object (L1).
 pub use recovery_ffi::{
-    vault_guardian_open_share, vault_onboard_guardians, vault_recover_from_shares,
-    FfiGuardianRoster, FfiOnboardingResult, FfiOpenedShare, FfiRecoveryResult,
-    RECOVERY_FFI_SCHEMA_VERSION,
+    vault_guardian_open_share, vault_guardian_release_share, vault_onboard_guardians,
+    vault_recover_from_shares, vault_recovery_ingest_share, vault_recovery_recipient_identity,
+    FfiGuardianRoster, FfiOnboardingResult, FfiOpenedShare, FfiRecipientIdentity,
+    FfiRecoveryResult, RECOVERY_FFI_SCHEMA_VERSION, RECOVERY_RECIPIENT_FFI_SCHEMA_VERSION,
 };
 // MVP-3 issue #109: recovery-backup FFI surface — generate + seal,
 // decode, and recover-from-backup convenience. Wraps the merged

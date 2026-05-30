@@ -27,6 +27,14 @@
 //! gain a `uniffi` dependency — the FFI lives ONLY here.
 
 #![forbid(unsafe_code)]
+// Heavily-documented FFI module — the share-transport section in particular
+// needs in-source docs for the Decision-B anti-redirect gate. Allow the
+// doc-style pedantic lints at module level (matches `recovery_lifecycle.rs`).
+#![allow(
+    clippy::doc_markdown,
+    clippy::too_long_first_doc_paragraph,
+    clippy::doc_lazy_continuation
+)]
 
 use std::sync::Arc;
 
@@ -447,6 +455,283 @@ pub(crate) fn composition_error_into_ffi(
             message: rec.to_string(),
         },
     }
+}
+
+// =====================================================================
+// MVP-4-L L-0a-2.2 — recovery share-transport FFI surface
+//
+// Three bindings implementing the cross-device share-release protocol
+// (the LOCKED share-transport design's off-chain core):
+//
+//   1. vault_recovery_recipient_identity — the recovering device's
+//      per-attempt X25519 pubkey (the on-chain `recipientCommitment`),
+//      for the L2 human SAS check.
+//   2. vault_guardian_release_share — the guardian's "open-and-reseal"
+//      atomic engine call: opens the stored sealed-share, verifies the
+//      host-supplied recipient_commitment EQUALS the on-chain commitment
+//      (Decision B anti-redirect — refuses to release if the chain says
+//      otherwise), re-seals to the recipient pubkey. Cleartext piece
+//      NEVER materializes in the host.
+//   3. vault_recovery_ingest_share — the recoverer's unseal: opens a
+//      transported sealed blob using the recovery-recipient secret +
+//      returns the opened share as the existing opaque FfiOpenedShare
+//      Object (which the host then accumulates + feeds into
+//      vault_recover_from_shares).
+// =====================================================================
+
+/// Schema-version slot value for [`FfiRecipientIdentity`]. Independent of
+/// the wire-form bytes (the recipient pubkey is just 32 bytes; the slot
+/// here pins the FFI record shape).
+pub const RECOVERY_RECIPIENT_FFI_SCHEMA_VERSION: u16 = 1;
+
+/// The non-secret per-attempt recipient identity for an active recovery
+/// attempt on the recovering device. The pubkey is the on-chain
+/// `recipientCommitment`; the L2 SAS/QR human gate uses the bytes
+/// directly. Returned by [`vault_recovery_recipient_identity`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiRecipientIdentity {
+    /// The recovering device's 32-byte X25519 public key for this attempt
+    /// (the on-chain `recipientCommitment`).
+    pub recipient_pubkey: Vec<u8>,
+    /// The attempt nonce this keypair was bound to at persist time.
+    pub attempt_nonce: u64,
+    /// Schema-version slot.
+    pub schema_version: u16,
+}
+
+/// **Recovering device — read the per-attempt recipient identity.**
+///
+/// Returns the recoverer's ephemeral X25519 pubkey for the active attempt
+/// on `target_vault_id`. The pubkey IS the on-chain `recipientCommitment`
+/// — surface it for the L2 SAS / QR human check (the guardian's UX shows
+/// the same bytes; the user eyeballs them).
+///
+/// Returns [`FfiError::Validation`] (`kind = "argument"`) with a "no active
+/// attempt" message if no row exists for `target_vault_id`.
+///
+/// Loaded-only (any non-placeholder handle — no VDK required for this
+/// read; the secret is NOT decrypted here).
+///
+/// # Errors
+///
+/// - [`FfiError::Validation`] for a non-32-byte `target_vault_id` or no
+///   active attempt.
+/// - [`FfiError::Session`] for a placeholder handle.
+/// - [`FfiError::Store`] on a DB error.
+#[allow(clippy::significant_drop_tightening, clippy::needless_pass_by_value)]
+#[uniffi::export]
+pub fn vault_recovery_recipient_identity(
+    handle: Arc<VaultHandle>,
+    target_vault_id: Vec<u8>,
+) -> Result<FfiRecipientIdentity, FfiError> {
+    let vault_id_arr: [u8; VAULT_ID_LEN] = fixed_bytes(&target_vault_id, "target_vault_id")?;
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    let identity = vault
+        .recovery_recipient_pubkey(vault_id_arr)
+        .map_err(store_into_ffi)?;
+    let Some(id) = identity else {
+        return Err(FfiError::Validation {
+            kind: "argument".into(),
+            message: "no active recovery attempt recorded for the supplied target_vault_id"
+                .to_string(),
+        });
+    };
+    Ok(FfiRecipientIdentity {
+        recipient_pubkey: id.x25519_pub.to_vec(),
+        attempt_nonce: id.attempt_nonce,
+        schema_version: RECOVERY_RECIPIENT_FFI_SCHEMA_VERSION,
+    })
+}
+
+/// **Guardian device — open-and-re-seal in one engine call.**
+///
+/// The cross-device path's guardian-side primitive (Decision B anti-
+/// redirect). Steps performed in-engine, in ONE atomic call:
+///
+///  1. **Fetch the on-chain live attempt** for `target_vault_id` via
+///     [`pangolin_chain::read_live_attempt_v2`].
+///  2. **Verify the on-chain commitment matches the host-supplied one**:
+///     the live attempt must be PENDING, the `attempt_nonce` must match,
+///     and the on-chain `recipient_commitment` MUST byte-equal the
+///     supplied `recipient_commitment`. If any check fails the function
+///     errors out **before opening the share** — the cleartext piece
+///     never materializes on a mis-targeted release. This is the
+///     load-bearing anti-redirect gate.
+///  3. **Open the guardian's stored sealed share** via
+///     [`pangolin_store::Vault::guardian_open_sealed_share`] (uses the
+///     active session's X25519 sealing secret).
+///  4. **Re-seal** the opened piece to `recipient_commitment` via
+///     [`pangolin_crypto::share_transport::seal_share_to_recoverer`],
+///     binding `(target_vault_id, attempt_nonce, recipient_pub,
+///     share_identifier)` into the authenticated header.
+///
+/// Returns the `SealedShareForRecoverer` ciphertext bytes (non-secret;
+/// safe over any transport). The cleartext piece never crosses the FFI.
+///
+/// `epoch` is the escrow generation epoch (16 bytes — same form
+/// `vault_guardian_open_share` takes), needed to open the guardian's
+/// stored sealed share.
+///
+/// Session-gated (Active — the guardian's vault).
+///
+/// # Errors
+///
+/// - [`FfiError::Validation`] (`kind = "argument"`) for a bad length or a
+///   commitment/nonce/status mismatch ("not redirected" pre-check failed).
+/// - [`FfiError::Session`] for a non-Active / placeholder vault.
+/// - [`FfiError::Chain`] for an RPC or read failure during the on-chain
+///   commitment fetch.
+/// - [`FfiError::Validation`] (`kind = "authentication"`) for an open or
+///   seal cryptographic failure.
+#[allow(
+    clippy::significant_drop_tightening,
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments
+)]
+#[uniffi::export]
+pub fn vault_guardian_release_share(
+    handle: Arc<VaultHandle>,
+    sealed_share: Vec<u8>,
+    target_vault_id: Vec<u8>,
+    epoch: Vec<u8>,
+    attempt_nonce: u64,
+    recipient_commitment: Vec<u8>,
+    config: crate::chain_config::FfiChainConfig,
+) -> Result<Vec<u8>, FfiError> {
+    let vault_id_arr: [u8; VAULT_ID_LEN] = fixed_bytes(&target_vault_id, "target_vault_id")?;
+    let epoch_arr: [u8; EPOCH_LEN] = fixed_bytes(&epoch, "epoch")?;
+    let recipient_commitment_arr: [u8; 32] =
+        fixed_bytes(&recipient_commitment, "recipient_commitment")?;
+
+    // Phase 1: on-chain commitment verification (BEFORE opening the
+    // cleartext piece). This is the load-bearing Decision B gate; if the
+    // chain says the attempt's committed recipient differs, REFUSE to
+    // release the piece — the host cannot have been tricked into sealing
+    // to an attacker key.
+    let live = crate::chain_config::block_on_local(async {
+        let (env, _chain_id) = crate::chain_config::ffi_chain_env_and_id(&config.rpc_url)
+            .await
+            .map_err(crate::chain_config::chain_into_ffi)?;
+        pangolin_chain::read_live_attempt_v2(env, &config.rpc_url, vault_id_arr)
+            .await
+            .map_err(crate::chain_config::chain_into_ffi)
+    })??;
+    if live.status != 1 {
+        return Err(FfiError::Validation {
+            kind: "argument".into(),
+            message: format!(
+                "no PENDING recovery attempt on-chain for target vault (status={})",
+                live.status
+            ),
+        });
+    }
+    if live.attempt_nonce != attempt_nonce {
+        return Err(FfiError::Validation {
+            kind: "argument".into(),
+            message: format!(
+                "attempt_nonce mismatch: host supplied {attempt_nonce}, on-chain is {}",
+                live.attempt_nonce
+            ),
+        });
+    }
+    if live.recipient_commitment != recipient_commitment_arr {
+        return Err(FfiError::Validation {
+            kind: "argument".into(),
+            message: "recipient_commitment does not match on-chain RecoveryV2.recipientCommitment \
+                      — REFUSING to release a share (anti-redirect, Decision B)"
+                .into(),
+        });
+    }
+
+    // Phase 2: open the guardian's sealed share (Active session required).
+    let sealed = pangolin_crypto::escrow::SealedShare::from_bytes(sealed_share);
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+    let piece = vault
+        .guardian_open_sealed_share(&sealed, &vault_id_arr, &epoch_arr)
+        .map_err(store_into_ffi)?;
+
+    // Phase 3: re-seal to the on-chain-committed recipient. The cleartext
+    // `piece` lives only inside this function frame; `seal_share_to_recoverer`
+    // produces non-secret sealed bytes; the piece is dropped (zeroized) at
+    // the end of this expression.
+    let sealed_for_recoverer = pangolin_crypto::share_transport::seal_share_to_recoverer(
+        &piece,
+        &recipient_commitment_arr,
+        &vault_id_arr,
+        attempt_nonce,
+    )
+    .map_err(|_| FfiError::authentication_failed())?;
+    drop(piece);
+    Ok(sealed_for_recoverer.as_bytes().to_vec())
+}
+
+/// **Recovering device — ingest a transported sealed share.**
+///
+/// Unseals a `SealedShareForRecoverer` blob using the stored recovery
+/// recipient secret + returns the opened piece as the existing opaque
+/// [`FfiOpenedShare`] Object. The host then accumulates these handles
+/// and feeds them into [`vault_recover_from_shares`] when the quorum is
+/// reached.
+///
+/// Session-gated (Active — the recoverer's vault; needs the VDK to
+/// decrypt the persisted ephemeral secret).
+///
+/// `attempt_nonce` MUST match the nonce recorded in the persisted
+/// `recovery_recipient` row (the AAD binding catches a stale-attempt
+/// blob).
+///
+/// # Errors
+///
+/// - [`FfiError::Validation`] (`kind = "argument"`) for a bad
+///   `target_vault_id` length, no persisted recipient row, or an
+///   attempt_nonce mismatch.
+/// - [`FfiError::Session`] for a non-Active / placeholder vault.
+/// - [`FfiError::Validation`] (`kind = "authentication"`) for an unseal
+///   failure (wrong secret, tampered blob, wrong vault_id / nonce
+///   binding) — the undifferentiated indistinguishability collapse.
+#[allow(clippy::significant_drop_tightening, clippy::needless_pass_by_value)]
+#[uniffi::export]
+pub fn vault_recovery_ingest_share(
+    handle: Arc<VaultHandle>,
+    sealed_blob: Vec<u8>,
+    target_vault_id: Vec<u8>,
+    attempt_nonce: u64,
+) -> Result<Arc<FfiOpenedShare>, FfiError> {
+    let vault_id_arr: [u8; VAULT_ID_LEN] = fixed_bytes(&target_vault_id, "target_vault_id")?;
+    let mut guard = handle.lock_vault();
+    let vault = guard.as_mut()?;
+
+    let peek = vault
+        .peek_recovery_recipient_secret(vault_id_arr)
+        .map_err(store_into_ffi)?;
+    let Some((recorded_nonce, secret, _public)) = peek else {
+        return Err(FfiError::Validation {
+            kind: "argument".into(),
+            message: "no active recovery attempt recorded for the supplied target_vault_id"
+                .to_string(),
+        });
+    };
+    if recorded_nonce != attempt_nonce {
+        return Err(FfiError::Validation {
+            kind: "argument".into(),
+            message: format!(
+                "attempt_nonce mismatch: host supplied {attempt_nonce}, recorded {recorded_nonce}"
+            ),
+        });
+    }
+
+    let sealed = pangolin_crypto::share_transport::SealedShareForRecoverer::from_bytes(sealed_blob);
+    let piece = pangolin_crypto::share_transport::open_share_from_recoverer(
+        &sealed,
+        &secret,
+        &vault_id_arr,
+        attempt_nonce,
+    )
+    .map_err(|_| FfiError::authentication_failed())?;
+    drop(secret);
+    Ok(FfiOpenedShare::new(piece))
 }
 
 #[cfg(test)]

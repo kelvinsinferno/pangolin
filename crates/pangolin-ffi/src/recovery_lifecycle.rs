@@ -331,15 +331,11 @@ pub fn vault_initiate_recovery(
     config: FfiChainConfig,
     target_vault_id: Vec<u8>,
     proposed_authority: Vec<u8>,
-    recipient_commitment: Vec<u8>,
     expires_at_unix: u64,
 ) -> Result<FfiTxOutcome, FfiError> {
-    // The `expires_at_unix` parameter is documented in the plan + on the
-    // shared binding shape but is consumed only by `approve_recovery`'s
-    // EIP-712 signing path — `initiate_recovery_v2` itself does not take
-    // an expiry. Accepted here for surface uniformity with the rest of
-    // the lifecycle FFI; the chain-side contract has no `expiresAt`
-    // field on `initiateRecovery`.
+    // The `expires_at_unix` parameter is documented in the plan but is
+    // consumed only by `approve_recovery`'s EIP-712 signing path — the
+    // on-chain `initiateRecovery` itself does not take an expiry.
     let _ = expires_at_unix;
 
     let mut pw = zeroize::Zeroizing::new(master_password.bytes_for_bridge().to_vec());
@@ -349,15 +345,25 @@ pub fn vault_initiate_recovery(
     let proposed_authority_arr: [u8; EVM_ADDRESS_LEN] =
         fixed_bytes(&proposed_authority, "proposed_authority")?;
     let proposed_authority_addr = Address::from(proposed_authority_arr);
-    let recipient_commitment_arr: [u8; 32] =
-        fixed_bytes(&recipient_commitment, "recipient_commitment")?;
 
     let mut guard = handle.lock_vault();
     let vault = guard.as_mut()?;
     require_active(vault)?;
     let signer = vault.evm_wallet().map_err(store_into_ffi)?.signer().clone();
 
-    let outcome = block_on_local(async {
+    // L-0a-2.2: generate the per-attempt ephemeral X25519 keypair
+    // engine-side (in-memory). The pubkey is the on-chain
+    // `recipientCommitment` (Decision B); the secret persists
+    // sealed-at-rest AFTER broadcast (Decision A, ephemeral per attempt)
+    // so the persistence carries the actual `attempt_nonce` the contract
+    // assigned. If the post-broadcast persistence fails, the on-chain
+    // attempt is unrecoverable from this device and must be canceled.
+    let (secret_bytes_raw, public_bytes) =
+        pangolin_crypto::share_transport::generate_recoverer_keypair();
+    // Wrap the secret in Zeroizing so any panic/early-return wipes it.
+    let secret_bytes = zeroize::Zeroizing::new(secret_bytes_raw);
+
+    let (outcome, attempt_nonce) = block_on_local(async {
         let (env, _chain_id) = crate::chain_config::ffi_chain_env_and_id(&config.rpc_url)
             .await
             .map_err(chain_into_ffi)?;
@@ -366,14 +372,24 @@ pub fn vault_initiate_recovery(
             &wallet,
             vault_id_arr,
             proposed_authority_addr,
-            recipient_commitment_arr,
+            public_bytes,
             env,
             &config.rpc_url,
         )
         .await
         .map_err(chain_into_ffi)?;
-        Ok::<FfiTxOutcome, FfiError>(tx_outcome_from_anchor(anchor))
+        let nonce = anchor.attempt_nonce;
+        Ok::<(FfiTxOutcome, u64), FfiError>((tx_outcome_from_anchor(anchor), nonce))
     })??;
+
+    // Post-broadcast: persist the keypair with the now-known
+    // attempt_nonce (the contract's `RecoveryInitiated.attemptNonce` —
+    // which we couldn't know before broadcasting because the contract
+    // unconditionally increments `rec.attemptNonce + 1`).
+    vault
+        .persist_recovery_recipient(vault_id_arr, attempt_nonce, &secret_bytes, &public_bytes)
+        .map_err(store_into_ffi)?;
+
     drop(secret);
     Ok(outcome)
 }
@@ -573,6 +589,15 @@ pub fn vault_cancel_recovery(
             .map_err(chain_into_ffi)?;
         Ok::<FfiTxOutcome, FfiError>(tx_outcome_from_anchor(anchor))
     })??;
+
+    // L-0a-2.2: cancel ⇒ attempt is terminal ⇒ wipe the ephemeral
+    // recipient secret (Decision A: ephemeral per attempt). A failure
+    // here would leave a stale row but doesn't compromise the
+    // already-canceled attempt; map to FfiError::Store for visibility.
+    vault
+        .clear_recovery_recipient(vault_id_arr)
+        .map_err(store_into_ffi)?;
+
     drop(secret);
     Ok(outcome)
 }
@@ -642,6 +667,16 @@ pub fn vault_finalize_recovery(
             .map_err(chain_into_ffi)?;
         Ok::<FfiTxOutcome, FfiError>(tx_outcome_from_anchor(anchor))
     })??;
+
+    // L-0a-2.2: finalize ⇒ attempt is terminal ⇒ wipe the ephemeral
+    // recipient secret if this device drove the recovery (a finalize from
+    // a non-recovering device is a no-op — clear returns false). A failure
+    // here doesn't compromise the already-finalized rotation; map to
+    // FfiError::Store for visibility.
+    vault
+        .clear_recovery_recipient(vault_id_arr)
+        .map_err(store_into_ffi)?;
+
     Ok(outcome)
 }
 
@@ -854,7 +889,6 @@ mod tests {
             bogus_config(),
             vec![0u8; 31],
             good_addr(),
-            vec![0xAB; 32],
             0,
         )
         .unwrap_err();
@@ -872,30 +906,17 @@ mod tests {
             bogus_config(),
             good_vault_id(),
             vec![0u8; 19],
-            vec![0xAB; 32],
             0,
         )
         .unwrap_err();
         assert!(matches!(err, FfiError::Validation { ref kind, .. } if kind == "argument"));
     }
 
-    /// V2 (L-0a-1) `initiate_recovery`: bad recipient_commitment length.
-    #[test]
-    fn initiate_recovery_rejects_bad_recipient_commitment_length() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let h = unlocked_handle(&dir, "v.pvf");
-        let err = vault_initiate_recovery(
-            h,
-            SecretPassword::new(pwd_bytes()),
-            bogus_config(),
-            good_vault_id(),
-            good_addr(),
-            vec![0xAB; 31],
-            0,
-        )
-        .unwrap_err();
-        assert!(matches!(err, FfiError::Validation { ref kind, .. } if kind == "argument"));
-    }
+    // L-0a-2.2: `initiate_recovery_rejects_bad_recipient_commitment_length`
+    // (added in L-0a-1) is now obsolete — the FFI drops the
+    // `recipient_commitment` parameter (engine generates the ephemeral
+    // keypair internally; the pubkey becomes the on-chain commitment).
+    // The commitment is no longer a host-supplied input to validate.
 
     /// `approve_recovery`: bad vault_id length.
     #[test]
@@ -1064,7 +1085,6 @@ mod tests {
             bogus_config(),
             good_vault_id(),
             good_addr(),
-            vec![0xAB; 32],
             0,
         )
         .unwrap_err();
@@ -1081,7 +1101,6 @@ mod tests {
             bogus_config(),
             good_vault_id(),
             good_addr(),
-            vec![0xAB; 32],
             0,
         )
         .unwrap_err();
@@ -1262,7 +1281,6 @@ mod tests {
             bogus_config(),
             good_vault_id(),
             good_addr(),
-            vec![0xAB; 32],
             0,
         )
         .unwrap_err();
