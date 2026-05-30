@@ -702,16 +702,23 @@ pub fn vault_guardian_release_share(
 /// Session-gated (Active — the recoverer's vault; needs the VDK to
 /// decrypt the persisted ephemeral secret).
 ///
-/// `attempt_nonce` MUST match the nonce recorded in the persisted
-/// `recovery_recipient` row (the AAD binding catches a stale-attempt
-/// blob).
+/// `attempt_nonce` MUST match BOTH the nonce recorded in the persisted
+/// `recovery_recipient` row AND the on-chain live attempt's nonce. The
+/// chain re-check (L-0a-2.2 audit LOW-3 follow-up) catches the
+/// state-divergence case where the attempt was finalized / cancelled
+/// out-of-band (e.g., the authority cancelled while this device was
+/// offline) but the local row wasn't yet cleared.
 ///
 /// # Errors
 ///
 /// - [`FfiError::Validation`] (`kind = "argument"`) for a bad
-///   `target_vault_id` length, no persisted recipient row, or an
-///   attempt_nonce mismatch.
+///   `target_vault_id` length, no persisted recipient row, an
+///   attempt_nonce mismatch, or an on-chain attempt that is no longer
+///   PENDING.
 /// - [`FfiError::Session`] for a non-Active / placeholder vault.
+/// - [`FfiError::Chain`] for the on-chain status re-check failure (RPC
+///   down / deployment missing). Fail-closed: refuse to ingest if we
+///   can't confirm the attempt is still live.
 /// - [`FfiError::Validation`] (`kind = "authentication"`) for an unseal
 ///   failure (wrong secret, tampered blob, wrong vault_id / nonce
 ///   binding) — the undifferentiated indistinguishability collapse.
@@ -722,11 +729,62 @@ pub fn vault_recovery_ingest_share(
     sealed_blob: Vec<u8>,
     target_vault_id: Vec<u8>,
     attempt_nonce: u64,
+    config: crate::chain_config::FfiChainConfig,
 ) -> Result<Arc<FfiOpenedShare>, FfiError> {
     let vault_id_arr: [u8; VAULT_ID_LEN] = fixed_bytes(&target_vault_id, "target_vault_id")?;
+
+    // Phase 0: Active check BEFORE the chain RPC (mirror LOW-1 fix in
+    // vault_guardian_release_share — a Locked-vault caller would
+    // otherwise leak the target vault_id to the RPC node before failing
+    // closed at the secret peek).
+    {
+        let mut g = handle.lock_vault();
+        let v = g.as_mut()?;
+        if v.state() != pangolin_store::VaultState::Active {
+            return Err(FfiError::Session {
+                message: "vault is not unlocked".to_owned(),
+            });
+        }
+        drop(g);
+    }
+
+    // Phase 1: on-chain liveness re-check (LOW-3 follow-up). Refuse to
+    // ingest if the attempt has reached a terminal state — a stale
+    // delayed blob from a now-cancelled/finalized attempt would feed
+    // vault_recover_from_shares but cannot reconstruct anything useful;
+    // catching divergence here is a defense-in-depth UX win + closes the
+    // state-divergence window between local row + on-chain status.
+    let live = crate::chain_config::block_on_local(async {
+        let (env, _chain_id) = crate::chain_config::ffi_chain_env_and_id(&config.rpc_url)
+            .await
+            .map_err(crate::chain_config::chain_into_ffi)?;
+        pangolin_chain::read_live_attempt_v2(env, &config.rpc_url, vault_id_arr)
+            .await
+            .map_err(crate::chain_config::chain_into_ffi)
+    })??;
+    if live.status != 1 {
+        return Err(FfiError::Validation {
+            kind: "argument".into(),
+            message: format!(
+                "on-chain recovery attempt is no longer PENDING (status={}) — refusing to ingest \
+                 a share; the attempt has reached a terminal state",
+                live.status
+            ),
+        });
+    }
+    if live.attempt_nonce != attempt_nonce {
+        return Err(FfiError::Validation {
+            kind: "argument".into(),
+            message: format!(
+                "on-chain attempt_nonce ({}) does not match host-supplied ({attempt_nonce})",
+                live.attempt_nonce
+            ),
+        });
+    }
+
+    // Phase 2: peek + verify the locally-recorded nonce.
     let mut guard = handle.lock_vault();
     let vault = guard.as_mut()?;
-
     let peek = vault
         .peek_recovery_recipient_secret(vault_id_arr)
         .map_err(store_into_ffi)?;
@@ -741,11 +799,13 @@ pub fn vault_recovery_ingest_share(
         return Err(FfiError::Validation {
             kind: "argument".into(),
             message: format!(
-                "attempt_nonce mismatch: host supplied {attempt_nonce}, recorded {recorded_nonce}"
+                "locally-recorded attempt_nonce mismatch: host supplied {attempt_nonce}, \
+                 recorded {recorded_nonce}"
             ),
         });
     }
 
+    // Phase 3: unseal in-engine.
     let sealed = pangolin_crypto::share_transport::SealedShareForRecoverer::from_bytes(sealed_blob);
     let piece = pangolin_crypto::share_transport::open_share_from_recoverer(
         &sealed,
