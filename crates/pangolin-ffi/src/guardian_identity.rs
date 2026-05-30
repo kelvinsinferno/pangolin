@@ -48,10 +48,13 @@ use pangolin_crypto::escrow::X25519_KEY_LEN;
 use crate::error::FfiError;
 use crate::session::VaultHandle;
 
-/// Schema-version slot value for the [`FfiGuardianInvite`] Record. Bumped
-/// independently from the wire-form
-/// [`GUARDIAN_INVITE_SCHEMA_VERSION`]: the wire form pins the on-the-air byte
-/// layout, the FFI record pins the foreign-language Record shape.
+/// Schema-version slot pinning the `FfiGuardianInvite` Record's shape
+/// (the `Vec<u8>` / `String` / `u16` field layout the foreign-language
+/// binding sees). Bumped INDEPENDENTLY from the wire-form
+/// [`GUARDIAN_INVITE_SCHEMA_VERSION`] — the wire form pins the
+/// on-the-air byte layout; this version pins the FFI record shape. They
+/// are two distinct concerns: a host can be on V1 of the record shape
+/// while consuming V2 wire bytes (or vice versa) without ambiguity.
 pub const GUARDIAN_IDENTITY_FFI_SCHEMA_VERSION: u16 = 1;
 
 // ---------------------------------------------------------------------------
