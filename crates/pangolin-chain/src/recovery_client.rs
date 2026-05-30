@@ -1031,6 +1031,460 @@ fn decode_revert_reason_from_msg(msg: &str) -> Option<String> {
     Some("unknown revert".to_string())
 }
 
+// =====================================================================
+// MVP-4-L L-0a-1 — RecoveryV2 surface
+//
+// V2 adds the recipient X25519 pubkey to the recovery attempt as a
+// `bytes32 recipientCommitment` (the on-chain anti-redirect binding) +
+// surfaces the previously-dropped `initiatedAt` + `approvals` (the G-3
+// fix). The contract is hard-immutable, so V2 is a NEW deploy at a NEW
+// address (RecoveryV2 has its own `contracts/deployments/<env>.json`
+// entry — see `RECOVERY_V2_CONTRACT_NAME`).
+//
+// The broadcast / receipt / decode-anchor / merkle helpers are GENERIC
+// over the contract: V2 calldata builders + reads reuse `broadcast_call`,
+// `finish`, `decode_lifecycle_anchor`, `build_guardian_root`,
+// `build_membership_proof`, `verify_membership_proof` verbatim. Only the
+// `sol!` binding, the contract-name lookup, and the per-call calldata
+// shapes are V2-specific.
+// =====================================================================
+
+/// The contract name under which `RecoveryV2`'s address is recorded in
+/// `contracts/deployments/<env>.json`. V2 is a NEW deploy at a NEW
+/// address; the existing V1 entry (if any) is independent.
+pub const RECOVERY_V2_CONTRACT_NAME: &str = "RecoveryV2";
+
+/// Event-schema version every V2 call passes (L6 — same posture as V1).
+pub const RECOVERY_SCHEMA_VERSION_V2: u16 = 1;
+
+#[allow(clippy::too_many_arguments, clippy::module_name_repetitions)]
+pub mod recovery_v2_binding {
+    use alloy::sol;
+
+    sol! {
+        /// Mirror of `contracts/src/RecoveryV2.sol`. MUST stay
+        /// byte-for-byte aligned with the .sol source. Drift is caught
+        /// by the calldata-pin tests + the anvil lifecycle round-trip.
+        #[sol(rpc)]
+        contract RecoveryV2 {
+            function setGuardianSet(
+                bytes32 vaultId,
+                bytes32 root,
+                uint8 threshold,
+                uint8 guardianCount,
+                uint16 schemaVersion
+            ) external;
+
+            function initiateRecovery(
+                bytes32 vaultId,
+                address proposedAuthority,
+                bytes32 recipientCommitment,
+                uint16 schemaVersion
+            ) external;
+
+            function approveRecovery(
+                bytes32 vaultId,
+                address guardian,
+                bytes32[] calldata proof,
+                uint64 expiresAt,
+                uint16 schemaVersion,
+                bytes calldata signature
+            ) external;
+
+            function cancelRecovery(bytes32 vaultId, uint16 schemaVersion) external;
+
+            function finalizeRecovery(bytes32 vaultId, uint16 schemaVersion) external;
+
+            function recovery(bytes32 vaultId)
+                external
+                view
+                returns (
+                    address proposedAuthority,
+                    uint64 initiatedAt,
+                    uint64 attemptNonce,
+                    uint8 approvals,
+                    uint8 status,
+                    bytes32 recipientCommitment
+                );
+
+            function vaultAuthority(bytes32 vaultId) external view returns (address);
+
+            function hashApprove(
+                bytes32 vaultId,
+                address proposedAuthority,
+                uint64 attemptNonce,
+                uint64 expiresAt,
+                bytes32 recipientCommitment,
+                uint16 schemaVersion
+            ) external view returns (bytes32);
+
+            event GuardianSetInitialized(
+                bytes32 indexed vaultId,
+                bytes32 root,
+                uint8 threshold,
+                uint8 guardianCount,
+                address initialAuthority,
+                uint16 schemaVersion
+            );
+
+            event RecoveryInitiated(
+                bytes32 indexed vaultId,
+                uint64 indexed attemptNonce,
+                address proposedAuthority,
+                uint64 initiatedAt,
+                bytes32 recipientCommitment,
+                uint16 schemaVersion
+            );
+
+            event RecoveryApproved(
+                bytes32 indexed vaultId,
+                uint64 indexed attemptNonce,
+                address guardian,
+                uint8 approvals,
+                uint16 schemaVersion
+            );
+
+            event RecoveryCanceled(
+                bytes32 indexed vaultId, uint64 indexed attemptNonce, uint16 schemaVersion
+            );
+
+            event RecoveryFinalized(
+                bytes32 indexed vaultId,
+                uint64 indexed attemptNonce,
+                address oldAuthority,
+                address newAuthority,
+                uint16 schemaVersion
+            );
+        }
+    }
+}
+
+pub use recovery_v2_binding::RecoveryV2;
+
+/// The live PENDING attempt state read from the V2 contract. **Includes
+/// G-3 fields** (`initiated_at`, `approvals` — previously dropped from
+/// `LiveAttemptV1`) AND the V2 `recipient_commitment`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveAttemptV2 {
+    pub proposed_authority: Address,
+    pub attempt_nonce: u64,
+    pub status: u8,
+    /// G-3: when the attempt was initiated (block.timestamp at initiate).
+    pub initiated_at: u64,
+    /// G-3: how many guardians have approved so far.
+    pub approvals: u8,
+    /// V2: the on-chain-committed recipient X25519 pubkey for this attempt.
+    pub recipient_commitment: [u8; 32],
+}
+
+fn resolve_contract_address_v2(env: ChainEnv) -> Result<Address, ChainError> {
+    load_deployed_address(env, RECOVERY_V2_CONTRACT_NAME)
+}
+
+async fn connect_v2(
+    wallet: &EvmWallet,
+    env: ChainEnv,
+    rpc_url: &str,
+) -> Result<(DynProvider, Address, u64), ChainError> {
+    let contract = resolve_contract_address_v2(env)?;
+    let eth_wallet = EthereumWallet::from(wallet.signer().clone());
+    let provider = ProviderBuilder::new()
+        .wallet(eth_wallet)
+        .connect(rpc_url)
+        .await
+        .map_err(|e| ChainError::Rpc(format!("connect {rpc_url}: {e}")))?
+        .erased();
+    let chain_id = resolve_envelope_chain_id(&provider, env).await?;
+    Ok((provider, contract, chain_id))
+}
+
+/// V2 broadcast: `setGuardianSet`. Identical shape to V1 (the guardian-set
+/// surface is unchanged in V2).
+///
+/// # Errors
+///
+/// Same R-c retry taxonomy as [`set_guardian_set_v1`].
+pub async fn set_guardian_set_v2(
+    wallet: &EvmWallet,
+    vault_id: [u8; 32],
+    root: [u8; 32],
+    threshold: u8,
+    guardian_count: u8,
+    env: ChainEnv,
+    rpc_url: &str,
+) -> Result<RecoveryAnchorV1, ChainError> {
+    let (provider, contract, chain_id) = connect_v2(wallet, env, rpc_url).await?;
+    let call = RecoveryV2::setGuardianSetCall {
+        vaultId: vault_id.into(),
+        root: root.into(),
+        threshold,
+        guardianCount: guardian_count,
+        schemaVersion: RECOVERY_SCHEMA_VERSION_V2,
+    };
+    let calldata = SolCall::abi_encode(&call);
+    let pending = broadcast_call(&provider, wallet.address(), contract, calldata, chain_id).await?;
+    finish(pending, contract, |r, tx| {
+        decode_lifecycle_anchor::<RecoveryV2::GuardianSetInitialized>(r, contract, tx, |_d, log| {
+            anchor_basic(log, 0)
+        })
+    })
+    .await
+}
+
+/// V2 broadcast: `initiateRecovery` — **gains `recipient_commitment`**
+/// (the recovering user's per-attempt X25519 pubkey; the on-chain
+/// anti-redirect binding).
+///
+/// # Errors
+///
+/// Same R-c retry taxonomy as [`set_guardian_set_v1`].
+pub async fn initiate_recovery_v2(
+    wallet: &EvmWallet,
+    vault_id: [u8; 32],
+    proposed_authority: Address,
+    recipient_commitment: [u8; 32],
+    env: ChainEnv,
+    rpc_url: &str,
+) -> Result<RecoveryAnchorV1, ChainError> {
+    let (provider, contract, chain_id) = connect_v2(wallet, env, rpc_url).await?;
+    let call = RecoveryV2::initiateRecoveryCall {
+        vaultId: vault_id.into(),
+        proposedAuthority: proposed_authority,
+        recipientCommitment: recipient_commitment.into(),
+        schemaVersion: RECOVERY_SCHEMA_VERSION_V2,
+    };
+    let calldata = SolCall::abi_encode(&call);
+    let pending = broadcast_call(&provider, wallet.address(), contract, calldata, chain_id).await?;
+    finish(pending, contract, |r, tx| {
+        decode_lifecycle_anchor::<RecoveryV2::RecoveryInitiated>(r, contract, tx, |d, log| {
+            RecoveryAnchorV1 {
+                tx_hash: tx,
+                block_number: 0,
+                block_hash: B256::ZERO,
+                log_index: log,
+                attempt_nonce: d.attemptNonce,
+                old_authority: Address::ZERO,
+                new_authority: Address::ZERO,
+            }
+        })
+    })
+    .await
+}
+
+/// V2 read: the live PENDING attempt. Surfaces all 6 contract fields —
+/// the existing V1 trio + the G-3 `initiated_at`/`approvals` + the V2
+/// `recipient_commitment`.
+///
+/// # Errors
+///
+/// [`ChainError::Rpc`] on the view-call failure.
+pub async fn read_live_attempt_v2(
+    env: ChainEnv,
+    rpc_url: &str,
+    vault_id: [u8; 32],
+) -> Result<LiveAttemptV2, ChainError> {
+    let contract = resolve_contract_address_v2(env)?;
+    let provider = ProviderBuilder::new()
+        .connect(rpc_url)
+        .await
+        .map_err(|e| ChainError::Rpc(format!("connect {rpc_url}: {e}")))?
+        .erased();
+    let bound = RecoveryV2::new(contract, &provider);
+    let r = bound
+        .recovery(vault_id.into())
+        .call()
+        .await
+        .map_err(|e| ChainError::Rpc(format!("recovery({vault_id:?}) view: {e}")))?;
+    Ok(LiveAttemptV2 {
+        proposed_authority: r.proposedAuthority,
+        attempt_nonce: r.attemptNonce,
+        status: r.status,
+        initiated_at: r.initiatedAt,
+        approvals: r.approvals,
+        recipient_commitment: r.recipientCommitment.0,
+    })
+}
+
+/// V2: build the `Approve` field set for the CURRENT live attempt (L11)
+/// — gains `recipient_commitment` read from the chain.
+///
+/// # Errors
+///
+/// [`ChainError::Rpc`] on the view-call failure;
+/// [`ChainError::Decode`] if the slot is not PENDING.
+pub async fn build_live_approve_fields_v2(
+    env: ChainEnv,
+    rpc_url: &str,
+    vault_id: [u8; 32],
+    expires_at: u64,
+) -> Result<crate::recovery_signing::ApproveFieldsV2, ChainError> {
+    let live = read_live_attempt_v2(env, rpc_url, vault_id).await?;
+    if live.status != 1 {
+        return Err(ChainError::Decode(format!(
+            "no PENDING recovery for vault {vault_id:?} (status={}); refusing to build a \
+             stale-attempt V2 Approve digest (L11)",
+            live.status
+        )));
+    }
+    Ok(crate::recovery_signing::ApproveFieldsV2 {
+        vault_id,
+        proposed_authority: live.proposed_authority,
+        attempt_nonce: live.attempt_nonce,
+        expires_at,
+        recipient_commitment: live.recipient_commitment,
+        schema_version: RECOVERY_SCHEMA_VERSION_V2,
+    })
+}
+
+/// V2 broadcast: `approveRecovery` — record one guardian approval (V2).
+/// Carries a [`crate::recovery_signing::SignedApprovalV2`] (V2 digest
+/// covers the commitment).
+///
+/// # Errors
+///
+/// Same taxonomy as [`set_guardian_set_v1`]; [`ChainError::Decode`] if
+/// the supplied `proof` does not verify against `root` for `guardian`.
+#[allow(clippy::too_many_arguments)]
+pub async fn approve_recovery_v2(
+    wallet: &EvmWallet,
+    guardian: Address,
+    proof: &[[u8; 32]],
+    root: [u8; 32],
+    signed_approval: &crate::recovery_signing::SignedApprovalV2,
+    env: ChainEnv,
+    rpc_url: &str,
+) -> Result<RecoveryAnchorV1, ChainError> {
+    let leaf = guardian_leaf(guardian);
+    if !verify_membership_proof(proof, root, leaf) {
+        return Err(ChainError::Decode(format!(
+            "merkle proof for guardian {guardian} does not verify against root \
+             0x{}; the V2 contract's _verifyMerkleProof would revert ErrInvalidMerkleProof",
+            hex::encode(root)
+        )));
+    }
+
+    let (provider, contract, chain_id) = connect_v2(wallet, env, rpc_url).await?;
+    let proof_words: Vec<B256> = proof.iter().map(|p| B256::from(*p)).collect();
+    let call = RecoveryV2::approveRecoveryCall {
+        vaultId: signed_approval.fields.vault_id.into(),
+        guardian,
+        proof: proof_words,
+        expiresAt: signed_approval.fields.expires_at,
+        schemaVersion: signed_approval.fields.schema_version,
+        signature: Bytes::copy_from_slice(&signed_approval.signature[..]),
+    };
+    let calldata = SolCall::abi_encode(&call);
+    let pending = broadcast_call(&provider, wallet.address(), contract, calldata, chain_id).await?;
+    finish(pending, contract, |r, tx| {
+        decode_lifecycle_anchor::<RecoveryV2::RecoveryApproved>(r, contract, tx, |d, log| {
+            RecoveryAnchorV1 {
+                tx_hash: tx,
+                block_number: 0,
+                block_hash: B256::ZERO,
+                log_index: log,
+                attempt_nonce: d.attemptNonce,
+                old_authority: Address::ZERO,
+                new_authority: Address::ZERO,
+            }
+        })
+    })
+    .await
+}
+
+/// V2 broadcast: `cancelRecovery` (authority-only). Identical shape to V1.
+///
+/// # Errors
+///
+/// Same taxonomy as [`set_guardian_set_v1`].
+pub async fn cancel_recovery_v2(
+    wallet: &EvmWallet,
+    vault_id: [u8; 32],
+    env: ChainEnv,
+    rpc_url: &str,
+) -> Result<RecoveryAnchorV1, ChainError> {
+    let (provider, contract, chain_id) = connect_v2(wallet, env, rpc_url).await?;
+    let call = RecoveryV2::cancelRecoveryCall {
+        vaultId: vault_id.into(),
+        schemaVersion: RECOVERY_SCHEMA_VERSION_V2,
+    };
+    let calldata = SolCall::abi_encode(&call);
+    let pending = broadcast_call(&provider, wallet.address(), contract, calldata, chain_id).await?;
+    finish(pending, contract, |r, tx| {
+        decode_lifecycle_anchor::<RecoveryV2::RecoveryCanceled>(r, contract, tx, |d, log| {
+            RecoveryAnchorV1 {
+                tx_hash: tx,
+                block_number: 0,
+                block_hash: B256::ZERO,
+                log_index: log,
+                attempt_nonce: d.attemptNonce,
+                old_authority: Address::ZERO,
+                new_authority: Address::ZERO,
+            }
+        })
+    })
+    .await
+}
+
+/// V2 broadcast: `finalizeRecovery` (permissionless). Identical shape to V1.
+///
+/// # Errors
+///
+/// Same taxonomy as [`set_guardian_set_v1`].
+pub async fn finalize_recovery_v2(
+    wallet: &EvmWallet,
+    vault_id: [u8; 32],
+    env: ChainEnv,
+    rpc_url: &str,
+) -> Result<RecoveryAnchorV1, ChainError> {
+    let (provider, contract, chain_id) = connect_v2(wallet, env, rpc_url).await?;
+    let call = RecoveryV2::finalizeRecoveryCall {
+        vaultId: vault_id.into(),
+        schemaVersion: RECOVERY_SCHEMA_VERSION_V2,
+    };
+    let calldata = SolCall::abi_encode(&call);
+    let pending = broadcast_call(&provider, wallet.address(), contract, calldata, chain_id).await?;
+    finish(pending, contract, |r, tx| {
+        decode_lifecycle_anchor::<RecoveryV2::RecoveryFinalized>(r, contract, tx, |d, log| {
+            RecoveryAnchorV1 {
+                tx_hash: tx,
+                block_number: 0,
+                block_hash: B256::ZERO,
+                log_index: log,
+                attempt_nonce: d.attemptNonce,
+                old_authority: d.oldAuthority,
+                new_authority: d.newAuthority,
+            }
+        })
+    })
+    .await
+}
+
+/// V2 read: `vaultAuthority(vaultId)` (the rotated authority after a
+/// finalize). Mirror of `read_vault_authority_v1` for V2.
+///
+/// # Errors
+///
+/// [`ChainError::Rpc`] on the view-call failure.
+pub async fn read_vault_authority_v2(
+    env: ChainEnv,
+    rpc_url: &str,
+    vault_id: [u8; 32],
+) -> Result<Address, ChainError> {
+    let contract = resolve_contract_address_v2(env)?;
+    let provider = ProviderBuilder::new()
+        .connect(rpc_url)
+        .await
+        .map_err(|e| ChainError::Rpc(format!("connect {rpc_url}: {e}")))?
+        .erased();
+    let bound = RecoveryV2::new(contract, &provider);
+    let addr = bound
+        .vaultAuthority(vault_id.into())
+        .call()
+        .await
+        .map_err(|e| ChainError::Rpc(format!("vaultAuthority({vault_id:?}) view: {e}")))?;
+    Ok(addr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -318,6 +318,168 @@ pub fn recover_approver_v1(
         })
 }
 
+// ---------------------------------------------------------------------------
+// MVP-4-L L-0a-1 — RecoveryV2 EIP-712 surface (Approve gains
+// `recipientCommitment`; the new typehash means a V1-shape approval can
+// never validate against V2).
+// ---------------------------------------------------------------------------
+
+/// Pinned EIP-712 typehash for the **V2** `Approve` struct
+/// (`contracts/src/RecoveryV2.sol`'s `APPROVE_TYPEHASH` literal).
+///
+/// Equals `keccak256("Approve(bytes32 vaultId,address proposedAuthority,uint64 attemptNonce,uint64 expiresAt,bytes32 recipientCommitment,uint16 schemaVersion)")`,
+/// independently verified by `approve_typehash_v2_matches_pinned_constant`
+/// (which re-keccaks the literal). Drift in either the literal or the
+/// contract source fires loudly in CI.
+pub const APPROVE_TYPEHASH_V2: [u8; 32] =
+    alloy::primitives::hex!("8035ba2c3e373fe0071228b32e9b133bd20163069315c2af924dc620245d0f28");
+
+/// The six EIP-712 `Approve` struct fields for V2.
+///
+/// Identical to [`ApproveFieldsV1`] plus the on-chain-committed
+/// `recipient_commitment` (the strongest available anti-redirect binding;
+/// locked in the share-transport design Decision B). Mirrors
+/// `RecoveryV2.sol`'s `_hashApprove` field set verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApproveFieldsV2 {
+    /// 32-byte opaque vault identifier.
+    pub vault_id: [u8; 32],
+    /// The attempt's target authority (read from the live PENDING attempt).
+    pub proposed_authority: Address,
+    /// Per-attempt scope (read from the live PENDING attempt).
+    pub attempt_nonce: u64,
+    /// Unix timestamp after which the contract rejects the signature.
+    pub expires_at: u64,
+    /// The recovering user's 32-byte X25519 pubkey for this attempt (read
+    /// from `rec.recipientCommitment` on-chain). A guardian's signature
+    /// attests to both `proposed_authority` and `recipient_commitment`.
+    pub recipient_commitment: [u8; 32],
+    /// Event-schema version. `1`; the contract rejects
+    /// `> MAX_KNOWN_SCHEMA_VERSION`.
+    pub schema_version: u16,
+}
+
+/// A guardian's signed V2 `Approve` attestation: the field set + the
+/// 65-byte secp256k1 signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedApprovalV2 {
+    /// The same field set the digest was computed over.
+    pub fields: ApproveFieldsV2,
+    /// Exactly 65 bytes: `r (32) || s (32) || v (1)`.
+    pub signature: [u8; 65],
+}
+
+/// Compute the EIP-712 struct-hash for an [`ApproveFieldsV2`].
+///
+/// Mirrors `RecoveryV2.sol::_hashApprove`'s struct-hash (7 abi-encoded
+/// 32-byte words: typehash + 6 fields). Drift in the buffer size or field
+/// order fires loudly because `approve_typehash_v2_matches_pinned_constant`
+/// + the anvil E2E would diverge.
+#[must_use]
+pub fn approve_struct_hash_v2(fields: &ApproveFieldsV2) -> B256 {
+    // 7 × 32 bytes = 224 bytes (V1 was 6×32 = 192).
+    let mut buf = [0u8; 7 * 32];
+    let mut o = 0usize;
+    buf[o..o + 32].copy_from_slice(&APPROVE_TYPEHASH_V2);
+    o += 32;
+    buf[o..o + 32].copy_from_slice(&fields.vault_id);
+    o += 32;
+    buf[o + 12..o + 32].copy_from_slice(fields.proposed_authority.as_slice());
+    o += 32;
+    buf[o + 24..o + 32].copy_from_slice(&fields.attempt_nonce.to_be_bytes());
+    o += 32;
+    buf[o + 24..o + 32].copy_from_slice(&fields.expires_at.to_be_bytes());
+    o += 32;
+    buf[o..o + 32].copy_from_slice(&fields.recipient_commitment);
+    o += 32;
+    buf[o + 30..o + 32].copy_from_slice(&fields.schema_version.to_be_bytes());
+    o += 32;
+    debug_assert_eq!(o, buf.len(), "approve_struct_hash_v2 buffer drift");
+    keccak256(buf)
+}
+
+/// Compute the V2 EIP-712 `Approve` digest the V2 contract verifies.
+#[must_use]
+pub fn approve_digest_v2(
+    verifying_contract: Address,
+    chain_id: u64,
+    fields: &ApproveFieldsV2,
+) -> B256 {
+    let domain = build_domain_recovery(verifying_contract, chain_id);
+    let domain_sep = domain.separator();
+    let s_hash = approve_struct_hash_v2(fields);
+    eip712_digest(domain_sep, s_hash)
+}
+
+/// Sign a V2 `Approve` attestation with a guardian's `PrivateKeySigner`,
+/// returning a [`SignedApprovalV2`].
+///
+/// # Errors
+///
+/// [`ChainError::Wallet`] if the signer's internal `sign_hash_sync`
+/// returns an error.
+pub fn build_signed_approval_v2(
+    signer: &PrivateKeySigner,
+    fields: ApproveFieldsV2,
+    verifying_contract: Address,
+    chain_id: u64,
+) -> Result<SignedApprovalV2, ChainError> {
+    let digest = approve_digest_v2(verifying_contract, chain_id, &fields);
+    let sig = signer
+        .sign_hash_sync(&digest)
+        .map_err(|_e| ChainError::Wallet("alloy signer error signing V2 Approve digest"))?;
+    let canonical = sig.normalize_s().unwrap_or(sig);
+    let signature = canonical.as_bytes();
+
+    debug_assert!(
+        signature[64] == 27 || signature[64] == 28,
+        "v must be in {{27,28}} for EIP-712"
+    );
+    let mut s_be = [0u8; 32];
+    s_be.copy_from_slice(&signature[32..64]);
+    debug_assert!(is_canonical_s(&s_be), "s must be canonical-low (s <= n/2)");
+    let _ = s_be;
+
+    Ok(SignedApprovalV2 { fields, signature })
+}
+
+/// Recover the EVM address that signed a V2 `Approve` attestation.
+///
+/// # Errors
+///
+/// [`ChainError::SignerRecoveryFailed`] on high-s, bad `v`, or a
+/// curve-level malformed signature.
+pub fn recover_approver_v2(
+    approval: &SignedApprovalV2,
+    verifying_contract: Address,
+    chain_id: u64,
+) -> Result<Address, ChainError> {
+    let digest = approve_digest_v2(verifying_contract, chain_id, &approval.fields);
+
+    let mut s_be = [0u8; 32];
+    s_be.copy_from_slice(&approval.signature[32..64]);
+    if !is_canonical_s(&s_be) {
+        return Err(ChainError::SignerRecoveryFailed {
+            detail: "V2 Approve signature s component is non-canonical (high-s)".to_string(),
+        });
+    }
+    let v_byte = approval.signature[64];
+    if v_byte != 27 && v_byte != 28 {
+        return Err(ChainError::SignerRecoveryFailed {
+            detail: format!("V2 Approve signature v byte not in {{27,28}}: got {v_byte}"),
+        });
+    }
+
+    let r = U256::from_be_slice(&approval.signature[0..32]);
+    let s = U256::from_be_slice(&approval.signature[32..64]);
+    let y_parity = v_byte == 28;
+    let sig = alloy::primitives::Signature::new(r, s, y_parity);
+    sig.recover_address_from_prehash(&digest)
+        .map_err(|e| ChainError::SignerRecoveryFailed {
+            detail: format!("alloy recover_address_from_prehash failed: {e}"),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +590,93 @@ mod tests {
         let mut s_be = [0u8; 32];
         s_be.copy_from_slice(&approval.signature[32..64]);
         assert!(is_canonical_s(&s_be), "s must be canonical-low");
+    }
+
+    // -----------------------------------------------------------------
+    // V2 surface tests
+    // -----------------------------------------------------------------
+
+    fn sample_fields_v2() -> ApproveFieldsV2 {
+        ApproveFieldsV2 {
+            vault_id: [0x11; 32],
+            proposed_authority: Address::from([0x22; 20]),
+            attempt_nonce: 7,
+            expires_at: 1_900_000_000,
+            recipient_commitment: [0xC0; 32],
+            schema_version: 1,
+        }
+    }
+
+    /// L3: the pinned `APPROVE_TYPEHASH_V2` equals the keccak of the V2
+    /// literal string from `RecoveryV2.sol`'s `APPROVE_TYPEHASH`. Drift
+    /// in either the contract literal or the Rust pin fires here.
+    #[test]
+    fn approve_typehash_v2_matches_pinned_constant() {
+        let literal = "Approve(bytes32 vaultId,address proposedAuthority,uint64 attemptNonce,uint64 expiresAt,bytes32 recipientCommitment,uint16 schemaVersion)";
+        let computed = keccak256(literal.as_bytes());
+        assert_eq!(
+            computed.0, APPROVE_TYPEHASH_V2,
+            "V2 Approve typehash literal must keccak to the pinned constant"
+        );
+    }
+
+    /// The V1 and V2 typehashes are deliberately distinct (V2 added
+    /// `bytes32 recipientCommitment`). This pin closes any future
+    /// accidental same-hash collision.
+    #[test]
+    fn v1_and_v2_typehashes_are_distinct() {
+        assert_ne!(
+            APPROVE_TYPEHASH_V1, APPROVE_TYPEHASH_V2,
+            "V1 and V2 Approve typehashes must differ — anti-cross-version-replay"
+        );
+    }
+
+    /// L3: V2 sign + recover round-trip recovers the guardian's own
+    /// address.
+    #[test]
+    fn sign_recover_round_trip_v2() {
+        let signer = guardian_wallet(0x45);
+        let verifying = Address::from([0xAB; 20]);
+        let chain_id = 31_337;
+        let fields = sample_fields_v2();
+        let approval =
+            build_signed_approval_v2(&signer, fields, verifying, chain_id).expect("sign V2");
+        assert_eq!(approval.signature.len(), 65);
+        let recovered = recover_approver_v2(&approval, verifying, chain_id).expect("recover V2");
+        assert_eq!(
+            recovered,
+            signer.address(),
+            "V2 recovered approver must equal the guardian signer"
+        );
+    }
+
+    /// V2 digest changes if the commitment changes — concrete anti-redirect
+    /// pin: a sig over commitment A is NOT valid against an attempt
+    /// with stored commitment B.
+    #[test]
+    fn v2_digest_changes_with_commitment() {
+        let signer = guardian_wallet(0x46);
+        let verifying = Address::from([0xCD; 20]);
+        let chain_id = 31_337;
+        let mut f1 = sample_fields_v2();
+        f1.recipient_commitment = [0xAA; 32];
+        let mut f2 = sample_fields_v2();
+        f2.recipient_commitment = [0xBB; 32];
+        let d1 = approve_digest_v2(verifying, chain_id, &f1);
+        let d2 = approve_digest_v2(verifying, chain_id, &f2);
+        assert_ne!(d1, d2, "V2 digest must depend on recipient_commitment");
+        // And a sig over d1 recovered against the d2 digest's verifier
+        // recovers a DIFFERENT address (i.e. the on-chain check fails).
+        let a1 = build_signed_approval_v2(&signer, f1, verifying, chain_id).expect("sign f1");
+        let mismatched = SignedApprovalV2 {
+            fields: f2,
+            signature: a1.signature,
+        };
+        let recovered = recover_approver_v2(&mismatched, verifying, chain_id).expect("recover");
+        assert_ne!(
+            recovered,
+            signer.address(),
+            "a commitment mismatch must recover a different signer (anti-redirect binding holds)"
+        );
     }
 }

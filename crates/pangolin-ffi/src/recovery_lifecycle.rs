@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! **MVP-3 issue #108: the thin uniffi layer over the merged-and-audited
-//! `RecoveryV1` chain primitives.**
+//! **MVP-3 issue #108 (V1) → MVP-4-L L-0a-1 (V2 cut-over): the thin
+//! uniffi layer over the merged-and-audited `RecoveryV2` chain
+//! primitives.**
 //!
 //! Closes the remaining FFI gap so a host app can drive the full
-//! `RecoveryV1` lifecycle end-to-end:
+//! `RecoveryV2` lifecycle end-to-end:
 //!
 //! - [`vault_set_guardian_set`] — manager onboards the on-chain merkle
 //!   root over the M guardian EVM addresses + records the threshold.
@@ -76,9 +77,9 @@
 use std::sync::Arc;
 
 use pangolin_chain::{
-    approve_recovery_v1, build_guardian_root, build_live_approve_fields_v1, build_membership_proof,
-    build_signed_approval_v1, cancel_recovery_v1, finalize_recovery_v1, initiate_recovery_v1,
-    read_live_attempt_v1, read_vault_authority_v1, set_guardian_set_v1, Address, EvmWallet,
+    approve_recovery_v2, build_guardian_root, build_live_approve_fields_v2, build_membership_proof,
+    build_signed_approval_v2, cancel_recovery_v2, finalize_recovery_v2, initiate_recovery_v2,
+    read_live_attempt_v2, read_vault_authority_v2, set_guardian_set_v2, Address, EvmWallet,
 };
 use pangolin_core::EVM_ADDRESS_LEN;
 use pangolin_crypto::keys::VAULT_ID_LEN;
@@ -154,7 +155,7 @@ pub struct FfiVaultAuthority {
 }
 
 /// Non-secret read of the live recovery attempt slot
-/// (`RecoveryV1.recovery(vaultId)`).
+/// (`RecoveryV2.recovery(vaultId)`).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiRecoveryStatus {
     /// Lifecycle status mirroring the contract enum
@@ -166,13 +167,12 @@ pub struct FfiRecoveryStatus {
     /// Per-attempt scope; bumps on each `initiateRecovery`.
     pub attempt_nonce: u64,
     /// Unix timestamp the live attempt was opened
-    /// (`recovery.initiatedAt`). Always `0` in this v0 surface — the
-    /// chain-side `LiveAttemptV1` view does not yet expose it; the host
-    /// can re-derive it from the receipt block of the `initiate` tx if
-    /// it needs absolute time. Reserved for a future expansion of the
-    /// chain read primitive.
+    /// (`recovery.initiatedAt`). Surfaced from the V2 `LiveAttemptV2`
+    /// read (L-0a-1 G-3 fix); was hardcoded `0` under the V1 binding.
     pub initiated_at: u64,
-    /// Approval count accumulated on the live attempt.
+    /// Approval count accumulated on the live attempt. Surfaced from the
+    /// V2 `LiveAttemptV2` read (L-0a-1 G-3 fix); was hardcoded `0` under
+    /// the V1 binding.
     pub approval_count: u8,
     /// Schema-version slot.
     pub schema_version: u16,
@@ -208,7 +208,7 @@ fn require_active(vault: &pangolin_store::Vault) -> Result<(), FfiError> {
 
 /// **Active-gated.** Onboard the on-chain guardian merkle root + the
 /// `(threshold, guardian_count)` constants for the active vault, driving
-/// [`pangolin_chain::set_guardian_set_v1`].
+/// [`pangolin_chain::set_guardian_set_v2`].
 ///
 /// Engine wiring:
 /// 1. Length-validates each guardian EVM address (20 B).
@@ -279,7 +279,7 @@ pub fn vault_set_guardian_set(
             .await
             .map_err(chain_into_ffi)?;
         let wallet = EvmWallet::from_signer(signer);
-        let anchor = set_guardian_set_v1(
+        let anchor = set_guardian_set_v2(
             &wallet,
             vault_id,
             root,
@@ -301,7 +301,7 @@ pub fn vault_set_guardian_set(
 // ---------------------------------------------------------------------------
 
 /// **Active-gated.** Open the PENDING recovery attempt for `target_vault_id`,
-/// driving [`pangolin_chain::initiate_recovery_v1`].
+/// driving [`pangolin_chain::initiate_recovery_v2`].
 ///
 /// Per the plan: driven by the NEW (post-loss) device, which has a fresh
 /// vault unlocked under its own master password BEFORE initiating recovery
@@ -309,10 +309,16 @@ pub fn vault_set_guardian_set(
 /// signer; the contract is permissionless on the `initiate` step (the
 /// 72h cancelable delay + the guardian quorum are the security gate).
 ///
+/// **V2:** `recipient_commitment` (32 bytes) is the recovering device's
+/// per-attempt X25519 pubkey — the on-chain anti-redirect binding. L-0a-1
+/// requires the caller to supply it; L-0a-2 will introduce the
+/// engine-side ephemeral-key generator that fills it.
+///
 /// # Errors
 ///
 /// - [`FfiError::Validation`] (`kind = "argument"`) for a non-32-byte
-///   `target_vault_id` or non-20-byte `proposed_authority`.
+///   `target_vault_id`, non-20-byte `proposed_authority`, or non-32-byte
+///   `recipient_commitment`.
 /// - [`FfiError::Session`] for a placeholder / Locked vault.
 /// - [`FfiError::Chain`] for any chain-side failure (RPC, broadcast,
 ///   contract revert — e.g. `ErrRecoveryAlreadyPending`).
@@ -325,11 +331,12 @@ pub fn vault_initiate_recovery(
     config: FfiChainConfig,
     target_vault_id: Vec<u8>,
     proposed_authority: Vec<u8>,
+    recipient_commitment: Vec<u8>,
     expires_at_unix: u64,
 ) -> Result<FfiTxOutcome, FfiError> {
     // The `expires_at_unix` parameter is documented in the plan + on the
     // shared binding shape but is consumed only by `approve_recovery`'s
-    // EIP-712 signing path — `initiate_recovery_v1` itself does not take
+    // EIP-712 signing path — `initiate_recovery_v2` itself does not take
     // an expiry. Accepted here for surface uniformity with the rest of
     // the lifecycle FFI; the chain-side contract has no `expiresAt`
     // field on `initiateRecovery`.
@@ -342,6 +349,8 @@ pub fn vault_initiate_recovery(
     let proposed_authority_arr: [u8; EVM_ADDRESS_LEN] =
         fixed_bytes(&proposed_authority, "proposed_authority")?;
     let proposed_authority_addr = Address::from(proposed_authority_arr);
+    let recipient_commitment_arr: [u8; 32] =
+        fixed_bytes(&recipient_commitment, "recipient_commitment")?;
 
     let mut guard = handle.lock_vault();
     let vault = guard.as_mut()?;
@@ -353,10 +362,11 @@ pub fn vault_initiate_recovery(
             .await
             .map_err(chain_into_ffi)?;
         let wallet = EvmWallet::from_signer(signer);
-        let anchor = initiate_recovery_v1(
+        let anchor = initiate_recovery_v2(
             &wallet,
             vault_id_arr,
             proposed_authority_addr,
+            recipient_commitment_arr,
             env,
             &config.rpc_url,
         )
@@ -373,13 +383,13 @@ pub fn vault_initiate_recovery(
 // ---------------------------------------------------------------------------
 
 /// **Active-gated.** Record one guardian approval against the live
-/// PENDING attempt, driving [`pangolin_chain::approve_recovery_v1`].
+/// PENDING attempt, driving [`pangolin_chain::approve_recovery_v2`].
 ///
 /// The active vault is the GUARDIAN's vault — the engine pulls its
 /// secp256k1 signer (`Vault::evm_wallet`), computes the leaf for THIS
 /// signer and the merkle proof against the supplied `guardian_set`,
 /// reads the LIVE PENDING attempt via
-/// [`pangolin_chain::build_live_approve_fields_v1`] (L11 fail-closed:
+/// [`pangolin_chain::build_live_approve_fields_v2`] (L11 fail-closed:
 /// refuses to build a digest if the on-chain status is not PENDING),
 /// asserts the host-supplied `(attempt_nonce, proposed_authority)`
 /// match the live values (fail-closed `Chain` on mismatch so the host
@@ -389,7 +399,7 @@ pub fn vault_initiate_recovery(
 /// data). The contract enforces the merkle proof; if the active
 /// signer isn't actually a guardian under the set, the broadcast
 /// fails fast at the client-side pre-flight inside
-/// [`pangolin_chain::approve_recovery_v1`] (`ErrInvalidMerkleProof` mirror).
+/// [`pangolin_chain::approve_recovery_v2`] (`ErrInvalidMerkleProof` mirror).
 ///
 /// No `master_password` param — the approval is a guardian-DEVICE
 /// operation that doesn't re-wrap any local state. (Mirrors the
@@ -442,7 +452,7 @@ pub fn vault_approve_recovery(
     // builder returns `None` — surface as Chain class so the failure mode
     // matches the contract's `ErrInvalidMerkleProof` revert (which is the
     // class the broadcast would otherwise have hit). Note: building a
-    // proof and verifying it locally happens inside `approve_recovery_v1`
+    // proof and verifying it locally happens inside `approve_recovery_v2`
     // itself; here we only build it and pass it through.
     let proof =
         build_membership_proof(&guardians, guardian_addr).ok_or_else(|| FfiError::Chain {
@@ -456,11 +466,20 @@ pub fn vault_approve_recovery(
         let (env, chain_id) = crate::chain_config::ffi_chain_env_and_id(&config.rpc_url)
             .await
             .map_err(chain_into_ffi)?;
+        // L-0a-1 audit HIGH-1 fix: the EIP-712 digest binds the
+        // verifying contract's DOMAIN_SEPARATOR (chain id + ADDRESS). Both
+        // the digest build (`build_signed_approval_v2` below) and the
+        // broadcast (`approve_recovery_v2`, which calls `connect_v2`)
+        // MUST resolve the SAME contract address — i.e. the V2 deploy.
+        // Using `RECOVERY_CONTRACT_NAME` here (the V1 lookup) silently
+        // produces a digest under the V1 address while broadcasting to
+        // the V2 address, so the on-chain ecrecover recovers a different
+        // signer and every approval reverts `ErrInvalidSignature`.
         let contract =
-            pangolin_chain::load_deployed_address(env, pangolin_chain::RECOVERY_CONTRACT_NAME)
+            pangolin_chain::load_deployed_address(env, pangolin_chain::RECOVERY_V2_CONTRACT_NAME)
                 .map_err(chain_into_ffi)?;
 
-        // Read the LIVE PENDING attempt via `build_live_approve_fields_v1`
+        // Read the LIVE PENDING attempt via `build_live_approve_fields_v2`
         // (L11 fail-closed: refuses to build a digest if the on-chain
         // status is not PENDING). The host's `(attempt_nonce,
         // proposed_authority)` params are then asserted against the live
@@ -470,7 +489,7 @@ pub fn vault_approve_recovery(
         // `Chain` so the host can re-fetch + re-confirm instead of
         // signing a stale digest. Plan Q-a / "engine is source of truth".
         let live_fields =
-            build_live_approve_fields_v1(env, &config.rpc_url, vault_id_arr, expires_at_unix)
+            build_live_approve_fields_v2(env, &config.rpc_url, vault_id_arr, expires_at_unix)
                 .await
                 .map_err(chain_into_ffi)?;
         if live_fields.attempt_nonce != attempt_nonce
@@ -486,11 +505,11 @@ pub fn vault_approve_recovery(
                 ),
             });
         }
-        let signed_approval = build_signed_approval_v1(&signer, live_fields, contract, chain_id)
+        let signed_approval = build_signed_approval_v2(&signer, live_fields, contract, chain_id)
             .map_err(chain_into_ffi)?;
 
         let wallet = EvmWallet::from_signer(signer.clone());
-        let anchor = approve_recovery_v1(
+        let anchor = approve_recovery_v2(
             &wallet,
             guardian_addr,
             &proof,
@@ -511,7 +530,7 @@ pub fn vault_approve_recovery(
 // ---------------------------------------------------------------------------
 
 /// **Active-gated.** Abort the live PENDING attempt; driving
-/// [`pangolin_chain::cancel_recovery_v1`].
+/// [`pangolin_chain::cancel_recovery_v2`].
 ///
 /// The contract enforces `msg.sender == vaultAuthority`
 /// (`ErrNotAuthorizedToCancel` otherwise). The FFI does NOT pre-check
@@ -549,7 +568,7 @@ pub fn vault_cancel_recovery(
             .await
             .map_err(chain_into_ffi)?;
         let wallet = EvmWallet::from_signer(signer);
-        let anchor = cancel_recovery_v1(&wallet, vault_id_arr, env, &config.rpc_url)
+        let anchor = cancel_recovery_v2(&wallet, vault_id_arr, env, &config.rpc_url)
             .await
             .map_err(chain_into_ffi)?;
         Ok::<FfiTxOutcome, FfiError>(tx_outcome_from_anchor(anchor))
@@ -564,7 +583,7 @@ pub fn vault_cancel_recovery(
 
 /// **Loaded-only (NOT Active-gated).** Complete the lifecycle:
 /// PENDING → FINALIZED, rotating `vaultAuthority` to `proposedAuthority`.
-/// Drives [`pangolin_chain::finalize_recovery_v1`].
+/// Drives [`pangolin_chain::finalize_recovery_v2`].
 ///
 /// Per the plan (Q-c) the session gate relaxes here: any device with a
 /// configured RPC + the target `vault_id` may finalize after the 72h
@@ -618,7 +637,7 @@ pub fn vault_finalize_recovery(
             .await
             .map_err(chain_into_ffi)?;
         let wallet = EvmWallet::from_signer(signer);
-        let anchor = finalize_recovery_v1(&wallet, vault_id_arr, env, &config.rpc_url)
+        let anchor = finalize_recovery_v2(&wallet, vault_id_arr, env, &config.rpc_url)
             .await
             .map_err(chain_into_ffi)?;
         Ok::<FfiTxOutcome, FfiError>(tx_outcome_from_anchor(anchor))
@@ -632,7 +651,7 @@ pub fn vault_finalize_recovery(
 
 /// **Loaded-handle (placeholder-gated only).** Read the current on-chain
 /// `vaultAuthority(target_vault_id)`. Drives
-/// [`pangolin_chain::read_vault_authority_v1`].
+/// [`pangolin_chain::read_vault_authority_v2`].
 ///
 /// Fail-closed on chain-read errors per L3: any RPC / deployment failure
 /// returns [`FfiError::Chain`], never `Address::ZERO`.
@@ -662,7 +681,7 @@ pub fn vault_read_vault_authority(
         let (env, _chain_id) = crate::chain_config::ffi_chain_env_and_id(&config.rpc_url)
             .await
             .map_err(chain_into_ffi)?;
-        read_vault_authority_v1(env, &config.rpc_url, vault_id_arr)
+        read_vault_authority_v2(env, &config.rpc_url, vault_id_arr)
             .await
             .map_err(chain_into_ffi)
     })??;
@@ -678,17 +697,15 @@ pub fn vault_read_vault_authority(
 
 /// **Loaded-handle (placeholder-gated only).** Read the live recovery
 /// attempt slot for `target_vault_id`. Drives
-/// [`pangolin_chain::read_live_attempt_v1`].
+/// [`pangolin_chain::read_live_attempt_v2`].
 ///
 /// Fail-closed on chain-read errors per L3.
 ///
-/// Note: the chain-side `LiveAttemptV1` view does not (yet) expose
-/// `initiatedAt` or `approvals`; these surface as `0` here. The
-/// `RecoveryV1.recovery()` view returns them, so a future chain-side
-/// expansion is mechanical; for #108 the binding surfaces what the
-/// existing client primitive returns and pins the FFI record shape
-/// against the eventual expansion via `schema_version`. (Flagged below
-/// in #108's surrounding-code notes.)
+/// **G-3 (L-0a-1): RESOLVED.** Both `initiated_at` and `approval_count`
+/// are now surfaced from the V2 `LiveAttemptV2` read; the chain-side
+/// `recovery()` view always returned them, but the V1 binding's
+/// `LiveAttemptV1` dropped them — the V2 binding picks them up alongside
+/// the new `recipient_commitment`.
 ///
 /// # Errors
 ///
@@ -713,7 +730,7 @@ pub fn vault_read_recovery_status(
         let (env, _chain_id) = crate::chain_config::ffi_chain_env_and_id(&config.rpc_url)
             .await
             .map_err(chain_into_ffi)?;
-        read_live_attempt_v1(env, &config.rpc_url, vault_id_arr)
+        read_live_attempt_v2(env, &config.rpc_url, vault_id_arr)
             .await
             .map_err(chain_into_ffi)
     })??;
@@ -721,8 +738,12 @@ pub fn vault_read_recovery_status(
         status: live.status,
         proposed_authority: live.proposed_authority.into_array().to_vec(),
         attempt_nonce: live.attempt_nonce,
-        initiated_at: 0,
-        approval_count: 0,
+        // G-3 fix (L-0a-1): both values are already on-chain (stored in
+        // `Recovery.initiatedAt` / `Recovery.approvals`); LiveAttemptV2's
+        // read surfaces them. The previous `0` hardcodes here were the
+        // standing FFI stub the plan called out.
+        initiated_at: live.initiated_at,
+        approval_count: live.approvals,
         schema_version: RECOVERY_LIFECYCLE_FFI_SCHEMA_VERSION,
     })
 }
@@ -833,6 +854,7 @@ mod tests {
             bogus_config(),
             vec![0u8; 31],
             good_addr(),
+            vec![0xAB; 32],
             0,
         )
         .unwrap_err();
@@ -850,6 +872,25 @@ mod tests {
             bogus_config(),
             good_vault_id(),
             vec![0u8; 19],
+            vec![0xAB; 32],
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, FfiError::Validation { ref kind, .. } if kind == "argument"));
+    }
+
+    /// V2 (L-0a-1) `initiate_recovery`: bad recipient_commitment length.
+    #[test]
+    fn initiate_recovery_rejects_bad_recipient_commitment_length() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let h = unlocked_handle(&dir, "v.pvf");
+        let err = vault_initiate_recovery(
+            h,
+            SecretPassword::new(pwd_bytes()),
+            bogus_config(),
+            good_vault_id(),
+            good_addr(),
+            vec![0xAB; 31],
             0,
         )
         .unwrap_err();
@@ -1023,6 +1064,7 @@ mod tests {
             bogus_config(),
             good_vault_id(),
             good_addr(),
+            vec![0xAB; 32],
             0,
         )
         .unwrap_err();
@@ -1039,6 +1081,7 @@ mod tests {
             bogus_config(),
             good_vault_id(),
             good_addr(),
+            vec![0xAB; 32],
             0,
         )
         .unwrap_err();
@@ -1219,6 +1262,7 @@ mod tests {
             bogus_config(),
             good_vault_id(),
             good_addr(),
+            vec![0xAB; 32],
             0,
         )
         .unwrap_err();
