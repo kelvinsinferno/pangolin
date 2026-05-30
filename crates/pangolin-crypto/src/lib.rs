@@ -20,6 +20,14 @@ pub mod keys;
 pub mod pairing;
 pub mod rng;
 pub mod secret;
+/// **MVP-4-L L-0a-2 (G-1 off-chain).** Recovery opened-share TRANSPORT
+/// primitive: re-seal a guardian's opened Shamir piece to the recovering
+/// user's ephemeral X25519 pubkey, bound to the recovery-attempt context
+/// (vault_id + attempt_nonce + recoverer_pub + share_identifier).
+/// Structurally identical to [`pairing::seal_vdk_to_device`] /
+/// [`escrow::seal_share`] — same `crypto_box` sealed-box primitive,
+/// different recipient role, different payload, new domain string.
+pub mod share_transport;
 pub mod sign;
 
 /// Returns the crate name. Useful for diagnostics and version reporting.
