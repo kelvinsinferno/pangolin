@@ -180,7 +180,8 @@ pub use recovery_signing::{
     approve_digest, approve_digest_v2, approve_struct_hash, approve_struct_hash_v2,
     build_domain_recovery, build_signed_approval_v1, build_signed_approval_v2, recover_approver_v1,
     recover_approver_v2, ApproveFieldsV1, ApproveFieldsV2, SignedApprovalV1, SignedApprovalV2,
-    APPROVE_TYPEHASH_V1, APPROVE_TYPEHASH_V2, RECOVERY_DOMAIN_SEPARATOR_ANVIL_DEV_V1,
+    APPROVE_TYPEHASH_V1, APPROVE_TYPEHASH_V2, EXPECTED_RECOVERY_V2_ADDRESS_BASE_SEPOLIA,
+    RECOVERY_DOMAIN_SEPARATOR_ANVIL_DEV_V1, RECOVERY_DOMAIN_SEPARATOR_BASE_SEPOLIA_V2,
 };
 pub use revisionlog_v2_client::{
     add_device_v2, bootstrap_vault_v2, cancel_promotion_v2, decode_device_mgmt_events,
