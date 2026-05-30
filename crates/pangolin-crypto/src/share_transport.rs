@@ -73,7 +73,30 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::escrow::{Share, SHARE_ENCODED_LEN, X25519_KEY_LEN};
 use crate::keys::VAULT_ID_LEN;
-use crate::rng::os_rng;
+use crate::rng::{fill_random, os_rng};
+
+/// Generate a fresh per-recovery-attempt ephemeral X25519 keypair for the
+/// recovering device.
+///
+/// Returns `(secret_bytes, public_bytes)`. The SECRET MUST be persisted
+/// sealed-at-rest under the recovering vault's VDK for the attempt's
+/// duration (spans the on-chain 72h delay) and zeroized on finalize /
+/// cancel — see `pangolin_store::recovery_recipient`. The PUBLIC is the
+/// `recipientCommitment` committed on-chain at `initiate` time.
+///
+/// X25519 secrets are 32 random bytes; clamping happens internally at
+/// scalar-multiplication time (`crypto_box`, per RFC 7748 §5). The
+/// implementation mirrors `pairing::derive_x25519_pairing_key`'s raw-bytes
+/// path — generate-then-wrap — except the bytes come from the CSPRNG
+/// instead of an HKDF expansion.
+#[must_use]
+pub fn generate_recoverer_keypair() -> ([u8; X25519_KEY_LEN], [u8; X25519_KEY_LEN]) {
+    let mut secret = [0u8; X25519_KEY_LEN];
+    fill_random(&mut secret);
+    let sk = crypto_box::SecretKey::from_bytes(secret);
+    let public = *sk.public_key().as_bytes();
+    (secret, public)
+}
 
 /// Domain-separator prefix for the recovery share-transport sealed box.
 ///
