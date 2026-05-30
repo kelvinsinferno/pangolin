@@ -603,9 +603,7 @@ contract RecoveryV2Test is Test {
         uint64 exp = 12345;
         bytes32 viaView = rec.hashApprove(VAULT, NEW_AUTH, 7, exp, COMMITMENT, 1);
         bytes32 structHash = keccak256(
-            abi.encode(
-                APPROVE_TYPEHASH_V2, VAULT, NEW_AUTH, uint64(7), exp, COMMITMENT, uint16(1)
-            )
+            abi.encode(APPROVE_TYPEHASH_V2, VAULT, NEW_AUTH, uint64(7), exp, COMMITMENT, uint16(1))
         );
         bytes32 viaLocal =
             keccak256(abi.encodePacked(hex"1901", rec.DOMAIN_SEPARATOR(), structHash));
