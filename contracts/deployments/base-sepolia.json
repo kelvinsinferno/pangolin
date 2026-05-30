@@ -342,11 +342,11 @@
         "captured_at": "2026-05-30T18:42Z",
         "comment": "Pinned at source in crates/pangolin-chain/src/recovery_signing.rs as RECOVERY_DOMAIN_SEPARATOR_BASE_SEPOLIA_V2. The recovery_v2_domain_separator_matches_pinned_base_sepolia_value hermetic test catches drift at CI time; the cross-check tests in crates/pangolin-chain/tests/deployment_json_pins_match_rust_constants.rs catch JSON↔Rust drift."
       },
-      "verified_on_explorer": false,
+      "verified_on_explorer": true,
       "verification": {
-        "status": "deferred",
-        "manual_command": "forge verify-contract --show-standard-json-input 0xf0E08fd009d8a33ba844610dAdD90450C1C206CA src/RecoveryV2.sol:RecoveryV2 > recoveryv2-stdjson.json (then upload via Basescan web UI per env-quirk #4)",
-        "comment": "Etherscan V2 auto-verify is broken on forge 1.0.0-stable (the wrapper strips chainid query param); standard-JSON-input + web UI is the documented workaround. Verification just makes the source viewable on Basescan; the deployed contract works regardless. Same path as RevisionLogV1 / D-018."
+        "status": "verified",
+        "method": "Basescan Standard-JSON-Input upload (manual, via web UI) on 2026-05-30",
+        "comment": "Bytecode + ABI matched on first upload. Same env-quirk #4 manual path as RevisionLogV1 / D-018 (forge 1.0.0-stable's auto-verify is broken against the Etherscan V2 endpoint; standard-JSON-input + Basescan web UI is the documented workaround). Generated via `forge verify-contract --show-standard-json-input 0xf0E08fd009d8a33ba844610dAdD90450C1C206CA src/RecoveryV2.sol:RecoveryV2 > recoveryv2-stdjson.json`."
       },
       "smoke_tests": {
         "test_1_max_known_schema_version": {
