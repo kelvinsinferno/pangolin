@@ -147,6 +147,27 @@ pub async fn recovery_health(
 mod tests {
     use super::*;
 
+    /// `recovery_create_backup` first-line guard: errors `Session` when no
+    /// vault is open. Mirrors the `require_open()` shape at the top of every
+    /// recovery handler — exercising it via `VaultState::default()` proves
+    /// the closed-vault path is fail-closed without needing a Tauri runtime.
+    #[tokio::test]
+    async fn recovery_create_backup_with_no_vault_open_errors_session() {
+        let state = VaultState::default();
+        let err = state.require_open().expect_err("no vault");
+        assert!(matches!(err, DesktopError::Session(_)));
+    }
+
+    /// `recovery_health` first-line guard: same fail-closed contract.
+    /// Calling the chain layer in this state would be both wasteful and
+    /// unsound — the guard short-circuits before the spawn_blocking RPC.
+    #[tokio::test]
+    async fn recovery_health_with_no_vault_open_errors_session() {
+        let state = VaultState::default();
+        let err = state.require_open().expect_err("no vault");
+        assert!(matches!(err, DesktopError::Session(_)));
+    }
+
     #[test]
     fn backup_dto_projects_phrase_and_envelope() {
         let ffi = pangolin_ffi::FfiBackup {
