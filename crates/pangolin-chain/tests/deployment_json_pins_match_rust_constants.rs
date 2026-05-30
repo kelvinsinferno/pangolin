@@ -19,6 +19,7 @@
 use pangolin_chain::{
     d017_deploy_block, ChainEnv, ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1,
     EXPECTED_DEPLOYED_ADDRESS_BASE_SEPOLIA, EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA,
+    EXPECTED_RECOVERY_V2_ADDRESS_BASE_SEPOLIA, RECOVERY_DOMAIN_SEPARATOR_BASE_SEPOLIA_V2,
 };
 use std::path::PathBuf;
 
@@ -102,6 +103,39 @@ fn rust_entitlement_domain_separator_matches_json() {
         json_sep.to_lowercase(),
         "ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1 must match \
          contracts.EntitlementRegistry.domain_separator.value in the deployment JSON"
+    );
+}
+
+#[test]
+fn rust_recovery_v2_address_matches_json() {
+    let json = load_json();
+    let json_addr = json["contracts"]["RecoveryV2"]["address"]
+        .as_str()
+        .expect("RecoveryV2.address is a string");
+    let rust_addr = format!("{EXPECTED_RECOVERY_V2_ADDRESS_BASE_SEPOLIA:?}");
+    assert_eq!(
+        rust_addr.to_lowercase(),
+        json_addr.to_lowercase(),
+        "EXPECTED_RECOVERY_V2_ADDRESS_BASE_SEPOLIA must match \
+         contracts.RecoveryV2.address in the deployment JSON"
+    );
+}
+
+#[test]
+fn rust_recovery_v2_domain_separator_matches_json() {
+    let json = load_json();
+    let json_sep = json["contracts"]["RecoveryV2"]["domain_separator"]["value"]
+        .as_str()
+        .expect("RecoveryV2.domain_separator.value is a string");
+    let rust_sep = format!(
+        "0x{}",
+        hex_encode(&RECOVERY_DOMAIN_SEPARATOR_BASE_SEPOLIA_V2)
+    );
+    assert_eq!(
+        rust_sep.to_lowercase(),
+        json_sep.to_lowercase(),
+        "RECOVERY_DOMAIN_SEPARATOR_BASE_SEPOLIA_V2 must match \
+         contracts.RecoveryV2.domain_separator.value in the deployment JSON"
     );
 }
 

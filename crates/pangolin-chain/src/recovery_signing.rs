@@ -100,6 +100,32 @@ pub const APPROVE_TYPEHASH_V1: [u8; 32] =
 pub const RECOVERY_DOMAIN_SEPARATOR_ANVIL_DEV_V1: [u8; 32] =
     alloy::primitives::hex!("aeeea61ac426f08c0b36279db1b9eb67f2dca8673099fe0fcaf9754bb6e71f78");
 
+/// Pinned EIP-712 domain separator for the `RecoveryV2` contract on Base
+/// Sepolia (MVP-4-L L-0a-1 deploy; D-NNN in DECISIONS pending).
+///
+/// Captured via `cast call 0xf0E08fd009d8a33ba844610dAdD90450C1C206CA
+/// "DOMAIN_SEPARATOR()(bytes32)" --rpc-url https://sepolia.base.org` at
+/// 2026-05-30T18:42Z. Cross-checked against
+/// `contracts/deployments/base-sepolia.json` by the hermetic test
+/// `rust_recovery_v2_domain_separator_matches_json`; reconstructed via the
+/// alloy `eip712_domain!` macro by
+/// [`tests::recovery_v2_domain_separator_matches_pinned_base_sepolia_value`]
+/// so a drift in either the literal or the JSON or the live contract fires
+/// loudly in CI before merge.
+pub const RECOVERY_DOMAIN_SEPARATOR_BASE_SEPOLIA_V2: [u8; 32] =
+    alloy::primitives::hex!("e6f9f29b0aa9de091dfdefb3768bd18598bfd7cf5171fe9b2bc324056eaf542b");
+
+/// Pinned `RecoveryV2` contract address on Base Sepolia.
+///
+/// Cross-checked against `contracts/deployments/base-sepolia.json` by the
+/// hermetic test `rust_recovery_v2_address_matches_json`. A future drift
+/// (either an out-of-band redeploy or a constant rot) fires at PR review
+/// time, not on a fresh-vault first sync — the issue #98 L-rotted-constant
+/// posture extended to recovery.
+pub const EXPECTED_RECOVERY_V2_ADDRESS_BASE_SEPOLIA: Address = Address::new(
+    alloy::primitives::hex!("f0E08fd009d8a33ba844610dAdD90450C1C206CA"),
+);
+
 /// EIP-712 domain string for the contract `name` field (L3 verbatim,
 /// `RecoveryV1.sol:393`).
 const DOMAIN_NAME: &str = "Pangolin Recovery";
@@ -524,8 +550,7 @@ mod tests {
     /// `eip712_domain!` for the anvil first-deploy address + chainId
     /// 31337 matches the pinned anvil-dev constant. This is the
     /// hermetic half of the domain-separator pin; the anvil lifecycle
-    /// round-trip is the end-to-end half. (TODO: a `BaseSepolia` capture
-    /// once `RecoveryV1` is deployed there — see the constant docs.)
+    /// round-trip is the end-to-end half.
     #[test]
     fn recovery_domain_separator_matches_pinned_anvil_value() {
         let anvil_addr: Address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
@@ -536,6 +561,23 @@ mod tests {
         assert_eq!(
             sep.0, RECOVERY_DOMAIN_SEPARATOR_ANVIL_DEV_V1,
             "alloy-constructed recovery domain separator must equal pinned anvil-dev value"
+        );
+    }
+
+    /// L3 `BaseSepolia` capture (L-0a-1 deploy): the recovery domain
+    /// separator constructed via `eip712_domain!` for the deployed
+    /// `RecoveryV2` address + Base Sepolia chain id 84532 matches the
+    /// pinned constant. The hermetic half of the `BaseSepolia` separator
+    /// pin; the live-contract `cast call` (recorded in the deployment
+    /// JSON) is the on-chain half — both must agree byte-for-byte.
+    #[test]
+    fn recovery_v2_domain_separator_matches_pinned_base_sepolia_value() {
+        let domain = build_domain_recovery(EXPECTED_RECOVERY_V2_ADDRESS_BASE_SEPOLIA, 84_532);
+        let sep = domain.separator();
+        assert_eq!(
+            sep.0, RECOVERY_DOMAIN_SEPARATOR_BASE_SEPOLIA_V2,
+            "alloy-constructed RecoveryV2 domain separator must equal pinned Base Sepolia value \
+             (chain_id 84532 + contract 0xf0E08fd009d8a33ba844610dAdD90450C1C206CA)"
         );
     }
 

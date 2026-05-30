@@ -315,6 +315,62 @@
         "Per-user paid-balance ledger contract — funder-push split-signer (payment + redemption authorities) with strict-equality nonce + per-credit expiresAt. Same chain as RevisionLogV1 per D-008.",
         "Production-grade split-key separation closes the D-018 smoke-test posture per 3.4 R-d; pangolin-chain constants (EXPECTED_ENTITLEMENT_REGISTRY_ADDRESS_BASE_SEPOLIA + ENTITLEMENT_DOMAIN_SEPARATOR_BASE_SEPOLIA_V1) updated in the same commit that records this entry."
       ]
+    },
+    "RecoveryV2": {
+      "address": "0xf0E08fd009d8a33ba844610dAdD90450C1C206CA",
+      "deployer": "0x89e720238A3913688CB0E025ef03a64539575c54",
+      "deploy_tx": "0xf78add6989daef7d92dbf4089bd744978d014e5a9b33fc997268b03ea7d22cc0",
+      "deploy_block": 42199029,
+      "deploy_timestamp_unix": 1780166346,
+      "deploy_timestamp_iso": "2026-05-30T18:39:06Z",
+      "gas_used": 1248156,
+      "gas_price_gwei": 0.006,
+      "deploy_cost_eth": 0.000007488936,
+      "compiler": {
+        "name": "solc",
+        "version": "0.8.24",
+        "evm_version": "shanghai",
+        "optimizer": true,
+        "optimizer_runs": 200,
+        "bytecode_hash": "none"
+      },
+      "abi": "../abi/RecoveryV2.json",
+      "source": "../src/RecoveryV2.sol",
+      "domain_separator": {
+        "value": "0xe6f9f29b0aa9de091dfdefb3768bd18598bfd7cf5171fe9b2bc324056eaf542b",
+        "captured_via": "cast call 0xf0E08fd009d8a33ba844610dAdD90450C1C206CA \"DOMAIN_SEPARATOR()(bytes32)\" --rpc-url https://sepolia.base.org",
+        "captured_at": "2026-05-30T18:42Z",
+        "comment": "Pinned at source in crates/pangolin-chain/src/recovery_signing.rs as RECOVERY_DOMAIN_SEPARATOR_BASE_SEPOLIA_V2. The recovery_v2_domain_separator_matches_pinned_base_sepolia_value hermetic test catches drift at CI time; the cross-check tests in crates/pangolin-chain/tests/deployment_json_pins_match_rust_constants.rs catch JSON↔Rust drift."
+      },
+      "verified_on_explorer": false,
+      "verification": {
+        "status": "deferred",
+        "manual_command": "forge verify-contract --show-standard-json-input 0xf0E08fd009d8a33ba844610dAdD90450C1C206CA src/RecoveryV2.sol:RecoveryV2 > recoveryv2-stdjson.json (then upload via Basescan web UI per env-quirk #4)",
+        "comment": "Etherscan V2 auto-verify is broken on forge 1.0.0-stable (the wrapper strips chainid query param); standard-JSON-input + web UI is the documented workaround. Verification just makes the source viewable on Basescan; the deployed contract works regardless. Same path as RevisionLogV1 / D-018."
+      },
+      "smoke_tests": {
+        "test_1_max_known_schema_version": {
+          "command": "cast call 0xf0E08fd009d8a33ba844610dAdD90450C1C206CA \"MAX_KNOWN_SCHEMA_VERSION()(uint16)\" --rpc-url https://sepolia.base.org",
+          "expected": 1,
+          "comment": "Confirms the deployed bytecode exposes the V2 MAX_KNOWN_SCHEMA_VERSION getter at its expected value. Manual at-leisure; not blocking."
+        },
+        "test_2_domain_separator": {
+          "command": "cast call 0xf0E08fd009d8a33ba844610dAdD90450C1C206CA \"DOMAIN_SEPARATOR()(bytes32)\" --rpc-url https://sepolia.base.org",
+          "expected": "0xe6f9f29b0aa9de091dfdefb3768bd18598bfd7cf5171fe9b2bc324056eaf542b",
+          "passed": true,
+          "passed_at": "2026-05-30T18:42Z"
+        }
+      },
+      "explorer_links": {
+        "contract": "https://sepolia.basescan.org/address/0xf0E08fd009d8a33ba844610dAdD90450C1C206CA",
+        "deploy_tx": "https://sepolia.basescan.org/tx/0xf78add6989daef7d92dbf4089bd744978d014e5a9b33fc997268b03ea7d22cc0"
+      },
+      "notes": [
+        "MVP-4-L L-0a-1 — the FIRST recovery contract deploy to Base Sepolia. RecoveryV1 was anvil-only by design (hard-immutable, no proxy, no admin per its own §29-31 cardinal rules), so V2 is a fresh deploy at a new address rather than an upgrade.",
+        "Adds `bytes32 recipientCommitment` to the on-chain recovery attempt (Decision B from docs/issue-plans/mvp4-l-share-transport-design.md — the strongest available anti-redirect binding). The guardian's on-chain Approve EIP-712 signs over the commitment so a guardian client refuses to release a share off-chain to any key not matching the chain. New Approve typehash differs from V1's, closing cross-version replay by typehash mismatch.",
+        "Constructor takes no arguments (consistent with the no-admin / no-configurable-surface cardinal rule). Deploy initcode is exactly the contract creation code.",
+        "Recovery is TESTNET-ONLY until D-011 (external audit). No mainnet deploy until then. RecoveryV2 joins the not-yet-started D-011 contract audit scope; nothing previously audited was modified."
+      ]
     }
   }
 }
