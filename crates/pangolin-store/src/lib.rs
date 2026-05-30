@@ -47,6 +47,12 @@ pub mod publish;
 pub mod pull;
 pub mod recovery_backup;
 pub mod recovery_escrow;
+/// **MVP-4-L L-0a-2.2.** Recovery-recipient ephemeral X25519 keypair
+/// persistence (recovering-device side). Single-row-per-target-vault table
+/// with VDK-AEAD-encrypted secret + non-secret pubkey/nonce/created_at.
+/// Cleared atomically on finalize / cancel so the secret never lingers
+/// past attempt closure (Decision A: ephemeral per-attempt).
+pub mod recovery_recipient;
 pub mod revision;
 pub mod session;
 pub mod sync_status;

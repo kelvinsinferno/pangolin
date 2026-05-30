@@ -388,6 +388,28 @@ CREATE TABLE IF NOT EXISTS recovery_guardians (
     schema_version      INTEGER NOT NULL
 );
 
+-- MVP-4-L L-0a-2.2: per-target-vault ephemeral RECIPIENT X25519 keypair for
+-- an active recovery attempt on the RECOVERING device. The pubkey is the
+-- on-chain `recipientCommitment` (RecoveryV2); the secret is sealed-at-rest
+-- under the recovering vault's VDK column-AEAD with the AAD binding
+-- (domain || target_vault_id || attempt_nonce), so an at-rest attacker
+-- without the VDK cannot read it (the locked share-transport design
+-- Decision A — ephemeral per-attempt key). One row per target_vault_id
+-- (the on-chain contract enforces one-active-attempt-per-vault); the row
+-- is DELETEd by `vault_finalize_recovery` / `vault_cancel_recovery` to
+-- zeroize+purge the secret. Additive `CREATE TABLE IF NOT EXISTS` (no
+-- format_version bump); legacy vaults pick it up on next open via
+-- migrate_recovery_recipient_table.
+CREATE TABLE IF NOT EXISTS recovery_recipient (
+    target_vault_id  BLOB    PRIMARY KEY NOT NULL,
+    attempt_nonce    INTEGER NOT NULL,
+    x25519_pub       BLOB    NOT NULL,
+    enc_secret       BLOB    NOT NULL,
+    enc_nonce        BLOB    NOT NULL,
+    created_at_unix  INTEGER NOT NULL,
+    schema_version   INTEGER NOT NULL
+);
+
 -- MVP-3 issue #106b-2: single-row VDK-chain pointer. current_epoch is
 -- the shared monotonic per-vault epoch (Q-f) whose VDK encrypts NEW
 -- writes; it lives in meta.wrapped_ct (the password anchor) + the
@@ -598,6 +620,13 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     // onboarded guardians simply has the tables present-but-empty, which
     // `recovery_escrow::read_recovery_escrow` reads back as `None`.
     migrate_recovery_escrow_tables(conn)?;
+    // MVP-4-L L-0a-2.2 migration: the additive `recovery_recipient` table
+    // (single-row-per-target-vault ephemeral X25519 keypair for an active
+    // recovery attempt on the RECOVERING device). Belt + suspenders for
+    // legacy `.pvf` files whose `apply_pragmas_and_schema` ran under an
+    // older DDL. Additive; no `format_version` bump. Empty table on a
+    // vault with no active recovery attempt.
+    migrate_recovery_recipient_table(conn)?;
 
     // MVP-3 issue #106b-2 migrations: the additive `vdk_chain_state` +
     // `vdk_chain` tables (the epoch-keyed retained-VDK chain) and the
@@ -678,6 +707,26 @@ fn migrate_rotation_pending_table(conn: &Connection) -> Result<()> {
             observed_at     INTEGER NOT NULL,
             resolved        INTEGER NOT NULL DEFAULT 0,
             schema_version  INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// **MVP-4-L L-0a-2.2 migration.** Ensure the `recovery_recipient` table
+/// exists on legacy vaults. Idempotent — `CREATE TABLE IF NOT EXISTS`
+/// directly. Same belt + suspenders pattern as
+/// [`migrate_recovery_escrow_tables`].
+fn migrate_recovery_recipient_table(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS recovery_recipient (
+            target_vault_id  BLOB    PRIMARY KEY NOT NULL,
+            attempt_nonce    INTEGER NOT NULL,
+            x25519_pub       BLOB    NOT NULL,
+            enc_secret       BLOB    NOT NULL,
+            enc_nonce        BLOB    NOT NULL,
+            created_at_unix  INTEGER NOT NULL,
+            schema_version   INTEGER NOT NULL
         )",
         [],
     )?;
