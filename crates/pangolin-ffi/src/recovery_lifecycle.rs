@@ -357,7 +357,16 @@ pub fn vault_initiate_recovery(
     // sealed-at-rest AFTER broadcast (Decision A, ephemeral per attempt)
     // so the persistence carries the actual `attempt_nonce` the contract
     // assigned. If the post-broadcast persistence fails, the on-chain
-    // attempt is unrecoverable from this device and must be canceled.
+    // attempt is ORPHANED from this device: this device cannot ingest
+    // share blobs (the secret is gone), and it cannot cancel either
+    // (RecoveryV2.cancelRecovery is `msg.sender == vaultAuthority`-only
+    // and the recovering device is precisely NOT the current authority
+    // — that's why it's recovering). The attempt must reach a terminal
+    // state (cancel by the original authority, OR permissionless
+    // finalize after 72h+threshold) before a fresh re-initiate is
+    // possible. The cleartext secret bytes are wrapped in `Zeroizing`
+    // (next line) so any panic/early-return wipes them — no L1 leak
+    // window even on the orphan path.
     let (secret_bytes_raw, public_bytes) =
         pangolin_crypto::share_transport::generate_recoverer_keypair();
     // Wrap the secret in Zeroizing so any panic/early-return wipes it.

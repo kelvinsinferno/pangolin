@@ -506,8 +506,14 @@ pub struct FfiRecipientIdentity {
 /// — surface it for the L2 SAS / QR human check (the guardian's UX shows
 /// the same bytes; the user eyeballs them).
 ///
-/// Returns [`FfiError::Validation`] (`kind = "argument"`) with a "no active
-/// attempt" message if no row exists for `target_vault_id`.
+/// Returns [`FfiError::Validation`] (`kind = "argument"`) if no LOCAL row
+/// exists for `target_vault_id`. **NOTE:** local absence does NOT mean
+/// no on-chain attempt — the post-broadcast persist-failure orphan path
+/// in `vault_initiate_recovery` (see its doc) can leave an on-chain
+/// PENDING attempt with no matching local secret. The host should
+/// cross-check via `vault_read_recovery_status` to distinguish "never
+/// initiated" from "initiated but secret lost" / "initiated by a
+/// different device."
 ///
 /// Loaded-only (any non-placeholder handle — no VDK required for this
 /// read; the secret is NOT decrypted here).
@@ -603,6 +609,24 @@ pub fn vault_guardian_release_share(
     let epoch_arr: [u8; EPOCH_LEN] = fixed_bytes(&epoch, "epoch")?;
     let recipient_commitment_arr: [u8; 32] =
         fixed_bytes(&recipient_commitment, "recipient_commitment")?;
+
+    // Phase 0: assert Active BEFORE the chain RPC (L-0a-2.2 audit LOW-1).
+    // Without this hoist, a Locked-vault caller would issue a view-call
+    // exposing the target vault_id to the configured RPC node before
+    // failing closed at the share-open. The inner
+    // `guardian_open_sealed_share` re-asserts Active (so the open is still
+    // gated end-to-end), but doing the check up front avoids the metadata
+    // leak. Mirror of `recovery_lifecycle.rs`'s pre-RPC gate pattern.
+    {
+        let mut g = handle.lock_vault();
+        let v = g.as_mut()?;
+        if v.state() != pangolin_store::VaultState::Active {
+            return Err(FfiError::Session {
+                message: "vault is not unlocked".to_owned(),
+            });
+        }
+        drop(g);
+    }
 
     // Phase 1: on-chain commitment verification (BEFORE opening the
     // cleartext piece). This is the load-bearing Decision B gate; if the
