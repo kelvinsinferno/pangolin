@@ -168,15 +168,19 @@ pub use chain_sync::{
     WS_RECONNECT_MAX_BACKOFF_MS,
 };
 pub use recovery_client::{
-    approve_recovery_v1, build_guardian_root, build_live_approve_fields_v1, build_membership_proof,
-    cancel_recovery_v1, finalize_recovery_v1, guardian_leaf, initiate_recovery_v1,
-    read_live_attempt_v1, read_vault_authority_v1, set_guardian_set_v1, verify_membership_proof,
-    LiveAttemptV1, RecoveryAnchorV1, RECOVERY_CONTRACT_NAME, RECOVERY_SCHEMA_VERSION_V1,
+    approve_recovery_v1, approve_recovery_v2, build_guardian_root, build_live_approve_fields_v1,
+    build_live_approve_fields_v2, build_membership_proof, cancel_recovery_v1, cancel_recovery_v2,
+    finalize_recovery_v1, finalize_recovery_v2, guardian_leaf, initiate_recovery_v1,
+    initiate_recovery_v2, read_live_attempt_v1, read_live_attempt_v2, read_vault_authority_v1,
+    read_vault_authority_v2, set_guardian_set_v1, set_guardian_set_v2, verify_membership_proof,
+    LiveAttemptV1, LiveAttemptV2, RecoveryAnchorV1, RECOVERY_CONTRACT_NAME,
+    RECOVERY_SCHEMA_VERSION_V1, RECOVERY_SCHEMA_VERSION_V2, RECOVERY_V2_CONTRACT_NAME,
 };
 pub use recovery_signing::{
-    approve_digest, approve_struct_hash, build_domain_recovery, build_signed_approval_v1,
-    recover_approver_v1, ApproveFieldsV1, SignedApprovalV1, APPROVE_TYPEHASH_V1,
-    RECOVERY_DOMAIN_SEPARATOR_ANVIL_DEV_V1,
+    approve_digest, approve_digest_v2, approve_struct_hash, approve_struct_hash_v2,
+    build_domain_recovery, build_signed_approval_v1, build_signed_approval_v2, recover_approver_v1,
+    recover_approver_v2, ApproveFieldsV1, ApproveFieldsV2, SignedApprovalV1, SignedApprovalV2,
+    APPROVE_TYPEHASH_V1, APPROVE_TYPEHASH_V2, RECOVERY_DOMAIN_SEPARATOR_ANVIL_DEV_V1,
 };
 pub use revisionlog_v2_client::{
     add_device_v2, bootstrap_vault_v2, cancel_promotion_v2, decode_device_mgmt_events,
