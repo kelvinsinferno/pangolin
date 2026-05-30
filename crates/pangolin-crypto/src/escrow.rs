@@ -113,7 +113,7 @@ assert_not_impl_any!(RecoveryWrapKey: Clone, Copy);
 
 /// Expected encoded length of one [`Share`]: one identifier byte plus one
 /// y-coordinate byte per RWK byte.
-const SHARE_ENCODED_LEN: usize = 1 + KEY_LEN;
+pub const SHARE_ENCODED_LEN: usize = 1 + KEY_LEN;
 
 impl Share {
     /// Wraps raw share bytes produced by [`split_rwk`] / persisted by a
