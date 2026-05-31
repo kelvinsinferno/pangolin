@@ -469,12 +469,11 @@ pub async fn recovery_decode_request(text: String) -> Result<RecoveryRequestDto,
             kind: "argument".into(),
             message: format!("recovery request: base64 decode failed: {e}"),
         })?;
-    let parsed: RecoveryRequestDto = serde_json::from_slice(&json_bytes).map_err(|e| {
-        DesktopError::Validation {
+    let parsed: RecoveryRequestDto =
+        serde_json::from_slice(&json_bytes).map_err(|e| DesktopError::Validation {
             kind: "argument".into(),
             message: format!("recovery request: JSON parse failed: {e}"),
-        }
-    })?;
+        })?;
     // Validate hex-field shapes at decode time so downstream FFI calls
     // never get malformed input AND so a paste error fails loud at the
     // earliest possible point. Variable-length sealed_share is just
@@ -540,13 +539,15 @@ pub async fn recovery_help_approve(
     let proposed_authority_bytes = bytes_from_hex(&proposed_authority, "proposed_authority", 20)?;
     let mut roster_bytes = Vec::with_capacity(guardian_set.len());
     for (idx, addr) in guardian_set.iter().enumerate() {
-        roster_bytes.push(bytes_from_hex(addr, "guardian_set entry", 20).map_err(|e| match e {
-            DesktopError::Validation { kind, message } => DesktopError::Validation {
-                kind,
-                message: format!("guardian_set[{idx}]: {message}"),
-            },
-            other => other,
-        })?);
+        roster_bytes.push(
+            bytes_from_hex(addr, "guardian_set entry", 20).map_err(|e| match e {
+                DesktopError::Validation { kind, message } => DesktopError::Validation {
+                    kind,
+                    message: format!("guardian_set[{idx}]: {message}"),
+                },
+                other => other,
+            })?,
+        );
     }
     let config = chain_config()?;
     let outcome = tokio::task::spawn_blocking(move || {
@@ -623,7 +624,10 @@ fn bytes_from_hex_variable(hex: &str, label: &'static str) -> Result<Vec<u8>, De
     if s.is_empty() || !s.len().is_multiple_of(2) {
         return Err(DesktopError::Validation {
             kind: "argument".into(),
-            message: format!("{label} must be non-empty hex with even length (got {})", s.len()),
+            message: format!(
+                "{label} must be non-empty hex with even length (got {})",
+                s.len()
+            ),
         });
     }
     let mut out = Vec::with_capacity(s.len() / 2);
