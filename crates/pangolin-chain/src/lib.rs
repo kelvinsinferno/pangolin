@@ -173,7 +173,7 @@ pub use recovery_client::{
     finalize_recovery_v1, finalize_recovery_v2, guardian_leaf, initiate_recovery_v1,
     initiate_recovery_v2, read_live_attempt_v1, read_live_attempt_v2, read_vault_authority_v1,
     read_vault_authority_v2, set_guardian_set_v1, set_guardian_set_v2, verify_membership_proof,
-    LiveAttemptV1, LiveAttemptV2, RecoveryAnchorV1, RECOVERY_CONTRACT_NAME,
+    LiveAttemptV1, LiveAttemptV2, RecoveryAnchor, RECOVERY_CONTRACT_NAME,
     RECOVERY_SCHEMA_VERSION_V1, RECOVERY_SCHEMA_VERSION_V2, RECOVERY_V2_CONTRACT_NAME,
 };
 pub use recovery_signing::{

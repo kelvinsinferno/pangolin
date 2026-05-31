@@ -332,14 +332,21 @@ pub fn verify_membership_proof(proof: &[[u8; 32]], root: [u8; 32], leaf: [u8; 32
 // Receipt anchors
 // ---------------------------------------------------------------------
 
-/// Receipt anchor returned from a successful `finalizeRecovery`.
+/// Receipt anchor returned from a successful recovery-lifecycle broadcast
+/// (`setGuardianSet`, `initiateRecovery`, `approveRecovery`,
+/// `cancelRecovery`, or `finalizeRecovery`).
 ///
-/// The `RecoveryFinalized` event carries the rotated authority lineage
-/// (`oldAuthority` → `newAuthority`) so a caller can confirm the
-/// rotation landed (the load-bearing observable for #103-C
-/// revocation-on-read, deferred).
+/// Shared by BOTH the V1 client (deprecated, anvil-only) AND the V2 client
+/// (MVP-4-L L-0a-1+) — the anchor shape is version-agnostic
+/// (`tx_hash` + `block_number` + `block_hash` + `log_index` +
+/// `attempt_nonce` + authority lineage). The `RecoveryFinalized` event
+/// carries the rotated
+/// authority lineage (`oldAuthority` → `newAuthority`) so a caller can
+/// confirm the rotation landed (the load-bearing observable for
+/// revocation-on-read, deferred). On non-finalize events
+/// `old_authority`/`new_authority` are `Address::ZERO`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecoveryAnchorV1 {
+pub struct RecoveryAnchor {
     /// 32-byte transaction hash.
     pub tx_hash: B256,
     /// Block number the tx was included in.
@@ -394,7 +401,7 @@ pub async fn set_guardian_set_v1(
     guardian_count: u8,
     env: ChainEnv,
     rpc_url: &str,
-) -> Result<RecoveryAnchorV1, ChainError> {
+) -> Result<RecoveryAnchor, ChainError> {
     let (provider, contract, chain_id) = connect(wallet, env, rpc_url).await?;
     let call = RecoveryV1::setGuardianSetCall {
         vaultId: vault_id.into(),
@@ -428,7 +435,7 @@ pub async fn initiate_recovery_v1(
     proposed_authority: Address,
     env: ChainEnv,
     rpc_url: &str,
-) -> Result<RecoveryAnchorV1, ChainError> {
+) -> Result<RecoveryAnchor, ChainError> {
     let (provider, contract, chain_id) = connect(wallet, env, rpc_url).await?;
     let call = RecoveryV1::initiateRecoveryCall {
         vaultId: vault_id.into(),
@@ -439,7 +446,7 @@ pub async fn initiate_recovery_v1(
     let pending = broadcast_call(&provider, wallet.address(), contract, calldata, chain_id).await?;
     finish(pending, contract, |r, tx| {
         decode_lifecycle_anchor::<RecoveryV1::RecoveryInitiated>(r, contract, tx, |d, log| {
-            RecoveryAnchorV1 {
+            RecoveryAnchor {
                 tx_hash: tx,
                 block_number: 0, // filled by decode_lifecycle_anchor
                 block_hash: B256::ZERO,
@@ -542,7 +549,7 @@ pub async fn approve_recovery_v1(
     signed_approval: &SignedApprovalV1,
     env: ChainEnv,
     rpc_url: &str,
-) -> Result<RecoveryAnchorV1, ChainError> {
+) -> Result<RecoveryAnchor, ChainError> {
     // Client-side pre-flight (L2): fail loudly locally if the proof
     // would be rejected on-chain.
     let leaf = guardian_leaf(guardian);
@@ -568,7 +575,7 @@ pub async fn approve_recovery_v1(
     let pending = broadcast_call(&provider, wallet.address(), contract, calldata, chain_id).await?;
     finish(pending, contract, |r, tx| {
         decode_lifecycle_anchor::<RecoveryV1::RecoveryApproved>(r, contract, tx, |d, log| {
-            RecoveryAnchorV1 {
+            RecoveryAnchor {
                 tx_hash: tx,
                 block_number: 0,
                 block_hash: B256::ZERO,
@@ -596,7 +603,7 @@ pub async fn cancel_recovery_v1(
     vault_id: [u8; 32],
     env: ChainEnv,
     rpc_url: &str,
-) -> Result<RecoveryAnchorV1, ChainError> {
+) -> Result<RecoveryAnchor, ChainError> {
     let (provider, contract, chain_id) = connect(wallet, env, rpc_url).await?;
     let call = RecoveryV1::cancelRecoveryCall {
         vaultId: vault_id.into(),
@@ -606,7 +613,7 @@ pub async fn cancel_recovery_v1(
     let pending = broadcast_call(&provider, wallet.address(), contract, calldata, chain_id).await?;
     finish(pending, contract, |r, tx| {
         decode_lifecycle_anchor::<RecoveryV1::RecoveryCanceled>(r, contract, tx, |d, log| {
-            RecoveryAnchorV1 {
+            RecoveryAnchor {
                 tx_hash: tx,
                 block_number: 0,
                 block_hash: B256::ZERO,
@@ -626,7 +633,7 @@ pub async fn cancel_recovery_v1(
 /// Requires `approvals >= threshold` AND `block.timestamp >=
 /// initiatedAt + 72h` (`RecoveryV1.sol:709`). Permissionless.
 ///
-/// Returns a [`RecoveryAnchorV1`] whose `old_authority` / `new_authority`
+/// Returns a [`RecoveryAnchor`] whose `old_authority` / `new_authority`
 /// carry the rotation lineage from the `RecoveryFinalized` event.
 ///
 /// # Errors
@@ -637,7 +644,7 @@ pub async fn finalize_recovery_v1(
     vault_id: [u8; 32],
     env: ChainEnv,
     rpc_url: &str,
-) -> Result<RecoveryAnchorV1, ChainError> {
+) -> Result<RecoveryAnchor, ChainError> {
     let (provider, contract, chain_id) = connect(wallet, env, rpc_url).await?;
     let call = RecoveryV1::finalizeRecoveryCall {
         vaultId: vault_id.into(),
@@ -647,7 +654,7 @@ pub async fn finalize_recovery_v1(
     let pending = broadcast_call(&provider, wallet.address(), contract, calldata, chain_id).await?;
     finish(pending, contract, |r, tx| {
         decode_lifecycle_anchor::<RecoveryV1::RecoveryFinalized>(r, contract, tx, |d, log| {
-            RecoveryAnchorV1 {
+            RecoveryAnchor {
                 tx_hash: tx,
                 block_number: 0,
                 block_hash: B256::ZERO,
@@ -862,9 +869,9 @@ async fn finish<F>(
     pending: PendingTransactionBuilder<Ethereum>,
     _contract: Address,
     decode: F,
-) -> Result<RecoveryAnchorV1, ChainError>
+) -> Result<RecoveryAnchor, ChainError>
 where
-    F: FnOnce(&alloy::rpc::types::TransactionReceipt, B256) -> Result<RecoveryAnchorV1, ChainError>,
+    F: FnOnce(&alloy::rpc::types::TransactionReceipt, B256) -> Result<RecoveryAnchor, ChainError>,
 {
     let tx_hash: B256 = *pending.tx_hash();
     let pending = pending.with_timeout(Some(Duration::from_secs(RECEIPT_TIMEOUT_SECS)));
@@ -888,8 +895,8 @@ fn decode_lifecycle_anchor<E>(
     receipt: &alloy::rpc::types::TransactionReceipt,
     contract: Address,
     tx_hash: B256,
-    build: impl FnOnce(&E, u64) -> RecoveryAnchorV1,
-) -> Result<RecoveryAnchorV1, ChainError>
+    build: impl FnOnce(&E, u64) -> RecoveryAnchor,
+) -> Result<RecoveryAnchor, ChainError>
 where
     E: SolEvent,
 {
@@ -924,8 +931,8 @@ where
 
 /// Helper for the `GuardianSetInitialized` anchor (no attempt nonce —
 /// the set-up event predates any attempt).
-fn anchor_basic(log_index: u64, attempt_nonce: u64) -> RecoveryAnchorV1 {
-    RecoveryAnchorV1 {
+fn anchor_basic(log_index: u64, attempt_nonce: u64) -> RecoveryAnchor {
+    RecoveryAnchor {
         tx_hash: B256::ZERO,
         block_number: 0,
         block_hash: B256::ZERO,
@@ -1212,7 +1219,7 @@ pub async fn set_guardian_set_v2(
     guardian_count: u8,
     env: ChainEnv,
     rpc_url: &str,
-) -> Result<RecoveryAnchorV1, ChainError> {
+) -> Result<RecoveryAnchor, ChainError> {
     let (provider, contract, chain_id) = connect_v2(wallet, env, rpc_url).await?;
     let call = RecoveryV2::setGuardianSetCall {
         vaultId: vault_id.into(),
@@ -1245,7 +1252,7 @@ pub async fn initiate_recovery_v2(
     recipient_commitment: [u8; 32],
     env: ChainEnv,
     rpc_url: &str,
-) -> Result<RecoveryAnchorV1, ChainError> {
+) -> Result<RecoveryAnchor, ChainError> {
     let (provider, contract, chain_id) = connect_v2(wallet, env, rpc_url).await?;
     let call = RecoveryV2::initiateRecoveryCall {
         vaultId: vault_id.into(),
@@ -1257,7 +1264,7 @@ pub async fn initiate_recovery_v2(
     let pending = broadcast_call(&provider, wallet.address(), contract, calldata, chain_id).await?;
     finish(pending, contract, |r, tx| {
         decode_lifecycle_anchor::<RecoveryV2::RecoveryInitiated>(r, contract, tx, |d, log| {
-            RecoveryAnchorV1 {
+            RecoveryAnchor {
                 tx_hash: tx,
                 block_number: 0,
                 block_hash: B256::ZERO,
@@ -1353,7 +1360,7 @@ pub async fn approve_recovery_v2(
     signed_approval: &crate::recovery_signing::SignedApprovalV2,
     env: ChainEnv,
     rpc_url: &str,
-) -> Result<RecoveryAnchorV1, ChainError> {
+) -> Result<RecoveryAnchor, ChainError> {
     let leaf = guardian_leaf(guardian);
     if !verify_membership_proof(proof, root, leaf) {
         return Err(ChainError::Decode(format!(
@@ -1377,7 +1384,7 @@ pub async fn approve_recovery_v2(
     let pending = broadcast_call(&provider, wallet.address(), contract, calldata, chain_id).await?;
     finish(pending, contract, |r, tx| {
         decode_lifecycle_anchor::<RecoveryV2::RecoveryApproved>(r, contract, tx, |d, log| {
-            RecoveryAnchorV1 {
+            RecoveryAnchor {
                 tx_hash: tx,
                 block_number: 0,
                 block_hash: B256::ZERO,
@@ -1401,7 +1408,7 @@ pub async fn cancel_recovery_v2(
     vault_id: [u8; 32],
     env: ChainEnv,
     rpc_url: &str,
-) -> Result<RecoveryAnchorV1, ChainError> {
+) -> Result<RecoveryAnchor, ChainError> {
     let (provider, contract, chain_id) = connect_v2(wallet, env, rpc_url).await?;
     let call = RecoveryV2::cancelRecoveryCall {
         vaultId: vault_id.into(),
@@ -1411,7 +1418,7 @@ pub async fn cancel_recovery_v2(
     let pending = broadcast_call(&provider, wallet.address(), contract, calldata, chain_id).await?;
     finish(pending, contract, |r, tx| {
         decode_lifecycle_anchor::<RecoveryV2::RecoveryCanceled>(r, contract, tx, |d, log| {
-            RecoveryAnchorV1 {
+            RecoveryAnchor {
                 tx_hash: tx,
                 block_number: 0,
                 block_hash: B256::ZERO,
@@ -1435,7 +1442,7 @@ pub async fn finalize_recovery_v2(
     vault_id: [u8; 32],
     env: ChainEnv,
     rpc_url: &str,
-) -> Result<RecoveryAnchorV1, ChainError> {
+) -> Result<RecoveryAnchor, ChainError> {
     let (provider, contract, chain_id) = connect_v2(wallet, env, rpc_url).await?;
     let call = RecoveryV2::finalizeRecoveryCall {
         vaultId: vault_id.into(),
@@ -1445,7 +1452,7 @@ pub async fn finalize_recovery_v2(
     let pending = broadcast_call(&provider, wallet.address(), contract, calldata, chain_id).await?;
     finish(pending, contract, |r, tx| {
         decode_lifecycle_anchor::<RecoveryV2::RecoveryFinalized>(r, contract, tx, |d, log| {
-            RecoveryAnchorV1 {
+            RecoveryAnchor {
                 tx_hash: tx,
                 block_number: 0,
                 block_hash: B256::ZERO,

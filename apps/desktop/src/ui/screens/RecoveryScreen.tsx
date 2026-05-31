@@ -50,22 +50,41 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
 
   useEffect(() => {
     let cancelled = false;
+    // L-D LOW-1 follow-up: race the chain read against a 5s client-side
+    // timeout so a slow / unreachable Base Sepolia RPC doesn't keep the
+    // "Loading…" panel pinned indefinitely. On timeout (or any other
+    // failure) we fall through to the "not set up on-chain" path (L3
+    // fail-closed) — which is the correct UX for the common L-D state
+    // anyway (guardian onboarding doesn't ship until L-A).
+    const HEALTH_RPC_TIMEOUT_MS = 5_000;
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
     void (async () => {
       try {
-        const h = await recoveryHealth();
+        const h = await Promise.race<RecoveryHealth>([
+          recoveryHealth(),
+          new Promise<RecoveryHealth>((_, reject) => {
+            timeoutHandle = setTimeout(
+              () => reject(new Error('recovery_health: client-side RPC timeout')),
+              HEALTH_RPC_TIMEOUT_MS,
+            );
+          }),
+        ]);
         if (!cancelled) {
           setHealth(h);
           setHealthAvailable(true);
         }
       } catch {
-        // Not set up on-chain for recovery yet / read unavailable (L3).
+        // Not set up on-chain for recovery yet / read unavailable (L3) /
+        // RPC timeout. Any of these → degrade to the "not set up" note.
         if (!cancelled) setHealthAvailable(false);
       } finally {
+        if (timeoutHandle !== null) clearTimeout(timeoutHandle);
         if (!cancelled) setHealthLoaded(true);
       }
     })();
     return () => {
       cancelled = true;
+      if (timeoutHandle !== null) clearTimeout(timeoutHandle);
     };
   }, []);
 

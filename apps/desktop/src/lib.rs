@@ -53,10 +53,12 @@ pub use state::VaultState;
 /// test harnesses can spawn the same wired app.
 ///
 /// The invoke-handler registry is the SOLE Tauri-side allow-list of
-/// commands the React frontend can call (mirrored by
-/// `capabilities/default.json`'s permission allow-list). Adding a
-/// command requires both (a) registering it here and (b) listing its
-/// permission slug in `capabilities/`.
+/// commands the React frontend can call. Adding a command requires only
+/// registering it here — Tauri v2 capabilities (`capabilities/*.json`)
+/// gate PLUGIN commands + `core:` APIs, NOT the app's own
+/// `#[tauri::command]` handlers. None of the existing `vault_*` /
+/// `pairing_*` / `recovery_*` commands appear in `capabilities/`, and
+/// they all work; the registry here is the only required wiring.
 pub fn build_app() -> tauri::Builder<tauri::Wry> {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())

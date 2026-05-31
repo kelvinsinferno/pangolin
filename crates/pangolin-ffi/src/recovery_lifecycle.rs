@@ -127,7 +127,7 @@ fn collect_guardian_addrs(guardians: &[Vec<u8>], what: &str) -> Result<Vec<Addre
 /// Non-secret receipt anchor returned from a chain-mutating lifecycle
 /// binding.
 ///
-/// Mirrors the public fields of [`pangolin_chain::RecoveryAnchorV1`]
+/// Mirrors the public fields of [`pangolin_chain::RecoveryAnchor`]
 /// that are useful to the host: the 32-byte tx hash and the including
 /// block number. Lineage fields (`old_authority` / `new_authority` on
 /// finalize, `attempt_nonce`) are deliberately NOT surfaced here — the
@@ -182,8 +182,8 @@ pub struct FfiRecoveryStatus {
 // Shared internals
 // ---------------------------------------------------------------------------
 
-/// Build an [`FfiTxOutcome`] from a [`pangolin_chain::RecoveryAnchorV1`].
-fn tx_outcome_from_anchor(anchor: pangolin_chain::RecoveryAnchorV1) -> FfiTxOutcome {
+/// Build an [`FfiTxOutcome`] from a [`pangolin_chain::RecoveryAnchor`].
+fn tx_outcome_from_anchor(anchor: pangolin_chain::RecoveryAnchor) -> FfiTxOutcome {
     FfiTxOutcome {
         tx_hash: anchor.tx_hash.0.to_vec(),
         block_number: anchor.block_number,
