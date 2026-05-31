@@ -10,6 +10,7 @@ import {
   type Backup,
   type RecoveryHealth,
 } from '../lib/invoke';
+import { SetupGuardiansWizard } from './SetupGuardiansWizard';
 
 export interface RecoveryScreenProps {
   onClose: () => void;
@@ -46,7 +47,20 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
   const [healthAvailable, setHealthAvailable] = useState(true);
   const [password, setPassword] = useState('');
   const [backup, setBackup] = useState<Backup | null>(null);
+  const [showGuardiansWizard, setShowGuardiansWizard] = useState(false);
+  // Health refresh trigger — bumped after the wizard reports success so
+  // the panel re-fetches without a full screen remount (Q-e).
+  const [healthRefreshTick, setHealthRefreshTick] = useState(0);
   const guard = useRef(false);
+
+  // ALL-ZERO authority address (40 hex zeros) — the contract returns this
+  // when `vaultAuthority` has never been set, i.e. setGuardianSet has not
+  // landed on-chain. Used by the "set up guardians" gating + the resume
+  // banner detection (Q-c).
+  const ZERO_AUTHORITY = '0'.repeat(40);
+  const authorityIsZero =
+    health !== null && (health.authority === '' || health.authority === ZERO_AUTHORITY);
+  const showSetupGuardiansCard = healthLoaded && healthAvailable && authorityIsZero;
 
   useEffect(() => {
     let cancelled = false;
@@ -86,7 +100,7 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
       cancelled = true;
       if (timeoutHandle !== null) clearTimeout(timeoutHandle);
     };
-  }, []);
+  }, [healthRefreshTick]);
 
   const cancel = () => {
     setPassword('');
@@ -122,6 +136,18 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
         (D-011) clears.
       </p>
 
+      {showGuardiansWizard ? (
+        <SetupGuardiansWizard
+          onError={onError}
+          onClose={() => setShowGuardiansWizard(false)}
+          onSuccess={() => {
+            // Q-e: trigger a health-panel refresh; the wizard's own
+            // 'done' step lets the user dismiss when they're ready.
+            setHealthRefreshTick((t) => t + 1);
+          }}
+        />
+      ) : null}
+
       {/* Read-only recovery-health panel */}
       <Card elevation="sm">
         <h2>Recovery status</h2>
@@ -141,10 +167,30 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
         ) : (
           <p className="recovery-screen__muted" data-testid="recovery-health-unavailable">
             Recovery isn&apos;t set up on-chain for this vault yet. Set up
-            guardians (coming soon) to enable recovery.
+            guardians below to enable recovery.
           </p>
         )}
       </Card>
+
+      {/* L-A: set up guardians card — visible when the health panel
+          confirms no on-chain authority is set yet, and the wizard
+          modal isn't already up. */}
+      {showSetupGuardiansCard && !showGuardiansWizard && (
+        <Card elevation="sm">
+          <h2>Set up guardians</h2>
+          <p>
+            Choose people you trust to help you recover this vault if you lose
+            your devices and password. You&apos;ll need at least 3 guardians;
+            you can set the threshold (how many must agree) afterwards.
+          </p>
+          <Button
+            onClick={() => setShowGuardiansWizard(true)}
+            data-testid="setup-guardians-open"
+          >
+            Set up guardians
+          </Button>
+        </Card>
+      )}
 
       {/* Create-backup section */}
       <Card elevation="sm">

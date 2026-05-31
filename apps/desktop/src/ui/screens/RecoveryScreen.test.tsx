@@ -71,4 +71,32 @@ describe('RecoveryScreen (L-D)', () => {
     fireEvent.click(await screen.findByTestId('recovery-back'));
     expect(onClose).toHaveBeenCalledTimes(1);
   });
+
+  // ---- L-A: Set up guardians card (visible only when authority is unset) ----
+
+  it('L-A: shows the Set up guardians card when on-chain authority is zero', async () => {
+    vi.mocked(recoveryHealth).mockResolvedValue({
+      authority: '0'.repeat(40),
+      recoveryStatus: 0,
+      proposedAuthority: '',
+      attemptNonce: 0,
+    });
+    render(<RecoveryScreen {...noop} />);
+    expect(await screen.findByTestId('setup-guardians-open')).toBeInTheDocument();
+  });
+
+  it('L-A: hides the Set up guardians card once authority is set', async () => {
+    // vi.clearAllMocks() clears call history but NOT mock implementations
+    // set via mockResolvedValue in prior tests — re-pin the default here
+    // so this test is order-independent.
+    vi.mocked(recoveryHealth).mockResolvedValue({
+      authority: 'aa'.repeat(20),
+      recoveryStatus: 0,
+      proposedAuthority: '',
+      attemptNonce: 0,
+    });
+    render(<RecoveryScreen {...noop} />);
+    await screen.findByTestId('recovery-health');
+    expect(screen.queryByTestId('setup-guardians-open')).not.toBeInTheDocument();
+  });
 });
