@@ -612,3 +612,121 @@ export async function recoverySetGuardianSet(
   });
   return { txHash: w.tx_hash, blockNumber: w.block_number };
 }
+
+// ---- MVP-4-L (L-C): guardian-side help wizard surface ----
+
+/** Parsed shape of a recovery request blob the recovering user pasted to
+ *  the guardian. Wire format = base64-of-JSON; field shapes are validated
+ *  Rust-side. Every field is non-secret. */
+export interface RecoveryRequest {
+  /** 64-char lowercase hex of the 32-byte target vault id. */
+  vaultId: string;
+  /** Per-attempt scope (RecoveryV2 attemptNonce). */
+  attemptNonce: number;
+  /** 40-char lowercase hex of the 20-byte EVM address the authority will
+   *  rotate to on finalize (the recovering user's new manager device). */
+  proposedAuthority: string;
+  /** 64-char lowercase hex of the 32-byte X25519 ephemeral pubkey the
+   *  recovering user generated for this attempt. On-chain
+   *  RecoveryV2.recipientCommitment was set to this value at initiate
+   *  time; engine refuses to release if the chain disagrees. */
+  recipientCommitment: string;
+  /** Hex (variable length) of the sealed share bytes that were originally
+   *  sealed to THIS guardian's pubkey at onboarding time. The recoverer
+   *  carries these in their backup envelope. */
+  sealedShare: string;
+  /** 32-char lowercase hex of the 16-byte escrow generation epoch. */
+  epoch: string;
+  /** M hex-encoded guardian EVM addresses (40 chars each). */
+  guardianSet: string[];
+  /** Unix-seconds expiry of the guardian's approval EIP-712 signature. */
+  expiresAt: number;
+}
+
+interface RecoveryRequestWire {
+  vault_id: string;
+  attempt_nonce: number;
+  proposed_authority: string;
+  recipient_commitment: string;
+  sealed_share: string;
+  epoch: string;
+  guardian_set: string[];
+  expires_at: number;
+}
+
+function requestFromWire(w: RecoveryRequestWire): RecoveryRequest {
+  return {
+    vaultId: w.vault_id,
+    attemptNonce: w.attempt_nonce,
+    proposedAuthority: w.proposed_authority,
+    recipientCommitment: w.recipient_commitment,
+    sealedShare: w.sealed_share,
+    epoch: w.epoch,
+    guardianSet: w.guardian_set,
+    expiresAt: w.expires_at,
+  };
+}
+
+/** Result of `recoveryHelpRelease` — the non-secret re-sealed-share
+ *  ciphertext (hex), ready for the guardian to copy back to the
+ *  recovering user. */
+export interface ReleaseResult {
+  /** Hex of the SealedShareForRecoverer ciphertext. NON-SECRET. */
+  sealedShareForRecoverer: string;
+}
+
+interface ReleaseResultWire {
+  sealed_share_for_recoverer: string;
+}
+
+/** Decode a recovery-request blob the recovering user pasted to the
+ *  guardian. Wire format = base64-of-JSON. Throws Validation on any
+ *  shape failure. */
+export async function recoveryDecodeRequest(text: string): Promise<RecoveryRequest> {
+  const w = await tauriInvoke<RecoveryRequestWire>('recovery_decode_request', { text });
+  return requestFromWire(w);
+}
+
+/** **GUARDIAN, step 1 of 2.** Sign + broadcast the V2 Approve on-chain.
+ *  Engine reads the LIVE attempt + asserts the host args match
+ *  (fail-closed Chain if drifted), builds the V2 EIP-712 digest binding
+ *  the on-chain recipientCommitment, signs with the active session's
+ *  signer, broadcasts. */
+export async function recoveryHelpApprove(
+  vaultId: string,
+  attemptNonce: number,
+  proposedAuthority: string,
+  expiresAt: number,
+  guardianSet: string[],
+): Promise<TxOutcome> {
+  const w = await tauriInvoke<TxOutcomeWire>('recovery_help_approve', {
+    vaultId,
+    attemptNonce,
+    proposedAuthority,
+    expiresAt,
+    guardianSet,
+  });
+  return { txHash: w.tx_hash, blockNumber: w.block_number };
+}
+
+/** **GUARDIAN, step 2 of 2.** Open the guardian's stored sealed share +
+ *  re-seal to the recoverer's per-attempt ephemeral pubkey. Engine
+ *  verifies the on-chain recipientCommitment matches (Decision B) BEFORE
+ *  opening; the cleartext never crosses; only the non-secret
+ *  SealedShareForRecoverer bytes return. */
+export async function recoveryHelpRelease(
+  vaultId: string,
+  attemptNonce: number,
+  recipientCommitment: string,
+  sealedShare: string,
+  epoch: string,
+): Promise<ReleaseResult> {
+  const w = await tauriInvoke<ReleaseResultWire>('recovery_help_release', {
+    vaultId,
+    attemptNonce,
+    recipientCommitment,
+    sealedShare,
+    epoch,
+  });
+  return { sealedShareForRecoverer: w.sealed_share_for_recoverer };
+}

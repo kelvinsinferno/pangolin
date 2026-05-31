@@ -10,6 +10,7 @@ import {
   type Backup,
   type RecoveryHealth,
 } from '../lib/invoke';
+import { HelpRecoverWizard } from './HelpRecoverWizard';
 import { SetupGuardiansWizard } from './SetupGuardiansWizard';
 
 export interface RecoveryScreenProps {
@@ -48,6 +49,7 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
   const [password, setPassword] = useState('');
   const [backup, setBackup] = useState<Backup | null>(null);
   const [showGuardiansWizard, setShowGuardiansWizard] = useState(false);
+  const [showHelpRecoverWizard, setShowHelpRecoverWizard] = useState(false);
   // Health refresh trigger — bumped after the wizard reports success so
   // the panel re-fetches without a full screen remount (Q-e).
   const [healthRefreshTick, setHealthRefreshTick] = useState(0);
@@ -60,7 +62,12 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
   const ZERO_AUTHORITY = '0'.repeat(40);
   const authorityIsZero =
     health !== null && (health.authority === '' || health.authority === ZERO_AUTHORITY);
-  const showSetupGuardiansCard = healthLoaded && healthAvailable && authorityIsZero;
+  // Audit MED-2: at most ONE wizard can be open at a time. Both cards
+  // hide when either wizard is up to prevent racing the buttons into a
+  // confusing dual-modal state.
+  const anyWizardOpen = showGuardiansWizard || showHelpRecoverWizard;
+  const showSetupGuardiansCard =
+    healthLoaded && healthAvailable && authorityIsZero && !anyWizardOpen;
 
   useEffect(() => {
     let cancelled = false;
@@ -148,6 +155,13 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
         />
       ) : null}
 
+      {showHelpRecoverWizard ? (
+        <HelpRecoverWizard
+          onError={onError}
+          onClose={() => setShowHelpRecoverWizard(false)}
+        />
+      ) : null}
+
       {/* Read-only recovery-health panel */}
       <Card elevation="sm">
         <h2>Recovery status</h2>
@@ -173,9 +187,9 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
       </Card>
 
       {/* L-A: set up guardians card — visible when the health panel
-          confirms no on-chain authority is set yet, and the wizard
-          modal isn't already up. */}
-      {showSetupGuardiansCard && !showGuardiansWizard && (
+          confirms no on-chain authority is set yet, and NO wizard is up
+          (mutual exclusion gate per audit MED-2). */}
+      {showSetupGuardiansCard && (
         <Card elevation="sm">
           <h2>Set up guardians</h2>
           <p>
@@ -188,6 +202,27 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
             data-testid="setup-guardians-open"
           >
             Set up guardians
+          </Button>
+        </Card>
+      )}
+
+      {/* L-C: help someone recover card — visible whenever NO wizard is
+          up. Any guardian can be asked at any time, regardless of
+          whether THIS vault has set up its own guardians (audit MED-2
+          gates against the dual-modal state). */}
+      {!anyWizardOpen && (
+        <Card elevation="sm">
+          <h2>Help someone recover</h2>
+          <p>
+            Were you asked to help someone recover their vault? Paste the
+            request they sent you here. You&apos;ll see what they&apos;re
+            asking for before you approve.
+          </p>
+          <Button
+            onClick={() => setShowHelpRecoverWizard(true)}
+            data-testid="help-recover-open"
+          >
+            Help someone recover
           </Button>
         </Card>
       )}

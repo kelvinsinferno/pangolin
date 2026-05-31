@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Recovery Tauri commands (MVP-4-L, slices L-D + L-A).
+//! Recovery Tauri commands (MVP-4-L, slices L-D + L-A + L-C).
 //!
 //! Thin wrappers over the already-built recovery FFI. L-D ships the
 //! backup-phrase create flow + a read-only recovery-health panel. L-A
-//! ships the owner-side guardian-onboarding wizard surface: export THIS
-//! device's guardian identity (for the self-as-guardian guard), decode
-//! a guardian-supplied invite text, seed the off-chain escrow, then
-//! commit the on-chain merkle root. Plan-LOCKs:
-//! `docs/issue-plans/mvp4-l-recovery-ux.md`,
-//! `docs/issue-plans/mvp4-l-a-guardian-onboarding.md`.
+//! ships the owner-side guardian-onboarding wizard surface. L-C ships
+//! the guardian-side help wizard surface: decode an incoming
+//! recovery-request blob (paste-format), approve the attempt on-chain
+//! (`vault_approve_recovery`), and release the guardian's share
+//! re-sealed to the recoverer's per-attempt ephemeral pubkey
+//! (`vault_guardian_release_share` — Decision-B anti-redirect verify
+//! lives FFI-side). Plan-LOCKs: `docs/issue-plans/mvp4-l-recovery-ux.md`,
+//! `docs/issue-plans/mvp4-l-a-guardian-onboarding.md`,
+//! `docs/issue-plans/mvp4-l-c-guardian-help.md`.
 //!
 //! ## L-invariants
 //!
@@ -43,7 +46,7 @@
     clippy::unused_async
 )]
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use pangolin_ffi::SecretPassword;
@@ -393,6 +396,274 @@ pub async fn recovery_set_guardian_set(
     Ok(outcome.into())
 }
 
+// ---------------------------------------------------------------------------
+// MVP-4-L L-C — guardian-side help wizard surface
+// ---------------------------------------------------------------------------
+
+/// The parsed shape of a recovery request blob the recovering user pasted
+/// to the guardian. JSON wire format under base64-of-JSON envelope; field
+/// shapes are validated at decode time (hex lengths, non-empty roster,
+/// numeric bounds). Mirrors the parameter set of `vault_approve_recovery`
+/// + `vault_guardian_release_share` so the wizard can extract subsets.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RecoveryRequestDto {
+    /// 64-char hex of the 32-byte target vault id (the recovering user's
+    /// vault — the one whose authority will rotate on finalize).
+    pub vault_id: String,
+    /// Per-attempt scope (RecoveryV2 attemptNonce).
+    pub attempt_nonce: u64,
+    /// 40-char hex of the 20-byte EVM address the authority would rotate
+    /// to (the recovering user's NEW manager device's signer).
+    pub proposed_authority: String,
+    /// 64-char hex of the 32-byte X25519 ephemeral pubkey the recovering
+    /// user generated for this attempt. The on-chain
+    /// `RecoveryV2.recipientCommitment` was set to this value at
+    /// `initiateRecovery` time; the engine refuses to release if the
+    /// chain doesn't agree (Decision B).
+    pub recipient_commitment: String,
+    /// Hex of the variable-length sealed share bytes that were
+    /// (originally, at onboarding time) sealed to THIS guardian's pubkey.
+    /// The recoverer carries these in their backup envelope.
+    pub sealed_share: String,
+    /// 32-char hex of the 16-byte escrow generation epoch.
+    pub epoch: String,
+    /// Hex-encoded `M` guardian EVM addresses (40 chars each). The
+    /// guardian's signer is matched to one of these by the engine; the
+    /// engine builds the merkle proof itself.
+    pub guardian_set: Vec<String>,
+    /// Unix-seconds expiry of the guardian's approval EIP-712 signature.
+    /// If `now > expires_at` the contract reverts `ErrApprovalExpired`.
+    pub expires_at: u64,
+}
+
+/// Wire result of `recovery_help_release` — the non-secret
+/// re-sealed-share ciphertext bytes (in hex, suitable for paste-text),
+/// ready for the guardian to copy back to the recovering user.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseResultDto {
+    /// Hex of the `SealedShareForRecoverer` ciphertext. NON-SECRET —
+    /// authentication-protected by the recoverer's per-attempt key.
+    pub sealed_share_for_recoverer: String,
+}
+
+/// **Pure decode** (no handle, no session). Parse a recovery-request
+/// blob the guardian pasted from the recovering user. Format is
+/// base64-of-JSON; field shapes are validated.
+///
+/// # Errors
+/// `DesktopError::Validation { kind = "argument" }` for any decode
+/// failure (base64 / JSON / field shape).
+#[tauri::command]
+pub async fn recovery_decode_request(text: String) -> Result<RecoveryRequestDto, DesktopError> {
+    use base64::Engine as _;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(DesktopError::Validation {
+            kind: "argument".into(),
+            message: "recovery request must not be empty".into(),
+        });
+    }
+    let json_bytes = base64::engine::general_purpose::STANDARD
+        .decode(trimmed)
+        .map_err(|e| DesktopError::Validation {
+            kind: "argument".into(),
+            message: format!("recovery request: base64 decode failed: {e}"),
+        })?;
+    let parsed: RecoveryRequestDto =
+        serde_json::from_slice(&json_bytes).map_err(|e| DesktopError::Validation {
+            kind: "argument".into(),
+            message: format!("recovery request: JSON parse failed: {e}"),
+        })?;
+    // Validate hex-field shapes at decode time so downstream FFI calls
+    // never get malformed input AND so a paste error fails loud at the
+    // earliest possible point. Variable-length sealed_share is just
+    // length-non-zero; the engine validates the rest at open time.
+    let _ = bytes_from_hex(&parsed.vault_id, "vault_id", 32)?;
+    let _ = bytes_from_hex(&parsed.proposed_authority, "proposed_authority", 20)?;
+    let _ = bytes_from_hex(&parsed.recipient_commitment, "recipient_commitment", 32)?;
+    let _ = bytes_from_hex(&parsed.epoch, "epoch", 16)?;
+    if parsed.sealed_share.is_empty() || !parsed.sealed_share.len().is_multiple_of(2) {
+        return Err(DesktopError::Validation {
+            kind: "argument".into(),
+            message: "sealed_share must be non-empty hex with even length".into(),
+        });
+    }
+    if parsed.guardian_set.is_empty() {
+        return Err(DesktopError::Validation {
+            kind: "argument".into(),
+            message: "guardian_set must be non-empty".into(),
+        });
+    }
+    for (idx, addr) in parsed.guardian_set.iter().enumerate() {
+        bytes_from_hex(addr, "guardian_set entry", 20).map_err(|e| match e {
+            DesktopError::Validation { kind, message } => DesktopError::Validation {
+                kind,
+                message: format!("guardian_set[{idx}]: {message}"),
+            },
+            other => other,
+        })?;
+    }
+    if parsed.expires_at == 0 {
+        return Err(DesktopError::Validation {
+            kind: "argument".into(),
+            message: "expires_at must be non-zero".into(),
+        });
+    }
+    // Audit LOW-2: the contract guarantees `attemptNonce >= 1` after a
+    // successful `initiateRecovery` (RecoveryV2.sol — `newNonce =
+    // rec.attemptNonce + 1`), so a request with attempt_nonce == 0 can
+    // never match a live attempt — fail loud at decode rather than
+    // burning an RPC.
+    if parsed.attempt_nonce == 0 {
+        return Err(DesktopError::Validation {
+            kind: "argument".into(),
+            message: "attempt_nonce must be >= 1 (contract starts nonces at 1)".into(),
+        });
+    }
+    // Audit LOW-2: RecoveryV2.initiateRecovery rejects an all-zero
+    // proposedAuthority (ErrZeroValue), so a request carrying one can
+    // never match a real live attempt.
+    let proposed_bytes = bytes_from_hex(&parsed.proposed_authority, "proposed_authority", 20)?;
+    if proposed_bytes.iter().all(|&b| b == 0) {
+        return Err(DesktopError::Validation {
+            kind: "argument".into(),
+            message: "proposed_authority must not be the zero address".into(),
+        });
+    }
+    Ok(parsed)
+}
+
+/// **GUARDIAN, step 1 of 2.** Sign + broadcast the V2 Approve on-chain
+/// for the recovering user's attempt. Wraps `vault_approve_recovery`:
+/// engine reads the LIVE PENDING attempt + asserts the host-supplied
+/// `(attempt_nonce, proposed_authority)` match (L11 fail-closed), builds
+/// the EIP-712 V2 digest binding the on-chain `recipientCommitment`,
+/// signs with the active session's EVM signer, broadcasts.
+///
+/// Chain broadcast → `spawn_blocking`.
+///
+/// # Errors
+/// `DesktopError::Session` (locked) / `DesktopError::Validation` (bad
+/// hex / arg lengths) / `DesktopError::Chain` (RPC / live-attempt drift
+/// / contract revert).
+#[tauri::command]
+pub async fn recovery_help_approve(
+    vault_id: String,
+    attempt_nonce: u64,
+    proposed_authority: String,
+    expires_at: u64,
+    guardian_set: Vec<String>,
+    state: State<'_, VaultState>,
+) -> Result<TxOutcomeDto, DesktopError> {
+    let handle = state.require_open()?;
+    let vault_id_bytes = bytes_from_hex(&vault_id, "vault_id", 32)?;
+    let proposed_authority_bytes = bytes_from_hex(&proposed_authority, "proposed_authority", 20)?;
+    let mut roster_bytes = Vec::with_capacity(guardian_set.len());
+    for (idx, addr) in guardian_set.iter().enumerate() {
+        roster_bytes.push(
+            bytes_from_hex(addr, "guardian_set entry", 20).map_err(|e| match e {
+                DesktopError::Validation { kind, message } => DesktopError::Validation {
+                    kind,
+                    message: format!("guardian_set[{idx}]: {message}"),
+                },
+                other => other,
+            })?,
+        );
+    }
+    let config = chain_config()?;
+    let outcome = tokio::task::spawn_blocking(move || {
+        pangolin_ffi::vault_approve_recovery(
+            handle,
+            config,
+            vault_id_bytes,
+            attempt_nonce,
+            proposed_authority_bytes,
+            expires_at,
+            roster_bytes,
+        )
+    })
+    .await
+    .map_err(|e| DesktopError::Internal(format!("approve-recovery task join failed: {e}")))?
+    .map_err(DesktopError::from)?;
+    Ok(outcome.into())
+}
+
+/// **GUARDIAN, step 2 of 2.** Open the guardian's stored sealed share +
+/// re-seal it to the recovering user's per-attempt ephemeral pubkey.
+/// Wraps `vault_guardian_release_share`: engine verifies the on-chain
+/// `recipientCommitment` matches the host-supplied value (Decision B
+/// anti-redirect, the load-bearing gate — FFI Phase 1) BEFORE opening
+/// the share; the cleartext piece never crosses the FFI; only the
+/// non-secret `SealedShareForRecoverer` bytes return.
+///
+/// Chain read + local crypto → `spawn_blocking`.
+///
+/// # Errors
+/// `DesktopError::Session` (locked) / `DesktopError::Validation` (bad
+/// hex / commitment mismatch / live-attempt status mismatch / open or
+/// re-seal cryptographic failure) / `DesktopError::Chain` (RPC).
+#[tauri::command]
+pub async fn recovery_help_release(
+    vault_id: String,
+    attempt_nonce: u64,
+    recipient_commitment: String,
+    sealed_share: String,
+    epoch: String,
+    state: State<'_, VaultState>,
+) -> Result<ReleaseResultDto, DesktopError> {
+    let handle = state.require_open()?;
+    let vault_id_bytes = bytes_from_hex(&vault_id, "vault_id", 32)?;
+    let recipient_commitment_bytes =
+        bytes_from_hex(&recipient_commitment, "recipient_commitment", 32)?;
+    let epoch_bytes = bytes_from_hex(&epoch, "epoch", 16)?;
+    let sealed_share_bytes = bytes_from_hex_variable(&sealed_share, "sealed_share")?;
+    let config = chain_config()?;
+    let result_bytes = tokio::task::spawn_blocking(move || {
+        pangolin_ffi::vault_guardian_release_share(
+            handle,
+            sealed_share_bytes,
+            vault_id_bytes,
+            epoch_bytes,
+            attempt_nonce,
+            recipient_commitment_bytes,
+            config,
+        )
+    })
+    .await
+    .map_err(|e| DesktopError::Internal(format!("guardian-release task join failed: {e}")))?
+    .map_err(DesktopError::from)?;
+    Ok(ReleaseResultDto {
+        sealed_share_for_recoverer: hex_encode(&result_bytes),
+    })
+}
+
+/// Variable-length hex → bytes helper (for the `sealed_share` blob which
+/// has no fixed length — it's the variable-size sealed-box ciphertext).
+/// Strict even BYTE-length on the trimmed input (i.e. `s.len()` in `u8`
+/// units, not graphemes — multi-byte UTF-8 input is safely rejected by
+/// `hex_nibble` per-byte but its byte-length is what the gate counts).
+/// Strict even byte-length only; empty input rejected.
+fn bytes_from_hex_variable(hex: &str, label: &'static str) -> Result<Vec<u8>, DesktopError> {
+    let s = hex.trim().trim_start_matches("0x");
+    if s.is_empty() || !s.len().is_multiple_of(2) {
+        return Err(DesktopError::Validation {
+            kind: "argument".into(),
+            message: format!(
+                "{label} must be non-empty hex with even length (got {})",
+                s.len()
+            ),
+        });
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for chunk in bytes.chunks(2) {
+        let hi = hex_nibble(chunk[0], label)?;
+        let lo = hex_nibble(chunk[1], label)?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,6 +742,164 @@ mod tests {
     #[test]
     fn bytes_from_hex_accepts_prefix_and_mixed_case() {
         let v = bytes_from_hex("0xAabb", "test", 2).expect("ok");
+        assert_eq!(v, vec![0xaa, 0xbb]);
+    }
+
+    /// L-C: closed-vault rejection on the two session-gated commands.
+    #[tokio::test]
+    async fn recovery_help_approve_with_no_vault_open_errors_session() {
+        let state = VaultState::default();
+        let err = state.require_open().expect_err("no vault");
+        assert!(matches!(err, DesktopError::Session(_)));
+    }
+
+    #[tokio::test]
+    async fn recovery_help_release_with_no_vault_open_errors_session() {
+        let state = VaultState::default();
+        let err = state.require_open().expect_err("no vault");
+        assert!(matches!(err, DesktopError::Session(_)));
+    }
+
+    /// L-C decoder smoke: empty input fails closed.
+    #[tokio::test]
+    async fn recovery_decode_request_rejects_empty() {
+        let err = recovery_decode_request(String::new())
+            .await
+            .expect_err("empty must fail decode");
+        assert!(matches!(err, DesktopError::Validation { .. }));
+    }
+
+    /// L-C decoder: bad base64 fails closed.
+    #[tokio::test]
+    async fn recovery_decode_request_rejects_bad_base64() {
+        let err = recovery_decode_request("!!!not-base64!!!".into())
+            .await
+            .expect_err("bad base64");
+        assert!(matches!(err, DesktopError::Validation { .. }));
+    }
+
+    /// L-C decoder: valid base64 + invalid JSON fails closed.
+    #[tokio::test]
+    async fn recovery_decode_request_rejects_non_json_payload() {
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::STANDARD.encode(b"not json");
+        let err = recovery_decode_request(payload)
+            .await
+            .expect_err("not json");
+        assert!(matches!(err, DesktopError::Validation { .. }));
+    }
+
+    /// L-C decoder: valid base64-of-JSON with wrong-length hex fields
+    /// fails closed at the field-validation step.
+    #[tokio::test]
+    async fn recovery_decode_request_rejects_wrong_length_hex() {
+        use base64::Engine as _;
+        let bad = serde_json::json!({
+            "vault_id": "aa", // too short — should be 64 chars
+            "attempt_nonce": 1,
+            "proposed_authority": "cc".repeat(20),
+            "recipient_commitment": "dd".repeat(32),
+            "sealed_share": "ee".repeat(32),
+            "epoch": "ff".repeat(16),
+            "guardian_set": ["aa".repeat(20)],
+            "expires_at": 100,
+        });
+        let payload =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&bad).unwrap());
+        let err = recovery_decode_request(payload)
+            .await
+            .expect_err("wrong length");
+        assert!(matches!(err, DesktopError::Validation { .. }));
+    }
+
+    /// L-C decoder happy path: well-formed payload round-trips.
+    #[tokio::test]
+    async fn recovery_decode_request_accepts_well_formed_payload() {
+        use base64::Engine as _;
+        let good = serde_json::json!({
+            "vault_id": "aa".repeat(32),
+            "attempt_nonce": 7,
+            "proposed_authority": "bb".repeat(20),
+            "recipient_commitment": "cc".repeat(32),
+            "sealed_share": "dd".repeat(40),
+            "epoch": "ee".repeat(16),
+            "guardian_set": ["aa".repeat(20), "bb".repeat(20), "cc".repeat(20)],
+            "expires_at": 100,
+        });
+        let payload =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&good).unwrap());
+        let dto = recovery_decode_request(payload).await.expect("decode ok");
+        assert_eq!(dto.attempt_nonce, 7);
+        assert_eq!(dto.expires_at, 100);
+        assert_eq!(dto.guardian_set.len(), 3);
+    }
+
+    /// L-C decoder audit LOW-2: rejects attempt_nonce == 0 (contract
+    /// guarantees attemptNonce >= 1 after initiateRecovery).
+    #[tokio::test]
+    async fn recovery_decode_request_rejects_zero_attempt_nonce() {
+        use base64::Engine as _;
+        let bad = serde_json::json!({
+            "vault_id": "aa".repeat(32),
+            "attempt_nonce": 0,
+            "proposed_authority": "bb".repeat(20),
+            "recipient_commitment": "cc".repeat(32),
+            "sealed_share": "dd".repeat(40),
+            "epoch": "ee".repeat(16),
+            "guardian_set": ["aa".repeat(20), "bb".repeat(20), "cc".repeat(20)],
+            "expires_at": 100,
+        });
+        let payload =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&bad).unwrap());
+        let err = recovery_decode_request(payload)
+            .await
+            .expect_err("zero nonce");
+        match err {
+            DesktopError::Validation { ref message, .. } => {
+                assert!(message.contains("attempt_nonce"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// L-C decoder audit LOW-2: rejects all-zero proposed_authority
+    /// (contract rejects ErrZeroValue at initiate, so this can never
+    /// match a live attempt).
+    #[tokio::test]
+    async fn recovery_decode_request_rejects_zero_proposed_authority() {
+        use base64::Engine as _;
+        let bad = serde_json::json!({
+            "vault_id": "aa".repeat(32),
+            "attempt_nonce": 1,
+            "proposed_authority": "00".repeat(20),
+            "recipient_commitment": "cc".repeat(32),
+            "sealed_share": "dd".repeat(40),
+            "epoch": "ee".repeat(16),
+            "guardian_set": ["aa".repeat(20), "bb".repeat(20), "cc".repeat(20)],
+            "expires_at": 100,
+        });
+        let payload =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&bad).unwrap());
+        let err = recovery_decode_request(payload)
+            .await
+            .expect_err("zero authority");
+        match err {
+            DesktopError::Validation { ref message, .. } => {
+                assert!(message.contains("zero address"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// `bytes_from_hex_variable` smoke: rejects empty + odd-length;
+    /// accepts even-length hex.
+    #[test]
+    fn bytes_from_hex_variable_rejects_empty_and_odd() {
+        let err = bytes_from_hex_variable("", "test").expect_err("empty");
+        assert!(matches!(err, DesktopError::Validation { .. }));
+        let err = bytes_from_hex_variable("aaa", "test").expect_err("odd");
+        assert!(matches!(err, DesktopError::Validation { .. }));
+        let v = bytes_from_hex_variable("0xAaBb", "test").expect("ok");
         assert_eq!(v, vec![0xaa, 0xbb]);
     }
 
