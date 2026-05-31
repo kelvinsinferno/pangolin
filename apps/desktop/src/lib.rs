@@ -146,6 +146,11 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         // MVP-4-L (L-D): recovery backup create + health panel.
         commands::recovery::recovery_create_backup,
         commands::recovery::recovery_health,
+        // MVP-4-L (L-A): guardian-onboarding wizard surface.
+        commands::recovery::guardian_identity_export,
+        commands::recovery::guardian_invite_decode_text,
+        commands::recovery::recovery_onboard_guardians,
+        commands::recovery::recovery_set_guardian_set,
         #[cfg(feature = "test-hooks")]
         test_hooks::__test__commands_invoked,
         #[cfg(feature = "test-hooks")]
