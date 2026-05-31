@@ -75,16 +75,34 @@ function errMessage(e: unknown): string {
  *  revert message shape (audit LOW-3). */
 const ZERO_AUTHORITY_HEX = '0'.repeat(40);
 
+/** Client-side RPC timeout for the chain-probe path (audit re-audit
+ *  NEW-LOW-1). Same shape as the L-D LOW-1 RecoveryScreen timeout: if a
+ *  hung Base Sepolia RPC doesn't respond promptly, we degrade to the
+ *  keyword-check + retry path instead of pinning the wizard on its
+ *  "broadcasting" spinner forever. */
+const CHAIN_PROBE_TIMEOUT_MS = 5_000;
+
 /** Probe the on-chain authority. Returns true iff a non-zero authority is
  *  set, indicating the prior `setGuardianSet` broadcast landed. Quiet on
- *  ANY failure (RPC down, vault not initialized, anything) — the caller
- *  falls back to the error-message keyword check. */
+ *  ANY failure (RPC down, vault not initialized, RPC timeout, anything)
+ *  — the caller falls back to the error-message keyword check. */
 async function chainShowsAuthoritySet(): Promise<boolean> {
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
   try {
-    const h = await recoveryHealth();
+    const h = await Promise.race<{ authority: string }>([
+      recoveryHealth(),
+      new Promise<{ authority: string }>((_, reject) => {
+        timeoutHandle = setTimeout(
+          () => reject(new Error('chainShowsAuthoritySet: client-side RPC timeout')),
+          CHAIN_PROBE_TIMEOUT_MS,
+        );
+      }),
+    ]);
     return h.authority !== '' && h.authority !== ZERO_AUTHORITY_HEX;
   } catch {
     return false;
+  } finally {
+    if (timeoutHandle !== null) clearTimeout(timeoutHandle);
   }
 }
 
@@ -157,6 +175,17 @@ export function SetupGuardiansWizard({
   const addInvite = async () => {
     const trimmed = pasteText.trim();
     if (trimmed === '') return;
+    // Defense beyond the disabled-button UI gate (audit re-audit LOW-1):
+    // the Q-d self-as-guardian check is meaningless until the identity
+    // export has settled. Refuse to advance until then so a synthesized
+    // event (devtools, accessibility tooling, future programmatic UX)
+    // cannot bypass the guard via the disabled-attribute path.
+    if (!selfLoaded) {
+      onError(
+        'Still loading this device’s identity — please wait a moment and try again.',
+      );
+      return;
+    }
     try {
       const invite = await guardianInviteDecodeText(trimmed);
 

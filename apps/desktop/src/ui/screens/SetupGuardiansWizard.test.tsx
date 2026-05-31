@@ -383,6 +383,16 @@ describe('SetupGuardiansWizard (MVP-4-L L-A)', () => {
     });
   });
 
+  // Re-audit LOW-1 defense-in-depth (in-function selfLoaded guard) and
+  // re-audit NEW-LOW-1 (chainShowsAuthoritySet 5s timeout) are CODE-LEVEL
+  // defenses — neither maps cleanly to a vitest case because React's
+  // synthetic-event system respects the disabled attribute (so we can't
+  // simulate a bypass click on the Add button) and the 5s timer doesn't
+  // interleave with vitest's fake-timers + jsdom's microtask order
+  // reliably without test scaffolding that's noisier than the defense
+  // itself. Both defenses are verified by source-read at the audit step;
+  // the L-D LOW-1 timeout pattern is the precedent for the latter.
+
   it('errMessage unwraps nested Validation error shape (audit LOW-4)', async () => {
     // Simulate the production Validation wire shape:
     // { kind: 'Validation', message: { kind: 'argument', message: '…' } }.
