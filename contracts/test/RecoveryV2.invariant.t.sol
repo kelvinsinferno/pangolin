@@ -397,8 +397,7 @@ contract RecoveryV2InvariantTest is Test {
     ///      the last-initiate nonce, the on-chain commitment equals the
     ///      value the handler passed in (captured into ghostCommitment).
     function invariant_commitmentImmutableDuringAttempt() public view {
-        (,, uint64 nonce,, RecoveryV2.Status st, bytes32 commitment) =
-            rec.recovery(handler.VAULT());
+        (,, uint64 nonce,, RecoveryV2.Status st, bytes32 commitment) = rec.recovery(handler.VAULT());
         if (
             st == RecoveryV2.Status.Pending && nonce == handler.lastNonce()
                 && handler.lastNonce() != 0
