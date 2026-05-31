@@ -510,3 +510,105 @@ export async function recoveryHealth(): Promise<RecoveryHealth> {
     attemptNonce: w.attempt_nonce,
   };
 }
+
+// ---- MVP-4-L (L-A): guardian-onboarding wizard surface ----
+
+/** A guardian invite — the non-secret (sealing-pubkey, signer-address)
+ *  pair the owner needs to set up social recovery. Hex-encoded for direct
+ *  display + transport via the wizard. */
+export interface GuardianInvite {
+  /** 64-char lowercase hex of the 32-byte X25519 sealing pubkey. The
+   *  off-chain Shamir share for this guardian is sealed against this key. */
+  x25519SealingPub: string;
+  /** 40-char lowercase hex of the 20-byte secp256k1 EVM signer address. The
+   *  on-chain merkle root commits all M of these. */
+  signer: string;
+  /** The canonical base32 + 4-byte-checksum text form. Echoed back so the
+   *  UI can show / copy it without re-encoding. */
+  stringForm: string;
+}
+
+interface GuardianInviteWire {
+  x25519_sealing_pub: string;
+  signer: string;
+  string_form: string;
+}
+
+function inviteFromWire(w: GuardianInviteWire): GuardianInvite {
+  return {
+    x25519SealingPub: w.x25519_sealing_pub,
+    signer: w.signer,
+    stringForm: w.string_form,
+  };
+}
+
+/** Result of recoveryOnboardGuardians — the epoch the off-chain escrow was
+ *  written at (genesis 0 for the first onboard on a vault). */
+export interface OnboardingResult {
+  epoch: number;
+}
+
+interface OnboardingResultWire {
+  epoch: number;
+}
+
+/** Receipt anchor returned from any chain-mutating recovery command. */
+export interface TxOutcome {
+  /** 64-char lowercase hex of the 32-byte transaction hash. */
+  txHash: string;
+  /** Block number the tx was included in (1-conf receipt). */
+  blockNumber: number;
+}
+
+interface TxOutcomeWire {
+  tx_hash: string;
+  block_number: number;
+}
+
+/** **THIS DEVICE.** Export this device's guardian identity. The L-A wizard
+ *  uses this for the self-as-guardian guard (Q-d) — refuses any ingested
+ *  invite whose pubkey matches this. */
+export async function guardianIdentityExport(): Promise<GuardianInvite> {
+  const w = await tauriInvoke<GuardianInviteWire>('guardian_identity_export');
+  return inviteFromWire(w);
+}
+
+/** Decode a guardian-supplied invite TEXT into the structured DTO.
+ *  Length-strict + domain-checked + version-gated FFI-side; throws
+ *  Validation on any malformed input. */
+export async function guardianInviteDecodeText(text: string): Promise<GuardianInvite> {
+  const w = await tauriInvoke<GuardianInviteWire>('guardian_invite_decode_text', { text });
+  return inviteFromWire(w);
+}
+
+/** **OWNER, step 1 of 2.** Seed the off-chain escrow: Shamir-split a fresh
+ *  RecoveryWrapKey into M shares + seal to each guardian's pubkey.
+ *  `x25519Pubs` is the M hex-encoded sealing pubkeys collected from the
+ *  guardian invites (each 64 hex chars); `threshold` is t. The FFI
+ *  revalidates t/M bounds. */
+export async function recoveryOnboardGuardians(
+  threshold: number,
+  x25519Pubs: string[],
+): Promise<OnboardingResult> {
+  const w = await tauriInvoke<OnboardingResultWire>('recovery_onboard_guardians', {
+    threshold,
+    x25519Pubs,
+  });
+  return { epoch: w.epoch };
+}
+
+/** **OWNER, step 2 of 2.** Commit the on-chain guardian merkle root +
+ *  self-bootstrap this device's EVM wallet as the vault authority. The FFI
+ *  computes the merkle root engine-side. */
+export async function recoverySetGuardianSet(
+  password: string,
+  evmAddrs: string[],
+  threshold: number,
+): Promise<TxOutcome> {
+  const w = await tauriInvoke<TxOutcomeWire>('recovery_set_guardian_set', {
+    password,
+    evmAddrs,
+    threshold,
+  });
+  return { txHash: w.tx_hash, blockNumber: w.block_number };
+}
