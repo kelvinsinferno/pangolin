@@ -371,6 +371,22 @@ pub fn vault_recover_from_shares(
 /// on-chain bounds (`t ∈ 2..=9`, `M ∈ 3..=15`, `t ≤ M`). Non-secret: guardian
 /// pubkeys in, the recovery-generation epoch out.
 ///
+/// # Self-as-guardian — NOT enforced here
+///
+/// This FFI does **NOT** refuse `THIS` device's own sealing pubkey (the one
+/// `vault_export_guardian_identity` would return for the active session). A
+/// self-onboard defeats the recovery threat model — if the owner loses all
+/// devices, the share sealed to the owner's device is unrecoverable, so the
+/// effective threshold becomes `t` of `M-1`. The check is intentionally
+/// UI-side (MVP-4-L L-A wizard, Q-d) because the engine has no concept of
+/// "this device's identity vs another's" beyond the active session's derived
+/// sealing key; pushing the check into the engine would couple the recovery
+/// composition to the session-derivation path.
+///
+/// **Every new caller** of this FFI (a future second UI surface, a CLI, an
+/// E2E harness) MUST replicate the self-as-guardian gate at its own layer.
+/// Plan-LOCK: `docs/issue-plans/mvp4-l-a-guardian-onboarding.md` §5.
+///
 /// # Errors
 ///
 /// - [`FfiError::Session`] for a locked / placeholder handle.

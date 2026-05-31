@@ -1,36 +1,47 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Recovery Tauri commands (MVP-4-L, slice L-D).
+//! Recovery Tauri commands (MVP-4-L, slices L-D + L-A).
 //!
-//! Thin wrappers over the already-built recovery FFI for the gap-free
-//! slice: create a recovery backup (24-word phrase + envelope) and a
-//! read-only recovery-health panel (current on-chain authority + any
-//! in-flight recovery). NO guardian onboarding, NO recovery wizard, NO new
-//! crypto — those are deferred behind the share-transport design (plan-LOCK
-//! docs/issue-plans/mvp4-l-recovery-ux.md §1/§2). A backup ALWAYS requires
-//! guardians to actually recover (Q-c) — the phrase is an aid, not a key.
+//! Thin wrappers over the already-built recovery FFI. L-D ships the
+//! backup-phrase create flow + a read-only recovery-health panel. L-A
+//! ships the owner-side guardian-onboarding wizard surface: export THIS
+//! device's guardian identity (for the self-as-guardian guard), decode
+//! a guardian-supplied invite text, seed the off-chain escrow, then
+//! commit the on-chain merkle root. Plan-LOCKs:
+//! `docs/issue-plans/mvp4-l-recovery-ux.md`,
+//! `docs/issue-plans/mvp4-l-a-guardian-onboarding.md`.
 //!
 //! ## L-invariants
 //!
-//! - **L1.** The ONE secret that crosses here is the 24-word seed phrase
-//!   (the backup's wrap authority) — it crosses out at create time exactly
-//!   as designed (`vault_create_backup`), and the master password crosses
-//!   in via the same `SecretPassword::new` path as `vault_unlock`. The VDK
-//!   never crosses. The health-panel reads carry only non-secret on-chain
-//!   addresses + status.
-//! - **L3.** Fail-closed: the health-panel chain reads surface a typed
-//!   `DesktopError` (the UX shows "unavailable / not set up") rather than
-//!   fabricating a state.
-//! - **L4.** Handle-bearing commands are session-gated FFI-side.
+//! - **L1.** Secrets crossing here: the 24-word seed phrase (L-D, out)
+//!   and the master password (L-D / L-A, in via the opaque
+//!   `SecretPassword::new` path). VDK never crosses. Guardian invites +
+//!   sealing pubkeys + EVM addresses are explicitly non-secret per L-0b.
+//! - **L3.** Fail-closed: the health-panel + chain-broadcast paths surface
+//!   typed `DesktopError`s rather than fabricating success / state.
+//! - **L4.** Handle-bearing commands are session-gated FFI-side. The pure
+//!   `guardian_invite_decode_text` command takes no handle by design.
 //!
-//! Chain reads (`recovery_health`) run via `spawn_blocking` (the FFI drives
-//! a nested current-thread runtime that would panic inline — same trap as
-//! the pairing chain commands). `recovery_create_backup` is local crypto
-//! (no chain) and runs inline.
+//! Chain commands (`recovery_health`, `recovery_set_guardian_set`) run via
+//! `spawn_blocking` (the FFI drives a nested current-thread runtime that
+//! would panic inline — same trap as the pairing chain commands). The
+//! local-crypto commands (`recovery_create_backup`,
+//! `recovery_onboard_guardians`, `guardian_identity_export`) run inline.
 
 #![forbid(unsafe_code)]
 // Documented recovery module; doc-style pedantic lints allowed at module
 // level, matching commands/pairing.rs. Substantive lints stay enforced.
-#![allow(clippy::doc_markdown, clippy::too_long_first_doc_paragraph)]
+//
+// `clippy::unused_async` is allowed because `#[tauri::command]` handlers
+// that take `State<'_, VaultState>` require `async fn` (the lifetime on
+// State binds against the future), and that requirement extends to the
+// pure commands in the module for surface uniformity (the frontend's
+// invoke layer assumes every command returns a Promise). The body-level
+// "no await" pattern is a Tauri quirk, not a code smell.
+#![allow(
+    clippy::doc_markdown,
+    clippy::too_long_first_doc_paragraph,
+    clippy::unused_async
+)]
 
 use serde::Serialize;
 use tauri::State;
@@ -143,6 +154,245 @@ pub async fn recovery_health(
     .map_err(|e| DesktopError::Internal(format!("recovery-health task join failed: {e}")))?
 }
 
+// ---------------------------------------------------------------------------
+// MVP-4-L L-A — guardian-onboarding wizard surface
+// ---------------------------------------------------------------------------
+
+/// A guardian invite — the non-secret `(x25519_sealing_pub, signer)` pair
+/// (32 + 20 bytes) plus the two transport forms produced by L-0b. Mirrors
+/// `pangolin_ffi::FfiGuardianInvite`.
+///
+/// Every field is non-secret. The owner ingests these (one per guardian)
+/// via the wizard's paste flow (Q-a = Option 1 paste-only); both pubkey
+/// fields then feed `recovery_onboard_guardians` (off-chain) and
+/// `recovery_set_guardian_set` (on-chain).
+#[derive(Debug, Clone, Serialize)]
+pub struct GuardianInviteDto {
+    /// 64-char hex of the 32-byte X25519 sealing pubkey. The off-chain
+    /// Shamir share for this guardian is sealed against this key.
+    pub x25519_sealing_pub: String,
+    /// 40-char hex of the 20-byte secp256k1 EVM signer address. The owner
+    /// commits the merkle root of all M signers on-chain.
+    pub signer: String,
+    /// Canonical text form (base32 + 4-byte checksum) — what the guardian
+    /// originally copy-pasted. Echoed back so the UI can show / copy it.
+    pub string_form: String,
+}
+
+impl From<pangolin_ffi::FfiGuardianInvite> for GuardianInviteDto {
+    fn from(i: pangolin_ffi::FfiGuardianInvite) -> Self {
+        Self {
+            x25519_sealing_pub: hex_encode(&i.x25519_sealing_pub),
+            signer: hex_encode(&i.signer),
+            string_form: i.string_form,
+        }
+    }
+}
+
+/// Non-secret result of `recovery_onboard_guardians`.
+#[derive(Debug, Clone, Serialize)]
+pub struct OnboardingResultDto {
+    /// The recovery-generation epoch the off-chain escrow was written at
+    /// (GENESIS `0` for the first onboard on a vault).
+    pub epoch: u64,
+}
+
+impl From<pangolin_ffi::FfiOnboardingResult> for OnboardingResultDto {
+    fn from(o: pangolin_ffi::FfiOnboardingResult) -> Self {
+        Self { epoch: o.epoch }
+    }
+}
+
+/// Non-secret receipt anchor returned from any chain-mutating recovery
+/// binding (currently `recovery_set_guardian_set`). Mirrors
+/// `pangolin_ffi::FfiTxOutcome`.
+#[derive(Debug, Clone, Serialize)]
+pub struct TxOutcomeDto {
+    /// 64-char hex of the 32-byte transaction hash.
+    pub tx_hash: String,
+    /// Block number the tx was included in (1-conf receipt).
+    pub block_number: u64,
+}
+
+impl From<pangolin_ffi::FfiTxOutcome> for TxOutcomeDto {
+    fn from(o: pangolin_ffi::FfiTxOutcome) -> Self {
+        Self {
+            tx_hash: hex_encode(&o.tx_hash),
+            block_number: o.block_number,
+        }
+    }
+}
+
+/// Hex → byte helper for the wizard's invite pubkeys / EVM addresses.
+/// Strict-length, lowercase-tolerant; rejects odd lengths + non-hex bytes
+/// with a typed `Validation` error.
+fn bytes_from_hex(
+    hex: &str,
+    label: &'static str,
+    expected_len: usize,
+) -> Result<Vec<u8>, DesktopError> {
+    let s = hex.trim().trim_start_matches("0x");
+    if s.len() != expected_len * 2 {
+        return Err(DesktopError::Validation {
+            kind: "argument".into(),
+            message: format!(
+                "{label} must be {} hex chars (got {})",
+                expected_len * 2,
+                s.len()
+            ),
+        });
+    }
+    let mut out = Vec::with_capacity(expected_len);
+    let bytes = s.as_bytes();
+    for chunk in bytes.chunks(2) {
+        let hi = hex_nibble(chunk[0], label)?;
+        let lo = hex_nibble(chunk[1], label)?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8, label: &'static str) -> Result<u8, DesktopError> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(DesktopError::Validation {
+            kind: "argument".into(),
+            message: format!("{label} contains non-hex byte"),
+        }),
+    }
+}
+
+/// **THIS DEVICE.** Export this device's guardian identity — the same
+/// non-secret `(x25519_sealing_pub, signer)` pair another vault's owner
+/// would commit. Used by the L-A wizard for the self-as-guardian guard
+/// (Q-d): the wizard refuses any ingested invite whose pubkey matches.
+///
+/// Session-gated FFI-side. No chain.
+///
+/// # Errors
+/// `DesktopError::Session` (locked) / `DesktopError::Store`.
+#[tauri::command]
+pub async fn guardian_identity_export(
+    state: State<'_, VaultState>,
+) -> Result<GuardianInviteDto, DesktopError> {
+    let handle = state.require_open()?;
+    let invite =
+        pangolin_ffi::vault_export_guardian_identity(handle).map_err(DesktopError::from)?;
+    Ok(invite.into())
+}
+
+/// **Pure decode** (no handle, no session). Decode a guardian-supplied
+/// invite TEXT (base32 + 4-byte checksum, as produced by
+/// `guardian_identity_export`'s `string_form`) into the structured DTO.
+/// Length-strict + domain-checked + version-gated FFI-side.
+///
+/// The wizard accepts a pasted invite — this is the only ingest path
+/// under Q-a = Option 1 (paste-only). The host can derive the bytes form
+/// from a future QR-render flow without a new command if needed.
+///
+/// # Errors
+/// `DesktopError::Validation { kind = "argument" }` for any decode failure.
+#[tauri::command]
+pub async fn guardian_invite_decode_text(text: String) -> Result<GuardianInviteDto, DesktopError> {
+    let invite = pangolin_ffi::guardian_invite_decode_string(text).map_err(DesktopError::from)?;
+    Ok(invite.into())
+}
+
+/// **OWNER, step 1 of 2.** Seed the off-chain recovery escrow: Shamir-split
+/// a fresh `RecoveryWrapKey` into `M` shares + seal each to the matching
+/// guardian's X25519 sealing pubkey + persist the roster. `x25519_pubs` is
+/// the M hex-encoded pubkeys (each exactly 64 hex chars) collected from
+/// the guardian invites; `threshold` is `t`. The FFI revalidates t/M
+/// bounds (the contract requires `t ∈ 2..=9`, `M ∈ 3..=15`, `t ≤ M`).
+///
+/// Local crypto — no chain — runs inline.
+///
+/// # Self-as-guardian — UI gate only
+///
+/// The underlying [`pangolin_ffi::vault_onboard_guardians`] does NOT refuse
+/// THIS device's own sealing pubkey (see the FFI's "Self-as-guardian"
+/// section). The `SetupGuardiansWizard.tsx` Q-d guard is the sole
+/// enforcement; if a future caller bypasses the wizard (devtools direct
+/// invoke, a new screen) the gate is lost. This wrapper deliberately
+/// stays stateless to keep the FFI-mirroring policy uniform.
+///
+/// # Errors
+/// `DesktopError::Session` (locked) / `DesktopError::Validation` (bad
+/// pubkey length / out-of-bounds bounds) / `DesktopError::Store` (DB).
+#[tauri::command]
+pub async fn recovery_onboard_guardians(
+    threshold: u8,
+    x25519_pubs: Vec<String>,
+    state: State<'_, VaultState>,
+) -> Result<OnboardingResultDto, DesktopError> {
+    let handle = state.require_open()?;
+    let mut pubs_bytes = Vec::with_capacity(x25519_pubs.len());
+    for (idx, hex) in x25519_pubs.iter().enumerate() {
+        pubs_bytes.push(bytes_from_hex(hex, "guardian X25519 pubkey", 32).map_err(
+            |e| match e {
+                DesktopError::Validation { kind, message } => DesktopError::Validation {
+                    kind,
+                    message: format!("guardian #{idx}: {message}"),
+                },
+                other => other,
+            },
+        )?);
+    }
+    let outcome = pangolin_ffi::vault_onboard_guardians(handle, threshold, pubs_bytes)
+        .map_err(DesktopError::from)?;
+    Ok(outcome.into())
+}
+
+/// **OWNER, step 2 of 2.** Commit the on-chain guardian merkle root +
+/// self-bootstrap this device's EVM wallet as the initial `vaultAuthority`.
+/// `evm_addrs` is the M hex-encoded 20-byte addresses from the guardian
+/// invites; `threshold` is `t`. The FFI computes the merkle root engine-
+/// side (host never supplies it) and broadcasts `setGuardianSet` on the
+/// pinned `RecoveryV2` deployment.
+///
+/// On a partial-onboarding state (step 1 already succeeded for a prior
+/// attempt + step 2 failed), the contract reverts
+/// `ErrGuardianSetAlreadyInitialized` on a successful re-attempt — the
+/// frontend detects this as "already done" per the L-A Q-c plan.
+///
+/// Chain broadcast → `spawn_blocking`.
+///
+/// # Errors
+/// `DesktopError::Session` (locked) / `DesktopError::Validation` (bad
+/// address length) / `DesktopError::Chain` (RPC / revert / receipt).
+#[tauri::command]
+pub async fn recovery_set_guardian_set(
+    password: String,
+    evm_addrs: Vec<String>,
+    threshold: u8,
+    state: State<'_, VaultState>,
+) -> Result<TxOutcomeDto, DesktopError> {
+    let handle = state.require_open()?;
+    let mut addr_bytes = Vec::with_capacity(evm_addrs.len());
+    for (idx, hex) in evm_addrs.iter().enumerate() {
+        addr_bytes.push(
+            bytes_from_hex(hex, "guardian EVM address", 20).map_err(|e| match e {
+                DesktopError::Validation { kind, message } => DesktopError::Validation {
+                    kind,
+                    message: format!("guardian #{idx}: {message}"),
+                },
+                other => other,
+            })?,
+        );
+    }
+    let config = chain_config()?;
+    let pw = SecretPassword::new(password.into_bytes());
+    let outcome = tokio::task::spawn_blocking(move || {
+        pangolin_ffi::vault_set_guardian_set(handle, pw, config, addr_bytes, threshold)
+    })
+    .await
+    .map_err(|e| DesktopError::Internal(format!("set-guardian-set task join failed: {e}")))?
+    .map_err(DesktopError::from)?;
+    Ok(outcome.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +416,62 @@ mod tests {
         let state = VaultState::default();
         let err = state.require_open().expect_err("no vault");
         assert!(matches!(err, DesktopError::Session(_)));
+    }
+
+    /// L-A: each handle-bearing onboarding command first-line-guards on
+    /// `require_open`. Mirror the L-D LOW-2 pattern + the precedent at
+    /// vault.rs::vault_lock_with_no_vault_open_errors_session.
+    #[tokio::test]
+    async fn guardian_identity_export_with_no_vault_open_errors_session() {
+        let state = VaultState::default();
+        let err = state.require_open().expect_err("no vault");
+        assert!(matches!(err, DesktopError::Session(_)));
+    }
+
+    #[tokio::test]
+    async fn recovery_onboard_guardians_with_no_vault_open_errors_session() {
+        let state = VaultState::default();
+        let err = state.require_open().expect_err("no vault");
+        assert!(matches!(err, DesktopError::Session(_)));
+    }
+
+    #[tokio::test]
+    async fn recovery_set_guardian_set_with_no_vault_open_errors_session() {
+        let state = VaultState::default();
+        let err = state.require_open().expect_err("no vault");
+        assert!(matches!(err, DesktopError::Session(_)));
+    }
+
+    /// `guardian_invite_decode_text` is PURE — no handle, no session — so
+    /// the closed-vault path doesn't apply. Smoke that bad-input fails
+    /// closed with a typed Validation error instead.
+    #[tokio::test]
+    async fn guardian_invite_decode_text_rejects_empty() {
+        let err = guardian_invite_decode_text(String::new())
+            .await
+            .expect_err("empty must fail decode");
+        assert!(matches!(err, DesktopError::Validation { .. }));
+    }
+
+    /// Hex parser rejects malformed input with a typed Validation error
+    /// (lengthbound + non-hex byte). Defends both onboard + set-guardian-set
+    /// commands.
+    #[test]
+    fn bytes_from_hex_rejects_short_and_nonhex() {
+        let too_short = bytes_from_hex("aa", "test pubkey", 32).expect_err("len");
+        assert!(matches!(too_short, DesktopError::Validation { .. }));
+
+        // Right length, contains a non-hex character (the 'z').
+        let bad_char = "z".repeat(40);
+        let nonhex = bytes_from_hex(&bad_char, "test addr", 20).expect_err("nonhex");
+        assert!(matches!(nonhex, DesktopError::Validation { .. }));
+    }
+
+    /// Hex parser tolerates the 0x prefix + uppercase hex.
+    #[test]
+    fn bytes_from_hex_accepts_prefix_and_mixed_case() {
+        let v = bytes_from_hex("0xAabb", "test", 2).expect("ok");
+        assert_eq!(v, vec![0xaa, 0xbb]);
     }
 
     #[test]
