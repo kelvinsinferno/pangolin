@@ -226,12 +226,20 @@ impl From<pangolin_ffi::FfiTxOutcome> for TxOutcomeDto {
 /// Hex → byte helper for the wizard's invite pubkeys / EVM addresses.
 /// Strict-length, lowercase-tolerant; rejects odd lengths + non-hex bytes
 /// with a typed `Validation` error.
-fn bytes_from_hex(hex: &str, label: &'static str, expected_len: usize) -> Result<Vec<u8>, DesktopError> {
+fn bytes_from_hex(
+    hex: &str,
+    label: &'static str,
+    expected_len: usize,
+) -> Result<Vec<u8>, DesktopError> {
     let s = hex.trim().trim_start_matches("0x");
     if s.len() != expected_len * 2 {
         return Err(DesktopError::Validation {
             kind: "argument".into(),
-            message: format!("{label} must be {} hex chars (got {})", expected_len * 2, s.len()),
+            message: format!(
+                "{label} must be {} hex chars (got {})",
+                expected_len * 2,
+                s.len()
+            ),
         });
     }
     let mut out = Vec::with_capacity(expected_len);
@@ -288,8 +296,7 @@ pub async fn guardian_identity_export(
 /// `DesktopError::Validation { kind = "argument" }` for any decode failure.
 #[tauri::command]
 pub async fn guardian_invite_decode_text(text: String) -> Result<GuardianInviteDto, DesktopError> {
-    let invite =
-        pangolin_ffi::guardian_invite_decode_string(text).map_err(DesktopError::from)?;
+    let invite = pangolin_ffi::guardian_invite_decode_string(text).map_err(DesktopError::from)?;
     Ok(invite.into())
 }
 
@@ -314,14 +321,15 @@ pub async fn recovery_onboard_guardians(
     let handle = state.require_open()?;
     let mut pubs_bytes = Vec::with_capacity(x25519_pubs.len());
     for (idx, hex) in x25519_pubs.iter().enumerate() {
-        pubs_bytes
-            .push(bytes_from_hex(hex, "guardian X25519 pubkey", 32).map_err(|e| match e {
+        pubs_bytes.push(bytes_from_hex(hex, "guardian X25519 pubkey", 32).map_err(
+            |e| match e {
                 DesktopError::Validation { kind, message } => DesktopError::Validation {
                     kind,
                     message: format!("guardian #{idx}: {message}"),
                 },
                 other => other,
-            })?);
+            },
+        )?);
     }
     let outcome = pangolin_ffi::vault_onboard_guardians(handle, threshold, pubs_bytes)
         .map_err(DesktopError::from)?;
@@ -355,13 +363,15 @@ pub async fn recovery_set_guardian_set(
     let handle = state.require_open()?;
     let mut addr_bytes = Vec::with_capacity(evm_addrs.len());
     for (idx, hex) in evm_addrs.iter().enumerate() {
-        addr_bytes.push(bytes_from_hex(hex, "guardian EVM address", 20).map_err(|e| match e {
-            DesktopError::Validation { kind, message } => DesktopError::Validation {
-                kind,
-                message: format!("guardian #{idx}: {message}"),
-            },
-            other => other,
-        })?);
+        addr_bytes.push(
+            bytes_from_hex(hex, "guardian EVM address", 20).map_err(|e| match e {
+                DesktopError::Validation { kind, message } => DesktopError::Validation {
+                    kind,
+                    message: format!("guardian #{idx}: {message}"),
+                },
+                other => other,
+            })?,
+        );
     }
     let config = chain_config()?;
     let pw = SecretPassword::new(password.into_bytes());
