@@ -6,6 +6,7 @@ import {
   guardianIdentityExport,
   guardianInviteDecodeText,
   isDesktopError,
+  recoveryHealth,
   recoveryOnboardGuardians,
   recoverySetGuardianSet,
   type GuardianInvite,
@@ -54,9 +55,37 @@ const MAX_THRESHOLD = 9;
 
 function errMessage(e: unknown): string {
   if (isDesktopError(e)) {
-    return typeof e.message === 'string' ? e.message : e.kind;
+    // Validation errors carry a nested { kind, message } record (see the
+    // invoke.ts DesktopError comment). Unwrap it so the toast surfaces
+    // the actual bound-violation reason, not the bare label "Validation".
+    const m = e.message;
+    if (typeof m === 'string') return m;
+    if (m !== null && typeof m === 'object') {
+      const inner = (m as { message?: unknown }).message;
+      if (typeof inner === 'string') return inner;
+    }
+    return e.kind;
   }
   return e instanceof Error ? e.message : 'unexpected error';
+}
+
+/** ZERO_AUTHORITY in hex (40 chars) — matches `hex_encode` of a 20-byte
+ *  all-zero EVM address. Used by the chain-read fallback in the retry path
+ *  to detect "the broadcast actually landed" without depending on the
+ *  revert message shape (audit LOW-3). */
+const ZERO_AUTHORITY_HEX = '0'.repeat(40);
+
+/** Probe the on-chain authority. Returns true iff a non-zero authority is
+ *  set, indicating the prior `setGuardianSet` broadcast landed. Quiet on
+ *  ANY failure (RPC down, vault not initialized, anything) — the caller
+ *  falls back to the error-message keyword check. */
+async function chainShowsAuthoritySet(): Promise<boolean> {
+  try {
+    const h = await recoveryHealth();
+    return h.authority !== '' && h.authority !== ZERO_AUTHORITY_HEX;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -87,6 +116,13 @@ export function SetupGuardiansWizard({
   const [pasteText, setPasteText] = useState('');
   const [password, setPassword] = useState('');
   const [selfPubkey, setSelfPubkey] = useState<string | null>(null);
+  // `selfLoaded` is set once the identity-export resolves OR fails, so the
+  // UI can close the Q-d race window where a fast paste-and-click could
+  // sneak past the guard while the pubkey is still loading (audit LOW-1).
+  // The guard's degraded mode (selfPubkey === null after a failed load)
+  // is preserved — selfLoaded is true even on failure, so the user can
+  // still proceed.
+  const [selfLoaded, setSelfLoaded] = useState(false);
   // Re-entry guard: the chain step must never fire twice from a double-
   // click. Mirrors AddDeviceWizard.publishGuard.
   const broadcastGuard = useRef(false);
@@ -103,6 +139,8 @@ export function SetupGuardiansWizard({
         if (!cancelled) setSelfPubkey(me.x25519SealingPub);
       } catch {
         if (!cancelled) setSelfPubkey(null);
+      } finally {
+        if (!cancelled) setSelfLoaded(true);
       }
     })();
     return () => {
@@ -194,6 +232,17 @@ export function SetupGuardiansWizard({
       onSuccess();
     } catch (e) {
       broadcastGuard.current = false;
+      // Audit LOW-3: a post-broadcast on-chain revert surfaces as
+      // "unknown revert (status=0)" — the reason is not decoded — so
+      // the keyword check alone could miss a successful broadcast that
+      // technically reverted on a re-attempt. Probe the chain DIRECTLY:
+      // if the authority is set, the prior broadcast actually landed.
+      if (await chainShowsAuthoritySet()) {
+        setPassword('');
+        setStep('done');
+        onSuccess();
+        return;
+      }
       // Q-c: a chain failure leaves the off-chain escrow seeded. Route to
       // the retry step so the user can re-attempt JUST the chain step
       // (idempotent: the contract reverts ErrGuardianSetAlreadyInitialized
@@ -215,9 +264,19 @@ export function SetupGuardiansWizard({
       onSuccess();
     } catch (e) {
       broadcastGuard.current = false;
+      // Audit LOW-3: the chain-read fallback is the most robust signal
+      // that the prior broadcast landed — independent of however the
+      // revert reason is (or isn't) decoded.
+      if (await chainShowsAuthoritySet()) {
+        setPassword('');
+        setStep('done');
+        onSuccess();
+        return;
+      }
+      // Estimate-gas revert messages DO include the reason; keyword
+      // check is the fallback for that path (or any error class where
+      // the chain isn't yet observably in the post-broadcast state).
       const msg = errMessage(e).toLowerCase();
-      // Treat "already initialized" as success — the prior broadcast
-      // actually landed; the local UI just lost the receipt.
       if (msg.includes('alreadyinitialized') || msg.includes('already initialized')) {
         setPassword('');
         setStep('done');
@@ -257,7 +316,7 @@ export function SetupGuardiansWizard({
           />
           <Button
             onClick={() => void addInvite()}
-            disabled={pasteText.trim() === ''}
+            disabled={pasteText.trim() === '' || !selfLoaded}
             data-testid="setup-guardians-add"
           >
             Add guardian

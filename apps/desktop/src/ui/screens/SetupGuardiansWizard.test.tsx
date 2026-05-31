@@ -6,6 +6,7 @@ import { SetupGuardiansWizard } from './SetupGuardiansWizard';
 import {
   guardianIdentityExport,
   guardianInviteDecodeText,
+  recoveryHealth,
   recoveryOnboardGuardians,
   recoverySetGuardianSet,
 } from '../lib/invoke';
@@ -35,7 +36,7 @@ vi.mock('../lib/invoke', async (importOriginal) => {
       // Echo "INV-XYZ" → fakeInvite('XYZ'); reject everything else as
       // Validation so the wizard's error-toast path is exercised on bad input.
       const m = /^INV-([A-Za-z0-9]+)$/.exec(text);
-      if (m === null) {
+      if (m === null || m[1] === undefined) {
         const err = { kind: 'Validation', message: 'malformed invite' };
         throw err;
       }
@@ -46,12 +47,25 @@ vi.mock('../lib/invoke', async (importOriginal) => {
       txHash: 'aa'.repeat(32),
       blockNumber: 42,
     })),
+    // Default: no on-chain authority set (the wizard's pre-onboarding state).
+    // Tests override this to simulate "broadcast actually landed" scenarios.
+    recoveryHealth: vi.fn(async () => ({
+      authority: '0'.repeat(40),
+      recoveryStatus: 0,
+      proposedAuthority: '',
+      attemptNonce: 0,
+    })),
   };
 });
 
 async function addGuardian(seed: string) {
   fireEvent.change(screen.getByTestId('setup-guardians-paste'), {
     target: { value: `INV-${seed}` },
+  });
+  // Audit LOW-1: the Add button is disabled until the self-identity
+  // export resolves; wait for it before clicking.
+  await waitFor(() => {
+    expect(screen.getByTestId('setup-guardians-add')).not.toBeDisabled();
   });
   fireEvent.click(screen.getByTestId('setup-guardians-add'));
   await waitFor(() => {
@@ -135,11 +149,14 @@ describe('SetupGuardiansWizard (MVP-4-L L-A)', () => {
     fireEvent.change(screen.getByTestId('setup-guardians-paste'), {
       target: { value: 'INV-SELF' },
     });
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-guardians-add')).not.toBeDisabled();
+    });
     fireEvent.click(screen.getByTestId('setup-guardians-add'));
     await waitFor(() => {
       expect(onError).toHaveBeenCalled();
     });
-    expect(onError.mock.calls[0][0]).toMatch(/own device/);
+    expect(onError.mock.calls[0]?.[0]).toMatch(/own device/);
     expect(screen.queryByTestId('guardian-0')).not.toBeInTheDocument();
   });
 
@@ -245,5 +262,158 @@ describe('SetupGuardiansWizard (MVP-4-L L-A)', () => {
 
     await screen.findByTestId('step-done');
     expect(onSuccess).toHaveBeenCalledTimes(1);
+  });
+
+  it('retry treats the realistic FFI Display message as success (audit LOW-2)', async () => {
+    // The production message that comes out of
+    // ChainError::RevertedPreBroadcast Display when setGuardianSet hits
+    // ErrGuardianSetAlreadyInitialized during estimate-gas (per the
+    // recovery_client::finish + error::Display paths). The wizard's
+    // case-insensitive substring match must accept this exact shape.
+    const onSuccess = vi.fn();
+    const setGuardianSet = recoverySetGuardianSet as unknown as ReturnType<typeof vi.fn>;
+    setGuardianSet.mockRejectedValueOnce({ kind: 'Chain', message: 'RPC down' });
+    setGuardianSet.mockRejectedValueOnce({
+      kind: 'Chain',
+      message:
+        'revision tx reverted pre-broadcast (estimate-gas): reason=ErrGuardianSetAlreadyInitialized',
+    });
+
+    render(
+      <SetupGuardiansWizard onError={() => {}} onClose={() => {}} onSuccess={onSuccess} />,
+    );
+    await addThreeAndAdvance();
+    fireEvent.click(screen.getByTestId('setup-guardians-threshold-next'));
+    await screen.findByTestId('step-password');
+    fireEvent.change(screen.getByTestId('setup-guardians-password'), {
+      target: { value: 'master-pw' },
+    });
+    fireEvent.click(screen.getByTestId('setup-guardians-onboard'));
+    await screen.findByTestId('step-retry');
+    fireEvent.change(screen.getByTestId('setup-guardians-retry-password'), {
+      target: { value: 'master-pw' },
+    });
+    fireEvent.click(screen.getByTestId('setup-guardians-retry'));
+
+    await screen.findByTestId('step-done');
+    expect(onSuccess).toHaveBeenCalledTimes(1);
+  });
+
+  it('retry uses the chain-read fallback when the revert reason is opaque (audit LOW-3)', async () => {
+    // Simulates a post-broadcast on-chain revert that surfaces as a
+    // non-decoded "unknown revert (status=0)" message. The wizard MUST
+    // observe the chain state directly to detect "the broadcast actually
+    // landed" instead of relying on the error keyword.
+    const onSuccess = vi.fn();
+    const setGuardianSet = recoverySetGuardianSet as unknown as ReturnType<typeof vi.fn>;
+    setGuardianSet.mockRejectedValueOnce({ kind: 'Chain', message: 'RPC down' });
+    setGuardianSet.mockRejectedValueOnce({
+      kind: 'Chain',
+      message: 'unknown revert (status=0)',
+    });
+    // The chain probe reports a non-zero authority → the broadcast DID
+    // land at some point; the wizard treats this as success.
+    const health = recoveryHealth as unknown as ReturnType<typeof vi.fn>;
+    // First call (during the first 'onboarding' attempt's chain-fail
+    // fallback): no authority yet. Second (during retry): authority IS
+    // set → success.
+    health.mockResolvedValueOnce({
+      authority: '0'.repeat(40),
+      recoveryStatus: 0,
+      proposedAuthority: '',
+      attemptNonce: 0,
+    });
+    health.mockResolvedValueOnce({
+      authority: 'aa'.repeat(20),
+      recoveryStatus: 0,
+      proposedAuthority: '',
+      attemptNonce: 0,
+    });
+
+    render(
+      <SetupGuardiansWizard onError={() => {}} onClose={() => {}} onSuccess={onSuccess} />,
+    );
+    await addThreeAndAdvance();
+    fireEvent.click(screen.getByTestId('setup-guardians-threshold-next'));
+    await screen.findByTestId('step-password');
+    fireEvent.change(screen.getByTestId('setup-guardians-password'), {
+      target: { value: 'master-pw' },
+    });
+    fireEvent.click(screen.getByTestId('setup-guardians-onboard'));
+    await screen.findByTestId('step-retry');
+    fireEvent.change(screen.getByTestId('setup-guardians-retry-password'), {
+      target: { value: 'master-pw' },
+    });
+    fireEvent.click(screen.getByTestId('setup-guardians-retry'));
+
+    await screen.findByTestId('step-done');
+    expect(onSuccess).toHaveBeenCalledTimes(1);
+    expect(health).toHaveBeenCalledTimes(2);
+  });
+
+  it('Add button stays disabled until the self-identity load resolves (audit LOW-1)', async () => {
+    // Defer the self-identity load with an unresolving promise so the
+    // wizard can never reach selfLoaded=true. The Add button must remain
+    // disabled even with valid paste text, closing the Q-d race.
+    const idExport = guardianIdentityExport as unknown as ReturnType<typeof vi.fn>;
+    let resolveExport: ((v: typeof ME) => void) | undefined;
+    idExport.mockImplementationOnce(
+      () =>
+        new Promise<typeof ME>((resolve) => {
+          resolveExport = resolve;
+        }),
+    );
+
+    render(
+      <SetupGuardiansWizard onError={() => {}} onClose={() => {}} onSuccess={() => {}} />,
+    );
+
+    // Type a valid invite — Add button should STILL be disabled until
+    // selfLoaded resolves.
+    fireEvent.change(screen.getByTestId('setup-guardians-paste'), {
+      target: { value: 'INV-AAA' },
+    });
+    const addBtn = screen.getByTestId('setup-guardians-add');
+    expect(addBtn).toBeDisabled();
+
+    // Once the export resolves the button becomes enabled.
+    resolveExport?.(ME);
+    await waitFor(() => {
+      expect(addBtn).not.toBeDisabled();
+    });
+  });
+
+  it('errMessage unwraps nested Validation error shape (audit LOW-4)', async () => {
+    // Simulate the production Validation wire shape:
+    // { kind: 'Validation', message: { kind: 'argument', message: '…' } }.
+    // The wizard's errMessage should surface the inner message string,
+    // NOT the bare label 'Validation'.
+    const onError = vi.fn();
+    const decode = guardianInviteDecodeText as unknown as ReturnType<typeof vi.fn>;
+    decode.mockRejectedValueOnce({
+      kind: 'Validation',
+      message: {
+        kind: 'argument',
+        message: 'guardian invite: WrongLength expected 56 got 32',
+      },
+    });
+
+    render(
+      <SetupGuardiansWizard onError={onError} onClose={() => {}} onSuccess={() => {}} />,
+    );
+    // Wait for selfLoaded so the Add button is interactive.
+    await waitFor(() => {
+      expect(guardianIdentityExport).toHaveBeenCalled();
+    });
+    fireEvent.change(screen.getByTestId('setup-guardians-paste'), {
+      target: { value: 'INV-bad' },
+    });
+    fireEvent.click(screen.getByTestId('setup-guardians-add'));
+    await waitFor(() => {
+      expect(onError).toHaveBeenCalled();
+    });
+    const firstCallArg = onError.mock.calls[0]?.[0];
+    expect(firstCallArg).toMatch(/WrongLength expected 56/);
+    expect(firstCallArg).not.toBe('Validation');
   });
 });

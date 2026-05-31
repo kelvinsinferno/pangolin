@@ -309,6 +309,15 @@ pub async fn guardian_invite_decode_text(text: String) -> Result<GuardianInviteD
 ///
 /// Local crypto — no chain — runs inline.
 ///
+/// # Self-as-guardian — UI gate only
+///
+/// The underlying [`pangolin_ffi::vault_onboard_guardians`] does NOT refuse
+/// THIS device's own sealing pubkey (see the FFI's "Self-as-guardian"
+/// section). The `SetupGuardiansWizard.tsx` Q-d guard is the sole
+/// enforcement; if a future caller bypasses the wizard (devtools direct
+/// invoke, a new screen) the gate is lost. This wrapper deliberately
+/// stays stateless to keep the FFI-mirroring policy uniform.
+///
 /// # Errors
 /// `DesktopError::Session` (locked) / `DesktopError::Validation` (bad
 /// pubkey length / out-of-bounds bounds) / `DesktopError::Store` (DB).
