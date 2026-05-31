@@ -2,7 +2,7 @@
 
 # MVP-4-L (L-A) — Guardian onboarding UX (owner) — plan-gate DRAFT
 
-**Status: DRAFT — awaiting Kelvin sign-off.** Parent plan-gates: [mvp4-l-recovery-ux.md](mvp4-l-recovery-ux.md) (decomposition §1, L-A row) + [mvp4-l-0-engine-gapfill.md](mvp4-l-0-engine-gapfill.md) (gap G-2 closed by L-0b). L-0a-1 (RecoveryV2 + on-chain G-1/G-3) + L-0a-2 (off-chain G-1 transport) are already merged, so L-A is now an unblocked thin-UX slice over the existing FFI surface.
+**Status: LOCKED — Kelvin sign-off 2026-05-30.** Q-a = **Option 1** (paste-only). Q-b = **Option 1** (extend RecoveryScreen). Q-c = **Option 1** (resume + idempotent retry). Q-d = **Option 1** (hard refuse self-as-guardian). Q-e = **Option 1** (auto-refresh health panel after success). Parent plan-gates: [mvp4-l-recovery-ux.md](mvp4-l-recovery-ux.md) (decomposition §1, L-A row) + [mvp4-l-0-engine-gapfill.md](mvp4-l-0-engine-gapfill.md) (gap G-2 closed by L-0b). L-0a-1 (RecoveryV2 + on-chain G-1/G-3) + L-0a-2 (off-chain G-1 transport) are already merged, so L-A is now an unblocked thin-UX slice over the existing FFI surface.
 
 > **This slice builds ONLY:** the owner-side wizard that collects M guardian invites + a threshold `t`, then drives `vault_onboard_guardians` (off-chain Shamir split + seal) followed by `vault_set_guardian_set` (on-chain merkle root + self-bootstrap as `vaultAuthority`). NO guardian-side flow (that's L-C), NO recovery wizard (that's L-B), NO net-new crypto, NO net-new FFI. Testnet-only.
 
