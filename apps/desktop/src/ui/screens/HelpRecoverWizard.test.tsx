@@ -186,4 +186,52 @@ describe('HelpRecoverWizard (MVP-4-L L-C)', () => {
     fireEvent.click(await screen.findByTestId('help-recover-cancel'));
     expect(onClose).toHaveBeenCalledTimes(1);
   });
+
+  it('audit LOW-1: rejects requests with expiresAt within the 60s safety margin', async () => {
+    // A request that expires in 30s would race the broadcast time on the
+    // contract's block.timestamp check. Reject loud at ingest so the
+    // guardian doesn't burn gas only to hit ErrApprovalExpired.
+    const onError = vi.fn();
+    const decode = recoveryDecodeRequest as unknown as ReturnType<typeof vi.fn>;
+    decode.mockResolvedValueOnce(
+      fakeRequest({ expiresAt: Math.floor(Date.now() / 1000) + 30 }),
+    );
+
+    render(<HelpRecoverWizard onError={onError} onClose={() => {}} />);
+    fireEvent.change(screen.getByTestId('help-recover-paste'), {
+      target: { value: 'NEAR-EXPIRY' },
+    });
+    fireEvent.click(screen.getByTestId('help-recover-ingest'));
+
+    await waitFor(() => {
+      expect(onError).toHaveBeenCalled();
+    });
+    expect(onError.mock.calls[0]?.[0]).toMatch(/too soon|expires in/i);
+    expect(screen.queryByTestId('step-preview')).not.toBeInTheDocument();
+    expect(recoveryHelpApprove).not.toHaveBeenCalled();
+  });
+
+  it('audit LOW-3: preview truncates hex with first AND last segments', async () => {
+    // A prefix-only truncation lets an attacker craft a fake target with
+    // a colliding prefix; showing both ends raises the bar.
+    render(<HelpRecoverWizard onError={() => {}} onClose={() => {}} />);
+    await advanceToPreview();
+
+    const vaultPreview = screen.getByTestId('preview-vault-id');
+    // Truncated form should match 0x{6 hex}…{6 hex}.
+    expect(vaultPreview.textContent).toMatch(/^0x[a-f0-9]{6}…[a-f0-9]{6}$/);
+    // The commitment field also.
+    const commitPreview = screen.getByTestId('preview-recipient-commitment');
+    expect(commitPreview.textContent).toMatch(/^0x[a-f0-9]{6}…[a-f0-9]{6}$/);
+  });
+
+  // Audit LOW-4 defense (in-function broadcastGuard re-check in
+  // runReleaseOnly) — not directly testable: after the first retry
+  // click, React flushes the setStep('releasing') re-render before the
+  // second click can find the button, so testing-library can't simulate
+  // a true double-click during the in-flight call. The defense remains
+  // load-bearing for the case where (in production) two events race
+  // through React's event system before the re-render commits. The
+  // guard mirrors AddDeviceWizard.publishGuard + SetupGuardiansWizard's
+  // broadcastGuard, both of which are well-trodden patterns.
 });

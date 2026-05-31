@@ -509,6 +509,27 @@ pub async fn recovery_decode_request(text: String) -> Result<RecoveryRequestDto,
             message: "expires_at must be non-zero".into(),
         });
     }
+    // Audit LOW-2: the contract guarantees `attemptNonce >= 1` after a
+    // successful `initiateRecovery` (RecoveryV2.sol — `newNonce =
+    // rec.attemptNonce + 1`), so a request with attempt_nonce == 0 can
+    // never match a live attempt — fail loud at decode rather than
+    // burning an RPC.
+    if parsed.attempt_nonce == 0 {
+        return Err(DesktopError::Validation {
+            kind: "argument".into(),
+            message: "attempt_nonce must be >= 1 (contract starts nonces at 1)".into(),
+        });
+    }
+    // Audit LOW-2: RecoveryV2.initiateRecovery rejects an all-zero
+    // proposedAuthority (ErrZeroValue), so a request carrying one can
+    // never match a real live attempt.
+    let proposed_bytes = bytes_from_hex(&parsed.proposed_authority, "proposed_authority", 20)?;
+    if proposed_bytes.iter().all(|&b| b == 0) {
+        return Err(DesktopError::Validation {
+            kind: "argument".into(),
+            message: "proposed_authority must not be the zero address".into(),
+        });
+    }
     Ok(parsed)
 }
 
@@ -618,7 +639,10 @@ pub async fn recovery_help_release(
 
 /// Variable-length hex → bytes helper (for the `sealed_share` blob which
 /// has no fixed length — it's the variable-size sealed-box ciphertext).
-/// Strict even-length only.
+/// Strict even BYTE-length on the trimmed input (i.e. `s.len()` in `u8`
+/// units, not graphemes — multi-byte UTF-8 input is safely rejected by
+/// `hex_nibble` per-byte but its byte-length is what the gate counts).
+/// Strict even byte-length only; empty input rejected.
 fn bytes_from_hex_variable(hex: &str, label: &'static str) -> Result<Vec<u8>, DesktopError> {
     let s = hex.trim().trim_start_matches("0x");
     if s.is_empty() || !s.len().is_multiple_of(2) {
@@ -808,6 +832,63 @@ mod tests {
         assert_eq!(dto.attempt_nonce, 7);
         assert_eq!(dto.expires_at, 100);
         assert_eq!(dto.guardian_set.len(), 3);
+    }
+
+    /// L-C decoder audit LOW-2: rejects attempt_nonce == 0 (contract
+    /// guarantees attemptNonce >= 1 after initiateRecovery).
+    #[tokio::test]
+    async fn recovery_decode_request_rejects_zero_attempt_nonce() {
+        use base64::Engine as _;
+        let bad = serde_json::json!({
+            "vault_id": "aa".repeat(32),
+            "attempt_nonce": 0,
+            "proposed_authority": "bb".repeat(20),
+            "recipient_commitment": "cc".repeat(32),
+            "sealed_share": "dd".repeat(40),
+            "epoch": "ee".repeat(16),
+            "guardian_set": ["aa".repeat(20), "bb".repeat(20), "cc".repeat(20)],
+            "expires_at": 100,
+        });
+        let payload =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&bad).unwrap());
+        let err = recovery_decode_request(payload)
+            .await
+            .expect_err("zero nonce");
+        match err {
+            DesktopError::Validation { ref message, .. } => {
+                assert!(message.contains("attempt_nonce"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// L-C decoder audit LOW-2: rejects all-zero proposed_authority
+    /// (contract rejects ErrZeroValue at initiate, so this can never
+    /// match a live attempt).
+    #[tokio::test]
+    async fn recovery_decode_request_rejects_zero_proposed_authority() {
+        use base64::Engine as _;
+        let bad = serde_json::json!({
+            "vault_id": "aa".repeat(32),
+            "attempt_nonce": 1,
+            "proposed_authority": "00".repeat(20),
+            "recipient_commitment": "cc".repeat(32),
+            "sealed_share": "dd".repeat(40),
+            "epoch": "ee".repeat(16),
+            "guardian_set": ["aa".repeat(20), "bb".repeat(20), "cc".repeat(20)],
+            "expires_at": 100,
+        });
+        let payload =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&bad).unwrap());
+        let err = recovery_decode_request(payload)
+            .await
+            .expect_err("zero authority");
+        match err {
+            DesktopError::Validation { ref message, .. } => {
+                assert!(message.contains("zero address"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
     }
 
     /// `bytes_from_hex_variable` smoke: rejects empty + odd-length;

@@ -85,11 +85,35 @@ describe('RecoveryScreen (L-D)', () => {
     expect(await screen.findByTestId('setup-guardians-open')).toBeInTheDocument();
   });
 
-  it('L-C: shows the Help someone recover card unconditionally', async () => {
+  it('L-C: shows the Help someone recover card when no wizard is open', async () => {
     // Card visibility is independent of authority state — any guardian
-    // can be asked to help at any time.
+    // can be asked to help at any time, as long as no other wizard is up.
     render(<RecoveryScreen {...noop} />);
     expect(await screen.findByTestId('help-recover-open')).toBeInTheDocument();
+  });
+
+  it('audit MED-2: opening one wizard hides BOTH cards (mutual exclusion)', async () => {
+    // Configure the health mock to allow the L-A setup-guardians card to
+    // render (zero authority); then click into the L-A wizard and
+    // confirm BOTH the setup card AND the help card disappear.
+    vi.mocked(recoveryHealth).mockResolvedValue({
+      authority: '0'.repeat(40),
+      recoveryStatus: 0,
+      proposedAuthority: '',
+      attemptNonce: 0,
+    });
+    render(<RecoveryScreen {...noop} />);
+
+    // Both cards visible initially.
+    expect(await screen.findByTestId('setup-guardians-open')).toBeInTheDocument();
+    expect(screen.getByTestId('help-recover-open')).toBeInTheDocument();
+
+    // Open the L-A wizard.
+    fireEvent.click(screen.getByTestId('setup-guardians-open'));
+
+    // Both cards now hidden — MED-2 mutual exclusion enforced.
+    expect(screen.queryByTestId('setup-guardians-open')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('help-recover-open')).not.toBeInTheDocument();
   });
 
   it('L-A: hides the Set up guardians card once authority is set', async () => {

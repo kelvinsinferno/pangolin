@@ -6,7 +6,6 @@ import {
   copyToClipboard,
   isDesktopError,
   recoveryDecodeRequest,
-  recoveryHealth,
   recoveryHelpApprove,
   recoveryHelpRelease,
   type RecoveryRequest,
@@ -27,6 +26,17 @@ type Step =
   | 'done'
   | 'retry';
 
+/** Display a truncated hex string as `prefix…suffix` so the guardian can
+ *  detect a swap attempt that only differs in the middle bytes. Prefix-
+ *  only truncation (audit LOW-3) was vulnerable to a trivial off-chain
+ *  prefix collision; showing BOTH ends raises the bar to a full-length
+ *  preimage attack on a 32-byte hash. The full hex is still shown in the
+ *  click-to-expand block if a guardian wants byte-level certainty. */
+function truncateHex(hex: string, segLen: number = 6): string {
+  if (hex.length <= segLen * 2 + 1) return hex;
+  return `${hex.slice(0, segLen)}…${hex.slice(-segLen)}`;
+}
+
 function errMessage(e: unknown): string {
   if (isDesktopError(e)) {
     // Validation envelope is { kind, message: { kind, message } } — unwrap
@@ -42,50 +52,11 @@ function errMessage(e: unknown): string {
   return e instanceof Error ? e.message : 'unexpected error';
 }
 
-/** Client-side RPC timeout for the chain-probe path (mirrors L-A's
- *  CHAIN_PROBE_TIMEOUT_MS — the L-D LOW-1 lesson: a hung RPC must NOT
- *  pin the wizard on its progress step forever). */
-const CHAIN_PROBE_TIMEOUT_MS = 5_000;
-
-/** Probe whether the guardian's approval is already on-chain (the L-C
- *  analog of L-A's chainShowsAuthoritySet). We can't query "has this
- *  guardian approved THIS attempt" directly without a chain read that
- *  isn't exposed at the FFI level today; instead we observe via the
- *  shared `recoveryHealth` read on THIS device's vault — but that's the
- *  GUARDIAN'S vault, not the recovering user's. So we can't actually
- *  detect "approve landed but release failed" through health. The Q-d
- *  retry shape relies on the contract's idempotence: if the prior
- *  approve landed, a re-attempt reverts ErrDuplicateApproval, which the
- *  retry handler treats as success and falls through to the release
- *  step. */
-async function approveAlreadyLanded(): Promise<boolean> {
-  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-  try {
-    // The guardian-side health-panel reads THIS device's vault health.
-    // This is a low-fidelity signal for "has my approve to a foreign
-    // vault landed" but it does at least confirm RPC reachability,
-    // which is the more common failure mode at the retry boundary.
-    const probe = await Promise.race([
-      recoveryHealth(),
-      new Promise((_, reject) => {
-        timeoutHandle = setTimeout(
-          () => reject(new Error('approveAlreadyLanded: client-side RPC timeout')),
-          CHAIN_PROBE_TIMEOUT_MS,
-        );
-      }),
-    ]);
-    // We don't have a "did THIS guardian approve target-vault attempt
-    // N" view at the FFI today; this probe is purely a connectivity
-    // smoke. Return false so the keyword check is the authoritative
-    // signal — matches the L-A fallback shape.
-    void probe;
-    return false;
-  } catch {
-    return false;
-  } finally {
-    if (timeoutHandle !== null) clearTimeout(timeoutHandle);
-  }
-}
+/** Minimum margin between now and the request's `expiresAt`. Below this,
+ *  gas estimation + broadcast latency would race the contract's
+ *  ErrApprovalExpired revert — better to fail loud client-side (audit
+ *  LOW-1). The contract's check is `block.timestamp > expiresAt`. */
+const EXPIRY_MIN_MARGIN_SEC = 60;
 
 /**
  * Guardian-side "Help someone recover" wizard (MVP-4-L slice L-C). Per
@@ -119,15 +90,22 @@ export function HelpRecoverWizard({ onError, onClose }: HelpRecoverWizardProps) 
     try {
       const parsed = await recoveryDecodeRequest(trimmed);
       // Local pre-check: refuse to advance if the approval is already
-      // expired — the contract would revert ErrApprovalExpired anyway,
-      // but failing locally surfaces the issue to the guardian without
-      // burning gas. We compare against the client's clock; minor skew
-      // (a few seconds) is fine, large skew is the user's problem.
+      // expired OR within the EXPIRY_MIN_MARGIN_SEC window — by the time
+      // we estimate gas + broadcast, the contract's
+      // `block.timestamp > expiresAt` would revert ErrApprovalExpired
+      // and the guardian would burn gas (audit LOW-1).
       const nowSec = Math.floor(Date.now() / 1000);
-      if (parsed.expiresAt <= nowSec) {
-        onError(
-          `Recovery request has expired (expiresAt was ${parsed.expiresAt}; now ${nowSec}). Ask the recovering user to send a fresh request.`,
-        );
+      const marginRemaining = parsed.expiresAt - nowSec;
+      if (marginRemaining < EXPIRY_MIN_MARGIN_SEC) {
+        if (marginRemaining <= 0) {
+          onError(
+            `Recovery request has expired (expiresAt was ${parsed.expiresAt}; now ${nowSec}). Ask the recovering user to send a fresh request.`,
+          );
+        } else {
+          onError(
+            `Recovery request expires in ${marginRemaining}s — too soon to safely broadcast (need at least ${EXPIRY_MIN_MARGIN_SEC}s). Ask the recovering user to send a fresh request.`,
+          );
+        }
         return;
       }
       setReq(parsed);
@@ -158,7 +136,12 @@ export function HelpRecoverWizard({ onError, onClose }: HelpRecoverWizardProps) 
       return;
     }
 
-    // Step 2 of 2: release the re-sealed share.
+    // Step 2 of 2: release the re-sealed share. Release the broadcast
+    // guard before the in-function call so runReleaseOnly's own guard
+    // check can re-acquire it. There's no race here because the UI is
+    // on the 'approving'/'releasing' step with no clickable confirm
+    // button surfaced.
+    broadcastGuard.current = false;
     await runReleaseOnly();
   };
 
@@ -168,8 +151,12 @@ export function HelpRecoverWizard({ onError, onClose }: HelpRecoverWizardProps) 
    *  ErrDuplicateApproval — so the retry handler treats that revert as
    *  "approve has landed; proceed to release". */
   const runReleaseOnly = async () => {
-    if (req === null) return;
-    broadcastGuard.current = true; // belt-and-suspenders: already set in the initial path
+    // Audit LOW-4: the retry button calls this function directly, so the
+    // broadcastGuard check must live HERE (not just in the initial-flow
+    // caller). A double-click on retry would otherwise fire two parallel
+    // recoveryHelpRelease calls.
+    if (req === null || broadcastGuard.current) return;
+    broadcastGuard.current = true;
     setStep('releasing');
     try {
       const result = await recoveryHelpRelease(
@@ -183,12 +170,11 @@ export function HelpRecoverWizard({ onError, onClose }: HelpRecoverWizardProps) 
       setStep('done');
     } catch (e) {
       broadcastGuard.current = false;
-      // approveAlreadyLanded is a low-fidelity reachability smoke at the
-      // L-C boundary (we can't query "did THIS guardian approve target
-      // vault attempt N" without a new FFI); the wizard surfaces the
-      // typed error to the guardian and routes to the retry step so
-      // they can re-attempt without re-approving.
-      void (await approveAlreadyLanded());
+      // The retry shape relies on the contract's approve idempotence: if
+      // the prior approve actually landed, re-attempting reverts
+      // ErrDuplicateApproval and we'd reach release-only via the retry
+      // button. No client-side connectivity probe is load-bearing here
+      // (audit MED-1 removed the dead probe).
       onError(errMessage(e));
       setStep('retry');
     }
@@ -231,14 +217,14 @@ export function HelpRecoverWizard({ onError, onClose }: HelpRecoverWizardProps) 
           <p>Verify these details with the recovering user out-of-band before continuing.</p>
           <dl className="recovery-wizard__preview">
             <dt>Target vault</dt>
-            <dd data-testid="preview-vault-id">0x{req.vaultId.slice(0, 12)}…</dd>
+            <dd data-testid="preview-vault-id">0x{truncateHex(req.vaultId)}</dd>
             <dt>New authority (where recovery will rotate to)</dt>
             <dd data-testid="preview-proposed-authority">0x{req.proposedAuthority}</dd>
             <dt>Attempt nonce</dt>
             <dd data-testid="preview-attempt-nonce">{req.attemptNonce}</dd>
             <dt>Recoverer pubkey (commitment)</dt>
             <dd data-testid="preview-recipient-commitment">
-              0x{req.recipientCommitment.slice(0, 12)}…
+              0x{truncateHex(req.recipientCommitment)}
             </dd>
             <dt>Approval expires</dt>
             <dd data-testid="preview-expires-at">
