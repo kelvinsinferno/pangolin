@@ -10,6 +10,7 @@ import {
   type Backup,
   type RecoveryHealth,
 } from '../lib/invoke';
+import { HelpRecoverWizard } from './HelpRecoverWizard';
 import { SetupGuardiansWizard } from './SetupGuardiansWizard';
 
 export interface RecoveryScreenProps {
@@ -48,6 +49,7 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
   const [password, setPassword] = useState('');
   const [backup, setBackup] = useState<Backup | null>(null);
   const [showGuardiansWizard, setShowGuardiansWizard] = useState(false);
+  const [showHelpRecoverWizard, setShowHelpRecoverWizard] = useState(false);
   // Health refresh trigger — bumped after the wizard reports success so
   // the panel re-fetches without a full screen remount (Q-e).
   const [healthRefreshTick, setHealthRefreshTick] = useState(0);
@@ -148,6 +150,13 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
         />
       ) : null}
 
+      {showHelpRecoverWizard ? (
+        <HelpRecoverWizard
+          onError={onError}
+          onClose={() => setShowHelpRecoverWizard(false)}
+        />
+      ) : null}
+
       {/* Read-only recovery-health panel */}
       <Card elevation="sm">
         <h2>Recovery status</h2>
@@ -188,6 +197,26 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
             data-testid="setup-guardians-open"
           >
             Set up guardians
+          </Button>
+        </Card>
+      )}
+
+      {/* L-C: help someone recover card — always visible. Any guardian
+          can be asked at any time, regardless of whether THIS vault has
+          set up its own guardians. */}
+      {!showHelpRecoverWizard && (
+        <Card elevation="sm">
+          <h2>Help someone recover</h2>
+          <p>
+            Were you asked to help someone recover their vault? Paste the
+            request they sent you here. You&apos;ll see what they&apos;re
+            asking for before you approve.
+          </p>
+          <Button
+            onClick={() => setShowHelpRecoverWizard(true)}
+            data-testid="help-recover-open"
+          >
+            Help someone recover
           </Button>
         </Card>
       )}

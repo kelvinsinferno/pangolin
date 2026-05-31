@@ -85,6 +85,13 @@ describe('RecoveryScreen (L-D)', () => {
     expect(await screen.findByTestId('setup-guardians-open')).toBeInTheDocument();
   });
 
+  it('L-C: shows the Help someone recover card unconditionally', async () => {
+    // Card visibility is independent of authority state — any guardian
+    // can be asked to help at any time.
+    render(<RecoveryScreen {...noop} />);
+    expect(await screen.findByTestId('help-recover-open')).toBeInTheDocument();
+  });
+
   it('L-A: hides the Set up guardians card once authority is set', async () => {
     // vi.clearAllMocks() clears call history but NOT mock implementations
     // set via mockResolvedValue in prior tests — re-pin the default here
