@@ -57,16 +57,17 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
     // fail-closed) — which is the correct UX for the common L-D state
     // anyway (guardian onboarding doesn't ship until L-A).
     const HEALTH_RPC_TIMEOUT_MS = 5_000;
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
     void (async () => {
       try {
         const h = await Promise.race<RecoveryHealth>([
           recoveryHealth(),
-          new Promise<RecoveryHealth>((_, reject) =>
-            setTimeout(
+          new Promise<RecoveryHealth>((_, reject) => {
+            timeoutHandle = setTimeout(
               () => reject(new Error('recovery_health: client-side RPC timeout')),
               HEALTH_RPC_TIMEOUT_MS,
-            ),
-          ),
+            );
+          }),
         ]);
         if (!cancelled) {
           setHealth(h);
@@ -77,11 +78,13 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
         // RPC timeout. Any of these → degrade to the "not set up" note.
         if (!cancelled) setHealthAvailable(false);
       } finally {
+        if (timeoutHandle !== null) clearTimeout(timeoutHandle);
         if (!cancelled) setHealthLoaded(true);
       }
     })();
     return () => {
       cancelled = true;
+      if (timeoutHandle !== null) clearTimeout(timeoutHandle);
     };
   }, []);
 
