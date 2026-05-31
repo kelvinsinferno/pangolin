@@ -151,6 +151,10 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         commands::recovery::guardian_invite_decode_text,
         commands::recovery::recovery_onboard_guardians,
         commands::recovery::recovery_set_guardian_set,
+        // MVP-4-L (L-C): guardian-side help wizard surface.
+        commands::recovery::recovery_decode_request,
+        commands::recovery::recovery_help_approve,
+        commands::recovery::recovery_help_release,
         #[cfg(feature = "test-hooks")]
         test_hooks::__test__commands_invoked,
         #[cfg(feature = "test-hooks")]
