@@ -392,16 +392,19 @@ contract RecoveryV2InvariantTest is Test {
     }
 
     /// @dev V2 NEW: `recipientCommitment` is set at initiate and the
-    ///      contract has no path that mutates it during a pending
-    ///      attempt. Cross-check: whenever there's a Pending attempt at
-    ///      the last-initiate nonce, the on-chain commitment equals the
-    ///      value the handler passed in (captured into ghostCommitment).
+    ///      contract has no path that mutates it during ANY pending
+    ///      attempt. Cross-check: whenever the slot is Pending, the
+    ///      on-chain commitment equals the value the handler captured at
+    ///      the last successful initiate (the handler updates
+    ///      `ghostCommitment` atomically with `lastNonce` inside the
+    ///      initiate try-block, so the two ghosts stay aligned). The
+    ///      `st == Pending` guard is the only state-filter — strictly
+    ///      stronger than gating on `nonce == lastNonce`, since the
+    ///      contract has no path to Pending without a successful
+    ///      initiate AND no path to mutate the field once Pending.
     function invariant_commitmentImmutableDuringAttempt() public view {
-        (,, uint64 nonce,, RecoveryV2.Status st, bytes32 commitment) = rec.recovery(handler.VAULT());
-        if (
-            st == RecoveryV2.Status.Pending && nonce == handler.lastNonce()
-                && handler.lastNonce() != 0
-        ) {
+        (,,,, RecoveryV2.Status st, bytes32 commitment) = rec.recovery(handler.VAULT());
+        if (st == RecoveryV2.Status.Pending) {
             assertEq(
                 commitment,
                 handler.ghostCommitment(),
