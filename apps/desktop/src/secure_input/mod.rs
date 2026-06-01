@@ -32,11 +32,23 @@
 //!   in the inner FFI op (e.g. `vault_unlock` rejects on Locked
 //!   placeholder); secure-input runs before the gate but supplies the
 //!   secret that gates use.
-//! - **L6.** `forbid(unsafe_code)` at module level; the per-OS native
-//!   widgets that need FFI calls override this scoped to the unsafe
-//!   region with a justifying comment.
+//! - **L6.** `deny(unsafe_code)` at module level (was `forbid` until
+//!   we discovered `forbid` cannot be overridden by `allow` in a
+//!   child scope — the windows.rs Win32 FFI legitimately needs
+//!   `unsafe { ... }`). The per-OS files that need unsafe FFI
+//!   calls (currently only windows.rs) opt in via their own
+//!   `#![allow(unsafe_code)]` with a justifying comment. linux.rs
+//!   uses gtk-rs's safe wrappers; macos.rs uses objc2's safe
+//!   bindings — neither needs unsafe.
 
-#![forbid(unsafe_code)]
+// L6 invariant: the per-OS native widgets (linux.rs / macos.rs /
+// windows.rs) NEED `unsafe` to call into the C / Objective-C / Win32
+// FFIs. Rust's `forbid` lint level cannot be overridden by `allow`
+// in a child scope, but `deny` CAN — so we use `deny` here and let
+// each per-OS file opt in via its own `#![allow(unsafe_code)]` with
+// a justifying comment. The stub + the no-OS fall-through path use
+// no `unsafe` and inherit the deny.
+#![deny(unsafe_code)]
 #![allow(clippy::doc_markdown, clippy::too_long_first_doc_paragraph)]
 
 pub mod error;

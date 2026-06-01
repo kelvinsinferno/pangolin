@@ -29,16 +29,19 @@
 //! known trade-off; the secure widget closes the keylogger /
 //! screen-grab vector even if the in-memory buffer isn't zeroed.
 
-#![allow(unsafe_code)]
+// Verified against objc2-app-kit 0.3.2 source: NSAlert::new(mtm),
+// setMessageText/setInformativeText/setAlertStyle/addButtonWithTitle/
+// setAccessoryView/runModal, NSSecureTextField::initWithFrame, and
+// NSControl::stringValue are all `pub fn` (safe) in this binding.
+// `NSSecureTextField::alloc(mtm)` comes from the `MainThreadOnly`
+// trait — must be imported for the method to be visible on the type.
 
 use std::sync::mpsc;
 
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2::{ClassType, MainThreadMarker};
+use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSAlertStyle, NSApplication, NSControl, NSModalResponse, NSSecureTextField,
-    NSTextField, NSView,
+    NSAlert, NSAlertStyle, NSApplication, NSModalResponse, NSSecureTextField, NSTextField, NSView,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -88,39 +91,36 @@ fn run_nsalert(title: &str, body: &str) -> Result<Zeroizing<Vec<u8>>, SecureInpu
         });
     };
 
-    // SAFETY: All AppKit interactions below are on the main thread
-    // (proven by `mtm` above). Each `unsafe` block wraps a single
-    // Apple-API call whose preconditions are: main-thread + non-null
-    // self/args, both satisfied here. Bytes flow into a
-    // Zeroizing<Vec<u8>> at the end so the password lifetime in
-    // non-zeroizing buffers is minimal.
+    // All AppKit interactions below are SAFE because the per-method
+    // objc2-app-kit bindings prove main-thread + nullability invariants
+    // at the type system level (each method here is `pub fn`, not
+    // `pub unsafe fn` — verified against objc2-app-kit 0.3.2 source).
+    // Bytes flow into a Zeroizing<Vec<u8>> at the end so the password
+    // lifetime in non-zeroizing buffers is minimal.
 
     // Ensure the app is running. NSApp may not yet be wired up if
     // this is called extremely early in the lifecycle. We don't
     // assume any setup state beyond that mtm is valid.
     let _ = NSApplication::sharedApplication(mtm);
 
-    let alert: Retained<NSAlert> = unsafe { NSAlert::new(mtm) };
+    let alert: Retained<NSAlert> = NSAlert::new(mtm);
     let title_ns = NSString::from_str(title);
     let body_ns = NSString::from_str(body);
 
-    unsafe {
-        alert.setMessageText(&title_ns);
-        alert.setInformativeText(&body_ns);
-        alert.setAlertStyle(NSAlertStyle::Informational);
-    }
+    alert.setMessageText(&title_ns);
+    alert.setInformativeText(&body_ns);
+    alert.setAlertStyle(NSAlertStyle::Informational);
 
     let ok_title = NSString::from_str("OK");
     let cancel_title = NSString::from_str("Cancel");
-    unsafe {
-        // The first added button is the default (Enter key); second is
-        // typically Cancel / Esc.
-        alert.addButtonWithTitle(&ok_title);
-        alert.addButtonWithTitle(&cancel_title);
-    }
+    // The first added button is the default (Enter key); second is
+    // typically Cancel / Esc.
+    alert.addButtonWithTitle(&ok_title);
+    alert.addButtonWithTitle(&cancel_title);
 
     // NSSecureTextField for the password input. 24-pt height, 240-pt
-    // width — fits NSAlert's default content layout cleanly.
+    // width — fits NSAlert's default content layout cleanly. The
+    // `alloc(mtm)` method comes from the `MainThreadOnly` trait.
     let frame = NSRect {
         origin: NSPoint { x: 0.0, y: 0.0 },
         size: NSSize {
@@ -129,23 +129,21 @@ fn run_nsalert(title: &str, body: &str) -> Result<Zeroizing<Vec<u8>>, SecureInpu
         },
     };
     let field: Retained<NSSecureTextField> =
-        unsafe { NSSecureTextField::initWithFrame(NSSecureTextField::alloc(mtm), frame) };
+        NSSecureTextField::initWithFrame(NSSecureTextField::alloc(mtm), frame);
 
-    // Set the accessory view + give it first responder so the user
-    // can start typing immediately.
-    unsafe {
-        let field_view: &NSView = field.as_ref();
-        alert.setAccessoryView(Some(field_view));
-    }
+    // Set the accessory view so the field appears inside the alert
+    // and the user can start typing immediately.
+    let field_view: &NSView = field.as_ref();
+    alert.setAccessoryView(Some(field_view));
 
     // Run the modal. `runModal` returns NSModalResponse (i64); the
     // first button's response is NSAlertFirstButtonReturn (1000), the
     // second is NSAlertSecondButtonReturn (1001).
-    let response: NSModalResponse = unsafe { alert.runModal() };
+    let response: NSModalResponse = alert.runModal();
 
     // Capture the field text BEFORE dropping the alert (which would
     // destroy the accessory view + its NSString buffer).
-    let text_ns: Retained<NSString> = unsafe {
+    let text_ns: Retained<NSString> = {
         let parent: &NSTextField = field.as_ref();
         parent.stringValue()
     };

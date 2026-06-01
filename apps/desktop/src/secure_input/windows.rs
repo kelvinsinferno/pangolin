@@ -56,7 +56,7 @@ use std::sync::mpsc;
 use super::SecureInputError;
 use zeroize::Zeroizing;
 
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_CANCELLED, ERROR_SUCCESS, HWND};
 use windows::Win32::Security::Credentials::{
     CredUIPromptForCredentialsW, CREDUI_FLAGS, CREDUI_FLAGS_ALWAYS_SHOW_UI,
@@ -148,27 +148,28 @@ fn run_creduidialog(title: &str, body: &str) -> Result<Zeroizing<Vec<u8>>, Secur
     // SAFETY: All pointers passed below are valid for the duration of
     // the call: title_wide / body_wide / target_wide / username_buf /
     // password_buf all live in our stack frame across the
-    // CredUIPromptForCredentialsW invocation. The fixed buffer sizes
-    // satisfy the API's expectation that the caller pre-allocates the
-    // OUT buffers.
+    // CredUIPromptForCredentialsW invocation. The `windows` 0.61
+    // wrapper takes the username/password buffers as `&mut [u16]`
+    // slices (it derives ptr + length internally); the call is
+    // marked `unsafe` because it dereferences the `ui_info` raw
+    // pointer.
     let result = unsafe {
         CredUIPromptForCredentialsW(
             Some(&ui_info as *const _),
             PCWSTR(target_wide.as_ptr()),
             None,
             0,
-            PWSTR(username_buf.as_mut_ptr()),
-            u32::try_from(username_buf.len()).unwrap_or(0),
-            PWSTR(password_buf.as_mut_ptr()),
-            u32::try_from(password_buf.len()).unwrap_or(0),
+            &mut username_buf,
+            &mut password_buf,
             None,
             flags,
         )
     };
 
     let outcome = match result {
-        // ERROR_SUCCESS (0) = user clicked OK.
-        x if x == ERROR_SUCCESS.0 => {
+        // ERROR_SUCCESS (0) = user clicked OK. The wrapper returns
+        // `WIN32_ERROR`, a newtype around u32 — compare directly.
+        ERROR_SUCCESS => {
             let pw_utf16_len = password_buf
                 .iter()
                 .position(|c| *c == 0)
@@ -177,10 +178,11 @@ fn run_creduidialog(title: &str, body: &str) -> Result<Zeroizing<Vec<u8>>, Secur
             Ok(Zeroizing::new(pw_str.into_bytes()))
         }
         // ERROR_CANCELLED = user clicked Cancel / Esc / close.
-        x if x == ERROR_CANCELLED.0 => Err(SecureInputError::Cancelled),
-        // Anything else = unexpected OS error.
+        ERROR_CANCELLED => Err(SecureInputError::Cancelled),
+        // Anything else = unexpected OS error. `WIN32_ERROR` does
+        // not implement `LowerHex`; format the inner u32 (`.0`).
         other => Err(SecureInputError::Internal {
-            reason: format!("CredUIPromptForCredentialsW returned 0x{other:08x}"),
+            reason: format!("CredUIPromptForCredentialsW returned 0x{:08x}", other.0),
         }),
     };
 

@@ -478,14 +478,13 @@ jobs:
           # Events permission prompt is auto-granted on GitHub-hosted
           # runners via the runner's default trust profile.
           which osascript
-      - name: "Windows — PowerShell + SendKeys are preinstalled"
-        if: matrix.os == 'windows-latest'
-        run: |
-          # PowerShell ships with Windows; SendKeys is part of
-          # System.Windows.Forms in the .NET Framework that comes with
-          # the runner image. Print versions to surface drift quickly.
-          powershell -NoProfile -Command "$PSVersionTable.PSVersion"
-        shell: bash
+      # Windows: PowerShell + System.Windows.Forms (SendKeys) ship with
+      # the GitHub-hosted Windows runner image — no install step needed.
+      # The previous attempt to print versions failed because
+      # `shell: bash` interpolated `$PSVersionTable` to empty before
+      # PowerShell saw it (fixed by removing the diagnostic; the actual
+      # SendKeys invocation in the spec uses an explicit `powershell`
+      # call with a properly escaped command string).
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

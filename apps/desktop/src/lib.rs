@@ -25,7 +25,22 @@
 //!                                       pangolin_core::Vault + pangolin_store
 //! ```
 
-#![forbid(unsafe_code)]
+// MVP-4-H L5 needed a downgrade from `forbid` to `deny`:
+// `secure_input/windows.rs` legitimately requires `unsafe { ... }`
+// to call CredUIPromptForCredentialsW (Win32 FFI). `forbid` cannot
+// be overridden by `allow` in a child scope, so we use `deny` here
+// and let that one file opt in via its own `#![allow(unsafe_code)]`
+// with a justifying comment. The workspace lint
+// (`unsafe_code = "deny"` in the root `Cargo.toml`) still applies;
+// this attribute mirrors it at the crate root for clarity. All
+// non-windows.rs code in this crate continues to use no unsafe
+// (audit invariant — there is exactly ONE `#![allow(unsafe_code)]`
+// instance in the desktop crate, in `secure_input/windows.rs`).
+// `secure_input/macos.rs` uses objc2's safe bindings and needs no
+// unsafe at all (each Apple API call there is `pub fn` in objc2-
+// app-kit 0.3.2). `secure_input/linux.rs` uses gtk-rs's safe
+// wrappers (no unsafe).
+#![deny(unsafe_code)]
 #![deny(unused_must_use)]
 
 pub mod commands;
