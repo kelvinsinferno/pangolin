@@ -523,10 +523,28 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         working-directory: apps/desktop/e2e
         run: xvfb-run --auto-servernum pnpm e2e:secure-input
-      - name: "Run secure-input integration suite (macOS/Windows, native display)"
-        if: matrix.os != 'ubuntu-latest'
+      - name: "Run secure-input integration suite (Windows, native display)"
+        if: matrix.os == 'windows-latest'
         working-directory: apps/desktop/e2e
         run: pnpm e2e:secure-input
+      # macOS: tauri-driver v2.0.x does NOT support macOS (no WebDriver
+      # implementation for WKWebView yet — upstream emits "tauri-driver
+      # is not supported on this platform"). Run only the Rust
+      # compile step instead of the wdio integration. This still
+      # validates `secure_input/macos.rs` builds against the real
+      # Apple SDK + AppKit (objc2-app-kit bindings) and that the
+      # binary links — which is the gap the agent's WSL dev env
+      # cannot catch (aws-lc-sys's C build script requires Apple cc).
+      # When tauri-driver ships macOS support OR we adopt a non-
+      # WebDriver harness (e.g. AppleScript System Events against
+      # the Tauri WKWebView), restore this leg to the full
+      # `pnpm e2e:secure-input` path.
+      - name: "Compile-only on macOS (tauri-driver upstream gap)"
+        if: matrix.os == 'macos-latest'
+        run: |
+          cd apps/desktop/e2e
+          pnpm exec tsx setup/build-fixture-vault.ts
+          cargo build -p pangolin-desktop --features test-hooks,custom-protocol
 
       - name: "Upload wdio logs on failure"
         if: failure()
