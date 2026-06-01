@@ -31,6 +31,13 @@
 pub mod commands;
 pub mod error;
 pub mod ipc;
+// MVP-4-H: native secure-input plugin. The module's submodules are
+// cfg-gated by target_os so each OS only compiles its own native widget
+// path; under `feature = "test-hooks"` + cfg(test) the stub is compiled
+// instead, supplying a test-injected password queue.
+//
+// Plan-LOCK: docs/issue-plans/mvp4-h-secure-input.md §3.
+pub mod secure_input;
 pub mod state;
 
 // MVP-4-F: feature-gated test-hook module + `__test__*` commands.
