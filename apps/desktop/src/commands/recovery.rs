@@ -716,6 +716,12 @@ pub struct BackupContentsDto {
     /// `M` hex-encoded sealed-share ciphertexts (variable length, ~154
     /// bytes each), ordered parallel to `guardian_x25519_pubs`.
     pub sealed_shares: Vec<String>,
+    /// `M` hex-encoded 20-byte guardian EVM SIGNER addresses (40 hex chars
+    /// each), ordered parallel to `guardian_x25519_pubs` (L-0d). The
+    /// recoverer wizard passes these as the `guardian_set` field of the
+    /// per-guardian request blob so each guardian can recompute the
+    /// merkle root + proof for `recovery_help_approve`.
+    pub guardian_evm_addrs: Vec<String>,
     /// User-set display name (empty when not set).
     pub vault_display_name: String,
     /// Wall-clock unix-seconds backup-creation timestamp.
@@ -735,6 +741,7 @@ impl From<pangolin_ffi::FfiBackupContents> for BackupContentsDto {
                 .map(|p| hex_encode(p))
                 .collect(),
             sealed_shares: c.sealed_shares.iter().map(|s| hex_encode(s)).collect(),
+            guardian_evm_addrs: c.guardian_evm_addrs.iter().map(|a| hex_encode(a)).collect(),
             vault_display_name: c.vault_display_name,
             created_at_unix: c.created_at_unix,
         }

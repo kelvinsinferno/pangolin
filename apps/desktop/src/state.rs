@@ -128,10 +128,7 @@ impl VaultState {
     /// accumulator. Returns the new total count so the host can render
     /// "X of t collected".
     #[allow(clippy::significant_drop_tightening)]
-    pub fn push_opened_share(
-        &self,
-        share: Arc<FfiOpenedShare>,
-    ) -> Result<usize, DesktopError> {
+    pub fn push_opened_share(&self, share: Arc<FfiOpenedShare>) -> Result<usize, DesktopError> {
         let mut guard = self
             .recovery_opened_shares
             .lock()

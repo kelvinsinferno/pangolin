@@ -299,15 +299,11 @@ export function RecoverVaultWizard({ onError, onClose }: RecoverVaultWizardProps
             recipientCommitment,
             sealedShare,
             epoch: epochToHex16(backup.epoch),
-            // The L-C wizard's request shape carries the FULL guardian
-            // EVM-address roster (not just THIS guardian's address) so
-            // the guardian can compute the merkle root + proof
-            // themselves. We don't have EVM addresses in BackupContents;
-            // the L-C engine reads them from the request_set. For now
-            // pass an empty array and document the gap — the wizard
-            // build refuses to advance to distribute until this is
-            // wired in a follow-up (audit pin).
-            guardianSet: [],
+            // L-0d: pass the FULL M-address EVM signer roster from the
+            // backup envelope. Each guardian's L-C `recovery_help_approve`
+            // rebuilds the merkle root over this list and produces the
+            // proof for THEIR address against the on-chain commitment.
+            guardianSet: backup.guardianEvmAddrs,
             expiresAt,
           }),
         )

@@ -756,6 +756,11 @@ export interface BackupContents {
   /** M hex-encoded sealed-share ciphertexts (variable length), parallel
    *  to guardianX25519Pubs. */
   sealedShares: string[];
+  /** M hex-encoded 20-byte guardian EVM signer addresses (40 hex chars
+   *  each), parallel to guardianX25519Pubs (L-0d). The recoverer wizard
+   *  passes these as guardian_set so each guardian can rebuild the
+   *  merkle root + proof for recovery_help_approve. */
+  guardianEvmAddrs: string[];
   /** User-set display name (empty when not set). */
   vaultDisplayName: string;
   /** Wall-clock unix-seconds backup-creation timestamp. */
@@ -769,6 +774,7 @@ interface BackupContentsWire {
   guardian_count: number;
   guardian_x25519_pubs: string[];
   sealed_shares: string[];
+  guardian_evm_addrs: string[];
   vault_display_name: string;
   created_at_unix: number;
 }
@@ -845,6 +851,7 @@ export async function recoveryDecodeBackup(
     guardianCount: w.guardian_count,
     guardianX25519Pubs: w.guardian_x25519_pubs,
     sealedShares: w.sealed_shares,
+    guardianEvmAddrs: w.guardian_evm_addrs,
     vaultDisplayName: w.vault_display_name,
     createdAtUnix: w.created_at_unix,
   };

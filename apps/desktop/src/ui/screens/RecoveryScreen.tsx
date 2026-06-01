@@ -11,6 +11,7 @@ import {
   type RecoveryHealth,
 } from '../lib/invoke';
 import { HelpRecoverWizard } from './HelpRecoverWizard';
+import { RecoverVaultWizard } from './RecoverVaultWizard';
 import { SetupGuardiansWizard } from './SetupGuardiansWizard';
 
 export interface RecoveryScreenProps {
@@ -50,6 +51,7 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
   const [backup, setBackup] = useState<Backup | null>(null);
   const [showGuardiansWizard, setShowGuardiansWizard] = useState(false);
   const [showHelpRecoverWizard, setShowHelpRecoverWizard] = useState(false);
+  const [showRecoverVaultWizard, setShowRecoverVaultWizard] = useState(false);
   // Health refresh trigger — bumped after the wizard reports success so
   // the panel re-fetches without a full screen remount (Q-e).
   const [healthRefreshTick, setHealthRefreshTick] = useState(0);
@@ -65,7 +67,7 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
   // Audit MED-2: at most ONE wizard can be open at a time. Both cards
   // hide when either wizard is up to prevent racing the buttons into a
   // confusing dual-modal state.
-  const anyWizardOpen = showGuardiansWizard || showHelpRecoverWizard;
+  const anyWizardOpen = showGuardiansWizard || showHelpRecoverWizard || showRecoverVaultWizard;
   const showSetupGuardiansCard =
     healthLoaded && healthAvailable && authorityIsZero && !anyWizardOpen;
 
@@ -162,6 +164,13 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
         />
       ) : null}
 
+      {showRecoverVaultWizard ? (
+        <RecoverVaultWizard
+          onError={onError}
+          onClose={() => setShowRecoverVaultWizard(false)}
+        />
+      ) : null}
+
       {/* Read-only recovery-health panel */}
       <Card elevation="sm">
         <h2>Recovery status</h2>
@@ -223,6 +232,29 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
             data-testid="help-recover-open"
           >
             Help someone recover
+          </Button>
+        </Card>
+      )}
+
+      {/* L-B: recover MY vault card — visible whenever NO wizard is up.
+          Available on ANY device (a recovery is by definition driven by
+          a fresh device whose owner lost their previous ones; the user
+          might also rehearse here, but the wizard's first step is a big
+          destructive-replace warning so accidental clicks are gated. */}
+      {!anyWizardOpen && (
+        <Card elevation="sm">
+          <h2>Recover my vault</h2>
+          <p>
+            Lost all your devices? Paste your recovery backup and the
+            24-word phrase you wrote down, and we&apos;ll walk you through
+            the multi-day recovery flow. <strong>Warning:</strong> a
+            successful recovery REPLACES this vault on this device.
+          </p>
+          <Button
+            onClick={() => setShowRecoverVaultWizard(true)}
+            data-testid="recover-vault-open"
+          >
+            Recover my vault
           </Button>
         </Card>
       )}
