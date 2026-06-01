@@ -109,11 +109,20 @@ describe('SetupGuardiansWizard (MVP-4-L L-A)', () => {
     await waitFor(() => {
       expect(recoveryOnboardGuardians).toHaveBeenCalledTimes(1);
     });
-    expect(recoveryOnboardGuardians).toHaveBeenCalledWith(2, [
-      fakeInvite('AAA').x25519SealingPub,
-      fakeInvite('BBB').x25519SealingPub,
-      fakeInvite('CCC').x25519SealingPub,
-    ]);
+    expect(recoveryOnboardGuardians).toHaveBeenCalledWith(
+      2,
+      [
+        fakeInvite('AAA').x25519SealingPub,
+        fakeInvite('BBB').x25519SealingPub,
+        fakeInvite('CCC').x25519SealingPub,
+      ],
+      // L-0d: paired EVM signers, parallel to the pubkeys.
+      [
+        fakeInvite('AAA').signer,
+        fakeInvite('BBB').signer,
+        fakeInvite('CCC').signer,
+      ],
+    );
 
     // Step 2: on-chain set fires with the matching EVM addresses + threshold.
     await waitFor(() => {

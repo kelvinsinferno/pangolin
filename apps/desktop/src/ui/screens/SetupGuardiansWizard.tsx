@@ -243,7 +243,7 @@ export function SetupGuardiansWizard({
     if (!resume) {
       setStep('onboarding');
       try {
-        await recoveryOnboardGuardians(threshold, x25519Pubs);
+        await recoveryOnboardGuardians(threshold, x25519Pubs, evmAddrs);
       } catch (e) {
         broadcastGuard.current = false;
         onError(errMessage(e));

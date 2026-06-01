@@ -21,7 +21,7 @@
 //! ```text
 //! payload_bytes =
 //!     DOMAIN              (28 B = "pangolin-recovery-backup-v0")
-//!  || schema_version      (1 B = SCHEMA_VERSION; currently 2)
+//!  || schema_version      (1 B = SCHEMA_VERSION; currently 3 — L-0d)
 //!  || kdf_algo_id         (1 B = 1 = Argon2id)
 //!  || kdf_memory_kib      (u32 BE)
 //!  || kdf_time_cost       (u32 BE)
@@ -115,7 +115,7 @@ use ciborium_ll::{Decoder, Encoder, Header};
 /// `recovery_escrow` table — gone with the owner's devices). v1 envelopes
 /// are HARD-REJECTED on decode; recovery is testnet-only so no production
 /// v1 backups exist (plan-LOCK `docs/issue-plans/mvp4-l-0c-backup-sealed-shares.md`).
-pub const SCHEMA_VERSION: u8 = 2;
+pub const SCHEMA_VERSION: u8 = 3;
 
 /// Backup-envelope DOMAIN-separator prefix. 28 bytes, distinct from
 /// every other DOMAIN string in the codebase.
@@ -316,6 +316,21 @@ pub struct BackupContents {
     /// path). Opaque bytes from this module's perspective — same posture
     /// as `wrapped_recovery`. Added in schema v2 (MVP-4-L L-0c).
     pub sealed_shares: Vec<Vec<u8>>,
+    /// **L-0d.** The `M` guardians' 20-byte EVM signer addresses, ordered
+    /// by index `0..M`, parallel to [`Self::guardian_x25519_pubs`]. These
+    /// are the on-chain SIGNER commitments the `RecoveryV2.sol`
+    /// `setGuardianSet` merkle root binds to — needed BOTH by the
+    /// recoverer (to build merkle proofs for `recovery_help_approve`) and
+    /// by the recovered vault (to install the SAME guardian set on the
+    /// post-recovery escrow row). Added in schema v3.
+    ///
+    /// Each entry MUST be exactly 20 bytes; mismatched length is rejected
+    /// at decode with `BackupError::Cbor`. All-zero is REJECTED as well —
+    /// it would indicate a pre-L-0d backup leaking through, but Q-c hard-
+    /// rejects pre-v3 envelopes at the outer schema check so this is
+    /// defense-in-depth (the all-zero check fires only if a v3 producer
+    /// somehow forgot to populate the field).
+    pub guardian_evm_addrs: Vec<[u8; 20]>,
     /// User-set display name for the vault (empty-string allowed).
     pub vault_display_name: String,
     /// Wall-clock unix-seconds timestamp at which the backup was
@@ -676,21 +691,22 @@ fn pull_text_capped(
 
 /// Encode the backup body as a CBOR document.
 ///
-/// The shape is a fixed 10-element array (v2 — L-0c). Per plan §3.2,
+/// The shape is a fixed 11-element array (v3 — L-0d). Per plan §3.2,
 /// fields in canonical order + the trailing redundant `schema_version`.
-/// v1 was 9 elements; v2 adds `sealed_shares` (the M opaque per-guardian
-/// ciphertexts) immediately after `guardian_x25519_pubs` so the
-/// pubkey↔share ordering invariant is visually adjacent.
+/// v1 was 9 elements; v2 added `sealed_shares`; v3 adds
+/// `guardian_evm_addrs` (the M 20-byte on-chain SIGNER commitments)
+/// immediately after `sealed_shares` so the per-guardian parallel-array
+/// triple stays visually adjacent.
 fn encode_body(contents: &BackupContents) -> Zeroizing<Vec<u8>> {
     // The body is NOT secret per se (the wrapped_recovery + the
-    // sealing pubkeys + sealed_shares are non-secret), but the
-    // vault_display_name + the wrapped_recovery's existence are
+    // sealing pubkeys + sealed_shares + EVM addresses are non-secret),
+    // but the vault_display_name + the wrapped_recovery's existence are
     // user-private context that benefits from zero-on-drop discipline
     // as the CBOR moves through the AEAD seal.
     let mut out: Vec<u8> = Vec::with_capacity(256);
     {
         let mut enc = Encoder::from(&mut out);
-        push(&mut enc, Header::Array(Some(10)));
+        push(&mut enc, Header::Array(Some(11)));
         put_bytes(&mut enc, &contents.wrapped_recovery);
         put_bytes(&mut enc, &contents.vault_id);
         push(&mut enc, Header::Positive(contents.epoch));
@@ -710,6 +726,14 @@ fn encode_body(contents: &BackupContents) -> Zeroizing<Vec<u8>> {
         for ss in &contents.sealed_shares {
             put_bytes(&mut enc, ss);
         }
+        // L-0d: the M EVM signer addresses, one 20-B per guardian.
+        push(
+            &mut enc,
+            Header::Array(Some(contents.guardian_evm_addrs.len())),
+        );
+        for a in &contents.guardian_evm_addrs {
+            put_bytes(&mut enc, a);
+        }
         put_text(&mut enc, &contents.vault_display_name);
         push(&mut enc, Header::Positive(contents.created_at_unix));
         push(&mut enc, Header::Positive(u64::from(SCHEMA_VERSION)));
@@ -718,10 +742,10 @@ fn encode_body(contents: &BackupContents) -> Zeroizing<Vec<u8>> {
 }
 
 /// Decode a CBOR body (the AEAD plaintext). Strict bounds; never
-/// panics. v2 — L-0c — expects 10 elements.
+/// panics. v3 — L-0d — expects 11 elements.
 fn decode_body(buf: &[u8]) -> Result<BackupContents, BackupError> {
     let mut dec = Decoder::from(buf);
-    expect_array(&mut dec, 10)?;
+    expect_array(&mut dec, 11)?;
     let wrapped_recovery =
         pull_bytes_capped(&mut dec, MAX_WRAPPED_RECOVERY_LEN, "wrapped_recovery")?;
     let vault_id = pull_bytes_exact::<32>(&mut dec, "vault_id")?;
@@ -765,6 +789,27 @@ fn decode_body(buf: &[u8]) -> Result<BackupContents, BackupError> {
             "sealed_share",
         )?);
     }
+    // v3 (L-0d): guardian_evm_addrs array, M 20-byte on-chain SIGNER
+    // commitments. Length must match guardian_count, each entry must be
+    // 20 bytes, and an all-zero entry is rejected (a v3 producer that
+    // forgot to populate the field).
+    let addrs_n = pull_array_len(&mut dec)?;
+    if addrs_n != usize::from(guardian_count) {
+        return Err(cbor_err(format!(
+            "backup CBOR: guardian_count ({guardian_count}) ≠ guardian_evm_addrs array length ({addrs_n})"
+        )));
+    }
+    let mut guardian_evm_addrs = Vec::with_capacity(addrs_n);
+    for _ in 0..addrs_n {
+        let addr = pull_bytes_exact::<20>(&mut dec, "guardian_evm_addr")?;
+        if addr.iter().all(|&b| b == 0) {
+            return Err(cbor_err(
+                "backup CBOR: guardian_evm_addrs entry is all-zero \
+                 (re-create the backup under the current Pangolin version)",
+            ));
+        }
+        guardian_evm_addrs.push(addr);
+    }
     let vault_display_name =
         pull_text_capped(&mut dec, MAX_DISPLAY_NAME_LEN, "vault_display_name")?;
     let created_at_unix = pull_uint(&mut dec)?;
@@ -787,6 +832,7 @@ fn decode_body(buf: &[u8]) -> Result<BackupContents, BackupError> {
         guardian_count,
         guardian_x25519_pubs,
         sealed_shares,
+        guardian_evm_addrs,
         vault_display_name,
         created_at_unix,
     })
@@ -1212,6 +1258,9 @@ mod tests {
                     s
                 },
             ],
+            // v3 (L-0d): M EVM signer addresses, deterministic per index so
+            // the round-trip test pins ordering.
+            guardian_evm_addrs: vec![[0xC1; 20], [0xC2; 20], [0xC3; 20]],
             vault_display_name: "kelvin's main vault".into(),
             created_at_unix: 1_700_000_000,
         }
@@ -1248,6 +1297,14 @@ mod tests {
                 "sealed_shares[{i}] must round-trip in order"
             );
         }
+        // L-0d: guardian_evm_addrs round-trip + index-parallel ordering.
+        assert_eq!(back.guardian_evm_addrs.len(), c.guardian_evm_addrs.len());
+        for (i, a) in c.guardian_evm_addrs.iter().enumerate() {
+            assert_eq!(
+                &back.guardian_evm_addrs[i], a,
+                "guardian_evm_addrs[{i}] must round-trip in order"
+            );
+        }
     }
 
     /// L-0c: v1 envelopes (which lack `sealed_shares`) MUST be hard-
@@ -1282,9 +1339,234 @@ mod tests {
             BackupError::UnknownSchemaVersion(got, supported) => {
                 assert_eq!(got, 1);
                 assert_eq!(supported, SCHEMA_VERSION);
-                assert_eq!(supported, 2);
+                assert_eq!(supported, 3);
             }
-            other => panic!("expected UnknownSchemaVersion(1, 2), got {other:?}"),
+            other => panic!("expected UnknownSchemaVersion(1, 3), got {other:?}"),
+        }
+    }
+
+    /// L-0d Q-c: v2 envelopes (which lack `guardian_evm_addrs`) MUST be
+    /// hard-rejected with the typed `UnknownSchemaVersion` error, mirroring
+    /// the v1 rejection. Pre-L-0d backups are unrecoverable without re-
+    /// onboarding under the current Pangolin version (testnet-only — no
+    /// production state to migrate). Q-c locked the no-legacy-support
+    /// stance precisely to avoid the merkle-proof-from-thin-air failure
+    /// mode if a v2 backup leaked into the recoverer flow.
+    #[test]
+    fn v2_envelope_rejected_with_typed_unknown_schema_version() {
+        let kdf_params = KdfParams::RECOMMENDED;
+        let salt = KdfSalt::random();
+        let nonce = Nonce::random();
+        let ct_len: u64 = 0;
+        let mut header = write_outer_header(&kdf_params, &salt, &nonce, ct_len);
+        header[OFFSET_SCHEMA_VERSION] = 2;
+        let ih = integrity_hash(&header);
+        let mut blob = Vec::with_capacity(OUTER_HEADER_LEN + INTEGRITY_HASH_LEN);
+        blob.extend_from_slice(&header);
+        blob.extend_from_slice(&ih);
+
+        let phrase = known_phrase();
+        let err = decode_backup(&blob, &phrase).expect_err("v2 must be rejected");
+        match err {
+            BackupError::UnknownSchemaVersion(got, supported) => {
+                assert_eq!(got, 2);
+                assert_eq!(supported, SCHEMA_VERSION);
+                assert_eq!(supported, 3);
+            }
+            other => panic!("expected UnknownSchemaVersion(2, 3), got {other:?}"),
+        }
+    }
+
+    /// L-0d: schema bump landed at v3 (was v2 pre-L-0d).
+    #[test]
+    fn schema_version_is_three() {
+        assert_eq!(SCHEMA_VERSION, 3);
+    }
+
+    /// L-0d Q-a (decode side): a v3 body whose `guardian_evm_addrs[i]` is
+    /// all-zero must fail at decode with `Validation { kind: "cbor", .. }`.
+    /// The production encoder never produces all-zero entries (the source
+    /// is `StoredGuardian.signer`, which itself rejects all-zero at read
+    /// time), so this defense-in-depth gate protects against a malicious /
+    /// corrupted producer that bypassed the upstream check. Bypasses the
+    /// real encoder by hand-rolling a v3 body with an all-zero entry +
+    /// sealing through the production AEAD pipeline.
+    #[test]
+    fn all_zero_guardian_evm_addr_is_rejected_at_decode() {
+        use ciborium_ll::{Encoder, Header};
+
+        let vault_id = [0x42u8; 32];
+        let pub_a = [0xA1u8; 32];
+        let pub_b = [0xA2u8; 32];
+        let pub_c = [0xA3u8; 32];
+        let share_a = vec![0xB1u8; 80];
+        let share_b = vec![0xB2u8; 80];
+        let share_c = vec![0xB3u8; 80];
+
+        let mut body: Vec<u8> = Vec::with_capacity(256);
+        {
+            let mut enc = Encoder::from(&mut body);
+            enc.push(Header::Array(Some(11))).unwrap();
+            enc.push(Header::Bytes(Some(10))).unwrap();
+            enc.write_all(&[0u8; 10]).unwrap();
+            enc.push(Header::Bytes(Some(32))).unwrap();
+            enc.write_all(&vault_id).unwrap();
+            enc.push(Header::Positive(7)).unwrap();
+            enc.push(Header::Positive(2)).unwrap();
+            enc.push(Header::Positive(3)).unwrap();
+            enc.push(Header::Array(Some(3))).unwrap();
+            for pk in [&pub_a, &pub_b, &pub_c] {
+                enc.push(Header::Bytes(Some(32))).unwrap();
+                enc.write_all(pk).unwrap();
+            }
+            enc.push(Header::Array(Some(3))).unwrap();
+            for ss in [&share_a, &share_b, &share_c] {
+                enc.push(Header::Bytes(Some(ss.len()))).unwrap();
+                enc.write_all(ss).unwrap();
+            }
+            // guardian_evm_addrs: 3 entries, but index 1 is the all-zero
+            // sentinel — should be rejected at decode.
+            enc.push(Header::Array(Some(3))).unwrap();
+            for (i, _) in [0u8, 1, 2].iter().enumerate() {
+                enc.push(Header::Bytes(Some(20))).unwrap();
+                if i == 1 {
+                    enc.write_all(&[0u8; 20]).unwrap();
+                } else {
+                    let mut a = [0u8; 20];
+                    a[19] = u8::try_from(i + 1).unwrap();
+                    enc.write_all(&a).unwrap();
+                }
+            }
+            let name = "zero-addr";
+            enc.push(Header::Text(Some(name.len()))).unwrap();
+            enc.write_all(name.as_bytes()).unwrap();
+            enc.push(Header::Positive(1)).unwrap();
+            enc.push(Header::Positive(u64::from(SCHEMA_VERSION)))
+                .unwrap();
+        }
+
+        let phrase = known_phrase();
+        let kdf_input = seed_phrase_to_kdf_input(&phrase).expect("kdf_input");
+        let salt = KdfSalt::random();
+        let kdf_params = KdfParams::RECOMMENDED;
+        let kdf_secret = SecretBytes::new(kdf_input.to_vec());
+        let key: AeadKey = derive_key(&kdf_secret, &salt, &kdf_params).expect("derive");
+        drop(kdf_secret);
+        drop(kdf_input);
+        let nonce = Nonce::random();
+        let ct_len = u64::try_from(body.len() + pangolin_crypto::aead::TAG_LEN).expect("ct_len");
+        let aad = write_outer_header(&kdf_params, &salt, &nonce, ct_len);
+        let ct = key.seal(&nonce, &body, &aad).expect("aead seal");
+        let ct_bytes = ct.into_vec();
+        let mut blob = Vec::with_capacity(OUTER_HEADER_LEN + ct_bytes.len() + INTEGRITY_HASH_LEN);
+        blob.extend_from_slice(&aad);
+        blob.extend_from_slice(&ct_bytes);
+        let hash = integrity_hash(&blob);
+        blob.extend_from_slice(&hash);
+
+        let err = decode_backup(&blob, &phrase).expect_err("all-zero must reject");
+        match err {
+            BackupError::Validation {
+                kind, ref message, ..
+            } => {
+                assert_eq!(kind, "cbor", "expected cbor-kind validation, got kind={kind}");
+                assert!(
+                    message.contains("all-zero"),
+                    "message should mention all-zero: {message}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// L-0d cross-field: a v3 body where `guardian_evm_addrs.len()` ≠
+    /// `guardian_count` must be rejected at decode with the typed cross-
+    /// field message. Mirrors the sealed_shares cross-field test for the
+    /// new addrs array. Without this defense a producer that lost an
+    /// addr would silently feed a misaligned merkle leaf set to the
+    /// recoverer.
+    #[test]
+    fn mismatched_guardian_evm_addrs_count_rejected() {
+        use ciborium_ll::{Encoder, Header};
+
+        let vault_id = [0x42u8; 32];
+        let pub_a = [0xA1u8; 32];
+        let pub_b = [0xA2u8; 32];
+        let pub_c = [0xA3u8; 32];
+        let share_a = vec![0xB1u8; 80];
+        let share_b = vec![0xB2u8; 80];
+        let share_c = vec![0xB3u8; 80];
+
+        let mut body: Vec<u8> = Vec::with_capacity(256);
+        {
+            let mut enc = Encoder::from(&mut body);
+            enc.push(Header::Array(Some(11))).unwrap();
+            enc.push(Header::Bytes(Some(10))).unwrap();
+            enc.write_all(&[0u8; 10]).unwrap();
+            enc.push(Header::Bytes(Some(32))).unwrap();
+            enc.write_all(&vault_id).unwrap();
+            enc.push(Header::Positive(7)).unwrap();
+            enc.push(Header::Positive(2)).unwrap();
+            // guardian_count = 3
+            enc.push(Header::Positive(3)).unwrap();
+            enc.push(Header::Array(Some(3))).unwrap();
+            for pk in [&pub_a, &pub_b, &pub_c] {
+                enc.push(Header::Bytes(Some(32))).unwrap();
+                enc.write_all(pk).unwrap();
+            }
+            enc.push(Header::Array(Some(3))).unwrap();
+            for ss in [&share_a, &share_b, &share_c] {
+                enc.push(Header::Bytes(Some(ss.len()))).unwrap();
+                enc.write_all(ss).unwrap();
+            }
+            // guardian_evm_addrs: ONLY 2 entries (intentional mismatch).
+            enc.push(Header::Array(Some(2))).unwrap();
+            for i in 0..2u8 {
+                enc.push(Header::Bytes(Some(20))).unwrap();
+                let mut a = [0u8; 20];
+                a[19] = i + 1;
+                enc.write_all(&a).unwrap();
+            }
+            let name = "addr-mismatch";
+            enc.push(Header::Text(Some(name.len()))).unwrap();
+            enc.write_all(name.as_bytes()).unwrap();
+            enc.push(Header::Positive(1)).unwrap();
+            enc.push(Header::Positive(u64::from(SCHEMA_VERSION)))
+                .unwrap();
+        }
+
+        let phrase = known_phrase();
+        let kdf_input = seed_phrase_to_kdf_input(&phrase).expect("kdf_input");
+        let salt = KdfSalt::random();
+        let kdf_params = KdfParams::RECOMMENDED;
+        let kdf_secret = SecretBytes::new(kdf_input.to_vec());
+        let key: AeadKey = derive_key(&kdf_secret, &salt, &kdf_params).expect("derive");
+        drop(kdf_secret);
+        drop(kdf_input);
+        let nonce = Nonce::random();
+        let ct_len = u64::try_from(body.len() + pangolin_crypto::aead::TAG_LEN).expect("ct_len");
+        let aad = write_outer_header(&kdf_params, &salt, &nonce, ct_len);
+        let ct = key.seal(&nonce, &body, &aad).expect("aead seal");
+        let ct_bytes = ct.into_vec();
+        let mut blob = Vec::with_capacity(OUTER_HEADER_LEN + ct_bytes.len() + INTEGRITY_HASH_LEN);
+        blob.extend_from_slice(&aad);
+        blob.extend_from_slice(&ct_bytes);
+        let hash = integrity_hash(&blob);
+        blob.extend_from_slice(&hash);
+
+        let err = decode_backup(&blob, &phrase).expect_err("mismatch must reject");
+        match err {
+            BackupError::Validation {
+                kind, ref message, ..
+            } => {
+                assert_eq!(kind, "cbor", "expected cbor-kind validation, got kind={kind}");
+                assert!(
+                    message.contains("guardian_count")
+                        && message.contains("guardian_evm_addrs"),
+                    "message should name the addrs cross-field mismatch: {message}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
         }
     }
 
@@ -1376,6 +1658,15 @@ mod tests {
             guardian_count: M,
             guardian_x25519_pubs: pubs.clone(),
             sealed_shares,
+            // L-0d: deterministic non-zero per-index signers; the
+            // round-trip preserves them parallel to pubs / shares.
+            guardian_evm_addrs: (0..M)
+                .map(|i| {
+                    let mut a = [0u8; 20];
+                    a[19] = i.wrapping_add(1);
+                    a
+                })
+                .collect(),
             vault_display_name: String::new(),
             created_at_unix: 0,
         };
@@ -1442,7 +1733,8 @@ mod tests {
         let mut body: Vec<u8> = Vec::with_capacity(256);
         {
             let mut enc = Encoder::from(&mut body);
-            enc.push(Header::Array(Some(10))).unwrap();
+            // v3 (L-0d) body: 11 elements.
+            enc.push(Header::Array(Some(11))).unwrap();
             // wrapped_recovery (bytes)
             enc.push(Header::Bytes(Some(10))).unwrap();
             enc.write_all(&[0u8; 10]).unwrap();
@@ -1466,6 +1758,16 @@ mod tests {
             for ss in [&share_a, &share_b] {
                 enc.push(Header::Bytes(Some(ss.len()))).unwrap();
                 enc.write_all(ss).unwrap();
+            }
+            // guardian_evm_addrs: array of 3 (well-formed for THIS test —
+            // the assertion targets the sealed_shares cross-field gate;
+            // a sibling test covers the addrs cross-field gate).
+            enc.push(Header::Array(Some(3))).unwrap();
+            for i in 0..3u8 {
+                enc.push(Header::Bytes(Some(20))).unwrap();
+                let mut a = [0u8; 20];
+                a[19] = i + 1;
+                enc.write_all(&a).unwrap();
             }
             // vault_display_name (text)
             let name = "mismatch";

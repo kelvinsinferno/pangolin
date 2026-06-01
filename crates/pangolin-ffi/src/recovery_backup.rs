@@ -174,6 +174,14 @@ pub struct FfiBackupContents {
     /// schema v2 (MVP-4-L L-0c). The recoverer wizard distributes each
     /// entry to its matching guardian alongside the L-C request blob.
     pub sealed_shares: Vec<Vec<u8>>,
+    /// The `M` guardian EVM SIGNER addresses (20 B each), ordered by
+    /// index `0..M` parallel to `guardian_x25519_pubs`. Added in backup
+    /// schema v3 (MVP-4-L L-0d). The recoverer wizard uses these to
+    /// build the merkle proof against the on-chain RecoveryV2 root in
+    /// `recovery_help_approve`, AND the recovered vault re-installs
+    /// them on the post-recovery escrow row so future recoveries can
+    /// rebuild the same proof.
+    pub guardian_evm_addrs: Vec<Vec<u8>>,
     /// Schema-version slot.
     pub schema_version: u16,
 }
@@ -294,6 +302,11 @@ fn into_ffi_contents(contents: &BackupContents) -> FfiBackupContents {
             .map(|p| p.to_vec())
             .collect(),
         sealed_shares: contents.sealed_shares.clone(),
+        guardian_evm_addrs: contents
+            .guardian_evm_addrs
+            .iter()
+            .map(|a| a.to_vec())
+            .collect(),
         schema_version: RECOVERY_BACKUP_FFI_SCHEMA_VERSION,
     }
 }
@@ -347,6 +360,10 @@ pub fn vault_recover_from_backup(
         threshold: contents.threshold,
         guardian_count: contents.guardian_count,
         x25519_pubs: contents.guardian_x25519_pubs.clone(),
+        // L-0d: the EVM signer addresses ride in the v3 envelope; pass
+        // them to the composition driver so the post-recovery escrow is
+        // written with the SAME guardian SIGNER set.
+        evm_addrs: contents.guardian_evm_addrs.clone(),
     };
 
     // Extract owned `Share`s engine-side (mirrors
@@ -580,6 +597,11 @@ mod tests {
             Arc::clone(&main_h),
             T,
             g_pubs.iter().map(|p| p.to_vec()).collect(),
+            // L-0d: synthetic deterministic non-zero EVM signers (real
+            // identities would come from each guardian's invite). Each
+            // entry is 20 bytes; the all-zero rejection trips on the
+            // back-fill sentinel.
+            (0..M).map(|i| vec![i.wrapping_add(1); 20]).collect(),
         )
         .expect("vault_onboard_guardians");
 

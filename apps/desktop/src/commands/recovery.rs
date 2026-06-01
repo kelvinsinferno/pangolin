@@ -328,9 +328,25 @@ pub async fn guardian_invite_decode_text(text: String) -> Result<GuardianInviteD
 pub async fn recovery_onboard_guardians(
     threshold: u8,
     x25519_pubs: Vec<String>,
+    evm_addrs: Vec<String>,
     state: State<'_, VaultState>,
 ) -> Result<OnboardingResultDto, DesktopError> {
     let handle = state.require_open()?;
+    // L-0d: paired-array length check at the wrapper so a malformed host
+    // call returns the desktop-shaped validation message naming the
+    // wrapper's argument names (the FFI re-checks with FFI names; the
+    // store re-checks with store names — defense in depth at every
+    // layer the host crosses).
+    if x25519_pubs.len() != evm_addrs.len() {
+        return Err(DesktopError::Validation {
+            kind: "argument".into(),
+            message: format!(
+                "x25519_pubs.len() ({}) ≠ evm_addrs.len() ({})",
+                x25519_pubs.len(),
+                evm_addrs.len()
+            ),
+        });
+    }
     let mut pubs_bytes = Vec::with_capacity(x25519_pubs.len());
     for (idx, hex) in x25519_pubs.iter().enumerate() {
         pubs_bytes.push(bytes_from_hex(hex, "guardian X25519 pubkey", 32).map_err(
@@ -343,8 +359,21 @@ pub async fn recovery_onboard_guardians(
             },
         )?);
     }
-    let outcome = pangolin_ffi::vault_onboard_guardians(handle, threshold, pubs_bytes)
-        .map_err(DesktopError::from)?;
+    let mut addrs_bytes = Vec::with_capacity(evm_addrs.len());
+    for (idx, hex) in evm_addrs.iter().enumerate() {
+        addrs_bytes.push(bytes_from_hex(hex, "guardian EVM address", 20).map_err(
+            |e| match e {
+                DesktopError::Validation { kind, message } => DesktopError::Validation {
+                    kind,
+                    message: format!("guardian #{idx}: {message}"),
+                },
+                other => other,
+            },
+        )?);
+    }
+    let outcome =
+        pangolin_ffi::vault_onboard_guardians(handle, threshold, pubs_bytes, addrs_bytes)
+            .map_err(DesktopError::from)?;
     Ok(outcome.into())
 }
 

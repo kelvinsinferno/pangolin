@@ -97,8 +97,13 @@ fn production_onboard_then_recover_round_trips() {
     // PRODUCTION onboard — set up social recovery on the owner vault. This is
     // the surface #106e-0b builds: it reads the active VDK store-internal,
     // mints the escrow, and persists it under the active VDK's column-AEAD.
+    // L-0d: a parallel `guardian_evm_addrs` array is now required; the
+    // round-trip does not exercise the on-chain path so synthetic non-zero
+    // addresses suffice (the store-side all-zero rejection would trip on
+    // back-fill sentinels).
+    let guardian_signers: Vec<[u8; 20]> = (0..M).map(|i| [i.wrapping_add(1); 20]).collect();
     let outcome = owner
-        .onboard_guardians(T, &guardian_pubs)
+        .onboard_guardians(T, &guardian_pubs, &guardian_signers)
         .expect("production onboard_guardians succeeds");
     // Q-c: the first onboard writes at GENESIS (0).
     assert_eq!(outcome.epoch, 0, "first onboard writes at genesis epoch");
@@ -139,6 +144,9 @@ fn production_onboard_then_recover_round_trips() {
         threshold: T,
         guardian_count: M,
         x25519_pubs: guardian_pubs.clone(),
+        // L-0d: match the synthetic signers we passed to onboard above —
+        // the recoverer would source these from the BACKUP envelope.
+        evm_addrs: guardian_signers.clone(),
     };
     let escrow_epoch =
         pangolin_core::recovery::orchestration::RecoveryEpoch(current_epoch).to_escrow_bytes();

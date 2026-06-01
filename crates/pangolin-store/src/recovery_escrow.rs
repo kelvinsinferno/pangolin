@@ -39,7 +39,23 @@ use crate::error::{Result, StoreError};
 
 /// Schema-version slot for the recovery-escrow records (master plan
 /// §18.7). Mirrors [`crate::device::DEVICE_IDENTITY_SCHEMA_VERSION`].
-pub const RECOVERY_ESCROW_SCHEMA_VERSION: u16 = 1;
+///
+/// **v1 → v2 (MVP-4-L L-0d, 2026-06-01):** `recovery_guardians` gains a
+/// `guardian_signer BLOB NOT NULL` column carrying each guardian's
+/// 20-byte EVM signer address. Required by the recoverer (L-B): the
+/// guardian's L-C wizard needs the full M-address roster to build its
+/// merkle proof against `RecoveryV2.setGuardianSet`, and the addresses
+/// have to flow from the owner's onboard → escrow → backup → recoverer
+/// (the on-chain commitment is just the merkle root; addresses aren't
+/// queryable from chain). Migration: existing rows back-fill to the
+/// all-zero address sentinel + `read_recovery_escrow` rejects any
+/// load that surfaces the sentinel with `CorruptedRecovery` so legacy
+/// onboardings fail loud + the user re-onboards.
+pub const RECOVERY_ESCROW_SCHEMA_VERSION: u16 = 2;
+
+/// 20-byte EVM signer address length — mirrors `EVM_ADDRESS_LEN`
+/// elsewhere (kept local to avoid a cross-crate use just for a u8).
+pub const GUARDIAN_SIGNER_LEN: usize = 20;
 
 /// 8-byte AAD domain separator for double-wrapping a sealed share under
 /// the VDK column-AEAD.
@@ -57,8 +73,15 @@ const RECOVERY_SHARE_AAD_LEN: usize =
     RECOVERY_SHARE_AAD_DOMAIN.len() + VAULT_ID_LEN + EPOCH_LEN + 1;
 
 /// A guardian's persisted recovery-escrow assignment as loaded back from
-/// disk: the join index, the X25519 pubkey, and the (decrypted) sealed
-/// share.
+/// disk: the join index, the X25519 pubkey, the 20-byte EVM signer
+/// address, and the (decrypted) sealed share.
+///
+/// **L-0d:** the `signer` field is the guardian's 20-byte secp256k1 EVM
+/// address — the L2 join to the on-chain merkle-committed address at the
+/// same index. Persisted at onboard time so the recoverer can rebuild the
+/// full M-address roster from the backup envelope (the on-chain merkle
+/// root commits the roster privately; addresses aren't queryable from
+/// chain).
 #[derive(Debug)]
 pub struct StoredGuardian {
     /// The guardian's ordinal position in the set (`0..M`) — the L2 join
@@ -67,6 +90,9 @@ pub struct StoredGuardian {
     pub index: u8,
     /// The guardian's 32-byte X25519 public key.
     pub guardian_x25519_pub: [u8; X25519_KEY_LEN],
+    /// The guardian's 20-byte secp256k1 EVM signer address. NON-SECRET.
+    /// Added in L-0d (schema v1 → v2).
+    pub signer: [u8; GUARDIAN_SIGNER_LEN],
     /// The guardian's sealed share (decrypted from its under-VDK double
     /// wrap).
     pub sealed_share: SealedShare,
@@ -122,6 +148,8 @@ pub struct GuardianRecord<'a> {
     pub index: u8,
     /// The guardian's 32-byte X25519 public key.
     pub guardian_x25519_pub: [u8; X25519_KEY_LEN],
+    /// The guardian's 20-byte secp256k1 EVM signer address. L-0d.
+    pub signer: [u8; GUARDIAN_SIGNER_LEN],
     /// A borrow of the guardian's sealed share.
     pub sealed_share: &'a SealedShare,
 }
@@ -200,11 +228,13 @@ pub fn write_recovery_escrow_tx(
         let enc = vdk_aead.seal(&nonce, g.sealed_share.as_bytes(), &aad)?;
         tx.execute(
             "INSERT OR REPLACE INTO recovery_guardians
-                (guardian_index, guardian_x25519_pub, enc_sealed_share, enc_nonce, schema_version)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+                (guardian_index, guardian_x25519_pub, guardian_signer,
+                 enc_sealed_share, enc_nonce, schema_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 i64::from(g.index),
                 g.guardian_x25519_pub.as_slice(),
+                g.signer.as_slice(),
                 enc.as_bytes(),
                 nonce.as_bytes().as_slice(),
                 i64::from(RECOVERY_ESCROW_SCHEMA_VERSION),
@@ -300,7 +330,8 @@ pub fn read_recovery_escrow(
 
     // Load + decrypt each guardian row, ordered by index.
     let mut stmt = conn.prepare(
-        "SELECT guardian_index, guardian_x25519_pub, enc_sealed_share, enc_nonce, schema_version
+        "SELECT guardian_index, guardian_x25519_pub, guardian_signer,
+                enc_sealed_share, enc_nonce, schema_version
          FROM recovery_guardians ORDER BY guardian_index ASC",
     )?;
     let raw_rows = stmt.query_map([], |r| {
@@ -309,7 +340,8 @@ pub fn read_recovery_escrow(
             r.get::<_, Vec<u8>>(1)?,
             r.get::<_, Vec<u8>>(2)?,
             r.get::<_, Vec<u8>>(3)?,
-            r.get::<_, i64>(4)?,
+            r.get::<_, Vec<u8>>(4)?,
+            r.get::<_, i64>(5)?,
         ))
     })?;
     let mut guardians = Vec::new();
@@ -398,16 +430,23 @@ fn read_escrow_meta_row(conn: &Connection) -> Result<Option<EscrowMetaRow>> {
 }
 
 /// Raw `recovery_guardians` row tuple as read from `SQLite`.
-type RawGuardianRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>, i64);
+/// **L-0d:** six-tuple (was five) — adds the `guardian_signer` BLOB.
+type RawGuardianRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64);
 
 /// Decode + decrypt one `recovery_guardians` row into a [`StoredGuardian`].
+///
+/// **L-0d:** all-zero `guardian_signer` is treated as a SENTINEL for a
+/// pre-L-0d migrated row (additive ALTER TABLE back-fills the new column
+/// with `zeroblob(20)`). Surfaces as `CorruptedRecovery` so the host can
+/// route the user to a re-onboard flow — testnet-only, no production
+/// users impacted (plan-LOCK Q-a).
 fn decode_guardian_row(
     raw: RawGuardianRow,
     vault_id: &[u8; VAULT_ID_LEN],
     epoch: u64,
     vdk_aead: &AeadKey,
 ) -> Result<StoredGuardian> {
-    let (index_i, pub_blob, enc_share, enc_nonce_blob, g_schema_i) = raw;
+    let (index_i, pub_blob, signer_blob, enc_share, enc_nonce_blob, g_schema_i) = raw;
     let g_schema = u16::try_from(g_schema_i).map_err(|_| {
         StoreError::Corrupted("recovery_guardians.schema_version out of u16".into())
     })?;
@@ -423,6 +462,17 @@ fn decode_guardian_row(
         pub_blob.as_slice().try_into().map_err(|_| {
             StoreError::Corrupted("recovery_guardians.guardian_x25519_pub length".into())
         })?;
+    let signer: [u8; GUARDIAN_SIGNER_LEN] = signer_blob.as_slice().try_into().map_err(|_| {
+        StoreError::Corrupted("recovery_guardians.guardian_signer length".into())
+    })?;
+    // L-0d Q-a: all-zero signer is the back-fill sentinel for legacy rows.
+    if signer.iter().all(|&b| b == 0) {
+        return Err(StoreError::Corrupted(
+            "recovery_guardians.guardian_signer is all-zero (pre-L-0d onboard — \
+             re-onboard guardians under the current Pangolin version)"
+                .into(),
+        ));
+    }
     let nonce_arr: [u8; NONCE_LEN] = enc_nonce_blob
         .as_slice()
         .try_into()
@@ -436,6 +486,7 @@ fn decode_guardian_row(
     Ok(StoredGuardian {
         index,
         guardian_x25519_pub,
+        signer,
         sealed_share: SealedShare::from_bytes(plaintext),
     })
 }
@@ -504,6 +555,7 @@ mod tests {
             .map(|i| GuardianRecord {
                 index: u8::try_from(i).unwrap(),
                 guardian_x25519_pub: pubs[i],
+                signer: [u8::try_from(i + 1).unwrap_or(0xFF); GUARDIAN_SIGNER_LEN],
                 sealed_share: &sealed[i],
             })
             .collect();
@@ -555,6 +607,7 @@ mod tests {
             .map(|i| GuardianRecord {
                 index: u8::try_from(i).unwrap(),
                 guardian_x25519_pub: pubs[i],
+                signer: [u8::try_from(i + 1).unwrap_or(0xFF); GUARDIAN_SIGNER_LEN],
                 sealed_share: &sealed[i],
             })
             .collect();
@@ -594,6 +647,7 @@ mod tests {
             .map(|i| GuardianRecord {
                 index: u8::try_from(i).unwrap(),
                 guardian_x25519_pub: pubs[i],
+                signer: [u8::try_from(i + 1).unwrap_or(0xFF); GUARDIAN_SIGNER_LEN],
                 sealed_share: &sealed[i],
             })
             .collect();
@@ -630,6 +684,7 @@ mod tests {
             .map(|i| GuardianRecord {
                 index: u8::try_from(i).unwrap(),
                 guardian_x25519_pub: p1[i],
+                signer: [u8::try_from(i + 1).unwrap_or(0xFF); GUARDIAN_SIGNER_LEN],
                 sealed_share: &s1[i],
             })
             .collect();
@@ -641,6 +696,7 @@ mod tests {
             .map(|i| GuardianRecord {
                 index: u8::try_from(i).unwrap(),
                 guardian_x25519_pub: p2[i],
+                signer: [u8::try_from(i + 1 + 100).unwrap_or(0xFF); GUARDIAN_SIGNER_LEN],
                 sealed_share: &s2[i],
             })
             .collect();
@@ -663,6 +719,83 @@ mod tests {
         for (i, g) in loaded.guardians.iter().enumerate() {
             pangolin_crypto::escrow::open_sealed_share(&g.sealed_share, &sec2[i], &VAULT_A, &e2)
                 .unwrap();
+        }
+    }
+
+    /// L-0d: schema bump landed at v2 (was v1 pre-L-0d).
+    #[test]
+    fn schema_version_is_two() {
+        assert_eq!(RECOVERY_ESCROW_SCHEMA_VERSION, 2);
+    }
+
+    /// L-0d: signers round-trip verbatim (write side wrote them; read side
+    /// returns the same bytes).
+    #[test]
+    fn signers_round_trip() {
+        let conn = fresh_conn();
+        let vdk_aead = AeadKey::generate();
+        let (wrapped, sealed, pubs, _secrets, _vdk) = fixture(2, 3, 7);
+        let expected_signers: [[u8; GUARDIAN_SIGNER_LEN]; 3] = [
+            [0x11; GUARDIAN_SIGNER_LEN],
+            [0x22; GUARDIAN_SIGNER_LEN],
+            [0x33; GUARDIAN_SIGNER_LEN],
+        ];
+        let records: Vec<GuardianRecord<'_>> = (0..3)
+            .map(|i| GuardianRecord {
+                index: u8::try_from(i).unwrap(),
+                guardian_x25519_pub: pubs[i],
+                signer: expected_signers[i],
+                sealed_share: &sealed[i],
+            })
+            .collect();
+        write_recovery_escrow(&conn, &VAULT_A, &vdk_aead, &wrapped, 2, 3, 7, &records).unwrap();
+
+        let loaded = read_recovery_escrow(&conn, &VAULT_A, &vdk_aead)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.guardians.len(), 3);
+        for (i, g) in loaded.guardians.iter().enumerate() {
+            assert_eq!(g.signer, expected_signers[i], "signer round-trip for {i}");
+        }
+    }
+
+    /// L-0d Q-a: post-write, manually zero out a `guardian_signer` column to
+    /// simulate a legacy back-filled row. Read must reject with
+    /// `Corrupted`, not silently surface an all-zero address (which would
+    /// flow through to a bogus merkle proof later).
+    #[test]
+    fn all_zero_signer_is_rejected_on_read() {
+        let conn = fresh_conn();
+        let vdk_aead = AeadKey::generate();
+        let (wrapped, sealed, pubs, _secrets, _vdk) = fixture(2, 3, 0);
+        let records: Vec<GuardianRecord<'_>> = (0..3)
+            .map(|i| GuardianRecord {
+                index: u8::try_from(i).unwrap(),
+                guardian_x25519_pub: pubs[i],
+                signer: [u8::try_from(i + 1).unwrap_or(0xFF); GUARDIAN_SIGNER_LEN],
+                sealed_share: &sealed[i],
+            })
+            .collect();
+        write_recovery_escrow(&conn, &VAULT_A, &vdk_aead, &wrapped, 2, 3, 0, &records).unwrap();
+
+        // Smash one row's signer to all-zero (the back-fill sentinel).
+        let zeros = vec![0u8; GUARDIAN_SIGNER_LEN];
+        let updated = conn
+            .execute(
+                "UPDATE recovery_guardians SET guardian_signer = ?1 WHERE guardian_index = 1",
+                rusqlite::params![zeros],
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+
+        match read_recovery_escrow(&conn, &VAULT_A, &vdk_aead) {
+            Err(StoreError::Corrupted(msg)) => {
+                assert!(
+                    msg.contains("all-zero"),
+                    "expected all-zero rejection message, got: {msg}"
+                );
+            }
+            other => panic!("expected Corrupted, got {other:?}"),
         }
     }
 }

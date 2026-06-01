@@ -107,6 +107,9 @@ fn lost_everything_recovery_round_trips_through_composition() {
         threshold: T,
         guardian_count: M,
         x25519_pubs: guardian_pubs.clone(),
+        // L-0d: deterministic non-zero per index — the post-recovery escrow
+        // write rejects all-zero rows.
+        evm_addrs: (0..M).map(|i| [i.wrapping_add(1); 20]).collect(),
     };
     let epoch_bytes = RecoveryEpoch(current_epoch).to_escrow_bytes();
 
@@ -253,6 +256,9 @@ fn recover_from_shares_rejects_below_threshold() {
         threshold: T,
         guardian_count: M,
         x25519_pubs: guardian_pubs,
+        // L-0d: the < t recovery never commits a new escrow, but the field
+        // is still required to construct the roster.
+        evm_addrs: (0..M).map(|i| [i.wrapping_add(1); 20]).collect(),
     };
     let err = recover_from_shares(
         &mut fresh,
@@ -280,6 +286,73 @@ fn recover_from_shares_rejects_below_threshold() {
         VaultState::Active,
         "a failed recovery commits nothing"
     );
+}
+
+/// L-0d defense-in-depth: a host that bypasses the FFI wrappers and calls
+/// `recover_from_shares` directly with a roster whose `evm_addrs.len()`
+/// does NOT match `guardian_count` is rejected at the composition layer
+/// (`StoreError::Corrupted` via `CompositionError::Store`), instead of
+/// panicking in `re_split_records` on an out-of-bounds index. Pins the
+/// defense at the top of `recover_from_shares`.
+#[test]
+fn recover_from_shares_rejects_evm_addrs_count_mismatch() {
+    let g_dirs: Vec<tempfile::TempDir> = (0..M)
+        .map(|_| tempfile::TempDir::new().expect("tempdir"))
+        .collect();
+    let (guardian_pubs, _) = guardian_vaults(&g_dirs);
+
+    let recovered_vdk = VdkKey::generate();
+    let vault_id: [u8; VAULT_ID_LEN] = [0x88; VAULT_ID_LEN];
+    let config = GuardianSetConfig {
+        threshold: T,
+        guardian_count: M,
+    };
+    let escrow = onboard_guardian_escrow(
+        &recovered_vdk,
+        &vault_id,
+        config,
+        &guardian_pubs,
+        RecoveryEpoch(0),
+    )
+    .expect("onboard escrow");
+
+    let fresh_dir = tempfile::TempDir::new().expect("tempdir");
+    let fresh_path = fresh_dir.path().join("recovered.pvf");
+    Vault::create(&fresh_path, &SecretBytes::new(b"placeholder".to_vec())).expect("create fresh");
+    let mut fresh = Vault::open(&fresh_path).expect("open fresh");
+
+    // M=3 pubs but only 2 evm_addrs — the FFI checks the parallel-array
+    // pairing, but a direct embed-library caller might not. The
+    // composition gate MUST reject before re_split_records indexes past
+    // the addrs end.
+    let roster = GuardianRoster {
+        threshold: T,
+        guardian_count: M,
+        x25519_pubs: guardian_pubs,
+        evm_addrs: vec![[0x01; 20], [0x02; 20]],
+    };
+    let err = recover_from_shares(
+        &mut fresh,
+        &escrow.wrapped_recovery,
+        vec![], // shares don't matter — gate fires first
+        &roster,
+        &SecretBytes::new(b"new pw".to_vec()),
+        0,
+        vault_id,
+    )
+    .expect_err("mismatched evm_addrs.len() must reject");
+    match err {
+        pangolin_core::composition::CompositionError::Store(
+            pangolin_store::StoreError::Corrupted(msg),
+        ) => {
+            assert!(
+                msg.contains("guardian_count")
+                    && msg.contains("evm_addrs"),
+                "expected typed mismatch message naming the addrs field, got: {msg}"
+            );
+        }
+        other => panic!("expected Store(Corrupted), got {other:?}"),
+    }
 }
 
 #[test]
