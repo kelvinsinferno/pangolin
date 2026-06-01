@@ -683,14 +683,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          # Pinned to match the version Kelvin runs locally (forge
-          # 1.0.0-stable). Floating `stable` kept trapping us on Foundry
-          # CLI changes (e.g. `--no-commit` removed in 1.7.x; new
-          # `unsafe-typecast` linter introduced in 1.7.x). The invariant
-          # is: CI uses the same forge as local dev. Bump in lockstep.
-          version: v1.0.0
+      # MVP-4-H CI hotfix (#196+ regression): foundry-rs/foundry-toolchain@v1
+      # started failing for v1.0.0 on GitHub-hosted Linux runners around
+      # 2026-06-01 — foundryup HEAD took the "found attestation" branch
+      # then errored when no attestation artifact exists for the v1.0.0
+      # release (only the tarball does). WSL repro takes the correct
+      # "no attestation found" branch; CI does not. We bypass foundryup
+      # entirely with a direct tarball install. SHA256-pinned to the
+      # release. See scripts/install-foundry.sh for the full RCA.
+      - name: "Install Foundry v1.0.0 (direct tarball; bypasses foundryup)"
+        run: bash "$GITHUB_WORKSPACE/scripts/install-foundry.sh"
       # forge-std is vendored at contracts/lib/forge-std (v1.16.1) so no
       # `forge install` step is needed here — the working-directory checkout
       # already contains it. See `.gitignore` exception line.
@@ -768,14 +770,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          # Pinned to match the version Kelvin runs locally (forge
-          # 1.0.0-stable). Floating `stable` kept trapping us on Foundry
-          # CLI changes (e.g. `--no-commit` removed in 1.7.x; new
-          # `unsafe-typecast` linter introduced in 1.7.x). The invariant
-          # is: CI uses the same forge as local dev. Bump in lockstep.
-          version: v1.0.0
+      # MVP-4-H CI hotfix (#196+): direct-tarball install. See
+      # scripts/install-foundry.sh for the foundryup-attestation RCA.
+      - name: "Install Foundry v1.0.0 (direct tarball; bypasses foundryup)"
+        run: bash "$GITHUB_WORKSPACE/scripts/install-foundry.sh"
       # forge-std is vendored at contracts/lib/forge-std (v1.16.1) so no
       # `forge install` step is needed here — the working-directory checkout
       # already contains it. See `.gitignore` exception line.
@@ -804,12 +802,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          # SAME pinned Foundry version as the contracts jobs (L4 /
-          # env-quirk #4): CI uses the same anvil/forge/cast as local
-          # dev. Bump in lockstep.
-          version: v1.0.0
+      # MVP-4-H CI hotfix (#196+): direct-tarball install. See
+      # scripts/install-foundry.sh for the foundryup-attestation RCA.
+      - name: "Install Foundry v1.0.0 (direct tarball; bypasses foundryup)"
+        run: bash "$GITHUB_WORKSPACE/scripts/install-foundry.sh"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -832,14 +828,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          # Pinned to match the version Kelvin runs locally (forge
-          # 1.0.0-stable). Floating `stable` kept trapping us on Foundry
-          # CLI changes (e.g. `--no-commit` removed in 1.7.x; new
-          # `unsafe-typecast` linter introduced in 1.7.x). The invariant
-          # is: CI uses the same forge as local dev. Bump in lockstep.
-          version: v1.0.0
+      # MVP-4-H CI hotfix (#196+): direct-tarball install. See
+      # scripts/install-foundry.sh for the foundryup-attestation RCA.
+      - name: "Install Foundry v1.0.0 (direct tarball; bypasses foundryup)"
+        run: bash "$GITHUB_WORKSPACE/scripts/install-foundry.sh"
       # forge-std is vendored at contracts/lib/forge-std (v1.16.1) so no
       # `forge install` step is needed here — the working-directory checkout
       # already contains it. See `.gitignore` exception line.
@@ -917,14 +909,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          # Pinned to match the version Kelvin runs locally (forge
-          # 1.0.0-stable). Floating `stable` kept trapping us on Foundry
-          # CLI changes (e.g. `--no-commit` removed in 1.7.x; new
-          # `unsafe-typecast` linter introduced in 1.7.x). The invariant
-          # is: CI uses the same forge as local dev. Bump in lockstep.
-          version: v1.0.0
+      # MVP-4-H CI hotfix (#196+): direct-tarball install. See
+      # scripts/install-foundry.sh for the foundryup-attestation RCA.
+      - name: "Install Foundry v1.0.0 (direct tarball; bypasses foundryup)"
+        run: bash "$GITHUB_WORKSPACE/scripts/install-foundry.sh"
       # forge-std is vendored at contracts/lib/forge-std (v1.16.1) so no
       # `forge install` step is needed here — the working-directory checkout
       # already contains it. See `.gitignore` exception line.
