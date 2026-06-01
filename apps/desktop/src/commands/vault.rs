@@ -100,8 +100,15 @@ pub async fn vault_lock(state: State<'_, VaultState>) -> Result<(), DesktopError
 /// `SQLite` connection. Returns the React side to the Welcome screen.
 ///
 /// Idempotent: closing when no vault is open is a no-op.
+///
+/// **L-B Q-a defense-in-depth:** also wipes the recovery opened-share
+/// accumulator. A vault-close while an L-B flow is mid-collect would
+/// otherwise leave the `Arc<FfiOpenedShare>` handles stranded in
+/// `VaultState`; clearing here keeps the L1 boundary tight even on
+/// abnormal teardown.
 #[tauri::command]
 pub async fn vault_close(state: State<'_, VaultState>) -> Result<(), DesktopError> {
+    state.clear_opened_shares()?;
     let maybe_handle = state.take()?;
     if let Some(handle) = maybe_handle {
         pangolin_ffi::session::vault_close(handle).map_err(DesktopError::from)?;

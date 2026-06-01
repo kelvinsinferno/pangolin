@@ -146,6 +146,22 @@ impl FfiOpenedShare {
                     .into(),
             })
     }
+
+    /// **Test-only placeholder.** Construct an `FfiOpenedShare` wrapping
+    /// a Share whose canonical bytes are all `0x01` (the leading
+    /// identifier byte is non-zero, satisfying `Share::from_bytes`'s
+    /// invariant; the remaining bytes are dummy). Used by the desktop
+    /// crate's `VaultState` accumulator unit tests (MVP-4-L L-B Q-a)
+    /// which need *some* opaque `Arc` to round-trip but not real
+    /// secret material. `#[doc(hidden)]` so it isn't part of the
+    /// public surface.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __test_placeholder() -> Arc<Self> {
+        let bytes = vec![1u8; pangolin_crypto::escrow::SHARE_ENCODED_LEN];
+        let inner = Share::from_bytes(bytes).expect("placeholder share is well-formed");
+        Arc::new(Self { inner })
+    }
 }
 
 #[uniffi::export]
