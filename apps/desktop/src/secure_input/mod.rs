@@ -44,19 +44,19 @@ pub mod error;
 // Test stub: compiled when running the test suite OR when the
 // test-hooks feature is enabled (so the wdio harness can inject
 // passwords without spawning a real dialog).
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(any(test, feature = "secure-input-stub"))]
 pub mod stub;
 
 // Per-OS native widget impls. Each lives in its own file, gated by
 // target_os so unused OS code never compiles. The cfg-dispatched
 // [`prompt_password`] picks at compile time.
-#[cfg(all(target_os = "linux", not(any(test, feature = "test-hooks"))))]
+#[cfg(all(target_os = "linux", not(any(test, feature = "secure-input-stub"))))]
 pub mod linux;
 
-#[cfg(all(target_os = "macos", not(any(test, feature = "test-hooks"))))]
+#[cfg(all(target_os = "macos", not(any(test, feature = "secure-input-stub"))))]
 pub mod macos;
 
-#[cfg(all(target_os = "windows", not(any(test, feature = "test-hooks"))))]
+#[cfg(all(target_os = "windows", not(any(test, feature = "secure-input-stub"))))]
 pub mod windows;
 
 #[cfg(test)]
@@ -96,7 +96,7 @@ use zeroize::Zeroizing;
 /// - [`SecureInputError::TestHookEmpty`] — stub builds only; raised
 ///   when `prompt_password` is called without a queued password (test
 ///   bug).
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(any(test, feature = "secure-input-stub"))]
 #[allow(clippy::needless_pass_by_value)]
 pub fn prompt_password(
     _app: &tauri::AppHandle,
@@ -106,7 +106,7 @@ pub fn prompt_password(
     stub::pop_one()
 }
 
-#[cfg(all(target_os = "linux", not(any(test, feature = "test-hooks"))))]
+#[cfg(all(target_os = "linux", not(any(test, feature = "secure-input-stub"))))]
 pub fn prompt_password(
     app: &tauri::AppHandle,
     title: &str,
@@ -115,7 +115,7 @@ pub fn prompt_password(
     linux::prompt_password(app, title, body)
 }
 
-#[cfg(all(target_os = "macos", not(any(test, feature = "test-hooks"))))]
+#[cfg(all(target_os = "macos", not(any(test, feature = "secure-input-stub"))))]
 pub fn prompt_password(
     app: &tauri::AppHandle,
     title: &str,
@@ -124,7 +124,7 @@ pub fn prompt_password(
     macos::prompt_password(app, title, body)
 }
 
-#[cfg(all(target_os = "windows", not(any(test, feature = "test-hooks"))))]
+#[cfg(all(target_os = "windows", not(any(test, feature = "secure-input-stub"))))]
 pub fn prompt_password(
     app: &tauri::AppHandle,
     title: &str,
@@ -136,7 +136,7 @@ pub fn prompt_password(
 // Any other OS: fail closed (plan §0a Q-c). No silent fallback.
 #[cfg(not(any(
     test,
-    feature = "test-hooks",
+    feature = "secure-input-stub",
     target_os = "linux",
     target_os = "macos",
     target_os = "windows",

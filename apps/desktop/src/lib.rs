@@ -189,9 +189,9 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         test_hooks::__test__clear_invocations,
         #[cfg(feature = "test-hooks")]
         test_hooks::__test__force_unlock,
-        #[cfg(feature = "test-hooks")]
+        #[cfg(all(feature = "test-hooks", feature = "secure-input-stub"))]
         test_hooks::__test__secure_input_inject,
-        #[cfg(feature = "test-hooks")]
+        #[cfg(all(feature = "test-hooks", feature = "secure-input-stub"))]
         test_hooks::__test__secure_input_clear,
     ])
 }

@@ -18,6 +18,12 @@
     "allowSyntheticDefaultImports": true,
     "types": ["node", "mocha", "@wdio/globals/types"]
   },
-  "include": ["specs/**/*.ts", "setup/**/*.ts", "wdio.conf.ts"],
-  "exclude": ["node_modules", "wdio-logs"]
+  "include": [
+    "specs/**/*.ts",
+    "specs-secure-input/**/*.ts",
+    "setup/**/*.ts",
+    "wdio.conf.ts",
+    "wdio.secure-input.conf.ts"
+  ],
+  "exclude": ["node_modules", "wdio-logs", "wdio-logs-secure-input"]
 }

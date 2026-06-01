@@ -40,6 +40,21 @@ workspace = true
 # Plan-LOCK: docs/issue-plans/mvp4-f-desktop-e2e.md §3.2 + §6.
 test-hooks = []
 
+# MVP-4-H Layer 5: separates the secure_input stub (no native dialog,
+# stub queue is the input source) from the rest of test-hooks
+# (invocation log + force-unlock). The wdio desktop-e2e gate enables
+# BOTH features — secure-input-stub for the stub queue, test-hooks for
+# the invocation log + `__test__secure_input_inject` command body. The
+# Layer-5 OS-automation integration suite enables NEITHER (real per-OS
+# widget runs; assertion is DOM-based via wdio observing accounts-list).
+#
+# Before this split, secure_input/mod.rs's stub cfg keyed on
+# `feature = "test-hooks"`, which meant the wdio gate could never
+# exercise the real native widget. Decoupling lets L5 build the same
+# binary the user ships (no stub) while still using wdio to drive the
+# UI through the GTK/NSAlert/TaskDialog the OS opens.
+secure-input-stub = []
+
 # Forward Tauri's `custom-protocol` feature so the E2E build loads the
 # embedded `frontendDist` assets instead of trying to fetch the Vite
 # devUrl (http://localhost:5173). Tauri v2's `tauri-codegen` selects

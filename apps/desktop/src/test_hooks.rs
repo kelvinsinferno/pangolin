@@ -104,6 +104,15 @@ pub async fn __test__force_unlock(
 /// which the [`crate::secure_input::stub::pop_one`] consumer wraps in
 /// `Zeroizing<Vec<u8>>` before returning. This matches the per-OS
 /// widget hygiene posture (Layer 1 invariant L1).
+///
+/// **Cfg:** gated on `feature = "secure-input-stub"` (in addition to
+/// the file-level `feature = "test-hooks"`) because the stub module
+/// itself only compiles in when the stub feature is on. Calling this
+/// in a build that has `test-hooks` but NOT `secure-input-stub` (the
+/// Layer-5 OS-automation integration build) would be a no-op anyway —
+/// the real per-OS widget is the input source, the stub queue is
+/// nonexistent.
+#[cfg(feature = "secure-input-stub")]
 #[allow(non_snake_case)]
 #[tauri::command]
 pub fn __test__secure_input_inject(password: String) {
@@ -114,7 +123,9 @@ pub fn __test__secure_input_inject(password: String) {
 ///
 /// Called between wdio specs so a leaked previously-queued password
 /// doesn't bleed into the next test. Idempotent (clearing an empty
-/// queue is a no-op).
+/// queue is a no-op). Same `secure-input-stub` feature gate as the
+/// inject command above.
+#[cfg(feature = "secure-input-stub")]
 #[allow(non_snake_case)]
 #[tauri::command]
 pub fn __test__secure_input_clear() {
