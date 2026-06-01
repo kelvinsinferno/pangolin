@@ -25,20 +25,44 @@ jobs:
       - name: Scan user-facing surfaces
         run: |
           set -e
-          # Allowlist file: lines starting with # are comments; each non-empty line is a regex of allowed paths
           ALLOWLIST=".github/forbidden-terms-allowlist.txt"
           PATTERNS='\bgas\b|\bblockchain\b|\bdecentralized storage\b|\bhashes\b|\brevisions\b'
 
-          # Scan apps/ and design/ aggressively (user-facing)
-          # README.md and *.md outside docs/ also user-facing
-          rg --pcre2 -n -i "$PATTERNS" apps/ design/ README.md 2>&1 | tee /tmp/forbidden-hits.txt || true
+          # Scan apps/ aggressively (user-facing) + README.md
+          # (top-level developer landing). The `design/` dir was
+          # listed historically but does not exist in the current
+          # repo layout — drop it so `rg` doesn't error.
+          # Use `--no-messages` so a missing path is silently
+          # skipped instead of breaking the pipeline.
+          # rg exits 0 on hits AND 1 on no-match; the `|| true` keeps
+          # the pipeline going either way (we read the file next).
+          rg --pcre2 -n -i --no-messages "$PATTERNS" apps/ README.md \
+            > /tmp/forbidden-hits.txt 2>&1 || true
+
+          # Apply the allowlist: drop hits whose `path:line:content`
+          # line matches ANY non-comment, non-empty allowlist regex.
+          # The allowlist patterns are POSIX extended regex (grep -E).
+          if [ -s "$ALLOWLIST" ]; then
+            # Build a single combined alternation from non-comment,
+            # non-empty allowlist lines. `sed` strips comments and
+            # blanks; `tr` joins with `|` for grep -E.
+            COMBINED=$(sed -E '/^[[:space:]]*#/d; /^[[:space:]]*$/d' "$ALLOWLIST" \
+              | tr '\n' '|' | sed 's/|$//')
+            if [ -n "$COMBINED" ]; then
+              grep -Ev "$COMBINED" /tmp/forbidden-hits.txt \
+                > /tmp/forbidden-hits.filtered || true
+              mv /tmp/forbidden-hits.filtered /tmp/forbidden-hits.txt
+            fi
+          fi
 
           if [ -s /tmp/forbidden-hits.txt ]; then
             echo ""
             echo "::error::Forbidden user-facing terms detected. See Design Spec §15.2."
-            echo "If a usage is legitimate (e.g., import-format documentation), add it to $ALLOWLIST."
+            echo "If a usage is legitimate (internal Rust/JS doc, test fixture,"
+            echo "or developer-only README) add the path-anchored regex to $ALLOWLIST."
+            echo ""
             cat /tmp/forbidden-hits.txt
             exit 1
           fi
 
-          echo "No forbidden user-facing terms detected."
+          echo "No forbidden user-facing terms detected (allowlist applied)."
