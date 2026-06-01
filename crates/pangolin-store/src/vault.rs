@@ -8193,6 +8193,17 @@ impl Vault {
                 .iter()
                 .map(|g| g.guardian_x25519_pub)
                 .collect(),
+            // MVP-4-L L-0c: include the per-guardian sealed shares so a
+            // recoverer holding the envelope (after losing every device)
+            // has the bytes they need to send each guardian their share
+            // alongside the L-C request blob. Ordering is parallel to
+            // guardian_x25519_pubs above — `sealed_shares[i]` is the
+            // ciphertext sealed to `guardian_x25519_pubs[i]`.
+            sealed_shares: escrow
+                .guardians
+                .iter()
+                .map(|g| g.sealed_share.as_bytes().to_vec())
+                .collect(),
             vault_display_name: String::new(),
             created_at_unix,
         };
