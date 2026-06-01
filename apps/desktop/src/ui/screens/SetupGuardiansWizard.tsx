@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { useEffect, useRef, useState } from 'react';
-import { Button, Card, Input, Spinner } from '@pangolin/component-library';
+import {
+  Button,
+  Card,
+  Input,
+  SecurePasswordButton,
+  Spinner,
+  type SecureSubmitOutcome,
+} from '@pangolin/component-library';
 
 import {
   guardianIdentityExport,
@@ -8,7 +15,7 @@ import {
   isDesktopError,
   recoveryHealth,
   recoveryOnboardGuardians,
-  recoverySetGuardianSet,
+  recoverySetGuardianSetViaSecurePrompt,
   type GuardianInvite,
 } from '../lib/invoke';
 
@@ -39,7 +46,7 @@ export interface ResumeContext {
 type Step =
   | 'collect'
   | 'threshold'
-  | 'password'
+  | 'confirm'
   | 'onboarding'
   | 'broadcasting'
   | 'done'
@@ -124,7 +131,7 @@ export function SetupGuardiansWizard({
   onSuccess,
   resume,
 }: SetupGuardiansWizardProps) {
-  const [step, setStep] = useState<Step>(resume ? 'password' : 'collect');
+  const [step, setStep] = useState<Step>(resume ? 'confirm' : 'collect');
   const [guardians, setGuardians] = useState<GuardianInvite[]>(
     resume?.guardians ?? [],
   );
@@ -132,7 +139,6 @@ export function SetupGuardiansWizard({
     resume?.threshold ?? MIN_THRESHOLD,
   );
   const [pasteText, setPasteText] = useState('');
-  const [password, setPassword] = useState('');
   const [selfPubkey, setSelfPubkey] = useState<string | null>(null);
   // `selfLoaded` is set once the identity-export resolves OR fails, so the
   // UI can close the Q-d race window where a fast paste-and-click could
@@ -167,7 +173,6 @@ export function SetupGuardiansWizard({
   }, []);
 
   const cancel = () => {
-    setPassword('');
     setPasteText('');
     onClose();
   };
@@ -227,12 +232,14 @@ export function SetupGuardiansWizard({
     setStep('threshold');
   };
 
-  const advanceToPassword = () => {
-    setStep('password');
+  const advanceToConfirm = () => {
+    setStep('confirm');
   };
 
-  const runOnboarding = async () => {
-    if (broadcastGuard.current) return;
+  const runOnboarding = async (): Promise<SecureSubmitOutcome> => {
+    if (broadcastGuard.current) {
+      return { ok: false, message: 'already running' };
+    }
     broadcastGuard.current = true;
 
     const x25519Pubs = guardians.map((g) => g.x25519SealingPub);
@@ -246,19 +253,20 @@ export function SetupGuardiansWizard({
         await recoveryOnboardGuardians(threshold, x25519Pubs, evmAddrs);
       } catch (e) {
         broadcastGuard.current = false;
-        onError(errMessage(e));
-        setStep('password');
-        return;
+        setStep('confirm');
+        return { ok: false, message: errMessage(e) };
       }
     }
 
-    // Step 2 of 2: on-chain merkle root + self-bootstrap.
+    // Step 2 of 2: on-chain merkle root + self-bootstrap. The OS
+    // native dialog opens INSIDE
+    // recoverySetGuardianSetViaSecurePrompt.
     setStep('broadcasting');
     try {
-      await recoverySetGuardianSet(password, evmAddrs, threshold);
-      setPassword('');
+      await recoverySetGuardianSetViaSecurePrompt(evmAddrs, threshold);
       setStep('done');
       onSuccess();
+      return { ok: true };
     } catch (e) {
       broadcastGuard.current = false;
       // Audit LOW-3: a post-broadcast on-chain revert surfaces as
@@ -267,53 +275,52 @@ export function SetupGuardiansWizard({
       // technically reverted on a re-attempt. Probe the chain DIRECTLY:
       // if the authority is set, the prior broadcast actually landed.
       if (await chainShowsAuthoritySet()) {
-        setPassword('');
         setStep('done');
         onSuccess();
-        return;
+        return { ok: true };
       }
       // Q-c: a chain failure leaves the off-chain escrow seeded. Route to
       // the retry step so the user can re-attempt JUST the chain step
       // (idempotent: the contract reverts ErrGuardianSetAlreadyInitialized
       // if it actually landed, which the retry handler treats as success).
-      onError(errMessage(e));
       setStep('retry');
+      return { ok: false, message: errMessage(e) };
     }
   };
 
-  const retryChainOnly = async () => {
-    if (broadcastGuard.current) return;
+  const retryChainOnly = async (): Promise<SecureSubmitOutcome> => {
+    if (broadcastGuard.current) {
+      return { ok: false, message: 'already running' };
+    }
     broadcastGuard.current = true;
     setStep('broadcasting');
     const evmAddrs = guardians.map((g) => g.signer);
     try {
-      await recoverySetGuardianSet(password, evmAddrs, threshold);
-      setPassword('');
+      await recoverySetGuardianSetViaSecurePrompt(evmAddrs, threshold);
       setStep('done');
       onSuccess();
+      return { ok: true };
     } catch (e) {
       broadcastGuard.current = false;
       // Audit LOW-3: the chain-read fallback is the most robust signal
       // that the prior broadcast landed — independent of however the
       // revert reason is (or isn't) decoded.
       if (await chainShowsAuthoritySet()) {
-        setPassword('');
         setStep('done');
         onSuccess();
-        return;
+        return { ok: true };
       }
       // Estimate-gas revert messages DO include the reason; keyword
       // check is the fallback for that path (or any error class where
       // the chain isn't yet observably in the post-broadcast state).
       const msg = errMessage(e).toLowerCase();
       if (msg.includes('alreadyinitialized') || msg.includes('already initialized')) {
-        setPassword('');
         setStep('done');
         onSuccess();
-        return;
+        return { ok: true };
       }
-      onError(errMessage(e));
       setStep('retry');
+      return { ok: false, message: errMessage(e) };
     }
   };
 
@@ -410,7 +417,7 @@ export function SetupGuardiansWizard({
               Back
             </Button>
             <Button
-              onClick={advanceToPassword}
+              onClick={advanceToConfirm}
               disabled={threshold < MIN_THRESHOLD || threshold > maxT}
               data-testid="setup-guardians-threshold-next"
             >
@@ -420,26 +427,19 @@ export function SetupGuardiansWizard({
         </div>
       )}
 
-      {step === 'password' && (
-        <div className="recovery-wizard__step" data-testid="step-password">
+      {step === 'confirm' && (
+        <div className="recovery-wizard__step" data-testid="step-confirm">
           <p>
-            Confirm your master password to finish setting up your{' '}
-            {guardians.length} guardians (threshold {threshold}).
+            Click below to finish setting up your {guardians.length} guardians
+            (threshold {threshold}). A native dialog will collect your master
+            password — it never enters this app&apos;s memory.
           </p>
-          <Input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="Master password"
-            data-testid="setup-guardians-password"
-          />
-          <Button
-            onClick={() => void runOnboarding()}
-            disabled={password === ''}
+          <SecurePasswordButton
+            label="Set up guardians"
+            onSubmit={runOnboarding}
+            onError={onError}
             data-testid="setup-guardians-onboard"
-          >
-            Set up guardians
-          </Button>
+          />
         </div>
       )}
 
@@ -473,23 +473,16 @@ export function SetupGuardiansWizard({
         <div className="recovery-wizard__step" data-testid="step-retry">
           <p>
             The off-chain part of setting up your guardians succeeded, but the
-            on-chain step failed. You can retry just the on-chain step — your
-            guardians don&apos;t need to re-send their invites.
+            on-chain step failed. Click below to retry just the on-chain step
+            — your guardians don&apos;t need to re-send their invites. A
+            native dialog will collect your master password.
           </p>
-          <Input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="Master password"
-            data-testid="setup-guardians-retry-password"
-          />
-          <Button
-            onClick={() => void retryChainOnly()}
-            disabled={password === ''}
+          <SecurePasswordButton
+            label="Retry on-chain step"
+            onSubmit={retryChainOnly}
+            onError={onError}
             data-testid="setup-guardians-retry"
-          >
-            Retry on-chain step
-          </Button>
+          />
         </div>
       )}
     </Card>
