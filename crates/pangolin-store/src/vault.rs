@@ -370,6 +370,12 @@ pub struct RecoveryEscrowParams {
     /// The `M` guardians' 32-byte X25519 SEALING pubkeys, ordered by index
     /// (`0..M`). Non-secret — the re-split re-seals to the SAME guardian set.
     pub guardian_x25519_pubs: Vec<[u8; 32]>,
+    /// **L-0d.** The `M` guardians' 20-byte EVM signer addresses, ordered by
+    /// index (`0..M`) — the same addresses the merkle root on-chain commits
+    /// to. The rotation re-split preserves the guardian set unchanged, so
+    /// the signers are carried forward verbatim. Read from
+    /// [`recovery_escrow::StoredGuardian::signer`].
+    pub guardian_signers: Vec<[u8; 20]>,
     /// The current recovery epoch the escrow generation is tagged with.
     pub current_epoch: u64,
 }
@@ -1868,12 +1874,25 @@ impl Vault {
         &mut self,
         threshold: u8,
         guardian_x25519_pubs: &[[u8; 32]],
+        guardian_signers: &[[u8; 20]],
     ) -> Result<OnboardingOutcome> {
         // Q-c: the first onboard writes at GENESIS (0); rotation / recovery
         // bump it thereafter. A re-onboard (Q-b) REPLACES in place at the
         // same genesis epoch (the re-split, not a guardian-set change, owns
         // the forward-security bump).
         const GENESIS_EPOCH: u64 = 0;
+
+        // L-0d: paired-array length check (plan-LOCK Q-b). Fail fast before
+        // the active session gate so a malformed host call is rejected
+        // with a typed Corrupted error instead of producing a half-state.
+        if guardian_x25519_pubs.len() != guardian_signers.len() {
+            return Err(StoreError::Corrupted(format!(
+                "onboard_guardians: guardian_x25519_pubs.len() ({}) ≠ \
+                 guardian_signers.len() ({})",
+                guardian_x25519_pubs.len(),
+                guardian_signers.len()
+            )));
+        }
 
         let active = self.require_active()?;
         let vault_id = self.meta.vault_id;
@@ -1897,13 +1916,17 @@ impl Vault {
 
         // Map the crypto-level assignments into the store's borrowing
         // `GuardianRecord` slice (the sealed-share bytes are borrowed from
-        // `onboarding`, which outlives the transaction below).
+        // `onboarding`, which outlives the transaction below). L-0d: zip
+        // each assignment with the matching `guardian_signers[i]` (the
+        // assignments come back from the crypto layer ordered by index
+        // 0..M, parallel to the input arrays).
         let records: Vec<GuardianRecord<'_>> = onboarding
             .assignments
             .iter()
             .map(|a| GuardianRecord {
                 index: a.index,
                 guardian_x25519_pub: a.guardian_x25519_pub,
+                signer: guardian_signers[usize::from(a.index)],
                 sealed_share: &a.sealed_share,
             })
             .collect();
@@ -2030,6 +2053,10 @@ impl Vault {
             .map(|i| GuardianRecord {
                 index: u8::try_from(i).expect("index <= M-1 fits u8"),
                 guardian_x25519_pub: guardian_pubs[i],
+                // L-0d: test helper — synthesize a deterministic non-zero
+                // signer per guardian index so the production read-path's
+                // all-zero rejection doesn't trip on this fixture.
+                signer: [u8::try_from(i + 1).unwrap_or(0xFF); recovery_escrow::GUARDIAN_SIGNER_LEN],
                 sealed_share: &sealed[i],
             })
             .collect();
@@ -8111,6 +8138,12 @@ impl Vault {
             // to). The decrypted `sealed_share` bytes in `e.guardians` are
             // dropped here (never copied out).
             guardian_x25519_pubs: e.guardians.iter().map(|g| g.guardian_x25519_pub).collect(),
+            // L-0d: the matching guardian EVM signer addresses, ordered by
+            // index. The rotation re-split preserves the guardian set, so
+            // the signers carry forward verbatim through the new escrow
+            // generation. `read_recovery_escrow` already enforces the
+            // all-zero rejection for back-fill sentinels.
+            guardian_signers: e.guardians.iter().map(|g| g.signer).collect(),
             current_epoch,
         }))
     }
@@ -8204,6 +8237,12 @@ impl Vault {
                 .iter()
                 .map(|g| g.sealed_share.as_bytes().to_vec())
                 .collect(),
+            // MVP-4-L L-0d: the M guardian EVM SIGNER addresses, parallel
+            // to guardian_x25519_pubs / sealed_shares. The recoverer reads
+            // these to build the merkle proof against the on-chain
+            // RecoveryV2 root; the recovered vault re-installs them on the
+            // post-recovery escrow row.
+            guardian_evm_addrs: escrow.guardians.iter().map(|g| g.signer).collect(),
             vault_display_name: String::new(),
             created_at_unix,
         };
@@ -11251,7 +11290,7 @@ impl RawRevisionRow {
 
 #[cfg(test)]
 mod tests {
-    use super::{RevisionLogVersion, Vault, VaultState};
+    use super::{recovery_escrow::GUARDIAN_SIGNER_LEN, RevisionLogVersion, Vault, VaultState};
     use crate::account::AccountSnapshot;
     use crate::error::StoreError;
     use crate::meta::{FORMAT_VERSION, MAGIC};
@@ -11296,6 +11335,34 @@ mod tests {
     }
     fn vault_path(dir: &TempDir, name: &str) -> PathBuf {
         dir.path().join(name)
+    }
+
+    /// L-0d Q-b: `Vault::onboard_guardians` rejects mismatched-length
+    /// parallel arrays with `StoreError::Corrupted` and the typed message
+    /// names BOTH array sources (defense-in-depth — the FFI catches first
+    /// with FFI-named args; the store check runs even if a future caller
+    /// bypassed the FFI wrapper, e.g. a direct embedded-library user).
+    /// Fires BEFORE the active-session gate, so a Locked vault is enough.
+    #[test]
+    fn onboard_guardians_paired_array_length_mismatch_rejected() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "paired.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let mut v = Vault::open(&p).unwrap();
+        // No unlock — the paired-array gate fires before require_active().
+        let pubs: Vec<[u8; 32]> = vec![[0xA1; 32], [0xA2; 32], [0xA3; 32]];
+        let signers: Vec<[u8; 20]> = vec![[0xB1; 20], [0xB2; 20]]; // 2 ≠ 3
+        let err = v.onboard_guardians(2, &pubs, &signers).unwrap_err();
+        match err {
+            StoreError::Corrupted(msg) => {
+                assert!(
+                    msg.contains("guardian_x25519_pubs")
+                        && msg.contains("guardian_signers"),
+                    "expected paired-array message naming both sides, got: {msg}"
+                );
+            }
+            other => panic!("expected Corrupted, got {other:?}"),
+        }
     }
 
     /// Plan §"Test plan" / success criterion 2: fresh vault file
@@ -11493,6 +11560,7 @@ mod tests {
             .map(|i| GuardianRecord {
                 index: u8::try_from(i).unwrap(),
                 guardian_x25519_pub: new_pubs[i],
+                signer: [u8::try_from(i + 1).unwrap_or(0xFF); GUARDIAN_SIGNER_LEN],
                 sealed_share: &new_sealed[i],
             })
             .collect();
@@ -11604,6 +11672,7 @@ mod tests {
             .map(|i| GuardianRecord {
                 index: u8::try_from(i).unwrap(),
                 guardian_x25519_pub: new_pubs[i],
+                signer: [u8::try_from(i + 1).unwrap_or(0xFF); GUARDIAN_SIGNER_LEN],
                 sealed_share: &new_sealed[i],
             })
             .collect();
@@ -11696,6 +11765,7 @@ mod tests {
             .map(|i| GuardianRecord {
                 index: u8::try_from(i).unwrap(),
                 guardian_x25519_pub: new_pubs[i],
+                signer: [u8::try_from(i + 1).unwrap_or(0xFF); GUARDIAN_SIGNER_LEN],
                 sealed_share: &new_sealed[i],
             })
             .collect();
@@ -11797,6 +11867,7 @@ mod tests {
             .map(|i| GuardianRecord {
                 index: u8::try_from(i).unwrap(),
                 guardian_x25519_pub: new_pubs[i],
+                signer: [u8::try_from(i + 1).unwrap_or(0xFF); GUARDIAN_SIGNER_LEN],
                 sealed_share: &new_sealed[i],
             })
             .collect();

@@ -49,6 +49,10 @@ use crate::session::{SecretPassword, VaultHandle};
 /// Wire-form length of a guardian X25519 pubkey (the SEALING pubkey).
 const X25519_PUB_LEN: usize = 32;
 
+/// Wire-form length of a guardian's EVM address (the on-chain SIGNER
+/// commitment that lands in the merkle leaf — L-0d).
+const GUARDIAN_SIGNER_LEN: usize = 20;
+
 /// Map a [`pangolin_store::StoreError`] through the total
 /// `StoreError → pangolin_core::Error → FfiError` mapping (the established
 /// session.rs / device.rs discipline — collapses `AuthenticationFailed` to
@@ -70,6 +74,22 @@ fn fixed_bytes<const N: usize>(bytes: &[u8], what: &str) -> Result<[u8; N], FfiE
 fn collect_x25519_pubs(pubs: &[Vec<u8>]) -> Result<Vec<[u8; X25519_PUB_LEN]>, FfiError> {
     pubs.iter()
         .map(|p| fixed_bytes::<X25519_PUB_LEN>(p, "guardian X25519 pubkey"))
+        .collect()
+}
+
+/// Validate + collect a `Vec<Vec<u8>>` of 20-byte guardian EVM signer
+/// addresses into `[u8; 20]`s — L-0d. The on-chain RecoveryV2 contract
+/// stores ONLY the merkle root over these addresses (the addresses
+/// themselves are a private commitment), so the recoverer reads them from
+/// the BACKUP envelope; the engine persists them alongside the sealed
+/// shares (see [`pangolin_store::recovery_escrow::StoredGuardian::signer`])
+/// so a `create_recovery_backup` call can pull them back out.
+fn collect_guardian_signers(
+    signers: &[Vec<u8>],
+) -> Result<Vec<[u8; GUARDIAN_SIGNER_LEN]>, FfiError> {
+    signers
+        .iter()
+        .map(|s| fixed_bytes::<GUARDIAN_SIGNER_LEN>(s, "guardian EVM address"))
         .collect()
 }
 
@@ -149,9 +169,9 @@ pub const RECOVERY_FFI_SCHEMA_VERSION: u16 = 1;
 /// The host-supplied guardian roster for a LOST-EVERYTHING recovery.
 ///
 /// Mirrors [`pangolin_core::composition::GuardianRoster`]: the threshold
-/// `(t)`, the guardian count `(M)`, and the `M` guardians' 32-byte X25519
-/// SEALING pubkeys (host-supplied from a backup; the backup FORMAT stays
-/// deferred to 6.x). All non-secret.
+/// `(t)`, the guardian count `(M)`, the `M` guardians' 32-byte X25519
+/// SEALING pubkeys, and the `M` matching 20-byte EVM signer addresses
+/// (host-supplied from the backup envelope). All non-secret.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiGuardianRoster {
     /// Schema-version slot.
@@ -163,6 +183,11 @@ pub struct FfiGuardianRoster {
     /// The `M` guardians' 32-byte X25519 SEALING pubkeys, ordered by index
     /// (`0..M`). Each MUST be exactly 32 bytes.
     pub x25519_pubs: Vec<Vec<u8>>,
+    /// **L-0d.** The `M` guardians' 20-byte EVM signer addresses, ordered by
+    /// index (`0..M`). Parallel to `x25519_pubs`. Each MUST be exactly
+    /// 20 bytes; mismatched length is rejected with
+    /// `Validation { kind: "argument" }`.
+    pub evm_addrs: Vec<Vec<u8>>,
 }
 
 /// Non-secret result of [`vault_recover_from_shares`].
@@ -320,10 +345,24 @@ pub fn vault_recover_from_shares(
 ) -> Result<FfiRecoveryResult, FfiError> {
     let vault_id_arr: [u8; VAULT_ID_LEN] = fixed_bytes(&vault_id, "vault_id")?;
     let pubs = collect_x25519_pubs(&roster.x25519_pubs)?;
+    let evm_addrs = collect_guardian_signers(&roster.evm_addrs)?;
+    // L-0d: parallel-array length must match. Fail fast with the FFI's
+    // own argument-name shape (the store-side check uses store names).
+    if pubs.len() != evm_addrs.len() {
+        return Err(FfiError::Validation {
+            kind: "argument".into(),
+            message: format!(
+                "roster.x25519_pubs.len() ({}) ≠ roster.evm_addrs.len() ({})",
+                pubs.len(),
+                evm_addrs.len()
+            ),
+        });
+    }
     let core_roster = pangolin_core::composition::GuardianRoster {
         threshold: roster.threshold,
         guardian_count: roster.guardian_count,
         x25519_pubs: pubs,
+        evm_addrs,
     };
     let wrapped = decode_wrapped_recovery(&wrapped_recovery, vault_id_arr)?;
 
@@ -367,9 +406,22 @@ pub fn vault_recover_from_shares(
 ///
 /// Session-gated (Active — the onboard reads the active VDK store-internal).
 /// `guardian_x25519_pubs` are the `M` guardian SEALING pubkeys (each 32 B);
-/// the threshold `(t)` and `M = guardian_x25519_pubs.len()` must satisfy the
-/// on-chain bounds (`t ∈ 2..=9`, `M ∈ 3..=15`, `t ≤ M`). Non-secret: guardian
-/// pubkeys in, the recovery-generation epoch out.
+/// `guardian_evm_addrs` are the `M` matching guardian SIGNER EVM addresses
+/// (each 20 B) — parallel arrays ordered by guardian index (L-0d). The
+/// threshold `(t)` and `M = guardian_x25519_pubs.len()` must satisfy the
+/// on-chain bounds (`t ∈ 2..=9`, `M ∈ 3..=15`, `t ≤ M`). Non-secret:
+/// guardian pubkeys + addresses in, the recovery-generation epoch out.
+///
+/// # L-0d — paired guardian roster
+///
+/// The two arrays MUST have the same length; a mismatch is rejected
+/// store-side with `Validation { kind: "argument" }`. The signers feed the
+/// on-chain `setGuardianSet` merkle root + the BACKUP envelope's
+/// `guardian_evm_addrs` field, which the recoverer reads back to build a
+/// merkle proof during `recovery_help_approve`. The host (desktop /
+/// extension / CLI) is the source of truth for the pairing — typically
+/// from the same in-memory guardian-identity decode that produced the
+/// X25519 pubkey.
 ///
 /// # Self-as-guardian — NOT enforced here
 ///
@@ -400,12 +452,27 @@ pub fn vault_onboard_guardians(
     handle: Arc<VaultHandle>,
     threshold: u8,
     guardian_x25519_pubs: Vec<Vec<u8>>,
+    guardian_evm_addrs: Vec<Vec<u8>>,
 ) -> Result<FfiOnboardingResult, FfiError> {
     let pubs = collect_x25519_pubs(&guardian_x25519_pubs)?;
+    let signers = collect_guardian_signers(&guardian_evm_addrs)?;
+    // L-0d: paired-array length is also checked store-side, but reject
+    // here too so the typed FFI error message points at the FFI argument
+    // names the host called us with.
+    if pubs.len() != signers.len() {
+        return Err(FfiError::Validation {
+            kind: "argument".into(),
+            message: format!(
+                "guardian_x25519_pubs.len() ({}) ≠ guardian_evm_addrs.len() ({})",
+                pubs.len(),
+                signers.len()
+            ),
+        });
+    }
     let mut guard = handle.lock_vault();
     let vault = guard.as_mut()?;
     let outcome = vault
-        .onboard_guardians(threshold, &pubs)
+        .onboard_guardians(threshold, &pubs, &signers)
         .map_err(store_into_ffi)?;
     Ok(FfiOnboardingResult {
         epoch: outcome.epoch,
@@ -1009,6 +1076,12 @@ mod tests {
             threshold: T,
             guardian_count: M,
             x25519_pubs: pubs.iter().map(|p| p.to_vec()).collect(),
+            // L-0d: deterministic non-zero per index; the recovery driver
+            // persists these as the post-recovery escrow's signer set
+            // (the all-zero rejection trips on the back-fill sentinel).
+            evm_addrs: (0..M)
+                .map(|i| vec![i.wrapping_add(1); 20])
+                .collect(),
         };
         let result = vault_recover_from_shares(
             Arc::clone(&fresh_h),
@@ -1039,20 +1112,66 @@ mod tests {
         let (pubs, _handles) = guardian_handles(&dirs);
         let dir = tempfile::TempDir::new().unwrap();
         let h = unlocked_handle(&dir, "v.pvf", b"correct horse battery staple");
-        let res =
-            vault_onboard_guardians(Arc::clone(&h), T, pubs.iter().map(|p| p.to_vec()).collect())
-                .expect("onboard through the FFI");
+        // L-0d: synthetic deterministic non-zero EVM signers, one per pub.
+        let signers: Vec<Vec<u8>> = (0..M).map(|i| vec![i.wrapping_add(1); 20]).collect();
+        let res = vault_onboard_guardians(
+            Arc::clone(&h),
+            T,
+            pubs.iter().map(|p| p.to_vec()).collect(),
+            signers,
+        )
+        .expect("onboard through the FFI");
         assert_eq!(res.epoch, 0, "first onboard writes GENESIS epoch");
 
         // A bad-length pubkey is rejected.
-        let err = vault_onboard_guardians(h, T, vec![vec![0u8; 31]]).unwrap_err();
+        let err =
+            vault_onboard_guardians(Arc::clone(&h), T, vec![vec![0u8; 31]], vec![vec![0xAA; 20]])
+                .unwrap_err();
         assert!(matches!(err, FfiError::Validation { ref kind, .. } if kind == "argument"));
+
+        // L-0d: a bad-length EVM signer is rejected (the FFI's typed
+        // argument check).
+        let err = vault_onboard_guardians(
+            Arc::clone(&h),
+            T,
+            pubs.iter().map(|p| p.to_vec()).collect(),
+            vec![vec![0u8; 19]; usize::from(M)],
+        )
+        .unwrap_err();
+        assert!(matches!(err, FfiError::Validation { ref kind, .. } if kind == "argument"));
+
+        // L-0d: mismatched parallel-array lengths are rejected with the
+        // FFI's named-arg message before reaching the store check.
+        let err = vault_onboard_guardians(
+            h,
+            T,
+            pubs.iter().map(|p| p.to_vec()).collect(),
+            vec![vec![0xAA; 20]; usize::from(M).saturating_sub(1)],
+        )
+        .unwrap_err();
+        match err {
+            FfiError::Validation { kind, message } => {
+                assert_eq!(kind, "argument");
+                assert!(
+                    message.contains("guardian_x25519_pubs")
+                        && message.contains("guardian_evm_addrs"),
+                    "expected paired-array length message, got: {message}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
     }
 
     #[test]
     fn onboard_guardians_rejects_placeholder() {
         let empty = VaultHandle::new_placeholder();
-        let err = vault_onboard_guardians(empty, T, vec![vec![0u8; 32]; 3]).unwrap_err();
+        let err = vault_onboard_guardians(
+            empty,
+            T,
+            vec![vec![0u8; 32]; 3],
+            vec![vec![0xAA; 20]; 3],
+        )
+        .unwrap_err();
         assert!(matches!(err, FfiError::Session { .. }));
     }
 

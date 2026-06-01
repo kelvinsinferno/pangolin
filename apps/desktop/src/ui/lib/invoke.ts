@@ -584,15 +584,19 @@ export async function guardianInviteDecodeText(text: string): Promise<GuardianIn
 /** **OWNER, step 1 of 2.** Seed the off-chain escrow: Shamir-split a fresh
  *  RecoveryWrapKey into M shares + seal to each guardian's pubkey.
  *  `x25519Pubs` is the M hex-encoded sealing pubkeys collected from the
- *  guardian invites (each 64 hex chars); `threshold` is t. The FFI
- *  revalidates t/M bounds. */
+ *  guardian invites (each 64 hex chars); `evmAddrs` is the M matching
+ *  20-byte EVM signer addresses (40 hex chars each, parallel to
+ *  `x25519Pubs`, also from the guardian invites — L-0d); `threshold` is t.
+ *  The FFI revalidates t/M bounds AND the paired-array length. */
 export async function recoveryOnboardGuardians(
   threshold: number,
   x25519Pubs: string[],
+  evmAddrs: string[],
 ): Promise<OnboardingResult> {
   const w = await tauriInvoke<OnboardingResultWire>('recovery_onboard_guardians', {
     threshold,
     x25519Pubs,
+    evmAddrs,
   });
   return { epoch: w.epoch };
 }

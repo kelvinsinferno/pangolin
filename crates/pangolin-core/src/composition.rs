@@ -82,6 +82,12 @@ pub struct GuardianRoster {
     /// The `M` guardians' 32-byte X25519 SEALING pubkeys, ordered by index
     /// (`0..M`). The re-split re-seals to the SAME guardian set.
     pub x25519_pubs: Vec<[u8; 32]>,
+    /// **L-0d.** The `M` guardians' 20-byte EVM signer addresses, ordered by
+    /// index (`0..M`). The recoverer reads these from the BACKUP envelope
+    /// (`BackupContents::guardian_evm_addrs`) and threads them through so
+    /// the post-recovery re-split persists the SAME signers — which a
+    /// future `recovery_help_approve` needs to build the merkle proof.
+    pub evm_addrs: Vec<[u8; 20]>,
 }
 
 /// Errors from the composition layer.
@@ -141,15 +147,20 @@ pub type Result<T> = core::result::Result<T, CompositionError>;
 /// take — exactly the mapping the anvil E2E performs inline (#106c). Pure;
 /// no secret crosses (the `SealedShare`s are non-secret, sealed to the
 /// guardians).
-fn re_split_records(
-    re_split: &crate::recovery::orchestration::OnboardingArtifacts,
-) -> Vec<GuardianRecord<'_>> {
+fn re_split_records<'a>(
+    re_split: &'a crate::recovery::orchestration::OnboardingArtifacts,
+    guardian_signers: &[[u8; 20]],
+) -> Vec<GuardianRecord<'a>> {
     re_split
         .assignments
         .iter()
         .map(|a| GuardianRecord {
             index: a.index,
             guardian_x25519_pub: a.guardian_x25519_pub,
+            // L-0d: zip by guardian index — the assignments come back
+            // ordered 0..M from the crypto layer, parallel to the input
+            // pubs / signers arrays.
+            signer: guardian_signers[usize::from(a.index)],
             sealed_share: &a.sealed_share,
         })
         .collect()
@@ -239,7 +250,9 @@ pub fn complete_rotation(
 
     // 4. The audited single-tx commit. The store reads old_vdk/device_key
     //    from the active session INSIDE; the fresh new_vdk is consumed there.
-    let records = re_split_records(&re_split);
+    // L-0d: the rotation re-split preserves the guardian set unchanged, so
+    // the signers carry forward verbatim from the existing escrow.
+    let records = re_split_records(&re_split, &params.guardian_signers);
     vault.commit_vdk_rotation_from_active(
         new_vdk,
         master_password,
@@ -305,6 +318,24 @@ pub fn recover_from_shares(
         guardian_count: roster.guardian_count,
     };
 
+    // L-0d defense-in-depth: the FFI (recovery_ffi + recovery_backup)
+    // already checks roster.x25519_pubs.len() == roster.evm_addrs.len()
+    // and guardian_count, but a direct embed-library caller bypassing
+    // those wrappers must not be able to drive a re_split_records panic
+    // on an index that falls outside the addrs vec. The crypto layer
+    // produces assignments ordered 0..M; require both rosters match M.
+    let m = usize::from(roster.guardian_count);
+    if roster.x25519_pubs.len() != m || roster.evm_addrs.len() != m {
+        return Err(CompositionError::Store(pangolin_store::StoreError::Corrupted(
+            format!(
+                "recover_from_shares: guardian_count ({m}) does not match \
+                 roster.x25519_pubs.len() ({}) or roster.evm_addrs.len() ({})",
+                roster.x25519_pubs.len(),
+                roster.evm_addrs.len()
+            ),
+        )));
+    }
+
     // 1. Pure recovery driver: reconstruct the byte-identical VDK + re-split.
     let RecoveryArtifacts { vdk, re_split } = recover_vdk_from_shares(
         wrapped_recovery,
@@ -317,7 +348,9 @@ pub fn recover_from_shares(
 
     // 2. The audited single-tx atomic commit. The recovered VDK is consumed
     //    + dropped (zeroized) inside; nothing was pulled from self.active.
-    let records = re_split_records(&re_split);
+    // L-0d: the recoverer sourced the signers from the BACKUP envelope —
+    // the post-recovery re-split persists the SAME guardian set.
+    let records = re_split_records(&re_split, &roster.evm_addrs);
     let new_epoch = re_split.epoch.0;
     vault.commit_recovery_rekey(
         vdk,

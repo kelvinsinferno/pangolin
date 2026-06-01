@@ -380,9 +380,17 @@ CREATE TABLE IF NOT EXISTS recovery_escrow (
 -- with it. The `no_plaintext_on_disk`-style assertion holds for
 -- `enc_sealed_share`. Additive table; legacy vaults pick it up via
 -- migrate_recovery_escrow_tables.
+-- L-0d: guardian_signer (20-byte EVM address) added in schema v2 so the
+-- recoverer can rebuild the full M-address roster from a backup envelope
+-- (the on-chain merkle root commits the addresses privately; they're not
+-- queryable from chain). Legacy v1 vaults pick the column up via
+-- `migrate_recovery_guardians_table` on next open; the back-fill default
+-- is all-zero and `read_recovery_escrow` rejects any all-zero row as a
+-- corrupted pre-L-0d onboard.
 CREATE TABLE IF NOT EXISTS recovery_guardians (
     guardian_index      INTEGER PRIMARY KEY,
     guardian_x25519_pub BLOB    NOT NULL,
+    guardian_signer     BLOB    NOT NULL,
     enc_sealed_share    BLOB    NOT NULL,
     enc_nonce           BLOB    NOT NULL,
     schema_version      INTEGER NOT NULL
@@ -627,6 +635,10 @@ pub fn apply_pragmas_and_schema(conn: &Connection) -> Result<()> {
     // older DDL. Additive; no `format_version` bump. Empty table on a
     // vault with no active recovery attempt.
     migrate_recovery_recipient_table(conn)?;
+    // MVP-4-L L-0d: additive `guardian_signer` column on `recovery_guardians`.
+    // Legacy rows back-fill to zeroblob(20) + are rejected with
+    // CorruptedRecovery at read time (plan-LOCK Q-a).
+    migrate_recovery_guardians_table(conn)?;
 
     // MVP-3 issue #106b-2 migrations: the additive `vdk_chain_state` +
     // `vdk_chain` tables (the epoch-keyed retained-VDK chain) and the
@@ -864,12 +876,37 @@ fn migrate_recovery_escrow_tables(conn: &Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS recovery_guardians (
             guardian_index      INTEGER PRIMARY KEY,
             guardian_x25519_pub BLOB    NOT NULL,
+            guardian_signer     BLOB    NOT NULL,
             enc_sealed_share    BLOB    NOT NULL,
             enc_nonce           BLOB    NOT NULL,
             schema_version      INTEGER NOT NULL
         )",
         [],
     )?;
+    Ok(())
+}
+
+/// **MVP-4-L L-0d migration.** Add the `guardian_signer` column to
+/// `recovery_guardians`. Idempotent — gated by `PRAGMA table_info`. Legacy
+/// rows back-fill to `zeroblob(20)` and `read_recovery_escrow` rejects any
+/// all-zero signer with `StoreError::Corrupted` (plan-LOCK Q-a) so a
+/// pre-L-0d onboard fails loud + the user re-onboards (testnet-only; no
+/// production state).
+fn migrate_recovery_guardians_table(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(recovery_guardians)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut have: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in rows {
+        have.insert(r?);
+    }
+    drop(stmt);
+    if !have.contains("guardian_signer") {
+        conn.execute(
+            "ALTER TABLE recovery_guardians \
+             ADD COLUMN guardian_signer BLOB NOT NULL DEFAULT (zeroblob(20))",
+            [],
+        )?;
+    }
     Ok(())
 }
 
