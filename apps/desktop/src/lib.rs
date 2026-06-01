@@ -175,6 +175,14 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         // an audit-cleanup commit gates the legacy commands behind
         // `cfg(feature = "test-hooks")`. Plan-LOCK §3.
         commands::secure_prompt::vault_unlock_via_secure_prompt,
+        commands::secure_prompt::pairing_open_and_join_via_secure_prompt,
+        commands::secure_prompt::pairing_chain_bootstrap_via_secure_prompt,
+        commands::secure_prompt::pairing_add_device_via_secure_prompt,
+        commands::secure_prompt::pairing_complete_rotation_via_secure_prompt,
+        commands::secure_prompt::recovery_create_backup_via_secure_prompt,
+        commands::secure_prompt::recovery_set_guardian_set_via_secure_prompt,
+        commands::secure_prompt::recovery_initiate_via_secure_prompt,
+        commands::secure_prompt::recovery_complete_via_secure_prompt,
         #[cfg(feature = "test-hooks")]
         test_hooks::__test__commands_invoked,
         #[cfg(feature = "test-hooks")]

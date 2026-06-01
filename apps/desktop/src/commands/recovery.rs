@@ -229,7 +229,7 @@ impl From<pangolin_ffi::FfiTxOutcome> for TxOutcomeDto {
 /// Hex → byte helper for the wizard's invite pubkeys / EVM addresses.
 /// Strict-length, lowercase-tolerant; rejects odd lengths + non-hex bytes
 /// with a typed `Validation` error.
-fn bytes_from_hex(
+pub(crate) fn bytes_from_hex(
     hex: &str,
     label: &'static str,
     expected_len: usize,

@@ -196,7 +196,7 @@ fn hex_decode_exact(hex: &str, n_bytes: usize, kind: &str) -> Result<Vec<u8>, De
 
 /// Decode a 64-char hex 32-byte vault id (what `PairingPayloadDto.vault_id`
 /// round-trips).
-fn vault_id_from_hex(hex: &str) -> Result<Vec<u8>, DesktopError> {
+pub(crate) fn vault_id_from_hex(hex: &str) -> Result<Vec<u8>, DesktopError> {
     hex_decode_exact(hex, 32, "vault_id")
 }
 
