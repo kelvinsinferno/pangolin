@@ -18,9 +18,17 @@
 
 #![forbid(unsafe_code)]
 
+// MVP-4-H L6 cleanup: Arc is only used by the legacy `vault_unlock`
+// body (gated behind `test-hooks`) -- the unit-test module imports
+// its own Arc. SecretPassword is used by both the legacy fn AND the
+// unit-test module (via `super::*`), so it stays available under
+// `cfg(any(test, feature = "test-hooks"))`.
+#[cfg(feature = "test-hooks")]
 use std::sync::Arc;
 
-use pangolin_ffi::{PresenceProof, SecretPassword};
+#[cfg(any(test, feature = "test-hooks"))]
+use pangolin_ffi::SecretPassword;
+use pangolin_ffi::PresenceProof;
 use tauri::State;
 
 use crate::error::DesktopError;
@@ -68,6 +76,15 @@ pub async fn vault_open(path: String, state: State<'_, VaultState>) -> Result<()
 /// password / tampered-ciphertext / presence-replay class;
 /// `DesktopError::Session` if no vault is open (caller must
 /// `vault_open` first).
+///
+/// **MVP-4-H L6 cleanup (audit, plan §3 + §6 invariant L1):** gated
+/// behind `feature = "test-hooks"` because the production password
+/// path is now [`crate::commands::secure_prompt::vault_unlock_via_secure_prompt`]
+/// (no V8 plaintext). The legacy command stays available in test +
+/// wdio + L5 integration builds (which all pass `--features
+/// test-hooks`) so existing unit-test coverage of the
+/// `AuthenticationFailed` / `Session` error paths keeps working.
+#[cfg(feature = "test-hooks")]
 #[tauri::command]
 pub async fn vault_unlock(
     password: String,

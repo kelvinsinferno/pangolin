@@ -66,7 +66,12 @@
 use serde::Serialize;
 use tauri::State;
 
-use pangolin_ffi::{FfiChainConfig, SecretPassword, FFI_CHAIN_CONFIG_SCHEMA_VERSION};
+// MVP-4-H L6 cleanup: SecretPassword is only used by the four
+// legacy password-taking commands gated behind `test-hooks`; the
+// secure-prompt variants live in `commands::secure_prompt`.
+#[cfg(feature = "test-hooks")]
+use pangolin_ffi::SecretPassword;
+use pangolin_ffi::{FfiChainConfig, FFI_CHAIN_CONFIG_SCHEMA_VERSION};
 
 use crate::error::DesktopError;
 use crate::state::VaultState;
@@ -347,6 +352,11 @@ pub async fn pairing_derive_sas(
 /// `DesktopError::Validation` for a bad vault id; `DesktopError::Crypto` /
 /// `Store` if the seal does not open (wrong recipient / tampered);
 /// `DesktopError::Session` for a locked vault.
+///
+/// **MVP-4-H L6 cleanup:** gated behind `feature = "test-hooks"`;
+/// production callsite is
+/// `crate::commands::secure_prompt::pairing_open_and_join_via_secure_prompt`.
+#[cfg(feature = "test-hooks")]
 #[tauri::command]
 pub async fn pairing_open_and_join(
     sealed_bytes: Vec<u8>,
@@ -390,6 +400,11 @@ pub async fn pairing_device_list(
 /// `DesktopError::Chain` for an RPC / tx failure (incl. the
 /// already-bootstrapped revert — the frontend treats that as "already
 /// done"); `DesktopError::Session` for a locked vault.
+///
+/// **MVP-4-H L6 cleanup:** gated behind `feature = "test-hooks"`;
+/// production callsite is
+/// `crate::commands::secure_prompt::pairing_chain_bootstrap_via_secure_prompt`.
+#[cfg(feature = "test-hooks")]
 #[tauri::command]
 pub async fn pairing_chain_bootstrap(
     password: String,
@@ -416,6 +431,11 @@ pub async fn pairing_chain_bootstrap(
 /// `DesktopError::Validation` for a malformed payload; `DesktopError::Chain`
 /// for an RPC / tx / insufficient-gas failure; `DesktopError::Session` for
 /// a locked vault.
+///
+/// **MVP-4-H L6 cleanup:** gated behind `feature = "test-hooks"`;
+/// production callsite is
+/// `crate::commands::secure_prompt::pairing_add_device_via_secure_prompt`.
+#[cfg(feature = "test-hooks")]
 #[tauri::command]
 pub async fn pairing_add_device(
     their_bytes: Vec<u8>,
@@ -570,6 +590,11 @@ pub async fn pairing_pending_rotations(
 /// # Errors
 /// `DesktopError::Session` (locked) / `DesktopError::Chain` (set-read
 /// failure) / `DesktopError::Store` / `DesktopError::Crypto`.
+///
+/// **MVP-4-H L6 cleanup:** gated behind `feature = "test-hooks"`;
+/// production callsite is
+/// `crate::commands::secure_prompt::pairing_complete_rotation_via_secure_prompt`.
+#[cfg(feature = "test-hooks")]
 #[tauri::command]
 pub async fn pairing_complete_rotation(
     password: String,

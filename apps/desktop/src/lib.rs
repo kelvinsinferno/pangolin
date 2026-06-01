@@ -121,6 +121,11 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
     // without the duplication risk.
     builder.invoke_handler(tauri::generate_handler![
         commands::vault::vault_open,
+        // MVP-4-H L6 cleanup: legacy password-taking vault_unlock is
+        // available ONLY in test-hooks builds (kept for the wdio
+        // gate's existing AuthenticationFailed / Session error tests).
+        // Production uses vault_unlock_via_secure_prompt below.
+        #[cfg(feature = "test-hooks")]
         commands::vault::vault_unlock,
         commands::vault::vault_lock,
         commands::vault::vault_close,
@@ -136,14 +141,20 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         commands::pairing::pairing_decode_bytes,
         commands::pairing::pairing_local_payload,
         commands::pairing::pairing_derive_sas,
+        // MVP-4-H L6 cleanup: legacy password-taking pairing commands
+        // gated behind test-hooks (production uses *_via_secure_prompt).
+        #[cfg(feature = "test-hooks")]
         commands::pairing::pairing_open_and_join,
         commands::pairing::pairing_device_list,
+        #[cfg(feature = "test-hooks")]
         commands::pairing::pairing_chain_bootstrap,
+        #[cfg(feature = "test-hooks")]
         commands::pairing::pairing_add_device,
         // MVP-4-J: device removal + authorized-set / rotation.
         commands::pairing::pairing_list_authorized_devices,
         commands::pairing::pairing_remove_device,
         commands::pairing::pairing_pending_rotations,
+        #[cfg(feature = "test-hooks")]
         commands::pairing::pairing_complete_rotation,
         // MVP-4-K: manager handoff / promotion.
         commands::pairing::pairing_propose_promotion,
@@ -151,12 +162,16 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         commands::pairing::pairing_cancel_promotion,
         commands::pairing::pairing_pending_promotion,
         // MVP-4-L (L-D): recovery backup create + health panel.
+        // MVP-4-H L6 cleanup: legacy password-taking recovery commands
+        // gated behind test-hooks (production uses *_via_secure_prompt).
+        #[cfg(feature = "test-hooks")]
         commands::recovery::recovery_create_backup,
         commands::recovery::recovery_health,
         // MVP-4-L (L-A): guardian-onboarding wizard surface.
         commands::recovery::guardian_identity_export,
         commands::recovery::guardian_invite_decode_text,
         commands::recovery::recovery_onboard_guardians,
+        #[cfg(feature = "test-hooks")]
         commands::recovery::recovery_set_guardian_set,
         // MVP-4-L (L-C): guardian-side help wizard surface.
         commands::recovery::recovery_decode_request,
@@ -164,10 +179,12 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         commands::recovery::recovery_help_release,
         // MVP-4-L (L-B): recoverer wizard surface.
         commands::recovery::recovery_decode_backup,
+        #[cfg(feature = "test-hooks")]
         commands::recovery::recovery_initiate,
         commands::recovery::recovery_recipient_identity,
         commands::recovery::recovery_target_status,
         commands::recovery::recovery_ingest_share,
+        #[cfg(feature = "test-hooks")]
         commands::recovery::recovery_complete,
         // MVP-4-H Layer 2: secure-prompt variants (V8 password residue
         // closed). Land alongside the legacy commands during the
