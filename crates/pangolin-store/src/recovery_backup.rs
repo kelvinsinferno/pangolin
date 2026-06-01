@@ -21,7 +21,7 @@
 //! ```text
 //! payload_bytes =
 //!     DOMAIN              (28 B = "pangolin-recovery-backup-v0")
-//!  || schema_version      (1 B = SCHEMA_VERSION = 1)
+//!  || schema_version      (1 B = SCHEMA_VERSION; currently 2)
 //!  || kdf_algo_id         (1 B = 1 = Argon2id)
 //!  || kdf_memory_kib      (u32 BE)
 //!  || kdf_time_cost       (u32 BE)
@@ -599,8 +599,10 @@ const MAX_WRAPPED_RECOVERY_LEN: usize = 64 * 1024;
 
 /// Hard cap on a single sealed_share's byte length (defends against a
 /// hostile envelope that claims a giant sealed_share; a real
-/// `SealedShare` ciphertext is ~80 bytes — this 1 KiB ceiling is
-/// generously safe for future curve / share-size changes).
+/// `SealedShare` ciphertext is ~154 bytes — ephemeral_pk (32) + Poly1305
+/// tag (16) + domain (25) + vault_id (32) + epoch (16) + share (33) — so
+/// this 1 KiB ceiling is ~6.6× the production size, generously safe for
+/// future curve / share-size changes).
 const MAX_SEALED_SHARE_LEN: usize = 1024;
 
 /// Hard cap on the vault display name (a String the user typed — the
