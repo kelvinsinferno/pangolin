@@ -7,9 +7,10 @@
 //!
 //! - Compiles to the per-OS native widget in release builds
 //!   (`windows.rs` / `macos.rs` / `linux.rs`, picked by `cfg(target_os)`).
-//! - Compiles to the test stub ([`stub::prompt_password`]) under
-//!   `cfg(test)` or `feature = "test-hooks"`, returning whatever the
-//!   wdio harness queued via [`__test__secure_input_inject`].
+//! - Compiles to the test stub ([`stub::pop_one`]) under `cfg(test)`
+//!   or `feature = "test-hooks"`, returning whatever the wdio harness
+//!   queued via `stub::inject` (the `__test__secure_input_inject`
+//!   Tauri command exposes this to the test runner).
 //!
 //! The returned bytes are wrapped in [`Zeroizing<Vec<u8>>`] so the
 //! buffer zeroes on drop. The caller's first move should be
@@ -47,8 +48,8 @@ pub mod error;
 pub mod stub;
 
 // Per-OS native widget impls. Each lives in its own file, gated by
-// target_os so unused OS code never compiles. The `cfg_if`-style match
-// in [`prompt_password`] dispatches at compile time.
+// target_os so unused OS code never compiles. The cfg-dispatched
+// [`prompt_password`] picks at compile time.
 #[cfg(all(target_os = "linux", not(any(test, feature = "test-hooks"))))]
 pub mod linux;
 
@@ -66,6 +67,12 @@ use zeroize::Zeroizing;
 
 /// **Open a native OS password dialog and return the typed bytes.**
 ///
+/// `app` is the Tauri app handle whose main-thread GUI loop will drive
+/// the native dialog. The per-OS impls dispatch the dialog onto
+/// `app.run_on_main_thread(...)` so GTK / Cocoa / Win32 calls always
+/// happen on the GUI thread, even when the caller is a Tokio async
+/// command on the blocking pool.
+///
 /// `title` is the dialog window title (shown in the title bar / sheet);
 /// `body` is the prompt text above the password field. Both are
 /// non-secret + safe to log.
@@ -82,31 +89,48 @@ use zeroize::Zeroizing;
 ///   typing.
 /// - [`SecureInputError::Unavailable`] — plugin failed to load
 ///   (missing OS support, sandbox restriction, library symbol not
-///   resolvable). Per Q-c (plan §0a) this surfaces as a hard fail; no
-///   silent fallback.
+///   resolvable, main thread unreachable). Per Q-c (plan §0a) this
+///   surfaces as a hard fail; no silent fallback.
 /// - [`SecureInputError::Internal`] — unrecoverable OS error from the
 ///   widget itself.
 /// - [`SecureInputError::TestHookEmpty`] — stub builds only; raised
 ///   when `prompt_password` is called without a queued password (test
 ///   bug).
 #[cfg(any(test, feature = "test-hooks"))]
-pub fn prompt_password(title: &str, body: &str) -> Result<Zeroizing<Vec<u8>>, SecureInputError> {
-    stub::prompt_password(title, body)
+#[allow(clippy::needless_pass_by_value)]
+pub fn prompt_password(
+    _app: &tauri::AppHandle,
+    _title: &str,
+    _body: &str,
+) -> Result<Zeroizing<Vec<u8>>, SecureInputError> {
+    stub::pop_one()
 }
 
 #[cfg(all(target_os = "linux", not(any(test, feature = "test-hooks"))))]
-pub fn prompt_password(title: &str, body: &str) -> Result<Zeroizing<Vec<u8>>, SecureInputError> {
-    linux::prompt_password(title, body)
+pub fn prompt_password(
+    app: &tauri::AppHandle,
+    title: &str,
+    body: &str,
+) -> Result<Zeroizing<Vec<u8>>, SecureInputError> {
+    linux::prompt_password(app, title, body)
 }
 
 #[cfg(all(target_os = "macos", not(any(test, feature = "test-hooks"))))]
-pub fn prompt_password(title: &str, body: &str) -> Result<Zeroizing<Vec<u8>>, SecureInputError> {
-    macos::prompt_password(title, body)
+pub fn prompt_password(
+    app: &tauri::AppHandle,
+    title: &str,
+    body: &str,
+) -> Result<Zeroizing<Vec<u8>>, SecureInputError> {
+    macos::prompt_password(app, title, body)
 }
 
 #[cfg(all(target_os = "windows", not(any(test, feature = "test-hooks"))))]
-pub fn prompt_password(title: &str, body: &str) -> Result<Zeroizing<Vec<u8>>, SecureInputError> {
-    windows::prompt_password(title, body)
+pub fn prompt_password(
+    app: &tauri::AppHandle,
+    title: &str,
+    body: &str,
+) -> Result<Zeroizing<Vec<u8>>, SecureInputError> {
+    windows::prompt_password(app, title, body)
 }
 
 // Any other OS: fail closed (plan §0a Q-c). No silent fallback.
@@ -117,7 +141,12 @@ pub fn prompt_password(title: &str, body: &str) -> Result<Zeroizing<Vec<u8>>, Se
     target_os = "macos",
     target_os = "windows",
 )))]
-pub fn prompt_password(_title: &str, _body: &str) -> Result<Zeroizing<Vec<u8>>, SecureInputError> {
+#[allow(clippy::needless_pass_by_value)]
+pub fn prompt_password(
+    _app: &tauri::AppHandle,
+    _title: &str,
+    _body: &str,
+) -> Result<Zeroizing<Vec<u8>>, SecureInputError> {
     Err(SecureInputError::Unavailable {
         reason: "secure_input: unsupported target OS".into(),
     })

@@ -117,6 +117,18 @@ thiserror = { workspace = true }
 # preserved because the dep arrow is `desktop -> ffi`, never the reverse.
 serde = { version = "=1.0.228", features = ["derive"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# MVP-4-H: GTK3 bindings for the Linux native password-dialog widget.
+# Pinned to 0.18 (the version Tauri 2.x brings in transitively via the
+# muda/tao/webkit2gtk tree — `cargo tree -p pangolin-desktop -i gtk`
+# resolves `gtk v0.18.2`). Reusing the transitive version avoids a
+# duplicate `gtk` in the dep tree.
+#
+# The dep is target-gated so non-Linux builds don't try to fetch / link
+# the X11 / GTK system libraries. The Rust-side `cfg(target_os = "linux")`
+# arms in `src/secure_input/` are the only consumers.
+gtk = { version = "=0.18.2", default-features = false }
+
 [build-dependencies]
 # Tauri v2 emits resource files + Info.plist / manifest assets through
 # its build script. Required even for a minimum-surface build.

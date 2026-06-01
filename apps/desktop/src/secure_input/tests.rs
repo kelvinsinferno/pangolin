@@ -1,19 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Unit tests for the secure-input stub. Compiled under `cfg(test)`,
-//! shares the queue with the test-hook command in `crate::test_hooks`
-//! (no separate queue — the singleton in [`stub::queue`] is the only
-//! one).
+//! Unit tests for the secure-input stub queue.
+//!
+//! Unit tests can't construct a `tauri::AppHandle` without spinning up
+//! the full Tauri runtime, so these tests exercise the stub queue
+//! mechanics directly via [`stub::pop_one`] / [`stub::inject`] /
+//! [`stub::clear`]. The cfg-dispatched
+//! [`crate::secure_input::prompt_password`] is a thin pass-through to
+//! `pop_one` under `cfg(test) || feature = "test-hooks"`, so unit-level
+//! confidence transfers to the test-feature wizard E2Es.
 
-use super::{prompt_password, stub, SecureInputError};
+use super::{stub, SecureInputError};
 
-/// A queued password round-trips: inject, then prompt returns the
+/// A queued password round-trips: inject, then pop_one returns the
 /// same bytes. The `Zeroizing<Vec<u8>>` wrapper preserves the bytes
 /// across the FIFO pop.
 #[test]
 fn injected_password_round_trips() {
     stub::clear();
     stub::inject("hunter2".into());
-    let pw = prompt_password("Unlock", "Enter master password").unwrap();
+    let pw = stub::pop_one().expect("queued password");
     assert_eq!(pw.as_slice(), b"hunter2");
 }
 
@@ -25,9 +30,9 @@ fn fifo_ordering_across_multiple_prompts() {
     stub::inject("first".into());
     stub::inject("second".into());
     stub::inject("third".into());
-    let a = prompt_password("a", "a").unwrap();
-    let b = prompt_password("b", "b").unwrap();
-    let c = prompt_password("c", "c").unwrap();
+    let a = stub::pop_one().unwrap();
+    let b = stub::pop_one().unwrap();
+    let c = stub::pop_one().unwrap();
     assert_eq!(a.as_slice(), b"first");
     assert_eq!(b.as_slice(), b"second");
     assert_eq!(c.as_slice(), b"third");
@@ -38,7 +43,7 @@ fn fifo_ordering_across_multiple_prompts() {
 #[test]
 fn empty_queue_returns_test_hook_empty() {
     stub::clear();
-    let err = prompt_password("Unlock", "...").unwrap_err();
+    let err = stub::pop_one().unwrap_err();
     assert!(matches!(err, SecureInputError::TestHookEmpty));
 }
 
@@ -47,7 +52,7 @@ fn empty_queue_returns_test_hook_empty() {
 fn clear_drains_pending_passwords() {
     stub::inject("leaked".into());
     stub::clear();
-    let err = prompt_password("Unlock", "...").unwrap_err();
+    let err = stub::pop_one().unwrap_err();
     assert!(matches!(err, SecureInputError::TestHookEmpty));
 }
 

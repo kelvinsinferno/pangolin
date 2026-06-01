@@ -12,8 +12,11 @@ use zeroize::Zeroizing;
 /// Placeholder for the Win32 TaskDialog native password dialog.
 /// Returns [`SecureInputError::Unavailable`] until Layer 1 part 2
 /// ships the real impl.
-#[allow(clippy::needless_pass_by_value)]
-pub fn prompt_password(_title: &str, _body: &str) -> Result<Zeroizing<Vec<u8>>, SecureInputError> {
+pub fn prompt_password(
+    _app: &tauri::AppHandle,
+    _title: &str,
+    _body: &str,
+) -> Result<Zeroizing<Vec<u8>>, SecureInputError> {
     Err(SecureInputError::Unavailable {
         reason: "windows native widget not yet implemented (Layer 1 part 2)".into(),
     })

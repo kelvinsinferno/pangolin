@@ -4866,6 +4866,7 @@ name = "pangolin-desktop"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
+ "gtk",
  "interprocess",
  "keyring",
  "pangolin-core",
