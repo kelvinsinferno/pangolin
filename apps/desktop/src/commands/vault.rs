@@ -26,9 +26,9 @@
 #[cfg(feature = "test-hooks")]
 use std::sync::Arc;
 
+use pangolin_ffi::PresenceProof;
 #[cfg(any(test, feature = "test-hooks"))]
 use pangolin_ffi::SecretPassword;
-use pangolin_ffi::PresenceProof;
 use tauri::State;
 
 use crate::error::DesktopError;

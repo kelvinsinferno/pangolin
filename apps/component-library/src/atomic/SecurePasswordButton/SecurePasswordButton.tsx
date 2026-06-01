@@ -11,7 +11,12 @@ export type SecureSubmitOutcome =
   | { ok: false; message: string };
 
 export interface SecurePasswordButtonProps
-  extends Omit<ButtonProps, 'children' | 'onClick' | 'type'> {
+  // `onError` is omitted from the inherited Button props because the
+  // React DOM `onError` is a `ReactEventHandler<HTMLButtonElement>`
+  // (image-loading style errors) and our local `onError` carries a
+  // string message — the two signatures are incompatible. We never
+  // need to forward the DOM event, so the omit is safe.
+  extends Omit<ButtonProps, 'children' | 'onClick' | 'onError' | 'type'> {
   /** Button label. The native widget collects the password — the
    *  button is just the trigger. */
   label: ReactNode;
