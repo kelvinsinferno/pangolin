@@ -934,3 +934,105 @@ export async function recoveryComplete(
   });
   return { newEpoch: w.new_epoch };
 }
+
+// ============================================================================
+// MVP-4-H Layer 3: *_via_secure_prompt wrappers.
+//
+// Each wrapper drops the `password: string` arg from the legacy
+// equivalent and routes through the OS native password dialog
+// (Win32 CredUI / NSAlert + NSSecureTextField / GTK Dialog). The
+// password bytes never enter the V8 heap — they flow directly from
+// the native widget into SecretPassword in Rust.
+//
+// Plan-LOCK: docs/issue-plans/mvp4-h-secure-input.md §3.
+// ============================================================================
+
+/** Unlock the currently-open vault via the OS native password dialog. */
+export async function vaultUnlockViaSecurePrompt(): Promise<void> {
+  await tauriInvoke<void>('vault_unlock_via_secure_prompt');
+}
+
+/** Join a vault (new device) via the OS native password dialog. */
+export async function pairingOpenAndJoinViaSecurePrompt(
+  sealedBytes: number[],
+  vaultId: string,
+  epoch: number,
+): Promise<void> {
+  await tauriInvoke<void>('pairing_open_and_join_via_secure_prompt', {
+    sealedBytes,
+    vaultId,
+    epoch,
+  });
+}
+
+/** Bootstrap the vault's on-chain authorized-device set via the OS native password dialog. */
+export async function pairingChainBootstrapViaSecurePrompt(): Promise<void> {
+  await tauriInvoke<void>('pairing_chain_bootstrap_via_secure_prompt');
+}
+
+/** Authorize a new device on-chain via the OS native password dialog. */
+export async function pairingAddDeviceViaSecurePrompt(
+  theirBytes: number[],
+): Promise<SealedEnvelope> {
+  const w = await tauriInvoke<SealedEnvelopeWire>(
+    'pairing_add_device_via_secure_prompt',
+    { theirBytes },
+  );
+  return { bytes: w.bytes, stringForm: w.string_form };
+}
+
+/** Re-key the vault after a device removal via the OS native password dialog. */
+export async function pairingCompleteRotationViaSecurePrompt(): Promise<RotationResult> {
+  const w = await tauriInvoke<RotationResultWire>(
+    'pairing_complete_rotation_via_secure_prompt',
+  );
+  return { newEpoch: w.new_epoch, unknownSurvivors: w.unknown_survivors };
+}
+
+/** Create the 24-word recovery backup via the OS native password dialog. */
+export async function recoveryCreateBackupViaSecurePrompt(): Promise<Backup> {
+  const w = await tauriInvoke<BackupWire>('recovery_create_backup_via_secure_prompt');
+  return {
+    seedPhraseWords: w.seed_phrase_words,
+    bytes: w.bytes,
+    text: w.text,
+  };
+}
+
+/** Commit the on-chain guardian set via the OS native password dialog. */
+export async function recoverySetGuardianSetViaSecurePrompt(
+  evmAddrs: string[],
+  threshold: number,
+): Promise<TxOutcome> {
+  const w = await tauriInvoke<TxOutcomeWire>(
+    'recovery_set_guardian_set_via_secure_prompt',
+    { evmAddrs, threshold },
+  );
+  return { txHash: w.tx_hash, blockNumber: w.block_number };
+}
+
+/** Broadcast the on-chain recovery initiation via the OS native password dialog. */
+export async function recoveryInitiateViaSecurePrompt(
+  targetVaultId: string,
+  proposedAuthority: string,
+  expiresAt: number,
+): Promise<TxOutcome> {
+  const w = await tauriInvoke<TxOutcomeWire>(
+    'recovery_initiate_via_secure_prompt',
+    { targetVaultId, proposedAuthority, expiresAt },
+  );
+  return { txHash: w.tx_hash, blockNumber: w.block_number };
+}
+
+/** Finalize + rebuild the vault from collected guardian shares via the OS native password dialog. */
+export async function recoveryCompleteViaSecurePrompt(
+  targetVaultId: string,
+  backupText: string,
+  phrase: string[],
+): Promise<RecoveryCompleteResult> {
+  const w = await tauriInvoke<RecoveryCompleteResultWire>(
+    'recovery_complete_via_secure_prompt',
+    { targetVaultId, backupText, phrase },
+  );
+  return { newEpoch: w.new_epoch };
+}

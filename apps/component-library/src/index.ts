@@ -36,6 +36,15 @@ export type { TagProps } from './atomic/Tag/Tag';
 export { Code } from './atomic/Code/Code';
 export type { CodeProps, CodeVariant } from './atomic/Code/Code';
 
+// MVP-4-H Layer 3: native password dialog trigger. Replaces
+// `<Input type="password">` + `<Button>` pairs across the desktop
+// wizards. Plan-LOCK: docs/issue-plans/mvp4-h-secure-input.md §3.
+export { SecurePasswordButton } from './atomic/SecurePasswordButton/SecurePasswordButton';
+export type {
+  SecurePasswordButtonProps,
+  SecureSubmitOutcome,
+} from './atomic/SecurePasswordButton/SecurePasswordButton';
+
 // Composite components.
 export { ListRow } from './composite/ListRow/ListRow';
 export type { ListRowProps } from './composite/ListRow/ListRow';
