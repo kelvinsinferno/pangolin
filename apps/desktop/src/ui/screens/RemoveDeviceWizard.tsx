@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { useRef, useState } from 'react';
-import { Button, Card, Code, Input, Spinner } from '@pangolin/component-library';
+import {
+  Button,
+  Card,
+  Code,
+  SecurePasswordButton,
+  type SecureSubmitOutcome,
+} from '@pangolin/component-library';
 
 import {
   isDesktopError,
-  pairingCompleteRotation,
+  pairingCompleteRotationViaSecurePrompt,
   pairingRemoveDevice,
 } from '../lib/invoke';
 
@@ -13,12 +19,14 @@ export interface RemoveDeviceWizardProps {
   signer: string;
   onError: (message: string) => void;
   onClose: () => void;
-  /** After the removal + re-key, unlock the now-rotated (Locked) vault with
-   *  this password and land on the account list. */
-  onRekeyed: (password: string) => Promise<void>;
+  /** After the removal + re-key, re-unlock the now-rotated (Locked)
+   *  vault and land on the account list. The parent drives the unlock
+   *  via its own native prompt (the wizard no longer hands a password
+   *  back). */
+  onRekeyed: () => Promise<void>;
 }
 
-type Step = 'confirm' | 'password' | 'working' | 'rekey-retry';
+type Step = 'confirm' | 'run' | 'rekey-retry';
 
 function errMessage(e: unknown): string {
   if (isDesktopError(e)) {
@@ -28,12 +36,22 @@ function errMessage(e: unknown): string {
 }
 
 /**
- * Manager-side "Remove a device" wizard (MVP-4-J, Q-a single guided flow).
- * Confirm (destructive, names the signer) → master password → broadcast
- * `removeDevice` AND immediately complete the VDK rotation in one
- * uninterrupted action → unlock the re-keyed vault. A re-entry guard
- * prevents a double broadcast; if the app dies mid-flow the resumable
- * pending-rotation banner on the Devices screen finishes the re-key.
+ * Manager-side "Remove a device" wizard (MVP-4-J, **MVP-4-H L3 migrated**).
+ *
+ * Confirm (destructive, names the signer) → click "Remove + re-key"
+ * → broadcast `removeDevice` (no password) → OS native dialog
+ * collects the master password → complete the VDK rotation → unlock
+ * the re-keyed vault.
+ *
+ * **MVP-4-H L3 migration:** the rotation password is collected by
+ * the OS native widget at click time (no React state ever holds a
+ * password). Both the initial 'run' step AND the 'rekey-retry'
+ * fall-through step use SecurePasswordButton.
+ *
+ * A re-entry guard prevents a double broadcast. If the app dies
+ * mid-flow the resumable pending-rotation banner on the Devices
+ * screen finishes the re-key (which itself uses
+ * `pairingCompleteRotationViaSecurePrompt`).
  */
 export function RemoveDeviceWizard({
   signer,
@@ -42,39 +60,56 @@ export function RemoveDeviceWizard({
   onRekeyed,
 }: RemoveDeviceWizardProps) {
   const [step, setStep] = useState<Step>('confirm');
-  const [password, setPassword] = useState('');
   const guard = useRef(false);
   // Once the on-chain removal succeeds, the device is OUT of the set —
   // re-broadcasting it would revert (ErrNotAuthorized). So a later failure
   // (the re-key) must retry ONLY the rotation, never the removal.
   const removed = useRef(false);
 
-  const cancel = () => {
-    setPassword('');
-    onClose();
-  };
+  const cancel = () => onClose();
 
-  const run = async () => {
-    if (guard.current) return;
+  // Removal + re-key in one click. The OS native dialog opens INSIDE
+  // pairingCompleteRotationViaSecurePrompt (i.e. AFTER the on-chain
+  // removal lands). If the user dismisses the dialog after the
+  // removal already landed, we route to the rotation-only retry step.
+  const removeAndRekey = async (): Promise<SecureSubmitOutcome> => {
+    if (guard.current) {
+      return { ok: false, message: 'already running' };
+    }
     guard.current = true;
-    setStep('working');
     try {
       if (!removed.current) {
         await pairingRemoveDevice(signer);
         removed.current = true;
       }
-      await pairingCompleteRotation(password);
-      const pw = password;
-      setPassword('');
-      await onRekeyed(pw);
+      await pairingCompleteRotationViaSecurePrompt();
+      await onRekeyed();
+      return { ok: true };
     } catch (e) {
-      onError(errMessage(e));
       guard.current = false;
       // If the removal already landed on-chain, only the re-key remains —
       // route to the rotation-only retry (re-broadcasting would revert and
       // would leave the forward-secrecy gap open). Otherwise it is safe to
-      // retry the whole flow from the password step.
-      setStep(removed.current ? 'rekey-retry' : 'password');
+      // retry the whole flow from the run step.
+      setStep(removed.current ? 'rekey-retry' : 'run');
+      return { ok: false, message: errMessage(e) };
+    }
+  };
+
+  // Rotation-only retry — the removal already landed, so this only
+  // re-runs the VDK rotation under a fresh password prompt.
+  const rekeyOnly = async (): Promise<SecureSubmitOutcome> => {
+    if (guard.current) {
+      return { ok: false, message: 'already running' };
+    }
+    guard.current = true;
+    try {
+      await pairingCompleteRotationViaSecurePrompt();
+      await onRekeyed();
+      return { ok: true };
+    } catch (e) {
+      guard.current = false;
+      return { ok: false, message: errMessage(e) };
     }
   };
 
@@ -99,7 +134,7 @@ export function RemoveDeviceWizard({
             0x{signer}
           </Code>
           <div className="devices-wizard__actions">
-            <Button onClick={() => setStep('password')} data-testid="remove-confirm">
+            <Button onClick={() => setStep('run')} data-testid="remove-confirm">
               Remove this device
             </Button>
             <Button variant="ghost" onClick={cancel} data-testid="remove-cancel">
@@ -109,30 +144,19 @@ export function RemoveDeviceWizard({
         </div>
       )}
 
-      {step === 'password' && (
-        <div className="devices-wizard__step" data-testid="step-password">
-          <p>Enter your master password to remove the device and re-key the vault.</p>
-          <Input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="Master password"
-            data-testid="remove-password"
-          />
-          <Button
-            onClick={() => void run()}
-            disabled={password === ''}
+      {step === 'run' && (
+        <div className="devices-wizard__step" data-testid="step-run">
+          <p>
+            Click below to remove the device and re-key the vault. A native
+            dialog will prompt for your master password to complete the
+            re-key — the password never enters this app&apos;s memory.
+          </p>
+          <SecurePasswordButton
+            label="Remove + re-key"
+            onSubmit={removeAndRekey}
+            onError={onError}
             data-testid="remove-run"
-          >
-            Remove + re-key
-          </Button>
-        </div>
-      )}
-
-      {step === 'working' && (
-        <div className="devices-wizard__step" data-testid="step-working">
-          <Spinner />
-          <p>Removing the device and re-keying the vault on Base Sepolia…</p>
+          />
         </div>
       )}
 
@@ -141,23 +165,16 @@ export function RemoveDeviceWizard({
           <p>
             The device was removed on-chain, but re-keying the vault did not
             finish. Until you complete it, the removed device can still read
-            newly-added data. Re-enter your master password and retry — this
-            only finishes the re-key (the device is already removed).
+            newly-added data. Click below to retry — the native dialog will
+            collect your master password and finish the re-key only (the
+            device is already removed).
           </p>
-          <Input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="Master password"
-            data-testid="rekey-retry-password"
-          />
-          <Button
-            onClick={() => void run()}
-            disabled={password === ''}
+          <SecurePasswordButton
+            label="Retry re-key"
+            onSubmit={rekeyOnly}
+            onError={onError}
             data-testid="rekey-retry-run"
-          >
-            Retry re-key
-          </Button>
+          />
         </div>
       )}
     </Card>

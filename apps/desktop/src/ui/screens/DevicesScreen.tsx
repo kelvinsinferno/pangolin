@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { useEffect, useRef, useState } from 'react';
-import { Badge, Button, Input, ListRow } from '@pangolin/component-library';
+import {
+  Badge,
+  Button,
+  ListRow,
+  SecurePasswordButton,
+  type SecureSubmitOutcome,
+} from '@pangolin/component-library';
 
 import {
   isDesktopError,
   pairingCancelPromotion,
-  pairingCompleteRotation,
+  pairingCompleteRotationViaSecurePrompt,
   pairingDeviceList,
   pairingFinalizePromotion,
   pairingListAuthorizedDevices,
@@ -28,9 +34,11 @@ export interface DevicesScreenProps {
    *  opens a fresh OS native prompt for the unlock; the wizard itself
    *  no longer hands a password back). */
   onJoined: () => Promise<void>;
-  /** After a removal+re-key (or a resumed pending re-key), unlock the
-   *  now-rotated (Locked) vault. */
-  onRekeyed: (password: string) => Promise<void>;
+  /** After a removal+re-key (or a resumed pending re-key), re-unlock
+   *  the now-rotated (Locked) vault. The parent fires a fresh native
+   *  prompt for the unlock; the wizard no longer hands a password
+   *  back. */
+  onRekeyed: () => Promise<void>;
 }
 
 type Mode = 'landing' | 'add' | 'join' | 'remove' | 'rekey';
@@ -58,7 +66,6 @@ export function DevicesScreen({ onClose, onError, onJoined, onRekeyed }: Devices
   const [promotion, setPromotion] = useState<PromotionPending | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<string | null>(null);
-  const [rekeyPassword, setRekeyPassword] = useState('');
   const rekeyGuard = useRef(false);
   const promoGuard = useRef(false);
 
@@ -128,17 +135,18 @@ export function DevicesScreen({ onClose, onError, onJoined, onRekeyed }: Devices
     })();
   };
 
-  const completePendingRekey = async () => {
-    if (rekeyGuard.current) return;
+  const completePendingRekey = async (): Promise<SecureSubmitOutcome> => {
+    if (rekeyGuard.current) {
+      return { ok: false, message: 'already running' };
+    }
     rekeyGuard.current = true;
     try {
-      await pairingCompleteRotation(rekeyPassword);
-      const pw = rekeyPassword;
-      setRekeyPassword('');
-      await onRekeyed(pw);
+      await pairingCompleteRotationViaSecurePrompt();
+      await onRekeyed();
+      return { ok: true };
     } catch (e) {
-      onError(errMessage(e));
       rekeyGuard.current = false;
+      return { ok: false, message: errMessage(e) };
     }
   };
 
@@ -235,28 +243,21 @@ export function DevicesScreen({ onClose, onError, onJoined, onRekeyed }: Devices
 
       {mode === 'rekey' && (
         <section className="devices-screen__rekey" data-testid="rekey-form">
-          <p>Enter your master password to finish re-keying the vault.</p>
-          <Input
-            type="password"
-            value={rekeyPassword}
-            onChange={(e) => setRekeyPassword(e.target.value)}
-            placeholder="Master password"
-            data-testid="rekey-password"
-          />
+          <p>
+            Click below to finish re-keying the vault. A native dialog will
+            collect your master password — it never enters this app&apos;s
+            memory.
+          </p>
           <div className="devices-wizard__actions">
-            <Button
-              onClick={() => void completePendingRekey()}
-              disabled={rekeyPassword === ''}
+            <SecurePasswordButton
+              label="Re-key vault"
+              onSubmit={completePendingRekey}
+              onError={onError}
               data-testid="rekey-run"
-            >
-              Re-key vault
-            </Button>
+            />
             <Button
               variant="ghost"
-              onClick={() => {
-                setRekeyPassword('');
-                setMode('landing');
-              }}
+              onClick={() => setMode('landing')}
             >
               Cancel
             </Button>
