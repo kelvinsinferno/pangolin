@@ -5,8 +5,8 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { AddDeviceWizard } from './AddDeviceWizard';
 import { bytesToBase64 } from '../lib/base64';
 import {
-  pairingAddDevice,
-  pairingChainBootstrap,
+  pairingAddDeviceViaSecurePrompt,
+  pairingChainBootstrapViaSecurePrompt,
   pairingDeriveSas,
   pairingLocalPayload,
 } from '../lib/invoke';
@@ -22,22 +22,28 @@ vi.mock('../lib/invoke', async (importOriginal) => {
   });
   return {
     ...actual,
-    pairingChainBootstrap: vi.fn(async () => {}),
+    // MVP-4-H L3: the wizard now calls the *_via_secure_prompt
+    // variants. The legacy ones (pairingChainBootstrap,
+    // pairingAddDevice) are not exercised; left out of the mock to
+    // catch any regression that re-introduces them.
+    pairingChainBootstrapViaSecurePrompt: vi.fn(async () => {}),
+    pairingAddDeviceViaSecurePrompt: vi.fn(async () => ({
+      bytes: [7, 7, 7],
+      stringForm: 'env',
+    })),
     pairingDecodeBytes: vi.fn(async (b: number[]) => payload(b)),
     pairingLocalPayload: vi.fn(async () => payload([1, 2, 3])),
     pairingDeriveSas: vi.fn(async () => '472913'),
-    pairingAddDevice: vi.fn(async () => ({ bytes: [7, 7, 7], stringForm: 'env' })),
     copyToClipboard: vi.fn(async () => {}),
   };
 });
 
+/** MVP-4-H L3 migration: there is NO 'password' step anymore. The
+ *  wizard starts at 'bootstrap'; the user clicks "Initialize on-chain"
+ *  (which triggers the OS native dialog via SecurePasswordButton) OR
+ *  skips. The password is collected at chain-call time, not up front. */
 async function advanceToSas() {
-  // password
-  fireEvent.change(screen.getByTestId('wizard-password'), {
-    target: { value: 'master-pw' },
-  });
-  fireEvent.click(screen.getByTestId('wizard-password-next'));
-  // bootstrap → skip
+  // bootstrap → skip (no password step to clear first)
   fireEvent.click(await screen.findByTestId('wizard-bootstrap-skip'));
   // ingest B's payload
   const ingest = await screen.findByTestId('code-ingest-input');
@@ -47,7 +53,7 @@ async function advanceToSas() {
   fireEvent.click(await screen.findByTestId('wizard-share-next'));
 }
 
-describe('AddDeviceWizard (L2 SAS gate)', () => {
+describe('AddDeviceWizard (L2 SAS gate + MVP-4-H L3 secure-prompt)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -56,17 +62,15 @@ describe('AddDeviceWizard (L2 SAS gate)', () => {
     render(<AddDeviceWizard onError={() => {}} onClose={() => {}} />);
     await advanceToSas();
 
-    // We are on the SAS step; the code is shown, but addDevice MUST NOT
-    // have fired yet (the human gate, plan §4 L2).
     expect(await screen.findByTestId('wizard-sas')).toHaveTextContent('472913');
     expect(pairingDeriveSas).toHaveBeenCalled();
     expect(pairingLocalPayload).toHaveBeenCalled();
-    expect(pairingAddDevice).not.toHaveBeenCalled();
+    expect(pairingAddDeviceViaSecurePrompt).not.toHaveBeenCalled();
 
-    // Confirm → addDevice fires, envelope shows.
+    // Confirm → secure-prompt addDevice fires, envelope shows.
     fireEvent.click(screen.getByTestId('wizard-sas-confirm'));
     await waitFor(() => {
-      expect(pairingAddDevice).toHaveBeenCalledTimes(1);
+      expect(pairingAddDeviceViaSecurePrompt).toHaveBeenCalledTimes(1);
     });
     expect(await screen.findByTestId('step-envelope')).toBeInTheDocument();
   });
@@ -77,17 +81,23 @@ describe('AddDeviceWizard (L2 SAS gate)', () => {
     await advanceToSas();
     fireEvent.click(await screen.findByTestId('wizard-sas-reject'));
     expect(onClose).toHaveBeenCalledTimes(1);
-    expect(pairingAddDevice).not.toHaveBeenCalled();
+    expect(pairingAddDeviceViaSecurePrompt).not.toHaveBeenCalled();
   });
 
   it('skipping bootstrap does not call the bootstrap command', async () => {
     render(<AddDeviceWizard onError={() => {}} onClose={() => {}} />);
-    fireEvent.change(screen.getByTestId('wizard-password'), {
-      target: { value: 'master-pw' },
-    });
-    fireEvent.click(screen.getByTestId('wizard-password-next'));
     fireEvent.click(await screen.findByTestId('wizard-bootstrap-skip'));
     await screen.findByTestId('step-ingest');
-    expect(pairingChainBootstrap).not.toHaveBeenCalled();
+    expect(pairingChainBootstrapViaSecurePrompt).not.toHaveBeenCalled();
+  });
+
+  it('Initialize on-chain triggers the secure-prompt chain bootstrap', async () => {
+    render(<AddDeviceWizard onError={() => {}} onClose={() => {}} />);
+    fireEvent.click(await screen.findByTestId('wizard-bootstrap'));
+    await waitFor(() => {
+      expect(pairingChainBootstrapViaSecurePrompt).toHaveBeenCalledTimes(1);
+    });
+    // Lands on the ingest step after a successful bootstrap.
+    await screen.findByTestId('step-ingest');
   });
 });

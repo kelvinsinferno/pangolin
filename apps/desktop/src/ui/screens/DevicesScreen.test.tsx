@@ -117,7 +117,10 @@ describe('DevicesScreen (MVP-4-J)', () => {
   it('launches the Add + Join wizards', async () => {
     render(<DevicesScreen {...noop} />);
     fireEvent.click(await screen.findByTestId('devices-add'));
-    expect(await screen.findByTestId('step-password')).toBeInTheDocument();
+    // MVP-4-H L3: the legacy 'step-password' is gone (password is
+    // collected by the OS native widget at chain-call time). The
+    // wizard now starts at 'step-bootstrap'.
+    expect(await screen.findByTestId('step-bootstrap')).toBeInTheDocument();
   });
 
   // ---- MVP-4-K: promotion ----
