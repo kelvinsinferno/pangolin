@@ -23,7 +23,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use pangolin_ffi::VaultHandle;
+use pangolin_ffi::{FfiOpenedShare, VaultHandle};
 
 use crate::error::DesktopError;
 
@@ -32,9 +32,21 @@ use crate::error::DesktopError;
 /// Constructed once at app start by `tauri::Builder::manage(...)`. The
 /// inner `Option` is `Some` between `vault_open` and `vault_close` and
 /// `None` either side; a `vault_close` call leaves the slot empty.
+///
+/// ## Recovery opened-share accumulator (MVP-4-L L-B, Q-a)
+///
+/// `recovery_opened_shares` is the Rust-side accumulator for the
+/// in-flight L-B (recoverer wizard) flow. Each `recovery_ingest_share`
+/// command pushes an `Arc<FfiOpenedShare>` here; `recovery_complete`
+/// takes them out and feeds them to `vault_recover_from_backup`. The
+/// opened-share bytes NEVER cross the FFI back into JS — the `Arc`
+/// handles are opaque from uniffi's POV (L1). Cleared on
+/// `vault_close` + on any "start over" path in the wizard to avoid
+/// stranded secret material across vault-close boundaries.
 #[derive(Default)]
 pub struct VaultState {
     inner: Mutex<Option<Arc<VaultHandle>>>,
+    recovery_opened_shares: Mutex<Vec<Arc<FfiOpenedShare>>>,
 }
 
 impl std::fmt::Debug for VaultState {
@@ -45,7 +57,12 @@ impl std::fmt::Debug for VaultState {
             .lock()
             .map(|guard| guard.is_some())
             .unwrap_or(false);
-        f.debug_struct("VaultState").field("open", &has).finish()
+        // The recovery accumulator count is non-secret + diagnostic-only.
+        let opened = self.opened_share_count();
+        f.debug_struct("VaultState")
+            .field("open", &has)
+            .field("recovery_opened_shares", &opened)
+            .finish()
     }
 }
 
@@ -102,6 +119,61 @@ impl VaultState {
             .map(|guard| guard.is_some())
             .unwrap_or(false)
     }
+
+    // -----------------------------------------------------------------
+    // Recovery opened-share accumulator (L-B Q-a)
+    // -----------------------------------------------------------------
+
+    /// Push a freshly-ingested opened share into the recovery
+    /// accumulator. Returns the new total count so the host can render
+    /// "X of t collected".
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn push_opened_share(&self, share: Arc<FfiOpenedShare>) -> Result<usize, DesktopError> {
+        let mut guard = self
+            .recovery_opened_shares
+            .lock()
+            .map_err(|_| DesktopError::Internal("opened-shares lock poisoned".into()))?;
+        guard.push(share);
+        Ok(guard.len())
+    }
+
+    /// Move the accumulator contents out (replacing with an empty Vec).
+    /// Used by `recovery_complete` immediately before driving
+    /// `vault_recover_from_backup`; the Vec is consumed by the FFI in
+    /// the same `spawn_blocking`.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn take_opened_shares(&self) -> Result<Vec<Arc<FfiOpenedShare>>, DesktopError> {
+        let mut guard = self
+            .recovery_opened_shares
+            .lock()
+            .map_err(|_| DesktopError::Internal("opened-shares lock poisoned".into()))?;
+        Ok(std::mem::take(&mut *guard))
+    }
+
+    /// Drop all collected shares without consuming them. Called from
+    /// `vault_close` (defense-in-depth: wipes stranded secret material
+    /// when the vault is locked / handed off) and from any wizard
+    /// "start over" path.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn clear_opened_shares(&self) -> Result<(), DesktopError> {
+        let mut guard = self
+            .recovery_opened_shares
+            .lock()
+            .map_err(|_| DesktopError::Internal("opened-shares lock poisoned".into()))?;
+        guard.clear();
+        Ok(())
+    }
+
+    /// Return the current accumulator count. Used by the wizard's
+    /// resume path to render "X already collected" without disturbing
+    /// the contents.
+    #[must_use]
+    pub fn opened_share_count(&self) -> usize {
+        self.recovery_opened_shares
+            .lock()
+            .map(|g| g.len())
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -153,5 +225,49 @@ mod tests {
         state.install(h1).expect("install h1");
         state.install(h2).expect("install h2 replaces h1");
         assert!(state.is_open());
+    }
+
+    // -----------------------------------------------------------------
+    // Recovery opened-share accumulator tests (L-B Q-a)
+    // -----------------------------------------------------------------
+
+    /// Build an opaque opened-share for tests. The contents don't matter
+    /// (the wizard's count + lifecycle don't read them); we just need
+    /// distinct Arcs that round-trip through the accumulator API.
+    fn fake_share() -> std::sync::Arc<pangolin_ffi::FfiOpenedShare> {
+        pangolin_ffi::FfiOpenedShare::__test_placeholder()
+    }
+
+    #[test]
+    fn opened_shares_starts_empty() {
+        let state = VaultState::default();
+        assert_eq!(state.opened_share_count(), 0);
+    }
+
+    #[test]
+    fn push_opened_share_increments_count() {
+        let state = VaultState::default();
+        assert_eq!(state.push_opened_share(fake_share()).expect("push"), 1);
+        assert_eq!(state.push_opened_share(fake_share()).expect("push"), 2);
+        assert_eq!(state.opened_share_count(), 2);
+    }
+
+    #[test]
+    fn take_opened_shares_empties_accumulator() {
+        let state = VaultState::default();
+        state.push_opened_share(fake_share()).expect("push");
+        state.push_opened_share(fake_share()).expect("push");
+        let drained = state.take_opened_shares().expect("take");
+        assert_eq!(drained.len(), 2);
+        assert_eq!(state.opened_share_count(), 0);
+    }
+
+    #[test]
+    fn clear_opened_shares_drops_all() {
+        let state = VaultState::default();
+        state.push_opened_share(fake_share()).expect("push");
+        state.push_opened_share(fake_share()).expect("push");
+        state.clear_opened_shares().expect("clear");
+        assert_eq!(state.opened_share_count(), 0);
     }
 }

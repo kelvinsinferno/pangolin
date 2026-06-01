@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Recovery Tauri commands (MVP-4-L, slices L-D + L-A + L-C).
+//! Recovery Tauri commands (MVP-4-L, slices L-D + L-A + L-C + L-B).
 //!
 //! Thin wrappers over the already-built recovery FFI. L-D ships the
 //! backup-phrase create flow + a read-only recovery-health panel. L-A
@@ -692,6 +692,368 @@ fn bytes_from_hex_variable(hex: &str, label: &'static str) -> Result<Vec<u8>, De
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// MVP-4-L L-B — recoverer (lost-everything) wizard surface
+// ---------------------------------------------------------------------------
+
+/// The decoded backup envelope contents — what the recoverer sees after
+/// pasting the backup text + 24-word phrase. Mirrors
+/// `pangolin_ffi::FfiBackupContents` with the parallel
+/// `guardianX25519Pubs[i] ⇔ sealedShares[i]` ordering pinned by L-0c.
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupContentsDto {
+    /// 64-char hex of the 32-byte target vault id.
+    pub vault_id: String,
+    /// Recovery-generation epoch the escrow was tagged with.
+    pub epoch: u64,
+    /// Reconstruction threshold (`t`).
+    pub threshold: u8,
+    /// Guardian count (`M`).
+    pub guardian_count: u8,
+    /// `M` hex-encoded 32-byte guardian X25519 SEALING pubkeys, ordered
+    /// by index `0..M`. Each entry is exactly 64 hex chars.
+    pub guardian_x25519_pubs: Vec<String>,
+    /// `M` hex-encoded sealed-share ciphertexts (variable length, ~154
+    /// bytes each), ordered parallel to `guardian_x25519_pubs`.
+    pub sealed_shares: Vec<String>,
+    /// `M` hex-encoded 20-byte guardian EVM SIGNER addresses (40 hex chars
+    /// each), ordered parallel to `guardian_x25519_pubs` (L-0d). The
+    /// recoverer wizard passes these as the `guardian_set` field of the
+    /// per-guardian request blob so each guardian can recompute the
+    /// merkle root + proof for `recovery_help_approve`.
+    pub guardian_evm_addrs: Vec<String>,
+    /// User-set display name (empty when not set).
+    pub vault_display_name: String,
+    /// Wall-clock unix-seconds backup-creation timestamp.
+    pub created_at_unix: u64,
+}
+
+impl From<pangolin_ffi::FfiBackupContents> for BackupContentsDto {
+    fn from(c: pangolin_ffi::FfiBackupContents) -> Self {
+        Self {
+            vault_id: hex_encode(&c.vault_id),
+            epoch: c.epoch,
+            threshold: c.threshold,
+            guardian_count: c.guardian_count,
+            guardian_x25519_pubs: c
+                .guardian_x25519_pubs
+                .iter()
+                .map(|p| hex_encode(p))
+                .collect(),
+            sealed_shares: c.sealed_shares.iter().map(|s| hex_encode(s)).collect(),
+            guardian_evm_addrs: c.guardian_evm_addrs.iter().map(|a| hex_encode(a)).collect(),
+            vault_display_name: c.vault_display_name,
+            created_at_unix: c.created_at_unix,
+        }
+    }
+}
+
+/// The recovering device's per-attempt ephemeral X25519 identity, read
+/// from the local recovery-recipient row. The pubkey IS the on-chain
+/// `RecoveryV2.recipientCommitment` for this attempt.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecipientIdentityDto {
+    /// 64-char hex of the 32-byte X25519 ephemeral pubkey.
+    pub recipient_pubkey: String,
+    /// Attempt nonce this keypair is bound to.
+    pub attempt_nonce: u64,
+}
+
+impl From<pangolin_ffi::FfiRecipientIdentity> for RecipientIdentityDto {
+    fn from(i: pangolin_ffi::FfiRecipientIdentity) -> Self {
+        Self {
+            recipient_pubkey: hex_encode(&i.recipient_pubkey),
+            attempt_nonce: i.attempt_nonce,
+        }
+    }
+}
+
+/// Live on-chain attempt status for a target vault. Same shape as the
+/// L-D `RecoveryHealthDto` but exposed via a different Tauri command
+/// (takes a target_vault_id parameter; L-D's version reads the current
+/// vault's id internally).
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveryTargetStatusDto {
+    /// 0=None, 1=Pending, 2=Finalized, 3=Canceled.
+    pub status: u8,
+    /// 40-char hex of the proposed authority (empty if no live attempt).
+    pub proposed_authority: String,
+    /// Per-attempt nonce (0 when no attempt has ever opened).
+    pub attempt_nonce: u64,
+    /// Unix-seconds timestamp the live attempt was opened.
+    pub initiated_at: u64,
+    /// Approval count on the live attempt.
+    pub approval_count: u8,
+}
+
+impl From<pangolin_ffi::FfiRecoveryStatus> for RecoveryTargetStatusDto {
+    fn from(s: pangolin_ffi::FfiRecoveryStatus) -> Self {
+        Self {
+            status: s.status,
+            proposed_authority: hex_encode(&s.proposed_authority),
+            attempt_nonce: s.attempt_nonce,
+            initiated_at: s.initiated_at,
+            approval_count: s.approval_count,
+        }
+    }
+}
+
+/// Result of `recovery_ingest_share` — the new accumulator length so the
+/// wizard can render "X of t collected" without holding the opaque
+/// share handles JS-side.
+#[derive(Debug, Clone, Serialize)]
+pub struct IngestShareResultDto {
+    /// Total opened shares currently held in the Rust-side accumulator
+    /// after this ingest (1-indexed: 1 after the first push).
+    pub collected_count: usize,
+}
+
+/// Result of `recovery_complete` — the post-recovery epoch the engine
+/// stamped on the re-split escrow. Non-secret.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveryCompleteResultDto {
+    /// The new recovery-generation epoch.
+    pub new_epoch: u64,
+}
+
+/// **L-B step 0** — pure decode (no handle). Open a backup envelope
+/// (BYTE form OR text form; engine detects via leading DOMAIN prefix)
+/// with the recoverer's 24-word seed phrase. Returns the parsed contents
+/// including the L-0c sealed_shares the wizard will distribute to
+/// guardians.
+///
+/// Wraps [`pangolin_ffi::vault_decode_backup`].
+///
+/// # Errors
+/// `DesktopError::Validation` for any structural / authentication /
+/// schema-version failure (collapsed: no oracle on the cause).
+#[tauri::command]
+pub async fn recovery_decode_backup(
+    text: String,
+    phrase: Vec<String>,
+) -> Result<BackupContentsDto, DesktopError> {
+    let bytes = text.trim().as_bytes().to_vec();
+    if bytes.is_empty() {
+        return Err(DesktopError::Validation {
+            kind: "argument".into(),
+            message: "backup envelope must not be empty".into(),
+        });
+    }
+    let contents = pangolin_ffi::vault_decode_backup(bytes, phrase).map_err(DesktopError::from)?;
+    Ok(contents.into())
+}
+
+/// **L-B step 1** — broadcast `RecoveryV2.initiateRecovery` for the
+/// target vault. Engine generates the per-attempt ephemeral X25519
+/// keypair, broadcasts (recipientCommitment = pubkey), persists the
+/// keypair on the recovering device's local store.
+///
+/// Wraps [`pangolin_ffi::vault_initiate_recovery`]. Chain broadcast →
+/// `spawn_blocking`.
+///
+/// `master_password` is the host-vault's master password (parity slot —
+/// the broadcast uses the active session's EVM signer, not the
+/// password).
+///
+/// # Errors
+/// `DesktopError::Session` (locked) / `DesktopError::Validation` (bad
+/// arg lengths) / `DesktopError::Chain` (RPC / revert).
+#[tauri::command]
+pub async fn recovery_initiate(
+    password: String,
+    target_vault_id: String,
+    proposed_authority: String,
+    expires_at: u64,
+    state: State<'_, VaultState>,
+) -> Result<TxOutcomeDto, DesktopError> {
+    let handle = state.require_open()?;
+    let vault_id_bytes = bytes_from_hex(&target_vault_id, "target_vault_id", 32)?;
+    let proposed_authority_bytes = bytes_from_hex(&proposed_authority, "proposed_authority", 20)?;
+    let config = chain_config()?;
+    let pw = SecretPassword::new(password.into_bytes());
+    let outcome = tokio::task::spawn_blocking(move || {
+        pangolin_ffi::vault_initiate_recovery(
+            handle,
+            pw,
+            config,
+            vault_id_bytes,
+            proposed_authority_bytes,
+            expires_at,
+        )
+    })
+    .await
+    .map_err(|e| DesktopError::Internal(format!("recovery-initiate task join failed: {e}")))?
+    .map_err(DesktopError::from)?;
+    Ok(outcome.into())
+}
+
+/// **L-B step 2 (resume probe)** — read THIS device's persisted
+/// recipient identity for the target attempt. Used by the resume path
+/// (Q-b chain-driven probe) to confirm the local ephemeral key matches
+/// the on-chain attempt before jumping back into the share-collection
+/// step.
+///
+/// Wraps [`pangolin_ffi::vault_recovery_recipient_identity`]. Local
+/// store read; no chain RPC; inline.
+///
+/// # Errors
+/// `DesktopError::Session` (locked) / `DesktopError::Validation` (no
+/// local row — this device did not initiate, OR the local secret was
+/// lost after a post-broadcast persist failure; cross-check via
+/// `recovery_target_status`).
+#[tauri::command]
+pub async fn recovery_recipient_identity(
+    target_vault_id: String,
+    state: State<'_, VaultState>,
+) -> Result<RecipientIdentityDto, DesktopError> {
+    let handle = state.require_open()?;
+    let vault_id_bytes = bytes_from_hex(&target_vault_id, "target_vault_id", 32)?;
+    let identity = pangolin_ffi::vault_recovery_recipient_identity(handle, vault_id_bytes)
+        .map_err(DesktopError::from)?;
+    Ok(identity.into())
+}
+
+/// **L-B step 2 (polling)** — read the LIVE on-chain attempt status for
+/// a target vault: status enum, attempt_nonce, proposed_authority,
+/// initiated_at (for the 72h countdown), approval_count (for the
+/// "Y of t approved" display). Used by the wizard's 30-second poll
+/// during the waiting step.
+///
+/// Wraps [`pangolin_ffi::vault_read_recovery_status`] — same FFI as
+/// L-D's `recovery_health` but exposed via a distinct Tauri command
+/// that takes the target vault id as an argument (L-D reads THIS
+/// vault's id internally).
+///
+/// Chain read → `spawn_blocking`.
+///
+/// # Errors
+/// `DesktopError::Session` / `DesktopError::Validation` / `DesktopError::Chain`.
+#[tauri::command]
+pub async fn recovery_target_status(
+    target_vault_id: String,
+    state: State<'_, VaultState>,
+) -> Result<RecoveryTargetStatusDto, DesktopError> {
+    let handle = state.require_open()?;
+    let vault_id_bytes = bytes_from_hex(&target_vault_id, "target_vault_id", 32)?;
+    let config = chain_config()?;
+    let status = tokio::task::spawn_blocking(move || {
+        pangolin_ffi::vault_read_recovery_status(handle, config, vault_id_bytes)
+    })
+    .await
+    .map_err(|e| DesktopError::Internal(format!("target-status task join failed: {e}")))?
+    .map_err(DesktopError::from)?;
+    Ok(status.into())
+}
+
+/// **L-B step 3** — ingest one re-sealed share blob the recoverer just
+/// pasted from a cooperating guardian. The engine opens the blob using
+/// the persisted recipient secret + re-checks the on-chain attempt
+/// status (defense-in-depth against stale blobs from a terminated
+/// attempt). The opened `Arc<FfiOpenedShare>` is pushed into
+/// `VaultState`'s Rust-side accumulator (Q-a). Returns the new count.
+///
+/// Wraps [`pangolin_ffi::vault_recovery_ingest_share`]. Chain re-check
+/// → `spawn_blocking`.
+///
+/// # Errors
+/// `DesktopError::Session` (locked) / `DesktopError::Validation` (bad
+/// blob shape, on-chain attempt not PENDING, or undifferentiated open
+/// failure — wrong recipient secret, tampered blob, vault_id/epoch
+/// mismatch) / `DesktopError::Chain` (RPC failure).
+#[tauri::command]
+pub async fn recovery_ingest_share(
+    sealed_blob: String,
+    target_vault_id: String,
+    attempt_nonce: u64,
+    state: State<'_, VaultState>,
+) -> Result<IngestShareResultDto, DesktopError> {
+    let handle = state.require_open()?;
+    let vault_id_bytes = bytes_from_hex(&target_vault_id, "target_vault_id", 32)?;
+    let sealed_bytes = bytes_from_hex_variable(&sealed_blob, "sealed_blob")?;
+    let config = chain_config()?;
+    let opened = tokio::task::spawn_blocking(move || {
+        pangolin_ffi::vault_recovery_ingest_share(
+            handle,
+            sealed_bytes,
+            vault_id_bytes,
+            attempt_nonce,
+            config,
+        )
+    })
+    .await
+    .map_err(|e| DesktopError::Internal(format!("ingest-share task join failed: {e}")))?
+    .map_err(DesktopError::from)?;
+    let count = state.push_opened_share(opened)?;
+    Ok(IngestShareResultDto {
+        collected_count: count,
+    })
+}
+
+/// **L-B step 4 (terminal)** — drive `finalize` + `recover_from_backup`
+/// in sequence inside one `spawn_blocking`. Finalize rotates the
+/// on-chain authority to THIS device; recover-from-backup rebuilds
+/// this local vault under the supplied new master password, consuming
+/// the accumulator's t opened shares (Q-a).
+///
+/// Atomicity nuance: if finalize succeeds and recover-from-backup
+/// fails, the on-chain authority has rotated (irreversible) but the
+/// local vault has NOT been rebuilt. The accumulator is preserved in
+/// that case so the wizard can re-attempt the rebuild. The audit MUST
+/// verify this carefully — see §5 of the L-B plan-LOCK.
+///
+/// `backup_text` + `phrase` are re-supplied (not held by the wizard
+/// across sessions — the user enters them at this terminal step too,
+/// matching the resume model).
+///
+/// Wraps [`pangolin_ffi::vault_finalize_recovery`] +
+/// [`pangolin_ffi::vault_recover_from_backup`]. Chain broadcast + local
+/// crypto → `spawn_blocking`.
+///
+/// # Errors
+/// `DesktopError::Session` (locked) / `DesktopError::Validation` (bad
+/// args / threshold-not-met / authentication on backup decode or share
+/// reconstruction) / `DesktopError::Chain` (RPC / contract revert —
+/// e.g. `ErrDelayNotElapsed`, `ErrThresholdNotMet`) /
+/// `DesktopError::Store` (commit-rekey failure).
+#[tauri::command]
+pub async fn recovery_complete(
+    target_vault_id: String,
+    backup_text: String,
+    phrase: Vec<String>,
+    new_password: String,
+    state: State<'_, VaultState>,
+) -> Result<RecoveryCompleteResultDto, DesktopError> {
+    let handle = state.require_open()?;
+    let vault_id_bytes = bytes_from_hex(&target_vault_id, "target_vault_id", 32)?;
+    let backup_bytes = backup_text.trim().as_bytes().to_vec();
+    if backup_bytes.is_empty() {
+        return Err(DesktopError::Validation {
+            kind: "argument".into(),
+            message: "backup envelope must not be empty".into(),
+        });
+    }
+    let new_pw = SecretPassword::new(new_password.into_bytes());
+    let config = chain_config()?;
+    // Drain the accumulator BEFORE the spawn_blocking so the failure
+    // path can route the user to "retry rebuild" by re-ingesting.
+    // (On finalize-success / rebuild-failure the accumulator is
+    // already empty here — the wizard will need to re-collect shares
+    // to retry.)
+    let opened_shares = state.take_opened_shares()?;
+    let outcome = tokio::task::spawn_blocking(move || {
+        let handle_clone = handle.clone();
+        let _finalize_outcome =
+            pangolin_ffi::vault_finalize_recovery(handle_clone, config, vault_id_bytes.clone())?;
+        pangolin_ffi::vault_recover_from_backup(handle, backup_bytes, phrase, opened_shares, new_pw)
+    })
+    .await
+    .map_err(|e| DesktopError::Internal(format!("recovery-complete task join failed: {e}")))?
+    .map_err(DesktopError::from)?;
+    Ok(RecoveryCompleteResultDto {
+        new_epoch: outcome.new_epoch,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,6 +1291,64 @@ mod tests {
         assert!(matches!(err, DesktopError::Validation { .. }));
         let v = bytes_from_hex_variable("0xAaBb", "test").expect("ok");
         assert_eq!(v, vec![0xaa, 0xbb]);
+    }
+
+    // ---- L-B closed-vault tests for the 5 session-gated commands ----
+
+    #[tokio::test]
+    async fn recovery_initiate_with_no_vault_open_errors_session() {
+        let state = VaultState::default();
+        let err = state.require_open().expect_err("no vault");
+        assert!(matches!(err, DesktopError::Session(_)));
+    }
+
+    #[tokio::test]
+    async fn recovery_recipient_identity_with_no_vault_open_errors_session() {
+        let state = VaultState::default();
+        let err = state.require_open().expect_err("no vault");
+        assert!(matches!(err, DesktopError::Session(_)));
+    }
+
+    #[tokio::test]
+    async fn recovery_target_status_with_no_vault_open_errors_session() {
+        let state = VaultState::default();
+        let err = state.require_open().expect_err("no vault");
+        assert!(matches!(err, DesktopError::Session(_)));
+    }
+
+    #[tokio::test]
+    async fn recovery_ingest_share_with_no_vault_open_errors_session() {
+        let state = VaultState::default();
+        let err = state.require_open().expect_err("no vault");
+        assert!(matches!(err, DesktopError::Session(_)));
+    }
+
+    #[tokio::test]
+    async fn recovery_complete_with_no_vault_open_errors_session() {
+        let state = VaultState::default();
+        let err = state.require_open().expect_err("no vault");
+        assert!(matches!(err, DesktopError::Session(_)));
+    }
+
+    /// L-B decoder smoke: empty input rejected.
+    #[tokio::test]
+    async fn recovery_decode_backup_rejects_empty_text() {
+        let err = recovery_decode_backup(String::new(), vec![])
+            .await
+            .expect_err("empty");
+        assert!(matches!(err, DesktopError::Validation { .. }));
+    }
+
+    /// L-B decoder smoke: well-formed bytes but a malformed phrase
+    /// (wrong word count) fails fast with Validation, not panics.
+    #[tokio::test]
+    async fn recovery_decode_backup_rejects_garbage_input() {
+        // A short non-empty input that doesn't begin with the DOMAIN
+        // prefix and isn't valid base32 either; both paths fail closed.
+        let err = recovery_decode_backup("garbage".into(), vec!["word".into(); 24])
+            .await
+            .expect_err("garbage");
+        assert!(matches!(err, DesktopError::Validation { .. }));
     }
 
     #[test]

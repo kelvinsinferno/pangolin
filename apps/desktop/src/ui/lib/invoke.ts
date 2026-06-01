@@ -734,3 +734,203 @@ export async function recoveryHelpRelease(
   });
   return { sealedShareForRecoverer: w.sealed_share_for_recoverer };
 }
+
+// ---- MVP-4-L (L-B): recoverer wizard surface ----
+
+/** Decoded backup envelope contents — what the recoverer sees after
+ *  pasting the backup text + 24-word phrase. Carries the L-0c
+ *  sealedShares the wizard distributes to each guardian alongside the
+ *  request blob. Every field is non-secret. */
+export interface BackupContents {
+  /** 64-char hex of the 32-byte target vault id. */
+  vaultId: string;
+  /** Recovery-generation epoch the escrow was tagged with. */
+  epoch: number;
+  /** Reconstruction threshold (t). */
+  threshold: number;
+  /** Guardian count (M). */
+  guardianCount: number;
+  /** M hex-encoded guardian X25519 sealing pubkeys (each 64 hex chars),
+   *  ordered by index 0..M. */
+  guardianX25519Pubs: string[];
+  /** M hex-encoded sealed-share ciphertexts (variable length), parallel
+   *  to guardianX25519Pubs. */
+  sealedShares: string[];
+  /** M hex-encoded 20-byte guardian EVM signer addresses (40 hex chars
+   *  each), parallel to guardianX25519Pubs (L-0d). The recoverer wizard
+   *  passes these as guardian_set so each guardian can rebuild the
+   *  merkle root + proof for recovery_help_approve. */
+  guardianEvmAddrs: string[];
+  /** User-set display name (empty when not set). */
+  vaultDisplayName: string;
+  /** Wall-clock unix-seconds backup-creation timestamp. */
+  createdAtUnix: number;
+}
+
+interface BackupContentsWire {
+  vault_id: string;
+  epoch: number;
+  threshold: number;
+  guardian_count: number;
+  guardian_x25519_pubs: string[];
+  sealed_shares: string[];
+  guardian_evm_addrs: string[];
+  vault_display_name: string;
+  created_at_unix: number;
+}
+
+/** The recovering device's per-attempt ephemeral X25519 identity. The
+ *  recipientPubkey IS the on-chain RecoveryV2.recipientCommitment for
+ *  this attempt. */
+export interface RecipientIdentity {
+  /** 64-char hex of the 32-byte X25519 ephemeral pubkey. */
+  recipientPubkey: string;
+  /** Attempt nonce this keypair is bound to. */
+  attemptNonce: number;
+}
+
+interface RecipientIdentityWire {
+  recipient_pubkey: string;
+  attempt_nonce: number;
+}
+
+/** Live on-chain attempt status for a target vault. Read by the wizard's
+ *  30s poll during the waiting step. */
+export interface RecoveryTargetStatus {
+  /** 0=None, 1=Pending, 2=Finalized, 3=Canceled. */
+  status: number;
+  /** 40-char hex of the proposed authority (empty if no live attempt). */
+  proposedAuthority: string;
+  /** Per-attempt nonce (0 when no attempt has ever opened). */
+  attemptNonce: number;
+  /** Unix-seconds timestamp the live attempt was opened. */
+  initiatedAt: number;
+  /** Approval count on the live attempt. */
+  approvalCount: number;
+}
+
+interface RecoveryTargetStatusWire {
+  status: number;
+  proposed_authority: string;
+  attempt_nonce: number;
+  initiated_at: number;
+  approval_count: number;
+}
+
+/** Result of recoveryIngestShare. */
+export interface IngestShareResult {
+  /** Total opened shares currently held in the Rust-side accumulator. */
+  collectedCount: number;
+}
+
+interface IngestShareResultWire {
+  collected_count: number;
+}
+
+/** Result of recoveryComplete. */
+export interface RecoveryCompleteResult {
+  /** The new recovery-generation epoch the engine stamped on the
+   *  re-split escrow. Non-secret. */
+  newEpoch: number;
+}
+
+interface RecoveryCompleteResultWire {
+  new_epoch: number;
+}
+
+/** **L-B step 0.** Pure decode of the backup envelope (no handle). */
+export async function recoveryDecodeBackup(
+  text: string,
+  phrase: string[],
+): Promise<BackupContents> {
+  const w = await tauriInvoke<BackupContentsWire>('recovery_decode_backup', { text, phrase });
+  return {
+    vaultId: w.vault_id,
+    epoch: w.epoch,
+    threshold: w.threshold,
+    guardianCount: w.guardian_count,
+    guardianX25519Pubs: w.guardian_x25519_pubs,
+    sealedShares: w.sealed_shares,
+    guardianEvmAddrs: w.guardian_evm_addrs,
+    vaultDisplayName: w.vault_display_name,
+    createdAtUnix: w.created_at_unix,
+  };
+}
+
+/** **L-B step 1.** Broadcast initiateRecovery; engine generates the
+ *  ephemeral X25519 keypair + persists. Chain broadcast. */
+export async function recoveryInitiate(
+  password: string,
+  targetVaultId: string,
+  proposedAuthority: string,
+  expiresAt: number,
+): Promise<TxOutcome> {
+  const w = await tauriInvoke<TxOutcomeWire>('recovery_initiate', {
+    password,
+    targetVaultId,
+    proposedAuthority,
+    expiresAt,
+  });
+  return { txHash: w.tx_hash, blockNumber: w.block_number };
+}
+
+/** **L-B step 2 (resume probe).** Read this device's persisted recipient
+ *  identity for the target attempt. */
+export async function recoveryRecipientIdentity(
+  targetVaultId: string,
+): Promise<RecipientIdentity> {
+  const w = await tauriInvoke<RecipientIdentityWire>('recovery_recipient_identity', {
+    targetVaultId,
+  });
+  return { recipientPubkey: w.recipient_pubkey, attemptNonce: w.attempt_nonce };
+}
+
+/** **L-B step 2 (polling).** Read the live on-chain attempt status for a
+ *  target vault. Chain read. */
+export async function recoveryTargetStatus(
+  targetVaultId: string,
+): Promise<RecoveryTargetStatus> {
+  const w = await tauriInvoke<RecoveryTargetStatusWire>('recovery_target_status', {
+    targetVaultId,
+  });
+  return {
+    status: w.status,
+    proposedAuthority: w.proposed_authority,
+    attemptNonce: w.attempt_nonce,
+    initiatedAt: w.initiated_at,
+    approvalCount: w.approval_count,
+  };
+}
+
+/** **L-B step 3.** Ingest one re-sealed share blob; engine opens +
+ *  pushes into the Rust-side accumulator. Returns the new count. Chain
+ *  re-check inside. */
+export async function recoveryIngestShare(
+  sealedBlob: string,
+  targetVaultId: string,
+  attemptNonce: number,
+): Promise<IngestShareResult> {
+  const w = await tauriInvoke<IngestShareResultWire>('recovery_ingest_share', {
+    sealedBlob,
+    targetVaultId,
+    attemptNonce,
+  });
+  return { collectedCount: w.collected_count };
+}
+
+/** **L-B step 4 (terminal).** Finalize on-chain + recover-from-backup
+ *  in one spawn_blocking. Consumes the accumulator. */
+export async function recoveryComplete(
+  targetVaultId: string,
+  backupText: string,
+  phrase: string[],
+  newPassword: string,
+): Promise<RecoveryCompleteResult> {
+  const w = await tauriInvoke<RecoveryCompleteResultWire>('recovery_complete', {
+    targetVaultId,
+    backupText,
+    phrase,
+    newPassword,
+  });
+  return { newEpoch: w.new_epoch };
+}
