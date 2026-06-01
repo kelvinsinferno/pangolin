@@ -90,6 +90,37 @@ pub async fn __test__force_unlock(
     Ok(())
 }
 
+/// **MVP-4-H Layer 4: queue a password for the next secure-input call.**
+///
+/// Pushes `password` onto the [`crate::secure_input::stub`] queue so the
+/// next `*_via_secure_prompt` invocation pops it out instead of spawning
+/// the OS native dialog. The wdio harness calls this immediately BEFORE
+/// clicking the `SecurePasswordButton` for a flow it needs to drive.
+///
+/// **L1 (secret hygiene):** the `String` is consumed into bytes by
+/// [`crate::secure_input::stub::inject`] (`String::into_bytes()` is a
+/// move, not a copy); the original `String` drops at the end of this
+/// function body. The bytes live in the stub queue inside a `Vec<u8>`,
+/// which the [`crate::secure_input::stub::pop_one`] consumer wraps in
+/// `Zeroizing<Vec<u8>>` before returning. This matches the per-OS
+/// widget hygiene posture (Layer 1 invariant L1).
+#[allow(non_snake_case)]
+#[tauri::command]
+pub fn __test__secure_input_inject(password: String) {
+    crate::secure_input::stub::inject(password);
+}
+
+/// **MVP-4-H Layer 4: drain the secure-input stub queue.**
+///
+/// Called between wdio specs so a leaked previously-queued password
+/// doesn't bleed into the next test. Idempotent (clearing an empty
+/// queue is a no-op).
+#[allow(non_snake_case)]
+#[tauri::command]
+pub fn __test__secure_input_clear() {
+    crate::secure_input::stub::clear();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
