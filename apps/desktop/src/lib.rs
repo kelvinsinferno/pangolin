@@ -155,6 +155,13 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         commands::recovery::recovery_decode_request,
         commands::recovery::recovery_help_approve,
         commands::recovery::recovery_help_release,
+        // MVP-4-L (L-B): recoverer wizard surface.
+        commands::recovery::recovery_decode_backup,
+        commands::recovery::recovery_initiate,
+        commands::recovery::recovery_recipient_identity,
+        commands::recovery::recovery_target_status,
+        commands::recovery::recovery_ingest_share,
+        commands::recovery::recovery_complete,
         #[cfg(feature = "test-hooks")]
         test_hooks::__test__commands_invoked,
         #[cfg(feature = "test-hooks")]
