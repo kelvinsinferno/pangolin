@@ -24,8 +24,10 @@ import { RemoveDeviceWizard } from './RemoveDeviceWizard';
 export interface DevicesScreenProps {
   onClose: () => void;
   onError: (message: string) => void;
-  /** After a successful join, unlock the now-shared vault. */
-  onJoined: (newPassword: string) => Promise<void>;
+  /** After a successful join, unlock the now-shared vault (the parent
+   *  opens a fresh OS native prompt for the unlock; the wizard itself
+   *  no longer hands a password back). */
+  onJoined: () => Promise<void>;
   /** After a removal+re-key (or a resumed pending re-key), unlock the
    *  now-rotated (Locked) vault. */
   onRekeyed: (password: string) => Promise<void>;
