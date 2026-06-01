@@ -1318,6 +1318,209 @@ mod tests {
         );
     }
 
+    /// L-0c audit follow-up (LOW-3): **real-crypto** end-to-end ordering
+    /// pin. The prior `round_trip_byte_form` proves the BYTES survive
+    /// round-trip in order; this proves the ORDERING corresponds to the
+    /// guardian identities under actual crypto — `decoded.sealed_shares[i]`
+    /// opens under `guardian_x25519_pubs[i]`'s SECRET and FAILS to open
+    /// under any other guardian's secret.
+    ///
+    /// Without this test, a future refactor that drifted the iteration
+    /// order between `guardian_x25519_pubs` and `sealed_shares` in
+    /// `Vault::create_recovery_backup` would still pass `round_trip_byte_form`
+    /// but break real recovery (the recoverer would send each guardian
+    /// the wrong share, and every release would fail authentication).
+    #[test]
+    fn sealed_shares_open_under_matching_guardian_secret_in_order() {
+        use pangolin_crypto::escrow::{
+            open_sealed_share, seal_share, split_rwk, RecoveryWrapKey, SealedShare, EPOCH_LEN,
+        };
+        use pangolin_crypto::share_transport::generate_recoverer_keypair;
+
+        const M: u8 = 3;
+        const T: u8 = 2;
+        const VAULT_ID: [u8; 32] = [0x33; 32];
+        let epoch: [u8; EPOCH_LEN] = [0x07; EPOCH_LEN];
+
+        // Generate M guardian X25519 keypairs. Reuses the same
+        // X25519-keypair-generation primitive the share-transport
+        // module uses (consistent with the production seal/open path
+        // that consumes these bytes via `seal_share`).
+        let mut secrets: Vec<[u8; 32]> = Vec::with_capacity(usize::from(M));
+        let mut pubs: Vec<[u8; 32]> = Vec::with_capacity(usize::from(M));
+        for _ in 0..M {
+            let (sk, pk) = generate_recoverer_keypair();
+            secrets.push(sk);
+            pubs.push(pk);
+        }
+
+        // Split a real RWK into M shares + seal each to its matching
+        // guardian's pubkey.
+        let rwk = RecoveryWrapKey::generate();
+        let shares = split_rwk(&rwk, T, M).expect("split_rwk");
+        assert_eq!(shares.len(), usize::from(M), "split produces M shares");
+
+        let mut sealed_shares: Vec<Vec<u8>> = Vec::with_capacity(usize::from(M));
+        for (i, share) in shares.iter().enumerate() {
+            let sealed = seal_share(share, &pubs[i], &VAULT_ID, &epoch).expect("seal_share");
+            sealed_shares.push(sealed.as_bytes().to_vec());
+        }
+
+        // Build a BackupContents with the parallel pubs + sealed_shares.
+        let contents = BackupContents {
+            wrapped_recovery: vec![0xAA; 16],
+            vault_id: VAULT_ID,
+            epoch: 0, // separate u64 epoch field; the per-share epoch
+            // bound into the AEAD header is the [u8; 16] above.
+            threshold: T,
+            guardian_count: M,
+            guardian_x25519_pubs: pubs.clone(),
+            sealed_shares,
+            vault_display_name: String::new(),
+            created_at_unix: 0,
+        };
+        let phrase = known_phrase();
+        let blob = seal_backup(&contents, &phrase).expect("seal envelope");
+        let back = decode_backup(&blob, &phrase).expect("decode envelope");
+        assert_eq!(back.sealed_shares.len(), usize::from(M));
+
+        // For each i, the decoded sealed_shares[i] MUST open with
+        // secrets[i] AND MUST FAIL to open with secrets[i+1 mod M].
+        for i in 0..usize::from(M) {
+            let sealed = SealedShare::from_bytes(back.sealed_shares[i].clone());
+            let opened =
+                open_sealed_share(&sealed, &secrets[i], &VAULT_ID, &epoch).unwrap_or_else(|e| {
+                    panic!("sealed_shares[{i}] must open under matching secret: {e:?}")
+                });
+            // Reconstructed share's identifier must match the original
+            // split's i-th identifier (proves ordering integrity).
+            assert_eq!(
+                opened.identifier(),
+                shares[i].identifier(),
+                "decoded sealed_shares[{i}] reconstructed a Share with the wrong identifier"
+            );
+
+            // Wrong-secret path: opening with secrets[(i+1) % M] must
+            // fail closed (the AEAD on the sealed-box's inner content
+            // collapses to OpenFailed).
+            let wrong_idx = (i + 1) % usize::from(M);
+            let mismatch = open_sealed_share(&sealed, &secrets[wrong_idx], &VAULT_ID, &epoch);
+            assert!(
+                mismatch.is_err(),
+                "sealed_shares[{i}] must NOT open under guardian[{wrong_idx}]'s secret"
+            );
+        }
+    }
+
+    /// L-0c audit follow-up (LOW-4): the decoder's cross-field check at
+    /// `decode_body` (sealed_shares array length ≠ guardian_count → typed
+    /// `Validation`) cannot be reached via the production encoder
+    /// (`encode_body` derives both lengths from `sealed_shares.len()`).
+    /// This test bypasses the encoder by hand-building a CBOR body with
+    /// a deliberately mismatched length pair, sealing it through the
+    /// real AEAD pipeline, and verifying the decoder rejects with
+    /// `Validation { kind: "cbor", .. }` at the cross-field gate.
+    ///
+    /// Pins the defense at line ~753 of `decode_body` — without this
+    /// test, a future refactor that loosened the check would not
+    /// surface until a malformed envelope appeared in production.
+    #[test]
+    fn manually_mismatched_sealed_shares_count_rejected() {
+        use ciborium_ll::{Encoder, Header};
+
+        // Build a CBOR body where guardian_count = 3 but the
+        // sealed_shares array has only 2 elements. All other fields are
+        // well-formed.
+        let vault_id = [0x42u8; 32];
+        let pub_a = [0xA1u8; 32];
+        let pub_b = [0xA2u8; 32];
+        let pub_c = [0xA3u8; 32];
+        let share_a = vec![0xB1u8; 80];
+        let share_b = vec![0xB2u8; 80];
+        // Intentionally NO share_c — the array length will be 2, not 3.
+
+        let mut body: Vec<u8> = Vec::with_capacity(256);
+        {
+            let mut enc = Encoder::from(&mut body);
+            enc.push(Header::Array(Some(10))).unwrap();
+            // wrapped_recovery (bytes)
+            enc.push(Header::Bytes(Some(10))).unwrap();
+            enc.write_all(&[0u8; 10]).unwrap();
+            // vault_id (bytes, 32)
+            enc.push(Header::Bytes(Some(32))).unwrap();
+            enc.write_all(&vault_id).unwrap();
+            // epoch (uint)
+            enc.push(Header::Positive(7)).unwrap();
+            // threshold (uint)
+            enc.push(Header::Positive(2)).unwrap();
+            // guardian_count (uint) = 3
+            enc.push(Header::Positive(3)).unwrap();
+            // guardian_x25519_pubs: array of 3
+            enc.push(Header::Array(Some(3))).unwrap();
+            for pk in [&pub_a, &pub_b, &pub_c] {
+                enc.push(Header::Bytes(Some(32))).unwrap();
+                enc.write_all(pk).unwrap();
+            }
+            // sealed_shares: array of ONLY 2 (intentional mismatch!)
+            enc.push(Header::Array(Some(2))).unwrap();
+            for ss in [&share_a, &share_b] {
+                enc.push(Header::Bytes(Some(ss.len()))).unwrap();
+                enc.write_all(ss).unwrap();
+            }
+            // vault_display_name (text)
+            let name = "mismatch";
+            enc.push(Header::Text(Some(name.len()))).unwrap();
+            enc.write_all(name.as_bytes()).unwrap();
+            // created_at_unix (uint)
+            enc.push(Header::Positive(1)).unwrap();
+            // trailing inner schema_version (uint) = SCHEMA_VERSION
+            enc.push(Header::Positive(u64::from(SCHEMA_VERSION)))
+                .unwrap();
+        }
+
+        // Now seal `body` through the real AEAD pipeline (mirroring
+        // seal_backup's internal flow) so the integrity hash + AEAD all
+        // succeed and the decoder reaches decode_body.
+        let phrase = known_phrase();
+        let kdf_input = seed_phrase_to_kdf_input(&phrase).expect("kdf_input");
+        let salt = KdfSalt::random();
+        let kdf_params = KdfParams::RECOMMENDED;
+        let kdf_secret = SecretBytes::new(kdf_input.to_vec());
+        let key: AeadKey = derive_key(&kdf_secret, &salt, &kdf_params).expect("derive");
+        drop(kdf_secret);
+        drop(kdf_input);
+
+        let nonce = Nonce::random();
+        let ct_len = u64::try_from(body.len() + pangolin_crypto::aead::TAG_LEN).expect("ct_len");
+        let aad = write_outer_header(&kdf_params, &salt, &nonce, ct_len);
+        let ct = key.seal(&nonce, &body, &aad).expect("aead seal");
+        let ct_bytes = ct.into_vec();
+
+        let mut blob = Vec::with_capacity(OUTER_HEADER_LEN + ct_bytes.len() + INTEGRITY_HASH_LEN);
+        blob.extend_from_slice(&aad);
+        blob.extend_from_slice(&ct_bytes);
+        let hash = integrity_hash(&blob);
+        blob.extend_from_slice(&hash);
+
+        // Decode MUST fail at the cross-field check with typed Validation.
+        let err = decode_backup(&blob, &phrase).expect_err("mismatch must reject");
+        match err {
+            BackupError::Validation {
+                kind, ref message, ..
+            } => {
+                assert_eq!(
+                    kind, "cbor",
+                    "expected cbor-kind validation, got kind={kind}"
+                );
+                assert!(
+                    message.contains("guardian_count") && message.contains("sealed_shares"),
+                    "message should name the cross-field mismatch: {message}"
+                );
+            }
+            other => panic!("expected Validation cross-field, got {other:?}"),
+        }
+    }
+
     /// Text-form round-trip: encode_text → decode_text → byte-identical.
     #[test]
     fn round_trip_text_form() {
