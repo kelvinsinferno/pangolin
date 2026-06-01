@@ -1469,7 +1469,10 @@ mod tests {
             BackupError::Validation {
                 kind, ref message, ..
             } => {
-                assert_eq!(kind, "cbor", "expected cbor-kind validation, got kind={kind}");
+                assert_eq!(
+                    kind, "cbor",
+                    "expected cbor-kind validation, got kind={kind}"
+                );
                 assert!(
                     message.contains("all-zero"),
                     "message should mention all-zero: {message}"
@@ -1559,10 +1562,12 @@ mod tests {
             BackupError::Validation {
                 kind, ref message, ..
             } => {
-                assert_eq!(kind, "cbor", "expected cbor-kind validation, got kind={kind}");
+                assert_eq!(
+                    kind, "cbor",
+                    "expected cbor-kind validation, got kind={kind}"
+                );
                 assert!(
-                    message.contains("guardian_count")
-                        && message.contains("guardian_evm_addrs"),
+                    message.contains("guardian_count") && message.contains("guardian_evm_addrs"),
                     "message should name the addrs cross-field mismatch: {message}"
                 );
             }

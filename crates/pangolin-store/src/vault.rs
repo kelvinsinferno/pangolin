@@ -11356,8 +11356,7 @@ mod tests {
         match err {
             StoreError::Corrupted(msg) => {
                 assert!(
-                    msg.contains("guardian_x25519_pubs")
-                        && msg.contains("guardian_signers"),
+                    msg.contains("guardian_x25519_pubs") && msg.contains("guardian_signers"),
                     "expected paired-array message naming both sides, got: {msg}"
                 );
             }

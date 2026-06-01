@@ -346,8 +346,7 @@ fn recover_from_shares_rejects_evm_addrs_count_mismatch() {
             pangolin_store::StoreError::Corrupted(msg),
         ) => {
             assert!(
-                msg.contains("guardian_count")
-                    && msg.contains("evm_addrs"),
+                msg.contains("guardian_count") && msg.contains("evm_addrs"),
                 "expected typed mismatch message naming the addrs field, got: {msg}"
             );
         }

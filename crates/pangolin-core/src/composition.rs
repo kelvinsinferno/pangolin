@@ -326,14 +326,14 @@ pub fn recover_from_shares(
     // produces assignments ordered 0..M; require both rosters match M.
     let m = usize::from(roster.guardian_count);
     if roster.x25519_pubs.len() != m || roster.evm_addrs.len() != m {
-        return Err(CompositionError::Store(pangolin_store::StoreError::Corrupted(
-            format!(
+        return Err(CompositionError::Store(
+            pangolin_store::StoreError::Corrupted(format!(
                 "recover_from_shares: guardian_count ({m}) does not match \
                  roster.x25519_pubs.len() ({}) or roster.evm_addrs.len() ({})",
                 roster.x25519_pubs.len(),
                 roster.evm_addrs.len()
-            ),
-        )));
+            )),
+        ));
     }
 
     // 1. Pure recovery driver: reconstruct the byte-identical VDK + re-split.

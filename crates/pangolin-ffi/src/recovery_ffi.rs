@@ -1079,9 +1079,7 @@ mod tests {
             // L-0d: deterministic non-zero per index; the recovery driver
             // persists these as the post-recovery escrow's signer set
             // (the all-zero rejection trips on the back-fill sentinel).
-            evm_addrs: (0..M)
-                .map(|i| vec![i.wrapping_add(1); 20])
-                .collect(),
+            evm_addrs: (0..M).map(|i| vec![i.wrapping_add(1); 20]).collect(),
         };
         let result = vault_recover_from_shares(
             Arc::clone(&fresh_h),
@@ -1165,13 +1163,9 @@ mod tests {
     #[test]
     fn onboard_guardians_rejects_placeholder() {
         let empty = VaultHandle::new_placeholder();
-        let err = vault_onboard_guardians(
-            empty,
-            T,
-            vec![vec![0u8; 32]; 3],
-            vec![vec![0xAA; 20]; 3],
-        )
-        .unwrap_err();
+        let err =
+            vault_onboard_guardians(empty, T, vec![vec![0u8; 32]; 3], vec![vec![0xAA; 20]; 3])
+                .unwrap_err();
         assert!(matches!(err, FfiError::Session { .. }));
     }
 

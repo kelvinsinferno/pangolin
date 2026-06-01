@@ -462,9 +462,10 @@ fn decode_guardian_row(
         pub_blob.as_slice().try_into().map_err(|_| {
             StoreError::Corrupted("recovery_guardians.guardian_x25519_pub length".into())
         })?;
-    let signer: [u8; GUARDIAN_SIGNER_LEN] = signer_blob.as_slice().try_into().map_err(|_| {
-        StoreError::Corrupted("recovery_guardians.guardian_signer length".into())
-    })?;
+    let signer: [u8; GUARDIAN_SIGNER_LEN] = signer_blob
+        .as_slice()
+        .try_into()
+        .map_err(|_| StoreError::Corrupted("recovery_guardians.guardian_signer length".into()))?;
     // L-0d Q-a: all-zero signer is the back-fill sentinel for legacy rows.
     if signer.iter().all(|&b| b == 0) {
         return Err(StoreError::Corrupted(

@@ -361,19 +361,18 @@ pub async fn recovery_onboard_guardians(
     }
     let mut addrs_bytes = Vec::with_capacity(evm_addrs.len());
     for (idx, hex) in evm_addrs.iter().enumerate() {
-        addrs_bytes.push(bytes_from_hex(hex, "guardian EVM address", 20).map_err(
-            |e| match e {
+        addrs_bytes.push(
+            bytes_from_hex(hex, "guardian EVM address", 20).map_err(|e| match e {
                 DesktopError::Validation { kind, message } => DesktopError::Validation {
                     kind,
                     message: format!("guardian #{idx}: {message}"),
                 },
                 other => other,
-            },
-        )?);
+            })?,
+        );
     }
-    let outcome =
-        pangolin_ffi::vault_onboard_guardians(handle, threshold, pubs_bytes, addrs_bytes)
-            .map_err(DesktopError::from)?;
+    let outcome = pangolin_ffi::vault_onboard_guardians(handle, threshold, pubs_bytes, addrs_bytes)
+        .map_err(DesktopError::from)?;
     Ok(outcome.into())
 }
 
