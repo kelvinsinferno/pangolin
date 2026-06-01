@@ -22,10 +22,6 @@ vi.mock('../lib/invoke', async (importOriginal) => {
   });
   return {
     ...actual,
-    // MVP-4-H L3: the wizard now calls the *_via_secure_prompt
-    // variants. The legacy ones (pairingChainBootstrap,
-    // pairingAddDevice) are not exercised; left out of the mock to
-    // catch any regression that re-introduces them.
     pairingChainBootstrapViaSecurePrompt: vi.fn(async () => {}),
     pairingAddDeviceViaSecurePrompt: vi.fn(async () => ({
       bytes: [7, 7, 7],

@@ -17,10 +17,6 @@ vi.mock('../lib/invoke', async (importOriginal) => {
   });
   return {
     ...actual,
-    // MVP-4-H L3: the wizard now calls the *_via_secure_prompt
-    // variant. The legacy `pairingOpenAndJoin` is not exercised;
-    // left out of the mock so any regression that re-introduces it
-    // would trip a hard mock-miss.
     pairingBeginNewDevice: vi.fn(async () => payload([5, 5, 5])),
     pairingDecodeBytes: vi.fn(async (b: number[]) => payload(b)),
     pairingDeriveSas: vi.fn(async () => '472913'),

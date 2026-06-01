@@ -56,10 +56,6 @@ vi.mock('../lib/invoke', async (importOriginal) => {
       throw new Error('no persisted identity (fresh recovery)');
     }),
     recoveryTargetStatus: vi.fn(async () => fakeStatus()),
-    // MVP-4-H L3: the wizard now calls the *_via_secure_prompt
-    // variants. The legacy `recoveryInitiate` + `recoveryComplete`
-    // are intentionally omitted from the mock so any regression that
-    // re-introduces them would trip a hard mock-miss.
     recoveryInitiateViaSecurePrompt: vi.fn(async () => ({
       txHash: 'aa'.repeat(32),
       blockNumber: 100,

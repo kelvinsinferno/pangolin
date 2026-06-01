@@ -110,13 +110,8 @@ export async function vaultOpen(path: string): Promise<void> {
   await tauriInvoke<void>('vault_open', { path });
 }
 
-/** Unlock the currently-open vault with the supplied master password. */
-export async function vaultUnlock(password: string): Promise<void> {
-  await tauriInvoke<void>('vault_unlock', { password });
-}
-
 /** Lock the currently-open vault (the handle stays open; subsequent
- *  `vault_unlock` re-activates the session). */
+ *  unlock re-activates the session). */
 export async function vaultLock(): Promise<void> {
   await tauriInvoke<void>('vault_lock');
 }
@@ -172,7 +167,7 @@ export async function copyPasswordToClipboard(id: string): Promise<void> {
 // non-secret (the pairing payload + sealed envelope are exactly what a QR
 // exposes; the SAS is shown to the human). The only secrets are the
 // master passwords, which cross via the same direct-invoke path as
-// `vaultUnlock` — see plan §4 L1.
+// `vaultUnlockViaSecurePrompt` — see plan §4 L1.
 
 /** The non-secret pairing payload, in the shapes the wizard needs. */
 export interface PairingPayload {
@@ -183,7 +178,7 @@ export interface PairingPayload {
    *  encodes, so a scan round-trips through `pairingDecodeString`). */
   stringForm: string;
   /** 64-char lowercase hex of the 32-byte vault id this payload joins
-   *  (device B passes this to `pairingOpenAndJoin`). */
+   *  (device B passes this to `pairingOpenAndJoinViaSecurePrompt`). */
   vaultId: string;
   /** 64-char lowercase hex of the 32-byte device id. */
   deviceId: string;
@@ -240,10 +235,6 @@ function payloadFromWire(w: PairingPayloadWire): PairingPayload {
   };
 }
 
-function envelopeFromWire(w: SealedEnvelopeWire): SealedEnvelope {
-  return { bytes: w.bytes, stringForm: w.string_form };
-}
-
 function deviceFromWire(w: DeviceInfoWire): DeviceInfo {
   return {
     id: w.id,
@@ -289,43 +280,10 @@ export async function pairingDeriveSas(
   return tauriInvoke<string>('pairing_derive_sas', { aBytes, bBytes });
 }
 
-/** **NEW device, FINAL step.** Open the sealed envelope, install the VDK
- *  under a NEW master password, adopt the manager's vault id. Leaves the
- *  vault Locked — follow with {@link vaultUnlock}. */
-export async function pairingOpenAndJoin(args: {
-  sealedBytes: number[];
-  vaultId: string;
-  epoch: number;
-  newPassword: string;
-}): Promise<void> {
-  await tauriInvoke<void>('pairing_open_and_join', args);
-}
-
 /** Read the read-only paired-device list. */
 export async function pairingDeviceList(): Promise<DeviceInfo[]> {
   const list = await tauriInvoke<DeviceInfoWire[]>('pairing_device_list');
   return list.map(deviceFromWire);
-}
-
-/** **MANAGER.** Bootstrap the vault's on-chain device set (once per
- *  vault, before the first add-device). */
-export async function pairingChainBootstrap(password: string): Promise<void> {
-  await tauriInvoke<void>('pairing_chain_bootstrap', { password });
-}
-
-/** **MANAGER, FINAL CONFIRMATION.** After the human confirms the SAS,
- *  authorize device B on-chain + return the sealed envelope. `theirBytes`
- *  is B's payload byte-form. */
-export async function pairingAddDevice(
-  theirBytes: number[],
-  password: string,
-): Promise<SealedEnvelope> {
-  return envelopeFromWire(
-    await tauriInvoke<SealedEnvelopeWire>('pairing_add_device', {
-      theirBytes,
-      password,
-    }),
-  );
 }
 
 // ---- MVP-4-J: device removal + authorized-set / manager / rotation ----
@@ -385,7 +343,7 @@ export async function pairingListAuthorizedDevices(): Promise<AuthorizedDevice[]
 }
 
 /** **MANAGER-ONLY.** Remove a device (broadcast removeDevice + queue the
- *  rotation). MUST be followed by {@link pairingCompleteRotation}. */
+ *  rotation). MUST be followed by `pairingCompleteRotationViaSecurePrompt`. */
 export async function pairingRemoveDevice(signer: string): Promise<void> {
   await tauriInvoke<void>('pairing_remove_device', { signer });
 }
@@ -398,13 +356,6 @@ export async function pairingPendingRotations(): Promise<RotationPending[]> {
     removedSigner: w.removed_signer,
     observedEpoch: w.observed_epoch,
   }));
-}
-
-/** Complete the VDK rotation owed after a removal (re-key survivors, advance
- *  the epoch). Leaves the vault Locked — follow with {@link vaultUnlock}. */
-export async function pairingCompleteRotation(password: string): Promise<RotationResult> {
-  const w = await tauriInvoke<RotationResultWire>('pairing_complete_rotation', { password });
-  return { newEpoch: w.new_epoch, unknownSurvivors: w.unknown_survivors };
 }
 
 // ---- MVP-4-K: manager handoff / promotion ----
@@ -490,13 +441,6 @@ interface RecoveryHealthWire {
   recovery_status: number;
   proposed_authority: string;
   attempt_nonce: number;
-}
-
-/** Create a recovery backup (24-word phrase + envelope). Requires guardians
- *  to have been onboarded first. The phrase is shown once + never stored. */
-export async function recoveryCreateBackup(password: string): Promise<Backup> {
-  const w = await tauriInvoke<BackupWire>('recovery_create_backup', { password });
-  return { seedPhraseWords: w.seed_phrase_words, bytes: w.bytes, text: w.text };
 }
 
 /** Read this vault's recovery health (current authority + any in-flight
@@ -599,22 +543,6 @@ export async function recoveryOnboardGuardians(
     evmAddrs,
   });
   return { epoch: w.epoch };
-}
-
-/** **OWNER, step 2 of 2.** Commit the on-chain guardian merkle root +
- *  self-bootstrap this device's EVM wallet as the vault authority. The FFI
- *  computes the merkle root engine-side. */
-export async function recoverySetGuardianSet(
-  password: string,
-  evmAddrs: string[],
-  threshold: number,
-): Promise<TxOutcome> {
-  const w = await tauriInvoke<TxOutcomeWire>('recovery_set_guardian_set', {
-    password,
-    evmAddrs,
-    threshold,
-  });
-  return { txHash: w.tx_hash, blockNumber: w.block_number };
 }
 
 // ---- MVP-4-L (L-C): guardian-side help wizard surface ----
@@ -827,7 +755,7 @@ interface IngestShareResultWire {
   collected_count: number;
 }
 
-/** Result of recoveryComplete. */
+/** Result of recoveryCompleteViaSecurePrompt. */
 export interface RecoveryCompleteResult {
   /** The new recovery-generation epoch the engine stamped on the
    *  re-split escrow. Non-secret. */
@@ -855,23 +783,6 @@ export async function recoveryDecodeBackup(
     vaultDisplayName: w.vault_display_name,
     createdAtUnix: w.created_at_unix,
   };
-}
-
-/** **L-B step 1.** Broadcast initiateRecovery; engine generates the
- *  ephemeral X25519 keypair + persists. Chain broadcast. */
-export async function recoveryInitiate(
-  password: string,
-  targetVaultId: string,
-  proposedAuthority: string,
-  expiresAt: number,
-): Promise<TxOutcome> {
-  const w = await tauriInvoke<TxOutcomeWire>('recovery_initiate', {
-    password,
-    targetVaultId,
-    proposedAuthority,
-    expiresAt,
-  });
-  return { txHash: w.tx_hash, blockNumber: w.block_number };
 }
 
 /** **L-B step 2 (resume probe).** Read this device's persisted recipient
@@ -918,22 +829,6 @@ export async function recoveryIngestShare(
   return { collectedCount: w.collected_count };
 }
 
-/** **L-B step 4 (terminal).** Finalize on-chain + recover-from-backup
- *  in one spawn_blocking. Consumes the accumulator. */
-export async function recoveryComplete(
-  targetVaultId: string,
-  backupText: string,
-  phrase: string[],
-  newPassword: string,
-): Promise<RecoveryCompleteResult> {
-  const w = await tauriInvoke<RecoveryCompleteResultWire>('recovery_complete', {
-    targetVaultId,
-    backupText,
-    phrase,
-    newPassword,
-  });
-  return { newEpoch: w.new_epoch };
-}
 
 // ============================================================================
 // MVP-4-H Layer 3: *_via_secure_prompt wrappers.

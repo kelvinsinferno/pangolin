@@ -43,11 +43,6 @@ vi.mock('../lib/invoke', async (importOriginal) => {
       return fakeInvite(m[1]);
     }),
     recoveryOnboardGuardians: vi.fn(async () => ({ epoch: 0 })),
-    // MVP-4-H L3: the wizard now calls
-    // `recoverySetGuardianSetViaSecurePrompt`. The legacy
-    // `recoverySetGuardianSet` is intentionally omitted from the mock
-    // so any regression that re-introduces it would trip a hard
-    // mock-miss.
     recoverySetGuardianSetViaSecurePrompt: vi.fn(async () => ({
       txHash: 'aa'.repeat(32),
       blockNumber: 42,

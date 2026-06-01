@@ -15,10 +15,6 @@ vi.mock('../lib/invoke', async (importOriginal) => {
       proposedAuthority: '',
       attemptNonce: 0,
     })),
-    // MVP-4-H L3: the screen now calls `recoveryCreateBackupViaSecurePrompt`.
-    // The legacy `recoveryCreateBackup` is intentionally omitted from the
-    // mock so any regression that re-introduces it would trip a hard
-    // mock-miss.
     recoveryCreateBackupViaSecurePrompt: vi.fn(async () => ({
       seedPhraseWords: Array.from({ length: 24 }, (_, i) => `word${i + 1}`),
       bytes: [1, 2, 3],

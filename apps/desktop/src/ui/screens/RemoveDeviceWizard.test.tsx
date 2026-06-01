@@ -14,11 +14,6 @@ vi.mock('../lib/invoke', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/invoke')>();
   return {
     ...actual,
-    // MVP-4-H L3: the wizard now calls
-    // `pairingCompleteRotationViaSecurePrompt` instead of
-    // `pairingCompleteRotation`. The legacy variant is intentionally
-    // omitted from the mock so any regression that re-introduces it
-    // would trip a hard mock-miss.
     pairingRemoveDevice: vi.fn(async () => {}),
     pairingCompleteRotationViaSecurePrompt: vi.fn(async () => ({
       newEpoch: 1,
