@@ -282,6 +282,11 @@ async fn device_add_remove_rotate_e2e_against_anvil() {
         .clone();
 
     // Build the GuardianRecord slice from the re_split for commit_vdk_rotation.
+    // L-0d: synthesize deterministic non-zero signers per guardian index. The
+    // production rotation path sources signers from RecoveryEscrowParams,
+    // but this anvil E2E builds the rotation by hand against
+    // `__test_commit_vdk_rotation_reusing_active`, so we mint synthetic
+    // addresses parallel to the index-ordered assignments here.
     let re_split = &artifacts.re_split;
     let records: Vec<GuardianRecord<'_>> = re_split
         .assignments
@@ -289,6 +294,7 @@ async fn device_add_remove_rotate_e2e_against_anvil() {
         .map(|a| GuardianRecord {
             index: a.index,
             guardian_x25519_pub: a.guardian_x25519_pub,
+            signer: [a.index.wrapping_add(1); 20],
             sealed_share: &a.sealed_share,
         })
         .collect();
