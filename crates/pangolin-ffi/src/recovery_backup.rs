@@ -168,6 +168,12 @@ pub struct FfiBackupContents {
     /// The `M` guardians' 32-byte X25519 SEALING pubkeys, ordered by
     /// index (`0..M`).
     pub guardian_x25519_pubs: Vec<Vec<u8>>,
+    /// The `M` sealed-share ciphertexts (NON-SECRET — AEAD-protected at
+    /// the per-share crypto layer), one per guardian, ordered by index
+    /// `0..M` parallel to `guardian_x25519_pubs`. Added in backup
+    /// schema v2 (MVP-4-L L-0c). The recoverer wizard distributes each
+    /// entry to its matching guardian alongside the L-C request blob.
+    pub sealed_shares: Vec<Vec<u8>>,
     /// Schema-version slot.
     pub schema_version: u16,
 }
@@ -287,6 +293,7 @@ fn into_ffi_contents(contents: &BackupContents) -> FfiBackupContents {
             .iter()
             .map(|p| p.to_vec())
             .collect(),
+        sealed_shares: contents.sealed_shares.clone(),
         schema_version: RECOVERY_BACKUP_FFI_SCHEMA_VERSION,
     }
 }
