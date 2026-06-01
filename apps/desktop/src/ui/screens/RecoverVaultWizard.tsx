@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { useEffect, useRef, useState } from 'react';
-import { Button, Card, Code, Input, Spinner } from '@pangolin/component-library';
+import {
+  Button,
+  Card,
+  Code,
+  Input,
+  SecurePasswordButton,
+  Spinner,
+  type SecureSubmitOutcome,
+} from '@pangolin/component-library';
 
 import {
   copyToClipboard,
   guardianIdentityExport,
   isDesktopError,
-  recoveryComplete,
+  recoveryCompleteViaSecurePrompt,
   recoveryDecodeBackup,
   recoveryIngestShare,
-  recoveryInitiate,
+  recoveryInitiateViaSecurePrompt,
   recoveryRecipientIdentity,
   recoveryTargetStatus,
   type BackupContents,
@@ -27,11 +35,11 @@ type Step =
   | 'warn'
   | 'decode'
   | 'preview'
-  | 'init-password'
+  | 'init-confirm'
   | 'initiating'
   | 'distribute'
   | 'collect'
-  | 'finalize-password'
+  | 'finalize-confirm'
   | 'finalizing'
   | 'done';
 
@@ -111,14 +119,12 @@ export function RecoverVaultWizard({ onError, onClose }: RecoverVaultWizardProps
   const [phraseInput, setPhraseInput] = useState('');
   const [backup, setBackup] = useState<BackupContents | null>(null);
   const [proposedAuthority, setProposedAuthority] = useState<string | null>(null);
-  const [initPassword, setInitPassword] = useState('');
   const [recipientCommitment, setRecipientCommitment] = useState<string | null>(null);
   const [attemptNonce, setAttemptNonce] = useState<number | null>(null);
   const [expiresAt, setExpiresAt] = useState<number | null>(null);
   const [sharePaste, setSharePaste] = useState('');
   const [collectedCount, setCollectedCount] = useState(0);
   const [chainStatus, setChainStatus] = useState<RecoveryTargetStatus | null>(null);
-  const [newPassword, setNewPassword] = useState('');
   // Re-entry guards for the chain steps.
   const initiateGuard = useRef(false);
   const ingestGuard = useRef(false);
@@ -165,8 +171,6 @@ export function RecoverVaultWizard({ onError, onClose }: RecoverVaultWizardProps
   }, [step, backup]);
 
   const cancel = () => {
-    setInitPassword('');
-    setNewPassword('');
     setSharePaste('');
     onClose();
   };
@@ -210,11 +214,12 @@ export function RecoverVaultWizard({ onError, onClose }: RecoverVaultWizardProps
     }
   };
 
-  const doInitiate = async () => {
-    if (backup === null || proposedAuthority === null || initiateGuard.current) return;
-    if (initPassword === '') {
-      onError('Confirm your master password to broadcast.');
-      return;
+  const doInitiate = async (): Promise<SecureSubmitOutcome> => {
+    if (backup === null || proposedAuthority === null) {
+      return { ok: false, message: 'wizard not ready' };
+    }
+    if (initiateGuard.current) {
+      return { ok: false, message: 'already broadcasting' };
     }
     initiateGuard.current = true;
     setStep('initiating');
@@ -223,19 +228,19 @@ export function RecoverVaultWizard({ onError, onClose }: RecoverVaultWizardProps
       // minimum + a generous window for the recoverer to send out
       // requests + receive guardian approvals.
       const exp = Math.floor(Date.now() / 1000) + 24 * 3600;
-      await recoveryInitiate(initPassword, backup.vaultId, proposedAuthority, exp);
+      await recoveryInitiateViaSecurePrompt(backup.vaultId, proposedAuthority, exp);
       setExpiresAt(exp);
-      setInitPassword('');
       // After broadcast: read the persisted recipient identity to
       // learn the engine-assigned attempt_nonce + ephemeral pubkey.
       const id = await recoveryRecipientIdentity(backup.vaultId);
       setRecipientCommitment(id.recipientPubkey);
       setAttemptNonce(id.attemptNonce);
       setStep('distribute');
+      return { ok: true };
     } catch (e) {
       initiateGuard.current = false;
-      onError(errMessage(e));
-      setStep('init-password');
+      setStep('init-confirm');
+      return { ok: false, message: errMessage(e) };
     }
   };
 
@@ -259,23 +264,24 @@ export function RecoverVaultWizard({ onError, onClose }: RecoverVaultWizardProps
     }
   };
 
-  const doComplete = async () => {
-    if (backup === null || completeGuard.current) return;
-    if (newPassword === '') {
-      onError('Choose a new master password for the recovered vault.');
-      return;
+  const doComplete = async (): Promise<SecureSubmitOutcome> => {
+    if (backup === null) {
+      return { ok: false, message: 'wizard not ready' };
+    }
+    if (completeGuard.current) {
+      return { ok: false, message: 'already finalizing' };
     }
     completeGuard.current = true;
     setStep('finalizing');
     try {
       const phraseWords = phraseInput.trim().split(/\s+/).filter((w) => w.length > 0);
-      await recoveryComplete(backup.vaultId, backupText.trim(), phraseWords, newPassword);
-      setNewPassword('');
+      await recoveryCompleteViaSecurePrompt(backup.vaultId, backupText.trim(), phraseWords);
       setStep('done');
+      return { ok: true };
     } catch (e) {
       completeGuard.current = false;
-      onError(errMessage(e));
       setStep('collect');
+      return { ok: false, message: errMessage(e) };
     }
   };
 
@@ -400,7 +406,7 @@ export function RecoverVaultWizard({ onError, onClose }: RecoverVaultWizardProps
               Back
             </Button>
             <Button
-              onClick={() => setStep('init-password')}
+              onClick={() => setStep('init-confirm')}
               data-testid="preview-continue"
             >
               Continue
@@ -409,27 +415,21 @@ export function RecoverVaultWizard({ onError, onClose }: RecoverVaultWizardProps
         </div>
       )}
 
-      {step === 'init-password' && (
-        <div className="recovery-wizard__step" data-testid="step-init-password">
+      {step === 'init-confirm' && (
+        <div className="recovery-wizard__step" data-testid="step-init-confirm">
           <p>
-            Confirm this device&apos;s master password to broadcast the recovery
-            attempt to Base Sepolia. (Your new vault password is set later, at
-            the final step.)
+            Click below to broadcast the recovery attempt to Base Sepolia. A
+            native dialog will collect this device&apos;s master password — it
+            never enters this app&apos;s memory. (Your new vault password is
+            set later, at the final step.)
           </p>
-          <Input
-            type="password"
-            value={initPassword}
-            onChange={(e) => setInitPassword(e.target.value)}
-            placeholder="This device's master password"
-            data-testid="init-password-input"
-          />
-          <Button
-            onClick={() => void doInitiate()}
-            disabled={initPassword === '' || proposedAuthority === null}
+          <SecurePasswordButton
+            label="Broadcast recovery attempt"
+            onSubmit={doInitiate}
+            onError={onError}
+            disabled={proposedAuthority === null}
             data-testid="init-password-broadcast"
-          >
-            Broadcast recovery attempt
-          </Button>
+          />
         </div>
       )}
 
@@ -501,7 +501,7 @@ export function RecoverVaultWizard({ onError, onClose }: RecoverVaultWizardProps
               : ''}
           </p>
           <Button
-            onClick={() => setStep('finalize-password')}
+            onClick={() => setStep('finalize-confirm')}
             disabled={!finalizeAvailable}
             data-testid="collect-finalize"
           >
@@ -510,27 +510,20 @@ export function RecoverVaultWizard({ onError, onClose }: RecoverVaultWizardProps
         </div>
       )}
 
-      {step === 'finalize-password' && backup !== null && (
-        <div className="recovery-wizard__step" data-testid="step-finalize-password">
+      {step === 'finalize-confirm' && backup !== null && (
+        <div className="recovery-wizard__step" data-testid="step-finalize-confirm">
           <p>
-            Choose a NEW master password for the recovered vault. This password
-            will replace this device&apos;s current master password and unlock
-            your recovered data.
+            Click below to finalize. A native dialog will collect a NEW master
+            password for the recovered vault — this password will replace this
+            device&apos;s current master password and unlock your recovered
+            data.
           </p>
-          <Input
-            type="password"
-            value={newPassword}
-            onChange={(e) => setNewPassword(e.target.value)}
-            placeholder="New master password for the recovered vault"
-            data-testid="finalize-password-input"
-          />
-          <Button
-            onClick={() => void doComplete()}
-            disabled={newPassword === ''}
+          <SecurePasswordButton
+            label="Finalize and rebuild"
+            onSubmit={doComplete}
+            onError={onError}
             data-testid="finalize-complete"
-          >
-            Finalize and rebuild
-          </Button>
+          />
         </div>
       )}
 
