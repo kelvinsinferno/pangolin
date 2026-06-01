@@ -32,7 +32,7 @@ use crate::state::VaultState;
 /// the engine maps `PressYPresenceProof::confirmed()` for every CLI-tier
 /// proof, so the `bytes` field can be empty (the engine ignores it).
 /// The `schema_version` slot must still be the 1.1-frozen value `1`.
-fn cli_presence_proof() -> PresenceProof {
+pub(crate) fn cli_presence_proof() -> PresenceProof {
     PresenceProof {
         schema_version: 1,
         bytes: Vec::new(),

@@ -11,11 +11,23 @@
 
 use super::{stub, SecureInputError};
 
+/// Tests share the global queue singleton — without serialization a
+/// parallel test runner can interleave `inject` / `pop_one` / `clear`
+/// across tests + race the FIFO ordering. This guard acquires a
+/// process-wide lock at test start; only one test runs at a time.
+fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A queued password round-trips: inject, then pop_one returns the
 /// same bytes. The `Zeroizing<Vec<u8>>` wrapper preserves the bytes
 /// across the FIFO pop.
 #[test]
 fn injected_password_round_trips() {
+    let _g = test_guard();
     stub::clear();
     stub::inject("hunter2".into());
     let pw = stub::pop_one().expect("queued password");
@@ -26,6 +38,7 @@ fn injected_password_round_trips() {
 /// fires init-password then finalize-password sequentially).
 #[test]
 fn fifo_ordering_across_multiple_prompts() {
+    let _g = test_guard();
     stub::clear();
     stub::inject("first".into());
     stub::inject("second".into());
@@ -42,6 +55,7 @@ fn fifo_ordering_across_multiple_prompts() {
 /// E2E that forgets to inject sees a clear test-bug signal.
 #[test]
 fn empty_queue_returns_test_hook_empty() {
+    let _g = test_guard();
     stub::clear();
     let err = stub::pop_one().unwrap_err();
     assert!(matches!(err, SecureInputError::TestHookEmpty));
@@ -50,6 +64,7 @@ fn empty_queue_returns_test_hook_empty() {
 /// `clear()` drains everything in the queue.
 #[test]
 fn clear_drains_pending_passwords() {
+    let _g = test_guard();
     stub::inject("leaked".into());
     stub::clear();
     let err = stub::pop_one().unwrap_err();

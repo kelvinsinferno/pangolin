@@ -169,6 +169,12 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         commands::recovery::recovery_target_status,
         commands::recovery::recovery_ingest_share,
         commands::recovery::recovery_complete,
+        // MVP-4-H Layer 2: secure-prompt variants (V8 password residue
+        // closed). Land alongside the legacy commands during the
+        // L2 -> L3 transition; once Layer 3 ships the SecurePasswordButton
+        // an audit-cleanup commit gates the legacy commands behind
+        // `cfg(feature = "test-hooks")`. Plan-LOCK §3.
+        commands::secure_prompt::vault_unlock_via_secure_prompt,
         #[cfg(feature = "test-hooks")]
         test_hooks::__test__commands_invoked,
         #[cfg(feature = "test-hooks")]
