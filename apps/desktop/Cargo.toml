@@ -129,6 +129,40 @@ serde = { version = "=1.0.228", features = ["derive"] }
 # arms in `src/secure_input/` are the only consumers.
 gtk = { version = "=0.18.2", default-features = false }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# MVP-4-H: Objective-C / Cocoa bindings for the macOS native password
+# dialog. Versions match Tauri 2.11.2's transitive resolution
+# (`objc2 = 0.6.4`, `objc2-app-kit = 0.3.2`, `objc2-foundation = 0.3.2`)
+# so the dep tree doesn't gain a duplicate.
+#
+# Only the `NSAlert` + `NSSecureTextField` + a couple of NSString
+# helpers are needed; default features pull more than required, so we
+# stick to defaults for compatibility (the bundle is already in the
+# transitive tree, so extra features cost nothing at link time).
+objc2 = "=0.6.4"
+objc2-foundation = "=0.3.2"
+objc2-app-kit = "=0.3.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# MVP-4-H: Win32 bindings for the Windows native password dialog.
+# The `windows` crate is Microsoft's official Rust bindings.
+# Version pinned to the major Tauri 2.11.2 transitively brings
+# (`windows = 0.61.3`); reusing the transitive version avoids a
+# duplicate.
+#
+# Required feature flags: the Win32 dialog API (`DialogBoxIndirectParamW`,
+# `EndDialog`, `GetDlgItemTextW`) lives under `Win32_UI_WindowsAndMessaging`;
+# message-box constants under the same; security-related types under
+# `Win32_Security_Credentials` (not currently used, kept for future
+# `CredUIPromptForCredentialsW` work).
+windows = { version = "=0.61.3", features = [
+    "Win32_Foundation",
+    "Win32_Security_Credentials",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_Globalization",
+] }
+
 [build-dependencies]
 # Tauri v2 emits resource files + Info.plist / manifest assets through
 # its build script. Required even for a minimum-surface build.
