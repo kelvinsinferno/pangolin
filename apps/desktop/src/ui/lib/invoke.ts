@@ -105,6 +105,31 @@ function fromWire(w: AccountSummaryWire): AccountSummary {
 
 // ---- Command wrappers --------------------------------------------------
 
+// ---- MVP-4-M L4: closed-beta warning persistence ----------------------
+
+/** Wire-shape returned by `beta_warning_state`. */
+export interface BetaWarningState {
+  /** True if the user has NOT dismissed the warning for the current
+   *  binary version. Re-fires on every version bump per plan-LOCK Q-L4. */
+  shouldShow: boolean;
+  /** The current binary version, e.g. "0.1.0-beta.1". The modal renders
+   *  this so the user knows which build they're about to use. */
+  currentVersion: string;
+}
+
+/** Read whether the closed-beta warning modal should be shown for the
+ *  current binary version. */
+export async function betaWarningState(): Promise<BetaWarningState> {
+  return tauriInvoke<BetaWarningState>('beta_warning_state');
+}
+
+/** Persist that the user dismissed the warning for the current binary
+ *  version. Subsequent same-version launches will see `shouldShow: false`;
+ *  any version bump (including pre-release identifier) re-fires the modal. */
+export async function betaWarningDismiss(): Promise<void> {
+  await tauriInvoke<void>('beta_warning_dismiss');
+}
+
 /** Open a vault file. */
 export async function vaultOpen(path: string): Promise<void> {
   await tauriInvoke<void>('vault_open', { path });
