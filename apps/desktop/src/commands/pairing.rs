@@ -76,7 +76,8 @@ use pangolin_ffi::{FfiChainConfig, FFI_CHAIN_CONFIG_SCHEMA_VERSION};
 use crate::error::DesktopError;
 use crate::state::VaultState;
 
-/// Default Base Sepolia RPC endpoint (testnet-only — D-011 gates mainnet).
+/// Default Base Sepolia RPC endpoint (testnet-only — mainnet ships after enough
+/// community review + closed-beta tester feedback, see `feedback_audit_funding_pivot`).
 const DEFAULT_RPC_URL: &str = "https://sepolia.base.org";
 
 // ---------------------------------------------------------------------------
@@ -254,8 +255,9 @@ fn build_chain_config(
 ///
 /// `PANGOLIN_RPC_URL` (default Base Sepolia public RPC) +
 /// `PANGOLIN_DEPLOYMENT_PATH` (required). Testnet-only: the FFI hardcodes
-/// `ChainEnv::BaseSepolia` (D-011 gates mainnet), so this only supplies
-/// the RPC URL + deployment file path.
+/// `ChainEnv::BaseSepolia` (mainnet ships after community review + tester
+/// feedback per feedback_audit_funding_pivot), so this only supplies the
+/// RPC URL + deployment file path.
 pub(crate) fn chain_config() -> Result<FfiChainConfig, DesktopError> {
     let rpc_url = std::env::var("PANGOLIN_RPC_URL").unwrap_or_else(|_| DEFAULT_RPC_URL.to_owned());
     let deployment_path = std::env::var("PANGOLIN_DEPLOYMENT_PATH")
