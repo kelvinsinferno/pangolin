@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-# MVP-4-M — packaged release (closed-beta downloadable installer) — plan-gate DRAFT
+# MVP-4-M — packaged release (closed-beta downloadable installer) — plan-gate LOCKED
 
-**Status: DRAFT — awaiting Kelvin call on Q-a..e.** Other decisions self-locked.
+**Status: LOCKED — Kelvin call 2026-06-02.** Q-a..e all resolved; build can start.
 
 ## 0. One-paragraph summary
 
@@ -25,75 +25,45 @@ Reference posture memories:
 
 ## 0a. LOCKED decisions (proposed — Kelvin to confirm)
 
-### Open questions (need Kelvin's call)
+### Kelvin-locked decisions (2026-06-02)
 
-- **Q-a — macOS Gatekeeper UX.** Without a paid Apple Developer ID
-  ($99/yr) the first-launch is "Pangolin can't be opened because it
-  is from an unidentified developer."
-  - **Option 1 (recommended): README docs only.** Explain right-click
-    → Open the first time. Single-paragraph note in the Download
-    section. Standard unsigned-app dance.
-  - **Option 2:** Ship a tiny helper script (`unquarantine-pangolin.sh`)
-    alongside the `.dmg` that runs `xattr -d com.apple.quarantine
-    /Applications/Pangolin.app`. Lower friction but adds an
-    "untrusted script" trust ask.
-  - **Option 3:** Skip the `.dmg` from this slice; Mac users build
-    from source. Cleanest posture but hostile UX for Mac testers.
+- **Q-a — macOS Gatekeeper UX = README docs only.** Explain right-click
+  → Open the first time + the `xattr -d com.apple.quarantine
+  /Applications/Pangolin.app` fallback in the Download section.
+  Standard unsigned-app dance; smallest moving-part surface. No helper
+  scripts, no extra trust asks.
 
-- **Q-b — Pre-release "this is beta" framing.**
-  - **Option 1 (recommended): README banner + first-launch in-app
-    dialog** ("Pangolin is in closed beta on Base Sepolia testnet.
-    Not audited. Do not store production secrets. Continue?") shown
-    once per fresh install, with a persistent "BETA / TESTNET"
-    indicator in the title bar afterwards.
-  - **Option 2:** README only, no in-app messaging. Lowest friction;
-    relies on user reading the README before downloading.
-  - **Option 3:** README + persistent in-app status bar everywhere
-    (no one-shot dialog). Loudest but easy to install-blindness past.
+- **Q-b — Beta framing = README + first-launch in-app dialog.** One-shot
+  modal on fresh install ("Pangolin is in closed beta on Base Sepolia
+  testnet. Not audited. Do not store production secrets. Continue?")
+  with an "I understand" button; persistent "BETA / TESTNET" chip in
+  the title bar afterwards. Dismissal-persistence stored in
+  `app_data_dir()` (NOT localStorage — see §4 audit prompt: clearing
+  the data dir = fresh install = warning re-fires, which is desired).
 
-- **Q-c — Extension distribution.**
-  - **Option 1 (recommended): zip built `dist/` and attach to the
-    Release.** Users `chrome://extensions` → Load Unpacked. Same
-    release tag covers desktop + extension; version bump stays
-    synchronized.
-  - **Option 2:** Extension stays "build from source" — only the
-    desktop ships as a downloadable. Cleaner release surface but
-    means users who want the autofill UX still need the toolchain.
-  - **Option 3:** Publish to Chrome Web Store / Firefox Add-ons.
-    Explicitly **out of scope** per Kelvin's "no app stores" call.
+- **Q-c — Extension distribution = zip `dist/` into the same Release.**
+  Built extension artifact attached as `pangolin-extension-<version>.zip`.
+  Single tag covers desktop + extension; versions stay
+  synchronized. Users `chrome://extensions` → Developer Mode → Load
+  Unpacked.
 
-- **Q-d — Native-messaging-host install flow.** `pangolin-desktop` already
-  has an `install-native-host` CLI subcommand that writes the
-  Chrome/Firefox native-messaging manifest. How does it get invoked?
-  - **Option 1 (recommended): first-launch in-app wizard.** Detect
-    the absence of the manifest on app start; prompt the user with
-    a "Connect browser extension?" step that pastes the extension ID
-    and runs `install-native-host` under the hood. Standard
-    "configure" flow; works without elevated permissions.
-  - **Option 2:** Tauri installer post-install hook auto-runs
-    `install-native-host` with a baked-in extension ID. Faster but
-    bakes the extension ID into the installer — bad if the user
-    sideloads a different ID.
-  - **Option 3:** Pure manual — document the `pangolin-desktop
-    install-native-host --allowed-extension-id <ID>` invocation in
-    README. Lowest engineering cost; highest UX friction.
+- **Q-d — Native-messaging install = first-launch in-app wizard.**
+  Desktop detects the missing native-messaging manifest on app start;
+  surfaces a "Connect browser extension?" wizard that takes the user's
+  extension ID (paste from `chrome://extensions`) and invokes the
+  existing `install-native-host` command under the hood. No baked-in
+  IDs; reversible via `uninstall-native-host`. Surfaces the file paths
+  being written so users know what's happening on disk.
 
-- **Q-e — macOS release gating.** Per
-  [`pangolin_macos_release_smoke`](../../.claude/projects/C--Users-kelvi/memory/pangolin_macos_release_smoke.md),
-  every release needs a manual unlock smoke on real Mac hardware
-  before the `.dmg` ships.
-  - **Option 1 (recommended): two-phase release.** Publish Linux +
-    Windows immediately on tag; macOS `.dmg` gets attached to the
-    same Release as a follow-on after the manual smoke is signed off
-    (release-notes line moves from "macOS: PENDING SMOKE" → "macOS:
-    available"). Honest about the gap; honors the smoke memory.
-  - **Option 2:** Ship all three OSes simultaneously with a
-    "MANUAL_SMOKE_PENDING" badge in release notes for macOS; remove
-    the badge after the smoke. Risk: a user downloads before the
-    smoke runs.
-  - **Option 3:** Skip macOS from this slice entirely until
-    tauri-driver ships macOS WebDriver (could be months). Loses the
-    Mac-tester audience.
+- **Q-e — macOS release gating = two-phase release.** Tag triggers
+  Linux + Windows publish immediately; release notes start with
+  "macOS: PENDING SMOKE." The `.dmg` is built in CI and uploaded as a
+  workflow artifact (NOT attached to the release yet); a manual
+  follow-on (Kelvin or the homie with the Mac) downloads the
+  artifact, runs the [[pangolin_macos_release_smoke]] checklist, and
+  on pass attaches the `.dmg` to the existing Release + updates the
+  notes to "macOS: available." Honest about the gap; honors the
+  smoke memory; matches the L6 layer gate.
 
 ### Self-locked (no gate needed)
 
