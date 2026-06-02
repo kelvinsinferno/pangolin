@@ -60,24 +60,41 @@ export function readFixturePath(): string {
 }
 
 /**
- * Open the fixture vault on the welcome screen + submit.
+ * Open the fixture vault on the welcome screen.
  *
- * Selector strategy: `data-testid` first, ARIA-role + accessible
- * name second, text content last. See plan §3.4. The `vault-path-input`
- * testid lives on the welcome-screen text input; the existing
- * `vault-file-picker` wrapper carries the E2E stable ID.
+ * **MVP-4-N rewrite (2026-06-02).** The welcome screen no longer
+ * accepts a typed path — it uses native OS file dialogs via
+ * `tauri-plugin-dialog`. wdio can't drive native widgets, so this
+ * helper calls the React `openVault` action directly via the
+ * `window.__pangolinE2e` hook exposed by `App.tsx`. The hook
+ * dispatches the same `vault_open` Tauri command + React state
+ * transition the button + dialog flow would.
+ *
+ * Selector strategy: still wait for the welcome-actions wrapper to
+ * exist before invoking the hook — that's the cold-boot signal the
+ * React tree mounted.
  */
 export async function openFixtureVault(): Promise<void> {
   const vaultPath = readFixturePath();
   // Scrub sidecars left by a prior spec's Tauri SIGTERM (see helper
   // comment above scrubVaultSidecars).
   scrubVaultSidecars(vaultPath);
-  const picker = await $('[data-testid="vault-file-picker"]');
-  await picker.waitForExist({ timeout: 15_000 });
-  const input = await picker.$('[data-testid="vault-path-input"]');
-  await input.setValue(vaultPath);
-  const openButton = await $('button=Open');
-  await openButton.click();
+  // Wait for the welcome screen to mount before reaching for the
+  // window hook (the hook is registered in App.tsx's useEffect).
+  const actions = await $('[data-testid="welcome-actions"]');
+  await actions.waitForExist({ timeout: 15_000 });
+  await browser.executeAsync((path: string, done: () => void) => {
+    const w = window as unknown as {
+      __pangolinE2e?: {
+        openVault: (p: string) => Promise<void>;
+      };
+    };
+    if (!w.__pangolinE2e) {
+      done();
+      return;
+    }
+    void w.__pangolinE2e.openVault(path).then(() => done());
+  }, vaultPath);
 }
 
 /**

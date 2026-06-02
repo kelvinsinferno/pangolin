@@ -187,6 +187,18 @@ export async function vaultOpen(path: string): Promise<void> {
   await tauriInvoke<void>('vault_open', { path });
 }
 
+/** MVP-4-N: create a fresh vault file at `path`. Opens the OS native
+ *  password dialog to collect the master password; the password
+ *  never crosses V8 (same MVP-4-H secure-input posture as the unlock
+ *  path). After success the vault is on disk but Locked; the caller
+ *  must run `vaultOpen(path)` + `vaultUnlockViaSecurePrompt()` to
+ *  enter the Active stage. The user re-types the same password they
+ *  just chose — intentional to catch typos before they're locked
+ *  out of a freshly-created vault. */
+export async function vaultCreateViaSecurePrompt(path: string): Promise<void> {
+  await tauriInvoke<void>('vault_create_via_secure_prompt', { path });
+}
+
 /** Lock the currently-open vault (the handle stays open; subsequent
  *  unlock re-activates the session). */
 export async function vaultLock(): Promise<void> {

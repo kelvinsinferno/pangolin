@@ -19,12 +19,13 @@
     "test:e2e": "cd e2e && pnpm run e2e"
   },
   "dependencies": {
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
+    "@pangolin/component-library": "file:../component-library",
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-clipboard-manager": "^2.2.1",
-    "@pangolin/component-library": "file:../component-library",
-    "jsqr": "=1.4.0"
+    "@tauri-apps/plugin-dialog": "^2.7.1",
+    "jsqr": "=1.4.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@testing-library/dom": "^10.4.0",

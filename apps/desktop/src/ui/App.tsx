@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { useEffect } from 'react';
 import { Toast } from '@pangolin/component-library';
 
 import { BetaChip } from './components/BetaChip';
@@ -39,6 +40,33 @@ export function App() {
     const r = await actions.openVault(path);
     if (!r.ok) showError(r.error);
   };
+  const onCreate = async (path: string) => {
+    const r = await actions.createVault(path);
+    if (!r.ok) showError(r.error);
+  };
+
+  // MVP-4-N: expose the React openVault / createVault actions on
+  // `window.__pangolinE2e` so the desktop-e2e suite can drive the
+  // welcome screen without needing to control the native file dialog
+  // (wdio can't interact with native widgets — same limitation that
+  // motivated the MVP-4-H secure-input stub for unlocks). The hook
+  // is purely a JS-side reference to the existing actions; no new
+  // Tauri command, no new IPC surface. Production CSP (`script-src
+  // 'self'`) blocks third-party scripts from calling it; the hook
+  // can't do anything `window.__TAURI__.core.invoke('vault_open')`
+  // couldn't already do.
+  useEffect(() => {
+    (window as unknown as {
+      __pangolinE2e?: {
+        openVault: (path: string) => Promise<void>;
+        createVault: (path: string) => Promise<void>;
+      };
+    }).__pangolinE2e = { openVault: onOpen, createVault: onCreate };
+    // onOpen / onCreate are recreated each render but capture the
+    // same `actions.*` refs (which are stable from useVault). Re-
+    // assigning the hook on every render is cheap and avoids a
+    // stale-closure bug.
+  });
   const onUnlock = async (): Promise<UnlockResult> => {
     const r = await actions.unlockVault();
     if (!r.ok && !r.authenticationFailed) {
@@ -82,7 +110,13 @@ export function App() {
           ONCE per session when no native-host manifest is installed.
           Non-blocking; user can dismiss to "Maybe later". */}
       {state.stage === 'active' && <ExtensionBanner onConfigure={actions.goToSettings} />}
-      {state.stage === 'welcome' && <WelcomeScreen onOpen={onOpen} />}
+      {state.stage === 'welcome' && (
+        <WelcomeScreen
+          onOpen={onOpen}
+          onCreate={onCreate}
+          onError={(msg) => toastActions.danger(msg)}
+        />
+      )}
       {state.stage === 'locked' && (
         <UnlockScreen onUnlock={onUnlock} onClose={actions.closeVault} />
       )}
