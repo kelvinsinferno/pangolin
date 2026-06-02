@@ -9,6 +9,7 @@ export interface AccountListScreenProps {
   onLock: () => Promise<void>;
   onDevices: () => void;
   onRecovery: () => void;
+  onSettings: () => void;
 }
 
 /**
@@ -24,6 +25,7 @@ export function AccountListScreen({
   onLock,
   onDevices,
   onRecovery,
+  onSettings,
 }: AccountListScreenProps) {
   return (
     <main className="account-list-screen" aria-labelledby="account-list-title">
@@ -35,6 +37,9 @@ export function AccountListScreen({
           </Button>
           <Button variant="ghost" onClick={onRecovery} data-testid="recovery-button">
             Recovery
+          </Button>
+          <Button variant="ghost" onClick={onSettings} data-testid="settings-button">
+            Settings
           </Button>
           <Button variant="ghost" onClick={onLock} data-testid="lock-button">
             Lock

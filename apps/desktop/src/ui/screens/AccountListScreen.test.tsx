@@ -37,6 +37,7 @@ describe('AccountListScreen', () => {
         onLock={async () => {}}
         onDevices={() => {}}
         onRecovery={() => {}}
+        onSettings={() => {}}
       />,
     );
     expect(screen.getByText('Acme')).toBeInTheDocument();
@@ -57,6 +58,7 @@ describe('AccountListScreen', () => {
         onLock={async () => {}}
         onDevices={() => {}}
         onRecovery={() => {}}
+        onSettings={() => {}}
       />,
     );
     fireEvent.click(screen.getByTestId('account-row-0'));
@@ -74,6 +76,7 @@ describe('AccountListScreen', () => {
         onLock={onLock}
         onDevices={() => {}}
         onRecovery={() => {}}
+        onSettings={() => {}}
       />,
     );
     fireEvent.click(screen.getByTestId('lock-button'));
@@ -90,6 +93,7 @@ describe('AccountListScreen', () => {
         onLock={async () => {}}
         onDevices={() => {}}
         onRecovery={() => {}}
+        onSettings={() => {}}
       />,
     );
     expect(screen.getByText('No accounts in this vault.')).toBeInTheDocument();

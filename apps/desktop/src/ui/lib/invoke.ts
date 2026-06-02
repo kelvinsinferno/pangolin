@@ -105,6 +105,58 @@ function fromWire(w: AccountSummaryWire): AccountSummary {
 
 // ---- Command wrappers --------------------------------------------------
 
+// ---- MVP-4-M L3: native-host install (browser extension connection) ----
+
+/** One Chromium-family browser's native-host manifest presence. */
+export interface NativeHostBrowserState {
+  /** Browser family label: `"chrome" | "chromium" | "brave" | "edge"`. */
+  browser: string;
+  /** Absolute path the manifest is / would be written at. */
+  manifestPath: string;
+  /** True when the manifest file exists at the path right now. */
+  present: boolean;
+}
+
+/** Aggregate native-host install status returned by `nativeHostStatus`. */
+export interface NativeHostStatus {
+  /** True when at least one browser has the manifest written. The
+   *  first-launch banner uses this to decide whether to surface. */
+  connected: boolean;
+  /** Per-browser detail. Empty on Windows (the registry-based install
+   *  is gated behind a separate MVP — see install_native_host.rs M-1
+   *  fix comment). */
+  browsers: NativeHostBrowserState[];
+}
+
+/** Read whether the native-messaging manifest is currently installed
+ *  in any Chromium-family browser. */
+export async function nativeHostStatus(): Promise<NativeHostStatus> {
+  return tauriInvoke<NativeHostStatus>('native_host_status');
+}
+
+/** Install the native-messaging manifest into every Chromium-family
+ *  browser's per-user dir. The user pastes `extensionId` from
+ *  `chrome://extensions`; `binaryPath` is the absolute path to the
+ *  `pangolin-native-messaging-host` executable. Throws a typed
+ *  `DesktopError::Validation` if the extension ID is malformed (must
+ *  be exactly 32 lowercase letters in the range a..p, per Chrome's
+ *  hash-to-letter encoding). */
+export async function installNativeHost(
+  binaryPath: string,
+  extensionId: string,
+): Promise<void> {
+  await tauriInvoke<void>('install_native_host', {
+    binaryPath,
+    extensionId,
+  });
+}
+
+/** Remove the native-messaging manifest from every Chromium-family
+ *  browser's per-user dir. Idempotent. */
+export async function uninstallNativeHost(): Promise<void> {
+  await tauriInvoke<void>('uninstall_native_host');
+}
+
 // ---- MVP-4-M L4: closed-beta warning persistence ----------------------
 
 /** Wire-shape returned by `beta_warning_state`. */
