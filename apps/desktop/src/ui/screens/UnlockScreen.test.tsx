@@ -4,19 +4,26 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 
 import { UnlockScreen } from './UnlockScreen';
 
+/** MVP-4-H L3: the password input lives in the OS native widget, NOT
+ *  in React. These tests verify the React-side state machine + the
+ *  `onUnlock` contract (which has no arg post-migration). The native
+ *  widget is invoked inside `onUnlock` — the unit tests stub `onUnlock`
+ *  directly so we never actually open a dialog. */
 describe('UnlockScreen', () => {
-  test('renders the password field + an unlock button', () => {
+  test('renders the unlock button (no password field — native widget owns it)', () => {
     render(
       <UnlockScreen
         onUnlock={async () => ({ ok: true })}
         onClose={async () => {}}
       />,
     );
-    expect(screen.getByTestId('password-input')).toBeInTheDocument();
     expect(screen.getByTestId('unlock-button')).toBeInTheDocument();
+    // The legacy `password-input` testid is GONE — React no longer
+    // collects the password.
+    expect(screen.queryByTestId('password-input')).not.toBeInTheDocument();
   });
 
-  test('typed password fires onUnlock with the value', async () => {
+  test('clicking Unlock fires onUnlock (no args — native widget collects the password)', async () => {
     const onUnlock = vi.fn(async () => ({ ok: true as const }));
     render(
       <UnlockScreen
@@ -24,32 +31,48 @@ describe('UnlockScreen', () => {
         onClose={async () => {}}
       />,
     );
-    const input = screen.getByTestId('password-input') as HTMLInputElement;
-    fireEvent.change(input, { target: { value: 'hunter2' } });
     fireEvent.click(screen.getByTestId('unlock-button'));
     await waitFor(() => {
-      expect(onUnlock).toHaveBeenCalledWith('hunter2');
+      expect(onUnlock).toHaveBeenCalledWith();
     });
   });
 
-  test('AuthenticationFailed renders inline error under the password field', async () => {
+  test('AuthenticationFailed renders inline error', async () => {
     render(
       <UnlockScreen
         onUnlock={async () => ({ ok: false, authenticationFailed: true })}
         onClose={async () => {}}
       />,
     );
-    const input = screen.getByTestId('password-input') as HTMLInputElement;
-    fireEvent.change(input, { target: { value: 'wrong' } });
     fireEvent.click(screen.getByTestId('unlock-button'));
     const inline = await screen.findByTestId('auth-failed-inline');
     expect(inline).toBeInTheDocument();
     expect(inline).toHaveAttribute('role', 'alert');
-    // The password field gets aria-invalid + aria-describedby.
-    expect(input).toHaveAttribute('aria-invalid', 'true');
   });
 
-  test('disables the Unlock button while pending', async () => {
+  test('Successful unlock clears the auth-failed banner on retry', async () => {
+    let attempt = 0;
+    const onUnlock = vi.fn(async () => {
+      attempt += 1;
+      return attempt === 1
+        ? ({ ok: false, authenticationFailed: true } as const)
+        : ({ ok: true } as const);
+    });
+    render(
+      <UnlockScreen
+        onUnlock={onUnlock}
+        onClose={async () => {}}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('unlock-button'));
+    await screen.findByTestId('auth-failed-inline');
+    fireEvent.click(screen.getByTestId('unlock-button'));
+    await waitFor(() => {
+      expect(screen.queryByTestId('auth-failed-inline')).not.toBeInTheDocument();
+    });
+  });
+
+  test('button disables while onUnlock is in flight (Spinner shown)', async () => {
     let resolveUnlock: (r: { ok: true }) => void = () => {};
     const onUnlock = vi.fn(
       () =>
@@ -63,21 +86,10 @@ describe('UnlockScreen', () => {
         onClose={async () => {}}
       />,
     );
-    fireEvent.change(screen.getByTestId('password-input'), { target: { value: 'x' } });
     fireEvent.click(screen.getByTestId('unlock-button'));
     await waitFor(() => {
       expect(screen.getByTestId('unlock-button')).toBeDisabled();
     });
     resolveUnlock({ ok: true });
-  });
-
-  test('Unlock button stays disabled on empty password', () => {
-    render(
-      <UnlockScreen
-        onUnlock={async () => ({ ok: true })}
-        onClose={async () => {}}
-      />,
-    );
-    expect(screen.getByTestId('unlock-button')).toBeDisabled();
   });
 });

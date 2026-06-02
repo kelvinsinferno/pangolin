@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 
 import { RecoveryScreen } from './RecoveryScreen';
-import { recoveryCreateBackup, recoveryHealth } from '../lib/invoke';
+import { recoveryCreateBackupViaSecurePrompt, recoveryHealth } from '../lib/invoke';
 
 vi.mock('../lib/invoke', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/invoke')>();
@@ -15,7 +15,7 @@ vi.mock('../lib/invoke', async (importOriginal) => {
       proposedAuthority: '',
       attemptNonce: 0,
     })),
-    recoveryCreateBackup: vi.fn(async () => ({
+    recoveryCreateBackupViaSecurePrompt: vi.fn(async () => ({
       seedPhraseWords: Array.from({ length: 24 }, (_, i) => `word${i + 1}`),
       bytes: [1, 2, 3],
       text: 'envelope-text',
@@ -40,26 +40,22 @@ describe('RecoveryScreen (L-D)', () => {
     expect(await screen.findByTestId('recovery-health-unavailable')).toBeInTheDocument();
   });
 
-  it('does NOT create a backup until password + create are supplied', async () => {
+  it('does NOT create a backup until backup-start → backup-create is clicked', async () => {
     render(<RecoveryScreen {...noop} />);
     fireEvent.click(await screen.findByTestId('backup-start'));
-    expect(recoveryCreateBackup).not.toHaveBeenCalled();
-    fireEvent.change(screen.getByTestId('backup-password-input'), {
-      target: { value: 'master-pw' },
-    });
+    // No password input anymore — the native dialog collects it.
+    expect(screen.queryByTestId('backup-password-input')).not.toBeInTheDocument();
+    expect(recoveryCreateBackupViaSecurePrompt).not.toHaveBeenCalled();
     fireEvent.click(screen.getByTestId('backup-create'));
     await waitFor(() => {
-      expect(recoveryCreateBackup).toHaveBeenCalledWith('master-pw');
+      expect(recoveryCreateBackupViaSecurePrompt).toHaveBeenCalledTimes(1);
     });
   });
 
   it('shows the 24-word phrase after creating a backup', async () => {
     render(<RecoveryScreen {...noop} />);
     fireEvent.click(await screen.findByTestId('backup-start'));
-    fireEvent.change(screen.getByTestId('backup-password-input'), {
-      target: { value: 'pw' },
-    });
-    fireEvent.click(screen.getByTestId('backup-create'));
+    fireEvent.click(await screen.findByTestId('backup-create'));
     expect(await screen.findByTestId('backup-show')).toBeInTheDocument();
     expect(screen.getByText('word1')).toBeInTheDocument();
     expect(screen.getByText('word24')).toBeInTheDocument();

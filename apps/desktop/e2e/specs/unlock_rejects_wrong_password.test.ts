@@ -33,10 +33,14 @@ describe('unlock_rejects_wrong_password', () => {
     const list = await $('[data-testid="accounts-list"]');
     expect(await list.isExisting()).to.equal(false);
 
-    // The password input is cleared (the UnlockScreen resets the
-    // local state on auth failure per plan §3.3 of MVP-4-B).
-    const wrapper = await $('[data-testid="master-password-input"]');
-    const input = await wrapper.$('input');
-    expect(await input.getValue()).to.equal('');
+    // MVP-4-H L3: there is no longer a password `<input>` to clear —
+    // the password is collected by the OS native widget (stubbed in
+    // E2E builds) and never enters the React state. The inline
+    // error banner above is the only auth-failure UX; the
+    // SecurePasswordButton stays interactive so the user can retry.
+    // Assert the button is still present (i.e. the wizard didn't
+    // route to a different surface on failure).
+    const retryButton = await $('[data-testid="unlock-button"]');
+    expect(await retryButton.isExisting()).to.equal(true);
   });
 });

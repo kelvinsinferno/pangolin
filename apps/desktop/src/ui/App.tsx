@@ -35,8 +35,8 @@ export function App() {
     const r = await actions.openVault(path);
     if (!r.ok) showError(r.error);
   };
-  const onUnlock = async (password: string): Promise<UnlockResult> => {
-    const r = await actions.unlockVault(password);
+  const onUnlock = async (): Promise<UnlockResult> => {
+    const r = await actions.unlockVault();
     if (!r.ok && !r.authenticationFailed) {
       showError(r.error);
     }
@@ -94,16 +94,20 @@ export function App() {
         <DevicesScreen
           onClose={actions.backToList}
           onError={(msg) => toastActions.danger(msg)}
-          onJoined={async (newPassword) => {
-            const r = await actions.unlockVault(newPassword);
+          onJoined={async () => {
+            // MVP-4-H L3: the wizard collected the new master password
+            // via the OS native widget; nothing flows back to JS. The
+            // vault is left Locked; the user lands on UnlockScreen
+            // which prompts via SecurePasswordButton to activate.
+            const r = await actions.unlockVault();
             if (!r.ok && !r.authenticationFailed) {
               showError(r.error);
             }
           }}
-          onRekeyed={async (password) => {
-            // The vault is Locked after a rotation; re-unlock + land on the
-            // account list.
-            const r = await actions.unlockVault(password);
+          onRekeyed={async () => {
+            // The vault is Locked after a rotation; re-unlock via
+            // the OS native widget + land on the account list.
+            const r = await actions.unlockVault();
             if (!r.ok && !r.authenticationFailed) {
               showError(r.error);
             }

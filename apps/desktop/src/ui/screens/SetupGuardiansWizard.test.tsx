@@ -8,7 +8,7 @@ import {
   guardianInviteDecodeText,
   recoveryHealth,
   recoveryOnboardGuardians,
-  recoverySetGuardianSet,
+  recoverySetGuardianSetViaSecurePrompt,
 } from '../lib/invoke';
 
 // Helper: build a fake GuardianInvite. We make the pubkey deterministic
@@ -43,7 +43,7 @@ vi.mock('../lib/invoke', async (importOriginal) => {
       return fakeInvite(m[1]);
     }),
     recoveryOnboardGuardians: vi.fn(async () => ({ epoch: 0 })),
-    recoverySetGuardianSet: vi.fn(async () => ({
+    recoverySetGuardianSetViaSecurePrompt: vi.fn(async () => ({
       txHash: 'aa'.repeat(32),
       blockNumber: 42,
     })),
@@ -81,12 +81,12 @@ async function addThreeAndAdvance() {
   await screen.findByTestId('step-threshold');
 }
 
-describe('SetupGuardiansWizard (MVP-4-L L-A)', () => {
+describe('SetupGuardiansWizard (MVP-4-L L-A + MVP-4-H L3 secure-prompt)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('drives the happy path: collect → threshold → password → onboard + commit', async () => {
+  it('drives the happy path: collect → threshold → confirm → onboard + commit', async () => {
     const onSuccess = vi.fn();
     render(
       <SetupGuardiansWizard
@@ -98,11 +98,10 @@ describe('SetupGuardiansWizard (MVP-4-L L-A)', () => {
 
     await addThreeAndAdvance();
     fireEvent.click(screen.getByTestId('setup-guardians-threshold-next'));
-    await screen.findByTestId('step-password');
+    await screen.findByTestId('step-confirm');
+    // No password input anymore — the native dialog collects it.
+    expect(screen.queryByTestId('setup-guardians-password')).not.toBeInTheDocument();
 
-    fireEvent.change(screen.getByTestId('setup-guardians-password'), {
-      target: { value: 'master-pw' },
-    });
     fireEvent.click(screen.getByTestId('setup-guardians-onboard'));
 
     // Step 1: off-chain onboard fires with the collected pubkeys + threshold.
@@ -124,12 +123,13 @@ describe('SetupGuardiansWizard (MVP-4-L L-A)', () => {
       ],
     );
 
-    // Step 2: on-chain set fires with the matching EVM addresses + threshold.
+    // Step 2: on-chain set fires via the secure-prompt variant with the
+    // matching EVM addresses + threshold. The password is collected by
+    // the native dialog (NOT passed from React).
     await waitFor(() => {
-      expect(recoverySetGuardianSet).toHaveBeenCalledTimes(1);
+      expect(recoverySetGuardianSetViaSecurePrompt).toHaveBeenCalledTimes(1);
     });
-    expect(recoverySetGuardianSet).toHaveBeenCalledWith(
-      'master-pw',
+    expect(recoverySetGuardianSetViaSecurePrompt).toHaveBeenCalledWith(
       [
         fakeInvite('AAA').signer,
         fakeInvite('BBB').signer,
@@ -204,34 +204,29 @@ describe('SetupGuardiansWizard (MVP-4-L L-A)', () => {
   });
 
   it('Q-c: routes to retry on chain failure + idempotent re-attempt', async () => {
-    const onError = vi.fn();
     const onSuccess = vi.fn();
-    const setGuardianSet = recoverySetGuardianSet as unknown as ReturnType<typeof vi.fn>;
+    const setGuardianSet = recoverySetGuardianSetViaSecurePrompt as unknown as ReturnType<typeof vi.fn>;
 
     // First call FAILS (the on-chain step never lands).
     setGuardianSet.mockRejectedValueOnce({ kind: 'Chain', message: 'RPC down' });
 
     render(
-      <SetupGuardiansWizard onError={onError} onClose={() => {}} onSuccess={onSuccess} />,
+      <SetupGuardiansWizard onError={() => {}} onClose={() => {}} onSuccess={onSuccess} />,
     );
     await addThreeAndAdvance();
     fireEvent.click(screen.getByTestId('setup-guardians-threshold-next'));
-    await screen.findByTestId('step-password');
-    fireEvent.change(screen.getByTestId('setup-guardians-password'), {
-      target: { value: 'master-pw' },
-    });
+    await screen.findByTestId('step-confirm');
     fireEvent.click(screen.getByTestId('setup-guardians-onboard'));
 
     // Off-chain step fired; on-chain step fired + failed → retry step.
     await screen.findByTestId('step-retry');
+    // No retry-password input anymore — the native dialog collects it.
+    expect(screen.queryByTestId('setup-guardians-retry-password')).not.toBeInTheDocument();
     expect(recoveryOnboardGuardians).toHaveBeenCalledTimes(1);
     expect(setGuardianSet).toHaveBeenCalledTimes(1);
     expect(onSuccess).not.toHaveBeenCalled();
 
     // Second attempt SUCCEEDS — the off-chain step is NOT re-fired.
-    fireEvent.change(screen.getByTestId('setup-guardians-retry-password'), {
-      target: { value: 'master-pw' },
-    });
     fireEvent.click(screen.getByTestId('setup-guardians-retry'));
 
     await screen.findByTestId('step-done');
@@ -242,7 +237,7 @@ describe('SetupGuardiansWizard (MVP-4-L L-A)', () => {
 
   it('retry treats "already initialized" chain revert as success', async () => {
     const onSuccess = vi.fn();
-    const setGuardianSet = recoverySetGuardianSet as unknown as ReturnType<typeof vi.fn>;
+    const setGuardianSet = recoverySetGuardianSetViaSecurePrompt as unknown as ReturnType<typeof vi.fn>;
     // Both first attempt + retry fail — but retry hits the
     // ErrGuardianSetAlreadyInitialized revert which the wizard treats as
     // "the on-chain step DID land; we just lost the receipt".
@@ -257,16 +252,10 @@ describe('SetupGuardiansWizard (MVP-4-L L-A)', () => {
     );
     await addThreeAndAdvance();
     fireEvent.click(screen.getByTestId('setup-guardians-threshold-next'));
-    await screen.findByTestId('step-password');
-    fireEvent.change(screen.getByTestId('setup-guardians-password'), {
-      target: { value: 'master-pw' },
-    });
+    await screen.findByTestId('step-confirm');
     fireEvent.click(screen.getByTestId('setup-guardians-onboard'));
     await screen.findByTestId('step-retry');
 
-    fireEvent.change(screen.getByTestId('setup-guardians-retry-password'), {
-      target: { value: 'master-pw' },
-    });
     fireEvent.click(screen.getByTestId('setup-guardians-retry'));
 
     await screen.findByTestId('step-done');
@@ -280,7 +269,7 @@ describe('SetupGuardiansWizard (MVP-4-L L-A)', () => {
     // recovery_client::finish + error::Display paths). The wizard's
     // case-insensitive substring match must accept this exact shape.
     const onSuccess = vi.fn();
-    const setGuardianSet = recoverySetGuardianSet as unknown as ReturnType<typeof vi.fn>;
+    const setGuardianSet = recoverySetGuardianSetViaSecurePrompt as unknown as ReturnType<typeof vi.fn>;
     setGuardianSet.mockRejectedValueOnce({ kind: 'Chain', message: 'RPC down' });
     setGuardianSet.mockRejectedValueOnce({
       kind: 'Chain',
@@ -293,15 +282,9 @@ describe('SetupGuardiansWizard (MVP-4-L L-A)', () => {
     );
     await addThreeAndAdvance();
     fireEvent.click(screen.getByTestId('setup-guardians-threshold-next'));
-    await screen.findByTestId('step-password');
-    fireEvent.change(screen.getByTestId('setup-guardians-password'), {
-      target: { value: 'master-pw' },
-    });
+    await screen.findByTestId('step-confirm');
     fireEvent.click(screen.getByTestId('setup-guardians-onboard'));
     await screen.findByTestId('step-retry');
-    fireEvent.change(screen.getByTestId('setup-guardians-retry-password'), {
-      target: { value: 'master-pw' },
-    });
     fireEvent.click(screen.getByTestId('setup-guardians-retry'));
 
     await screen.findByTestId('step-done');
@@ -314,7 +297,7 @@ describe('SetupGuardiansWizard (MVP-4-L L-A)', () => {
     // observe the chain state directly to detect "the broadcast actually
     // landed" instead of relying on the error keyword.
     const onSuccess = vi.fn();
-    const setGuardianSet = recoverySetGuardianSet as unknown as ReturnType<typeof vi.fn>;
+    const setGuardianSet = recoverySetGuardianSetViaSecurePrompt as unknown as ReturnType<typeof vi.fn>;
     setGuardianSet.mockRejectedValueOnce({ kind: 'Chain', message: 'RPC down' });
     setGuardianSet.mockRejectedValueOnce({
       kind: 'Chain',
@@ -344,15 +327,9 @@ describe('SetupGuardiansWizard (MVP-4-L L-A)', () => {
     );
     await addThreeAndAdvance();
     fireEvent.click(screen.getByTestId('setup-guardians-threshold-next'));
-    await screen.findByTestId('step-password');
-    fireEvent.change(screen.getByTestId('setup-guardians-password'), {
-      target: { value: 'master-pw' },
-    });
+    await screen.findByTestId('step-confirm');
     fireEvent.click(screen.getByTestId('setup-guardians-onboard'));
     await screen.findByTestId('step-retry');
-    fireEvent.change(screen.getByTestId('setup-guardians-retry-password'), {
-      target: { value: 'master-pw' },
-    });
     fireEvent.click(screen.getByTestId('setup-guardians-retry'));
 
     await screen.findByTestId('step-done');

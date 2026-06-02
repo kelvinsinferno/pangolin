@@ -81,18 +81,49 @@ export async function openFixtureVault(): Promise<void> {
 }
 
 /**
- * Type a password into the unlock screen + click Unlock.
+ * **MVP-4-H L4 secure-prompt unlock helper.**
  *
- * Uses the plan's `master-password-input` wrapper testid as the
- * locator + reaches into the inner element for the actual text input.
+ * The React UnlockScreen no longer renders an `<Input type="password">`.
+ * Instead, a `SecurePasswordButton` opens the OS native dialog at click
+ * time. CI's headless WebKit can't interact with native widgets, so the
+ * desktop binary is built with `--features test-hooks` which swaps the
+ * per-OS widget for a stub queue (see
+ * `apps/desktop/src/secure_input/stub.rs`). This helper:
+ *
+ *   1. Invokes `__test__secure_input_inject(password)` via the Tauri
+ *      `__TAURI__.core.invoke` global — queues the bytes the stub will
+ *      pop on the next `*_via_secure_prompt` Rust call.
+ *   2. Clicks the `unlock-button` (the SecurePasswordButton) which
+ *      drives `vault_unlock_via_secure_prompt`.
+ *
+ * The `master-password-input` testid wrapper is preserved on the
+ * UnlockScreen action wrapper for the existing `waitForExist` flow so
+ * we still know the unlock surface is mounted before driving it.
  */
 export async function typeUnlockPassword(password: string): Promise<void> {
   const wrapper = await $('[data-testid="master-password-input"]');
   await wrapper.waitForExist({ timeout: 15_000 });
-  // The Input component renders the underlying <input> with the
-  // existing `password-input` testid; that's the actual text field.
-  const input = await wrapper.$('input');
-  await input.setValue(password);
-  const unlockButton = await $('button*=Unlock');
+  // Queue the password into the secure_input stub. Bytes flow:
+  // wdio → invoke('__test__secure_input_inject') → stub::inject →
+  // (later) stub::pop_one → SecretPassword::new (in Rust).
+  await browser.executeAsync((pw: string, done: () => void) => {
+    type WindowWithTauri = Window & {
+      __TAURI__?: {
+        core?: { invoke: (cmd: string, args?: unknown) => Promise<unknown> };
+      };
+    };
+    const win = window as WindowWithTauri;
+    const invoke = win.__TAURI__?.core?.invoke;
+    if (!invoke) {
+      done();
+      return;
+    }
+    void invoke('__test__secure_input_inject', { password: pw }).then(() =>
+      done(),
+    );
+  }, password);
+  // Click the SecurePasswordButton; the Rust command pops the queued
+  // password out of the stub and routes it into vault_unlock.
+  const unlockButton = await $('[data-testid="unlock-button"]');
   await unlockButton.click();
 }

@@ -25,12 +25,34 @@
 //!                                       pangolin_core::Vault + pangolin_store
 //! ```
 
-#![forbid(unsafe_code)]
+// MVP-4-H L5 needed a downgrade from `forbid` to `deny`:
+// `secure_input/windows.rs` legitimately requires `unsafe { ... }`
+// to call CredUIPromptForCredentialsW (Win32 FFI). `forbid` cannot
+// be overridden by `allow` in a child scope, so we use `deny` here
+// and let that one file opt in via its own `#![allow(unsafe_code)]`
+// with a justifying comment. The workspace lint
+// (`unsafe_code = "deny"` in the root `Cargo.toml`) still applies;
+// this attribute mirrors it at the crate root for clarity. All
+// non-windows.rs code in this crate continues to use no unsafe
+// (audit invariant — there is exactly ONE `#![allow(unsafe_code)]`
+// instance in the desktop crate, in `secure_input/windows.rs`).
+// `secure_input/macos.rs` uses objc2's safe bindings and needs no
+// unsafe at all (each Apple API call there is `pub fn` in objc2-
+// app-kit 0.3.2). `secure_input/linux.rs` uses gtk-rs's safe
+// wrappers (no unsafe).
+#![deny(unsafe_code)]
 #![deny(unused_must_use)]
 
 pub mod commands;
 pub mod error;
 pub mod ipc;
+// MVP-4-H: native secure-input plugin. The module's submodules are
+// cfg-gated by target_os so each OS only compiles its own native widget
+// path; under `feature = "test-hooks"` + cfg(test) the stub is compiled
+// instead, supplying a test-injected password queue.
+//
+// Plan-LOCK: docs/issue-plans/mvp4-h-secure-input.md §3.
+pub mod secure_input;
 pub mod state;
 
 // MVP-4-F: feature-gated test-hook module + `__test__*` commands.
@@ -114,6 +136,11 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
     // without the duplication risk.
     builder.invoke_handler(tauri::generate_handler![
         commands::vault::vault_open,
+        // MVP-4-H L6 cleanup: legacy password-taking vault_unlock is
+        // available ONLY in test-hooks builds (kept for the wdio
+        // gate's existing AuthenticationFailed / Session error tests).
+        // Production uses vault_unlock_via_secure_prompt below.
+        #[cfg(feature = "test-hooks")]
         commands::vault::vault_unlock,
         commands::vault::vault_lock,
         commands::vault::vault_close,
@@ -129,14 +156,20 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         commands::pairing::pairing_decode_bytes,
         commands::pairing::pairing_local_payload,
         commands::pairing::pairing_derive_sas,
+        // MVP-4-H L6 cleanup: legacy password-taking pairing commands
+        // gated behind test-hooks (production uses *_via_secure_prompt).
+        #[cfg(feature = "test-hooks")]
         commands::pairing::pairing_open_and_join,
         commands::pairing::pairing_device_list,
+        #[cfg(feature = "test-hooks")]
         commands::pairing::pairing_chain_bootstrap,
+        #[cfg(feature = "test-hooks")]
         commands::pairing::pairing_add_device,
         // MVP-4-J: device removal + authorized-set / rotation.
         commands::pairing::pairing_list_authorized_devices,
         commands::pairing::pairing_remove_device,
         commands::pairing::pairing_pending_rotations,
+        #[cfg(feature = "test-hooks")]
         commands::pairing::pairing_complete_rotation,
         // MVP-4-K: manager handoff / promotion.
         commands::pairing::pairing_propose_promotion,
@@ -144,12 +177,16 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         commands::pairing::pairing_cancel_promotion,
         commands::pairing::pairing_pending_promotion,
         // MVP-4-L (L-D): recovery backup create + health panel.
+        // MVP-4-H L6 cleanup: legacy password-taking recovery commands
+        // gated behind test-hooks (production uses *_via_secure_prompt).
+        #[cfg(feature = "test-hooks")]
         commands::recovery::recovery_create_backup,
         commands::recovery::recovery_health,
         // MVP-4-L (L-A): guardian-onboarding wizard surface.
         commands::recovery::guardian_identity_export,
         commands::recovery::guardian_invite_decode_text,
         commands::recovery::recovery_onboard_guardians,
+        #[cfg(feature = "test-hooks")]
         commands::recovery::recovery_set_guardian_set,
         // MVP-4-L (L-C): guardian-side help wizard surface.
         commands::recovery::recovery_decode_request,
@@ -157,17 +194,37 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         commands::recovery::recovery_help_release,
         // MVP-4-L (L-B): recoverer wizard surface.
         commands::recovery::recovery_decode_backup,
+        #[cfg(feature = "test-hooks")]
         commands::recovery::recovery_initiate,
         commands::recovery::recovery_recipient_identity,
         commands::recovery::recovery_target_status,
         commands::recovery::recovery_ingest_share,
+        #[cfg(feature = "test-hooks")]
         commands::recovery::recovery_complete,
+        // MVP-4-H Layer 2: secure-prompt variants (V8 password residue
+        // closed). Land alongside the legacy commands during the
+        // L2 -> L3 transition; once Layer 3 ships the SecurePasswordButton
+        // an audit-cleanup commit gates the legacy commands behind
+        // `cfg(feature = "test-hooks")`. Plan-LOCK §3.
+        commands::secure_prompt::vault_unlock_via_secure_prompt,
+        commands::secure_prompt::pairing_open_and_join_via_secure_prompt,
+        commands::secure_prompt::pairing_chain_bootstrap_via_secure_prompt,
+        commands::secure_prompt::pairing_add_device_via_secure_prompt,
+        commands::secure_prompt::pairing_complete_rotation_via_secure_prompt,
+        commands::secure_prompt::recovery_create_backup_via_secure_prompt,
+        commands::secure_prompt::recovery_set_guardian_set_via_secure_prompt,
+        commands::secure_prompt::recovery_initiate_via_secure_prompt,
+        commands::secure_prompt::recovery_complete_via_secure_prompt,
         #[cfg(feature = "test-hooks")]
         test_hooks::__test__commands_invoked,
         #[cfg(feature = "test-hooks")]
         test_hooks::__test__clear_invocations,
         #[cfg(feature = "test-hooks")]
         test_hooks::__test__force_unlock,
+        #[cfg(all(feature = "test-hooks", feature = "secure-input-stub"))]
+        test_hooks::__test__secure_input_inject,
+        #[cfg(all(feature = "test-hooks", feature = "secure-input-stub"))]
+        test_hooks::__test__secure_input_clear,
     ])
 }
 

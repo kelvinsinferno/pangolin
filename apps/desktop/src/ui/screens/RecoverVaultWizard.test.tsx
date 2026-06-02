@@ -5,9 +5,9 @@ import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { RecoverVaultWizard } from './RecoverVaultWizard';
 import {
   recoveryDecodeBackup,
-  recoveryInitiate,
+  recoveryInitiateViaSecurePrompt,
   recoveryIngestShare,
-  recoveryComplete,
+  recoveryCompleteViaSecurePrompt,
   recoveryRecipientIdentity,
   recoveryTargetStatus,
   type BackupContents,
@@ -56,9 +56,12 @@ vi.mock('../lib/invoke', async (importOriginal) => {
       throw new Error('no persisted identity (fresh recovery)');
     }),
     recoveryTargetStatus: vi.fn(async () => fakeStatus()),
-    recoveryInitiate: vi.fn(async () => ({ txHash: 'aa'.repeat(32), blockNumber: 100 })),
+    recoveryInitiateViaSecurePrompt: vi.fn(async () => ({
+      txHash: 'aa'.repeat(32),
+      blockNumber: 100,
+    })),
     recoveryIngestShare: vi.fn(async () => ({ collectedCount: 1 })),
-    recoveryComplete: vi.fn(async () => ({ newEpoch: 6 })),
+    recoveryCompleteViaSecurePrompt: vi.fn(async () => ({ newEpoch: 6 })),
     copyToClipboard: vi.fn(async () => {}),
   };
 });
@@ -79,7 +82,7 @@ async function decodeBackup() {
   await screen.findByTestId('step-preview');
 }
 
-describe('RecoverVaultWizard (MVP-4-L L-B)', () => {
+describe('RecoverVaultWizard (MVP-4-L L-B + MVP-4-H L3 secure-prompt)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -125,9 +128,12 @@ describe('RecoverVaultWizard (MVP-4-L L-B)', () => {
     render(<RecoverVaultWizard onError={() => {}} onClose={() => {}} />);
     await advancePastWarn();
     await decodeBackup();
-    // preview → init-password
+    // preview → init-confirm
     fireEvent.click(screen.getByTestId('preview-continue'));
-    await screen.findByTestId('step-init-password');
+    await screen.findByTestId('step-init-confirm');
+
+    // No password input anymore — the native dialog collects it.
+    expect(screen.queryByTestId('init-password-input')).not.toBeInTheDocument();
 
     // mock recipient identity for the post-initiate read
     const { recoveryRecipientIdentity: mockId } =
@@ -136,14 +142,10 @@ describe('RecoverVaultWizard (MVP-4-L L-B)', () => {
       recipientPubkey: 'ee'.repeat(32),
       attemptNonce: 11,
     });
-    fireEvent.change(screen.getByTestId('init-password-input'), {
-      target: { value: 'master-pw' },
-    });
     fireEvent.click(screen.getByTestId('init-password-broadcast'));
 
     await screen.findByTestId('step-distribute');
-    expect(recoveryInitiate).toHaveBeenCalledWith(
-      'master-pw',
+    expect(recoveryInitiateViaSecurePrompt).toHaveBeenCalledWith(
       'aa'.repeat(32),
       'ab'.repeat(20),
       expect.any(Number),
@@ -174,16 +176,13 @@ describe('RecoverVaultWizard (MVP-4-L L-B)', () => {
     await advancePastWarn();
     await decodeBackup();
     fireEvent.click(screen.getByTestId('preview-continue'));
-    await screen.findByTestId('step-init-password');
+    await screen.findByTestId('step-init-confirm');
 
     const { recoveryRecipientIdentity: mockId } =
       await import('../lib/invoke');
     (mockId as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       recipientPubkey: 'ee'.repeat(32),
       attemptNonce: 11,
-    });
-    fireEvent.change(screen.getByTestId('init-password-input'), {
-      target: { value: 'pw' },
     });
     fireEvent.click(screen.getByTestId('init-password-broadcast'));
 
@@ -243,7 +242,7 @@ describe('RecoverVaultWizard (MVP-4-L L-B)', () => {
     });
 
     await screen.findByTestId('step-distribute');
-    expect(recoveryInitiate).not.toHaveBeenCalled();
+    expect(recoveryInitiateViaSecurePrompt).not.toHaveBeenCalled();
   });
 
   it('finalize is gated until status=Pending + approvals>=threshold + 24h delay met', async () => {
@@ -280,10 +279,10 @@ describe('RecoverVaultWizard (MVP-4-L L-B)', () => {
 
     const finalizeBtn = screen.getByTestId('collect-finalize') as HTMLButtonElement;
     expect(finalizeBtn.disabled).toBe(true);
-    expect(recoveryComplete).not.toHaveBeenCalled();
+    expect(recoveryCompleteViaSecurePrompt).not.toHaveBeenCalled();
   });
 
-  it('full happy-path: collect → finalize-password → done', async () => {
+  it('full happy-path: collect → finalize-confirm → done', async () => {
     // Finalize delay is 72h; pick > 72h ago so the time gate is met.
     const initiated = Math.floor(Date.now() / 1000) - 73 * 3600;
     (recoveryTargetStatus as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(
@@ -326,7 +325,6 @@ describe('RecoverVaultWizard (MVP-4-L L-B)', () => {
         target: { value: `SHARE-${i}` },
       });
       fireEvent.click(screen.getByTestId('share-ingest'));
-      // eslint-disable-next-line no-await-in-loop -- sequential to verify each ingest
       await waitFor(() => {
         expect(recoveryIngestShare).toHaveBeenCalledTimes(i + 1);
       });
@@ -337,18 +335,17 @@ describe('RecoverVaultWizard (MVP-4-L L-B)', () => {
       expect(btn.disabled).toBe(false);
     });
     fireEvent.click(screen.getByTestId('collect-finalize'));
-    await screen.findByTestId('step-finalize-password');
+    await screen.findByTestId('step-finalize-confirm');
 
-    fireEvent.change(screen.getByTestId('finalize-password-input'), {
-      target: { value: 'new-master-pw' },
-    });
+    // No password input anymore — the native dialog collects it.
+    expect(screen.queryByTestId('finalize-password-input')).not.toBeInTheDocument();
+
     fireEvent.click(screen.getByTestId('finalize-complete'));
     await screen.findByTestId('step-done');
-    expect(recoveryComplete).toHaveBeenCalledWith(
+    expect(recoveryCompleteViaSecurePrompt).toHaveBeenCalledWith(
       'aa'.repeat(32),
       'X',
       VALID_PHRASE_24.split(/\s+/),
-      'new-master-pw',
     );
   });
 });

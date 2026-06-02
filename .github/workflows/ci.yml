@@ -346,11 +346,18 @@ jobs:
   #
   # Plan-LOCK: docs/issue-plans/mvp4-f-desktop-e2e.md §3.5. Runs the
   # WebDriverIO + tauri-driver suite against a debug build of
-  # `pangolin-desktop --features test-hooks` under xvfb-run. The
-  # `test-hooks` feature enables the `__test__commands_invoked` Tauri
-  # command the scenario-5 spec reads to assert the H-1 invariant
-  # (the Rust-side clipboard path fired; plaintext never crossed V8).
-  # Linux only this slice — cross-OS matrix is deferred (plan §0a).
+  # `pangolin-desktop --features test-hooks,secure-input-stub` under
+  # xvfb-run. The `test-hooks` feature enables the
+  # `__test__commands_invoked` Tauri command the scenario-5 spec reads
+  # to assert the H-1 invariant (the Rust-side clipboard path fired;
+  # plaintext never crossed V8). The `secure-input-stub` feature
+  # (MVP-4-H Layer 5) swaps the per-OS native password widget for an
+  # in-process FIFO queue so the wdio specs can drive the unlock flow
+  # without spawning a real GTK dialog (CI's headless WebKit can't
+  # interact with native widgets). Linux only this slice — cross-OS
+  # matrix is deferred (plan §0a); MVP-4-H Layer 5 adds a parallel
+  # `secure-input-e2e-{linux,macos,windows}` matrix that builds
+  # WITHOUT `secure-input-stub` to validate the real per-OS widgets.
   desktop-e2e:
     name: desktop-e2e
     runs-on: ubuntu-latest
@@ -422,6 +429,129 @@ jobs:
         with:
           name: wdio-logs
           path: apps/desktop/e2e/wdio-logs/
+          retention-days: 7
+
+  # -----------------------------------------------------------------
+  # MVP-4-H Layer 5: secure-input OS-automation integration suite
+  # -----------------------------------------------------------------
+  #
+  # Plan-LOCK: docs/issue-plans/mvp4-h-secure-input.md sec 3 L5.
+  #
+  # Validates the REAL per-OS password widget produced by
+  # `apps/desktop/src/secure_input/{linux,macos,windows}.rs`. The
+  # desktop binary is built with `--features test-hooks,custom-protocol`
+  # but WITHOUT `secure-input-stub`, so the actual GtkDialog /
+  # NSAlert / CredUI dialog opens on each leg. Each spec drives the
+  # dialog via platform-specific automation (xdotool / osascript /
+  # PowerShell SendKeys), then observes the React DOM via wdio to
+  # confirm the FFI chain succeeded (accounts-list appears).
+  #
+  # Per plan §3 L5 bounded-flake-blast-radius: this matrix is INDEPENDENT
+  # of `desktop-e2e` (no needs:), so an OS-automation flake doesn't
+  # gate the main wdio gate. Each OS leg is keyed by `runs-on`; the
+  # wdio config (`wdio.secure-input.conf.ts`) selects exactly the
+  # matching spec via `process.platform`.
+  secure-input-e2e:
+    name: secure-input-e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [component-library]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # OS-specific Tauri build deps + the per-OS automation tool.
+      - name: "Linux apt deps + xdotool"
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev webkit2gtk-driver libgtk-3-dev libsoup-3.0-dev libxdo-dev \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev \
+            pkg-config xvfb xdotool wmctrl
+      - name: "macOS — osascript is preinstalled"
+        if: matrix.os == 'macos-latest'
+        run: |
+          # osascript ships with macOS; nothing to install. The System
+          # Events permission prompt is auto-granted on GitHub-hosted
+          # runners via the runner's default trust profile.
+          which osascript
+      # Windows: PowerShell + System.Windows.Forms (SendKeys) ship with
+      # the GitHub-hosted Windows runner image — no install step needed.
+      # The previous attempt to print versions failed because
+      # `shell: bash` interpolated `$PSVersionTable` to empty before
+      # PowerShell saw it (fixed by removing the diagnostic; the actual
+      # SendKeys invocation in the spec uses an explicit `powershell`
+      # call with a properly escaped command string).
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1"
+          cache-bin: "false"
+
+      - name: "Install tauri-driver"
+        run: cargo install --locked --version =2.0.6 tauri-driver
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: 'apps/desktop/.nvmrc'
+          cache: 'pnpm'
+          cache-dependency-path: 'apps/desktop/e2e/pnpm-lock.yaml'
+
+      - name: "Pre-build component-library (file: dep target)"
+        working-directory: apps/component-library
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - name: "Install desktop deps (frozen lockfile)"
+        working-directory: apps/desktop
+        run: pnpm install --frozen-lockfile
+      - name: "Vite build (frontend dist for the Tauri binary)"
+        working-directory: apps/desktop
+        run: pnpm build:ui
+      - name: "Install E2E pnpm deps"
+        working-directory: apps/desktop/e2e
+        run: pnpm install --frozen-lockfile
+
+      - name: "Run secure-input integration suite (Linux, under xvfb)"
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: apps/desktop/e2e
+        run: xvfb-run --auto-servernum pnpm e2e:secure-input
+      - name: "Run secure-input integration suite (Windows, native display)"
+        if: matrix.os == 'windows-latest'
+        working-directory: apps/desktop/e2e
+        run: pnpm e2e:secure-input
+      # macOS: tauri-driver v2.0.x does NOT support macOS (no WebDriver
+      # implementation for WKWebView yet — upstream emits "tauri-driver
+      # is not supported on this platform"). Run only the Rust
+      # compile step instead of the wdio integration. This still
+      # validates `secure_input/macos.rs` builds against the real
+      # Apple SDK + AppKit (objc2-app-kit bindings) and that the
+      # binary links — which is the gap the agent's WSL dev env
+      # cannot catch (aws-lc-sys's C build script requires Apple cc).
+      # When tauri-driver ships macOS support OR we adopt a non-
+      # WebDriver harness (e.g. AppleScript System Events against
+      # the Tauri WKWebView), restore this leg to the full
+      # `pnpm e2e:secure-input` path.
+      - name: "Compile-only on macOS (tauri-driver upstream gap)"
+        if: matrix.os == 'macos-latest'
+        run: |
+          cd apps/desktop/e2e
+          pnpm exec tsx setup/build-fixture-vault.ts
+          cargo build -p pangolin-desktop --features test-hooks,custom-protocol
+
+      - name: "Upload wdio logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wdio-logs-secure-input-${{ matrix.os }}
+          path: apps/desktop/e2e/wdio-logs-secure-input/
           retention-days: 7
 
   # -----------------------------------------------------------------
@@ -570,14 +700,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          # Pinned to match the version Kelvin runs locally (forge
-          # 1.0.0-stable). Floating `stable` kept trapping us on Foundry
-          # CLI changes (e.g. `--no-commit` removed in 1.7.x; new
-          # `unsafe-typecast` linter introduced in 1.7.x). The invariant
-          # is: CI uses the same forge as local dev. Bump in lockstep.
-          version: v1.0.0
+      # MVP-4-H CI hotfix (#196+ regression): foundry-rs/foundry-toolchain@v1
+      # started failing for v1.0.0 on GitHub-hosted Linux runners around
+      # 2026-06-01 — foundryup HEAD took the "found attestation" branch
+      # then errored when no attestation artifact exists for the v1.0.0
+      # release (only the tarball does). WSL repro takes the correct
+      # "no attestation found" branch; CI does not. We bypass foundryup
+      # entirely with a direct tarball install. SHA256-pinned to the
+      # release. See scripts/install-foundry.sh for the full RCA.
+      - name: "Install Foundry v1.0.0 (direct tarball; bypasses foundryup)"
+        run: bash "$GITHUB_WORKSPACE/scripts/install-foundry.sh"
       # forge-std is vendored at contracts/lib/forge-std (v1.16.1) so no
       # `forge install` step is needed here — the working-directory checkout
       # already contains it. See `.gitignore` exception line.
@@ -655,14 +787,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          # Pinned to match the version Kelvin runs locally (forge
-          # 1.0.0-stable). Floating `stable` kept trapping us on Foundry
-          # CLI changes (e.g. `--no-commit` removed in 1.7.x; new
-          # `unsafe-typecast` linter introduced in 1.7.x). The invariant
-          # is: CI uses the same forge as local dev. Bump in lockstep.
-          version: v1.0.0
+      # MVP-4-H CI hotfix (#196+): direct-tarball install. See
+      # scripts/install-foundry.sh for the foundryup-attestation RCA.
+      - name: "Install Foundry v1.0.0 (direct tarball; bypasses foundryup)"
+        run: bash "$GITHUB_WORKSPACE/scripts/install-foundry.sh"
       # forge-std is vendored at contracts/lib/forge-std (v1.16.1) so no
       # `forge install` step is needed here — the working-directory checkout
       # already contains it. See `.gitignore` exception line.
@@ -691,12 +819,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          # SAME pinned Foundry version as the contracts jobs (L4 /
-          # env-quirk #4): CI uses the same anvil/forge/cast as local
-          # dev. Bump in lockstep.
-          version: v1.0.0
+      # MVP-4-H CI hotfix (#196+): direct-tarball install. See
+      # scripts/install-foundry.sh for the foundryup-attestation RCA.
+      - name: "Install Foundry v1.0.0 (direct tarball; bypasses foundryup)"
+        run: bash "$GITHUB_WORKSPACE/scripts/install-foundry.sh"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -719,14 +845,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          # Pinned to match the version Kelvin runs locally (forge
-          # 1.0.0-stable). Floating `stable` kept trapping us on Foundry
-          # CLI changes (e.g. `--no-commit` removed in 1.7.x; new
-          # `unsafe-typecast` linter introduced in 1.7.x). The invariant
-          # is: CI uses the same forge as local dev. Bump in lockstep.
-          version: v1.0.0
+      # MVP-4-H CI hotfix (#196+): direct-tarball install. See
+      # scripts/install-foundry.sh for the foundryup-attestation RCA.
+      - name: "Install Foundry v1.0.0 (direct tarball; bypasses foundryup)"
+        run: bash "$GITHUB_WORKSPACE/scripts/install-foundry.sh"
       # forge-std is vendored at contracts/lib/forge-std (v1.16.1) so no
       # `forge install` step is needed here — the working-directory checkout
       # already contains it. See `.gitignore` exception line.
@@ -804,14 +926,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          # Pinned to match the version Kelvin runs locally (forge
-          # 1.0.0-stable). Floating `stable` kept trapping us on Foundry
-          # CLI changes (e.g. `--no-commit` removed in 1.7.x; new
-          # `unsafe-typecast` linter introduced in 1.7.x). The invariant
-          # is: CI uses the same forge as local dev. Bump in lockstep.
-          version: v1.0.0
+      # MVP-4-H CI hotfix (#196+): direct-tarball install. See
+      # scripts/install-foundry.sh for the foundryup-attestation RCA.
+      - name: "Install Foundry v1.0.0 (direct tarball; bypasses foundryup)"
+        run: bash "$GITHUB_WORKSPACE/scripts/install-foundry.sh"
       # forge-std is vendored at contracts/lib/forge-std (v1.16.1) so no
       # `forge install` step is needed here — the working-directory checkout
       # already contains it. See `.gitignore` exception line.

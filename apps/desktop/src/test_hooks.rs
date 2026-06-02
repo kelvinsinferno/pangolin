@@ -90,6 +90,48 @@ pub async fn __test__force_unlock(
     Ok(())
 }
 
+/// **MVP-4-H Layer 4: queue a password for the next secure-input call.**
+///
+/// Pushes `password` onto the [`crate::secure_input::stub`] queue so the
+/// next `*_via_secure_prompt` invocation pops it out instead of spawning
+/// the OS native dialog. The wdio harness calls this immediately BEFORE
+/// clicking the `SecurePasswordButton` for a flow it needs to drive.
+///
+/// **L1 (secret hygiene):** the `String` is consumed into bytes by
+/// [`crate::secure_input::stub::inject`] (`String::into_bytes()` is a
+/// move, not a copy); the original `String` drops at the end of this
+/// function body. The bytes live in the stub queue inside a `Vec<u8>`,
+/// which the [`crate::secure_input::stub::pop_one`] consumer wraps in
+/// `Zeroizing<Vec<u8>>` before returning. This matches the per-OS
+/// widget hygiene posture (Layer 1 invariant L1).
+///
+/// **Cfg:** gated on `feature = "secure-input-stub"` (in addition to
+/// the file-level `feature = "test-hooks"`) because the stub module
+/// itself only compiles in when the stub feature is on. Calling this
+/// in a build that has `test-hooks` but NOT `secure-input-stub` (the
+/// Layer-5 OS-automation integration build) would be a no-op anyway —
+/// the real per-OS widget is the input source, the stub queue is
+/// nonexistent.
+#[cfg(feature = "secure-input-stub")]
+#[allow(non_snake_case)]
+#[tauri::command]
+pub fn __test__secure_input_inject(password: String) {
+    crate::secure_input::stub::inject(password);
+}
+
+/// **MVP-4-H Layer 4: drain the secure-input stub queue.**
+///
+/// Called between wdio specs so a leaked previously-queued password
+/// doesn't bleed into the next test. Idempotent (clearing an empty
+/// queue is a no-op). Same `secure-input-stub` feature gate as the
+/// inject command above.
+#[cfg(feature = "secure-input-stub")]
+#[allow(non_snake_case)]
+#[tauri::command]
+pub fn __test__secure_input_clear() {
+    crate::secure_input::stub::clear();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { useEffect, useRef, useState } from 'react';
-import { Badge, Button, Card, Input, SeedPhraseGrid } from '@pangolin/component-library';
+import {
+  Badge,
+  Button,
+  Card,
+  SecurePasswordButton,
+  SeedPhraseGrid,
+  type SecureSubmitOutcome,
+} from '@pangolin/component-library';
 
 import {
   copyToClipboard,
   isDesktopError,
-  recoveryCreateBackup,
+  recoveryCreateBackupViaSecurePrompt,
   recoveryHealth,
   type Backup,
   type RecoveryHealth,
@@ -19,7 +26,7 @@ export interface RecoveryScreenProps {
   onError: (message: string) => void;
 }
 
-type Step = 'overview' | 'password' | 'show-backup';
+type Step = 'overview' | 'confirm' | 'show-backup';
 
 function errMessage(e: unknown): string {
   if (isDesktopError(e)) {
@@ -47,7 +54,6 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
   const [health, setHealth] = useState<RecoveryHealth | null>(null);
   const [healthLoaded, setHealthLoaded] = useState(false);
   const [healthAvailable, setHealthAvailable] = useState(true);
-  const [password, setPassword] = useState('');
   const [backup, setBackup] = useState<Backup | null>(null);
   const [showGuardiansWizard, setShowGuardiansWizard] = useState(false);
   const [showHelpRecoverWizard, setShowHelpRecoverWizard] = useState(false);
@@ -112,20 +118,21 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
   }, [healthRefreshTick]);
 
   const cancel = () => {
-    setPassword('');
     onClose();
   };
 
-  const createBackup = async () => {
-    if (guard.current) return;
+  const createBackup = async (): Promise<SecureSubmitOutcome> => {
+    if (guard.current) {
+      return { ok: false, message: 'already running' };
+    }
     guard.current = true;
     try {
-      const b = await recoveryCreateBackup(password);
-      setPassword('');
+      const b = await recoveryCreateBackupViaSecurePrompt();
       setBackup(b);
       setStep('show-backup');
+      return { ok: true };
     } catch (e) {
-      onError(errMessage(e));
+      return { ok: false, message: errMessage(e) };
     } finally {
       guard.current = false;
     }
@@ -270,31 +277,26 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
               you lose your devices and password; it is NOT a standalone key,
               and you must set up guardians (coming soon) for it to work.
             </p>
-            <Button onClick={() => setStep('password')} data-testid="backup-start">
+            <Button onClick={() => setStep('confirm')} data-testid="backup-start">
               Create recovery backup
             </Button>
           </div>
         )}
 
-        {step === 'password' && (
-          <div className="recovery-screen__section" data-testid="backup-password">
-            <p>Confirm your master password to create the backup.</p>
-            <Input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="Master password"
-              data-testid="backup-password-input"
-            />
+        {step === 'confirm' && (
+          <div className="recovery-screen__section" data-testid="backup-confirm">
+            <p>
+              Click below to create the backup. A native dialog will collect
+              your master password — it never enters this app&apos;s memory.
+            </p>
             <div className="recovery-screen__actions">
-              <Button
-                onClick={() => void createBackup()}
-                disabled={password === ''}
+              <SecurePasswordButton
+                label="Create backup"
+                onSubmit={createBackup}
+                onError={onError}
                 data-testid="backup-create"
-              >
-                Create backup
-              </Button>
-              <Button variant="ghost" onClick={() => { setPassword(''); setStep('overview'); }}>
+              />
+              <Button variant="ghost" onClick={() => setStep('overview')}>
                 Cancel
               </Button>
             </div>

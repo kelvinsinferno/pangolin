@@ -12,7 +12,7 @@
     "dev": "vite",
     "build": "vite build",
     "build:ui": "vite build",
-    "build:debug": "cargo build -p pangolin-desktop --features test-hooks",
+    "build:debug": "cargo build -p pangolin-desktop --features test-hooks,secure-input-stub",
     "typecheck": "tsc --noEmit",
     "lint": "eslint \"src/**/*.{ts,tsx}\"",
     "test": "vitest run",

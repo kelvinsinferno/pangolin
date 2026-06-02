@@ -19,4 +19,8 @@ pub mod account;
 pub mod install_native_host;
 pub mod pairing;
 pub mod recovery;
+// MVP-4-H Layer 2: `*_via_secure_prompt` Tauri commands that open a
+// native OS password dialog instead of accepting a `password: String`
+// arg. Plan-LOCK: docs/issue-plans/mvp4-h-secure-input.md §3.
+pub mod secure_prompt;
 pub mod vault;

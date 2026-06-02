@@ -1,4 +1,61 @@
 # Allowlist for forbidden-terms CI check (Design Spec §15.2).
-# Lines starting with # are comments. Add specific path globs (one per line)
-# where a forbidden term has a legitimate, justified use case.
-# Empty for now — will populate as legitimate exceptions arise.
+#
+# Lines starting with `#` are comments. Each non-empty, non-comment
+# line is treated as a `grep -E` (POSIX extended regex) pattern
+# applied against `/tmp/forbidden-hits.txt` lines (which are in
+# `path:line:content` format from `rg -n`). Any hit whose line
+# matches ANY allowlist pattern is filtered out before the
+# fail-on-empty check.
+#
+# Rules of thumb for adding entries:
+#   - Path-anchored regexes are easiest: `^apps/cli/` allows the
+#     entire CLI.
+#   - Internal Rust doc comments (// or //!) and code comments are
+#     NOT user-facing (Vite strips JS comments, rustdoc is
+#     developer-only) — allowlist by path.
+#   - Test files that VERIFY forbidden terms are rejected need to
+#     contain them — allowlist by path.
+#   - User-visible UI strings, error toasts, README/marketing copy
+#     are NOT allowlistable — rewrite to comply with §15.2.
+
+# ─── apps/cli/ is internal-only (pre-mainnet desktop is the user-
+# facing surface; CLI is the developer/operator surface that gets
+# replaced before mainnet). Error messages still need to mention
+# "blockchain"/"gas"/"revisions" because they describe RPC and
+# Foundry-wallet behavior to the operator.
+#
+# Narrowed to .rs + .toml suffixes (the only file types in apps/cli/
+# today — Rust sources, integration tests, and the Cargo manifest).
+# This way a future user-facing asset added under apps/cli/
+# (HTML/CSS/Markdown user-docs/JSON config bundled with a packaged
+# CLI) would NOT be silently allowlisted — that PR would have to
+# explicitly broaden this entry, forcing a human decision.
+^apps/cli/[^:]*\.(rs|toml):
+
+# ─── apps/desktop/src/commands/pairing.rs: Rust `///` doc comment
+# describing the `DesktopError::Chain` variant ("insufficient-gas").
+# Rustdoc is developer-facing, not user-visible.
+^apps/desktop/src/commands/pairing\.rs:
+
+# ─── apps/desktop/src/ui/screens/HelpRecoverWizard.tsx: JS comments
+# explaining gas-estimation race condition (audit LOW-1 fix). The
+# Vite production bundle strips all `//` and `/* */` comments so
+# these never reach the rendered UI.
+^apps/desktop/src/ui/screens/HelpRecoverWizard\.tsx:
+
+# ─── apps/desktop/src/ui/screens/SetupGuardiansWizard.tsx: JS
+# comments describing the gas-estimate revert keyword sniffing
+# (audit LOW-2 fix). Same Vite stripping as above.
+^apps/desktop/src/ui/screens/SetupGuardiansWizard\.tsx:
+
+# ─── Vitest test files for the above wizards — they assert against
+# realistic Foundry error messages that contain "estimate-gas".
+^apps/desktop/src/ui/screens/HelpRecoverWizard\.test\.tsx:
+^apps/desktop/src/ui/screens/SetupGuardiansWizard\.test\.tsx:
+
+# ─── Project README is developer/contributor-facing (GitHub +
+# crates.io / docs.rs landing). The Design Spec §15.2 rule is
+# about end-user UI surfaces (the desktop app, extension popup,
+# Tauri toast text). Listed explicitly so a future audit can
+# revisit if user-vs-developer scope shifts.
+^README\.md:

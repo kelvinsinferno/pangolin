@@ -16,7 +16,6 @@ import {
   vaultClose,
   vaultLock,
   vaultOpen,
-  vaultUnlock,
 } from './invoke';
 
 beforeEach(() => {
@@ -29,12 +28,6 @@ describe('typed invoke wrappers', () => {
     await vaultOpen('/path/to/vault.pvf');
     expect(invokeMock).toHaveBeenCalledTimes(1);
     expect(invokeMock).toHaveBeenCalledWith('vault_open', { path: '/path/to/vault.pvf' });
-  });
-
-  test('vaultUnlock passes the password argument', async () => {
-    invokeMock.mockResolvedValue(undefined);
-    await vaultUnlock('hunter2');
-    expect(invokeMock).toHaveBeenCalledWith('vault_unlock', { password: 'hunter2' });
   });
 
   test('vaultLock dispatches with the right command name', async () => {
@@ -121,7 +114,7 @@ describe('typed invoke wrappers', () => {
 
   test('invoke rejection surfaces the DesktopError envelope as a thrown value', async () => {
     invokeMock.mockRejectedValue({ kind: 'AuthenticationFailed' });
-    await expect(vaultUnlock('wrong')).rejects.toEqual({ kind: 'AuthenticationFailed' });
+    await expect(vaultOpen('/wrong/path')).rejects.toEqual({ kind: 'AuthenticationFailed' });
   });
 });
 

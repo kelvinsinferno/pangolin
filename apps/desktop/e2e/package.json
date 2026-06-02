@@ -10,11 +10,12 @@
   },
   "scripts": {
     "build:fixture": "tsx setup/build-fixture-vault.ts",
-    "build:desktop": "cargo build -p pangolin-desktop --features test-hooks,custom-protocol",
+    "build:desktop": "cargo build -p pangolin-desktop --features test-hooks,secure-input-stub,custom-protocol",
     "wdio": "wdio run wdio.conf.ts",
-    "e2e": "tsx setup/build-fixture-vault.ts && cargo build -p pangolin-desktop --features test-hooks,custom-protocol && wdio run wdio.conf.ts",
+    "e2e": "tsx setup/build-fixture-vault.ts && cargo build -p pangolin-desktop --features test-hooks,secure-input-stub,custom-protocol && wdio run wdio.conf.ts",
+    "e2e:secure-input": "tsx setup/build-fixture-vault.ts && cargo build -p pangolin-desktop --features test-hooks,custom-protocol && wdio run wdio.secure-input.conf.ts",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint \"specs/**/*.ts\" \"setup/**/*.ts\" \"wdio.conf.ts\""
+    "lint": "eslint ."
   },
   "devDependencies": {
     "@types/chai": "=5.0.1",

@@ -27,7 +27,7 @@ import {
   vaultClose,
   vaultLock,
   vaultOpen,
-  vaultUnlock,
+  vaultUnlockViaSecurePrompt,
   type AccountSummary,
   type DesktopError,
 } from '../lib/invoke';
@@ -58,7 +58,7 @@ export type UnlockResult =
 
 export interface VaultActions {
   openVault(path: string): Promise<{ ok: true } | { ok: false; error: DesktopError }>;
-  unlockVault(password: string): Promise<UnlockResult>;
+  unlockVault(): Promise<UnlockResult>;
   lockVault(): Promise<{ ok: true } | { ok: false; error: DesktopError }>;
   closeVault(): Promise<void>;
   listAccounts(): Promise<{ ok: true } | { ok: false; error: DesktopError }>;
@@ -97,9 +97,11 @@ export function useVault(): { state: VaultState; actions: VaultActions } {
     }
   }, []);
 
-  const unlockVault = useCallback(async (password: string): Promise<UnlockResult> => {
+  const unlockVault = useCallback(async (): Promise<UnlockResult> => {
     try {
-      await vaultUnlock(password);
+      // MVP-4-H L3: the password flows directly from the OS native
+      // widget into Rust; no JS-side password string.
+      await vaultUnlockViaSecurePrompt();
       const list = await accountsList();
       setState((prev) => ({ ...prev, stage: 'active', accounts: list }));
       return { ok: true };

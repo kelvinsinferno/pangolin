@@ -4,7 +4,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 
 import { JoinVaultWizard } from './JoinVaultWizard';
 import { bytesToBase64 } from '../lib/base64';
-import { pairingOpenAndJoin } from '../lib/invoke';
+import { pairingOpenAndJoinViaSecurePrompt } from '../lib/invoke';
 
 vi.mock('../lib/invoke', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/invoke')>();
@@ -20,7 +20,7 @@ vi.mock('../lib/invoke', async (importOriginal) => {
     pairingBeginNewDevice: vi.fn(async () => payload([5, 5, 5])),
     pairingDecodeBytes: vi.fn(async (b: number[]) => payload(b)),
     pairingDeriveSas: vi.fn(async () => '472913'),
-    pairingOpenAndJoin: vi.fn(async () => {}),
+    pairingOpenAndJoinViaSecurePrompt: vi.fn(async () => {}),
     copyToClipboard: vi.fn(async () => {}),
   };
 });
@@ -34,7 +34,7 @@ async function advanceToSas() {
   fireEvent.click(screen.getByTestId('code-ingest-submit'));
 }
 
-describe('JoinVaultWizard (B-side SAS gate)', () => {
+describe('JoinVaultWizard (B-side SAS gate + MVP-4-H L3 secure-prompt)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     Object.defineProperty(globalThis.navigator, 'mediaDevices', {
@@ -51,7 +51,7 @@ describe('JoinVaultWizard (B-side SAS gate)', () => {
     expect(await screen.findByTestId('code-display-text')).toBeInTheDocument();
   });
 
-  it('does NOT open-and-join until the SAS is confirmed + envelope + password', async () => {
+  it('does NOT open-and-join until SAS is confirmed + envelope ingested + secure-prompt clicked', async () => {
     const onJoined = vi.fn(async () => {});
     render(
       <JoinVaultWizard onError={() => {}} onClose={() => {}} onJoined={onJoined} />,
@@ -59,31 +59,32 @@ describe('JoinVaultWizard (B-side SAS gate)', () => {
     await advanceToSas();
     // SAS shown; open-and-join not yet called.
     expect(await screen.findByTestId('wizard-sas')).toHaveTextContent('472913');
-    expect(pairingOpenAndJoin).not.toHaveBeenCalled();
+    expect(pairingOpenAndJoinViaSecurePrompt).not.toHaveBeenCalled();
 
     // Confirm SAS → envelope ingest.
     fireEvent.click(screen.getByTestId('wizard-sas-confirm'));
     const envIngest = await screen.findByTestId('code-ingest-input');
     fireEvent.change(envIngest, { target: { value: bytesToBase64([1, 2, 3, 4]) } });
     fireEvent.click(screen.getByTestId('code-ingest-submit'));
-    // Still not called — the password step gates it.
-    await screen.findByTestId('step-password');
-    expect(pairingOpenAndJoin).not.toHaveBeenCalled();
+    // Still not called — the finish step gates it.
+    await screen.findByTestId('step-finish');
+    expect(pairingOpenAndJoinViaSecurePrompt).not.toHaveBeenCalled();
 
-    // Set password → finish.
-    fireEvent.change(screen.getByTestId('wizard-new-password'), {
-      target: { value: 'fresh-pw' },
-    });
+    // Click the SecurePasswordButton → secure-prompt fires.
     fireEvent.click(screen.getByTestId('wizard-join-finish'));
     await waitFor(() => {
-      expect(pairingOpenAndJoin).toHaveBeenCalledTimes(1);
+      expect(pairingOpenAndJoinViaSecurePrompt).toHaveBeenCalledTimes(1);
     });
-    expect(pairingOpenAndJoin).toHaveBeenCalledWith(
-      expect.objectContaining({ vaultId: 'aa'.repeat(32), epoch: 0, newPassword: 'fresh-pw' }),
+    expect(pairingOpenAndJoinViaSecurePrompt).toHaveBeenCalledWith(
+      [1, 2, 3, 4],
+      'aa'.repeat(32),
+      0,
     );
     await waitFor(() => {
-      expect(onJoined).toHaveBeenCalledWith('fresh-pw');
+      expect(onJoined).toHaveBeenCalledTimes(1);
     });
+    // onJoined no longer receives a password arg.
+    expect(onJoined).toHaveBeenCalledWith();
   });
 
   it('rejecting the SAS cancels without joining', async () => {
@@ -94,6 +95,20 @@ describe('JoinVaultWizard (B-side SAS gate)', () => {
     await advanceToSas();
     fireEvent.click(await screen.findByTestId('wizard-sas-reject'));
     expect(onClose).toHaveBeenCalledTimes(1);
-    expect(pairingOpenAndJoin).not.toHaveBeenCalled();
+    expect(pairingOpenAndJoinViaSecurePrompt).not.toHaveBeenCalled();
+  });
+
+  it('there is NO password input — the native dialog collects it', async () => {
+    render(
+      <JoinVaultWizard onError={() => {}} onClose={() => {}} onJoined={async () => {}} />,
+    );
+    await advanceToSas();
+    fireEvent.click(await screen.findByTestId('wizard-sas-confirm'));
+    const envIngest = await screen.findByTestId('code-ingest-input');
+    fireEvent.change(envIngest, { target: { value: bytesToBase64([1, 2, 3, 4]) } });
+    fireEvent.click(screen.getByTestId('code-ingest-submit'));
+    await screen.findByTestId('step-finish');
+    // Legacy 'wizard-new-password' input testid must be GONE.
+    expect(screen.queryByTestId('wizard-new-password')).not.toBeInTheDocument();
   });
 });

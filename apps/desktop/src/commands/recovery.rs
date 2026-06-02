@@ -49,6 +49,10 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+// MVP-4-H L6 cleanup: only the legacy password-taking commands
+// (gated behind `test-hooks`) use `SecretPassword` directly; the
+// secure-prompt variants live in `commands::secure_prompt`.
+#[cfg(feature = "test-hooks")]
 use pangolin_ffi::SecretPassword;
 
 use crate::commands::pairing::chain_config;
@@ -111,6 +115,11 @@ pub struct RecoveryHealthDto {
 /// # Errors
 /// `DesktopError::Session` (locked) / `DesktopError::Validation` (no
 /// recovery escrow onboarded yet — set up guardians first).
+///
+/// **MVP-4-H L6 cleanup:** gated behind `feature = "test-hooks"`;
+/// production callsite is
+/// `crate::commands::secure_prompt::recovery_create_backup_via_secure_prompt`.
+#[cfg(feature = "test-hooks")]
 #[tauri::command]
 pub async fn recovery_create_backup(
     password: String,
@@ -229,7 +238,7 @@ impl From<pangolin_ffi::FfiTxOutcome> for TxOutcomeDto {
 /// Hex → byte helper for the wizard's invite pubkeys / EVM addresses.
 /// Strict-length, lowercase-tolerant; rejects odd lengths + non-hex bytes
 /// with a typed `Validation` error.
-fn bytes_from_hex(
+pub(crate) fn bytes_from_hex(
     hex: &str,
     label: &'static str,
     expected_len: usize,
@@ -393,6 +402,11 @@ pub async fn recovery_onboard_guardians(
 /// # Errors
 /// `DesktopError::Session` (locked) / `DesktopError::Validation` (bad
 /// address length) / `DesktopError::Chain` (RPC / revert / receipt).
+///
+/// **MVP-4-H L6 cleanup:** gated behind `feature = "test-hooks"`;
+/// production callsite is
+/// `crate::commands::secure_prompt::recovery_set_guardian_set_via_secure_prompt`.
+#[cfg(feature = "test-hooks")]
 #[tauri::command]
 pub async fn recovery_set_guardian_set(
     password: String,
@@ -858,6 +872,11 @@ pub async fn recovery_decode_backup(
 /// # Errors
 /// `DesktopError::Session` (locked) / `DesktopError::Validation` (bad
 /// arg lengths) / `DesktopError::Chain` (RPC / revert).
+///
+/// **MVP-4-H L6 cleanup:** gated behind `feature = "test-hooks"`;
+/// production callsite is
+/// `crate::commands::secure_prompt::recovery_initiate_via_secure_prompt`.
+#[cfg(feature = "test-hooks")]
 #[tauri::command]
 pub async fn recovery_initiate(
     password: String,
@@ -1015,6 +1034,11 @@ pub async fn recovery_ingest_share(
 /// reconstruction) / `DesktopError::Chain` (RPC / contract revert —
 /// e.g. `ErrDelayNotElapsed`, `ErrThresholdNotMet`) /
 /// `DesktopError::Store` (commit-rekey failure).
+///
+/// **MVP-4-H L6 cleanup:** gated behind `feature = "test-hooks"`;
+/// production callsite is
+/// `crate::commands::secure_prompt::recovery_complete_via_secure_prompt`.
+#[cfg(feature = "test-hooks")]
 #[tauri::command]
 pub async fn recovery_complete(
     target_vault_id: String,

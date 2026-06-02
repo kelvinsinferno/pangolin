@@ -4,7 +4,13 @@ import tsPlugin from '@typescript-eslint/eslint-plugin';
 
 export default [
   {
-    files: ['specs/**/*.ts', 'setup/**/*.ts', 'wdio.conf.ts'],
+    files: [
+      'specs/**/*.ts',
+      'specs-secure-input/**/*.ts',
+      'setup/**/*.ts',
+      'wdio.conf.ts',
+      'wdio.secure-input.conf.ts',
+    ],
     languageOptions: {
       parser: tsParser,
       parserOptions: {
@@ -48,6 +54,6 @@ export default [
     },
   },
   {
-    ignores: ['node_modules/**', 'wdio-logs/**'],
+    ignores: ['node_modules/**', 'wdio-logs/**', 'wdio-logs-secure-input/**'],
   },
 ];

@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { useRef, useState } from 'react';
-import { Button, Card, Code, Input, Spinner } from '@pangolin/component-library';
+import {
+  Button,
+  Card,
+  Code,
+  Spinner,
+  SecurePasswordButton,
+  type SecureSubmitOutcome,
+} from '@pangolin/component-library';
 
 import { CodeDisplay } from '../components/CodeDisplay';
 import { CodeIngest } from '../components/CodeIngest';
 import {
   isDesktopError,
-  pairingAddDevice,
-  pairingChainBootstrap,
+  pairingAddDeviceViaSecurePrompt,
+  pairingChainBootstrapViaSecurePrompt,
   pairingDeriveSas,
   pairingDecodeBytes,
   pairingLocalPayload,
@@ -22,14 +29,7 @@ export interface AddDeviceWizardProps {
   onClose: () => void;
 }
 
-type Step =
-  | 'password'
-  | 'bootstrap'
-  | 'ingest'
-  | 'share'
-  | 'sas'
-  | 'publishing'
-  | 'envelope';
+type Step = 'bootstrap' | 'ingest' | 'share' | 'sas' | 'publishing' | 'envelope';
 
 function errMessage(e: unknown): string {
   if (isDesktopError(e)) {
@@ -39,46 +39,49 @@ function errMessage(e: unknown): string {
 }
 
 /**
- * Manager-side "Add a device" wizard (MVP-4-I). Drives the device-add
- * handshake: collect the master password → optionally bootstrap on-chain
- * → ingest device B's payload → show this device's mirror payload + the
+ * Manager-side "Add a device" wizard (MVP-4-I, **MVP-4-H L3 migrated**).
+ *
+ * Drives the device-add handshake: optionally bootstrap on-chain →
+ * ingest device B's payload → show this device's mirror payload + the
  * SAS → (human confirms the codes match — L2) → publish `addDevice` →
  * show the sealed envelope for B to finish.
+ *
+ * **MVP-4-H L3 migration:** the master password is collected by the OS
+ * native widget at both the bootstrap step AND the SAS-confirm step.
+ * The user re-types twice — accepted trade-off (the alternative would
+ * be a combined `bootstrap_and_add` Tauri command which adds engine
+ * complexity for a minor UX win).
  */
 export function AddDeviceWizard({ onError, onClose }: AddDeviceWizardProps) {
-  const [step, setStep] = useState<Step>('password');
-  const [password, setPassword] = useState('');
+  // Step now starts at 'bootstrap'; the legacy 'password' step is gone
+  // because no React state needs to hold the password.
+  const [step, setStep] = useState<Step>('bootstrap');
   const [theirBytes, setTheirBytes] = useState<number[] | null>(null);
   const [myPayload, setMyPayload] = useState<PairingPayload | null>(null);
   const [sas, setSas] = useState<string | null>(null);
   const [envelope, setEnvelope] = useState<SealedEnvelope | null>(null);
-  const [busy, setBusy] = useState(false);
-  // Re-entry guard: a second click before the 'publishing' re-render must
-  // never fire a second on-chain addDevice (defense-in-depth on top of the
-  // contract's deviceNonce, which would already revert a duplicate).
+  // Re-entry guard: a second click before the 'publishing' re-render
+  // must never fire a second on-chain addDevice (defense-in-depth on
+  // top of the contract's deviceNonce, which would already revert a
+  // duplicate).
   const publishGuard = useRef(false);
 
-  const cancel = () => {
-    setPassword('');
-    onClose();
-  };
+  const cancel = () => onClose();
 
-  const runBootstrap = async () => {
-    setBusy(true);
+  const runBootstrap = async (): Promise<SecureSubmitOutcome> => {
     try {
-      await pairingChainBootstrap(password);
+      await pairingChainBootstrapViaSecurePrompt();
       setStep('ingest');
+      return { ok: true };
     } catch (e) {
-      // A second bootstrap reverts VaultAlreadyBootstrapped — treat any
-      // "already" chain error as "already set up, proceed".
+      // A second bootstrap reverts VaultAlreadyBootstrapped — treat
+      // any "already" chain error as "already set up, proceed".
       const msg = errMessage(e).toLowerCase();
       if (msg.includes('alreadybootstrapped') || msg.includes('already bootstrapped')) {
         setStep('ingest');
-      } else {
-        onError(errMessage(e));
+        return { ok: true };
       }
-    } finally {
-      setBusy(false);
+      return { ok: false, message: errMessage(e) };
     }
   };
 
@@ -97,18 +100,21 @@ export function AddDeviceWizard({ onError, onClose }: AddDeviceWizardProps) {
   // Publish addDevice once the human has confirmed the SAS matches.
   // Driven directly from the confirm click (NOT an effect) so a parent
   // re-render can never re-fire the on-chain transaction.
-  const confirmAndPublish = async () => {
-    if (theirBytes === null || publishGuard.current) return;
+  const confirmAndPublish = async (): Promise<SecureSubmitOutcome> => {
+    if (theirBytes === null || publishGuard.current) {
+      return { ok: false, message: 'already publishing' };
+    }
     publishGuard.current = true;
     setStep('publishing');
     try {
-      const env = await pairingAddDevice(theirBytes, password);
+      const env = await pairingAddDeviceViaSecurePrompt(theirBytes);
       setEnvelope(env);
       setStep('envelope');
+      return { ok: true };
     } catch (e) {
-      onError(errMessage(e));
       publishGuard.current = false;
       setStep('sas');
+      return { ok: false, message: errMessage(e) };
     }
   };
 
@@ -121,26 +127,6 @@ export function AddDeviceWizard({ onError, onClose }: AddDeviceWizardProps) {
         </Button>
       </header>
 
-      {step === 'password' && (
-        <div className="devices-wizard__step" data-testid="step-password">
-          <p>Confirm your master password to authorize a new device.</p>
-          <Input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="Master password"
-            data-testid="wizard-password"
-          />
-          <Button
-            onClick={() => setStep('bootstrap')}
-            disabled={password === ''}
-            data-testid="wizard-password-next"
-          >
-            Next
-          </Button>
-        </div>
-      )}
-
       {step === 'bootstrap' && (
         <div className="devices-wizard__step" data-testid="step-bootstrap">
           <p>
@@ -148,22 +134,21 @@ export function AddDeviceWizard({ onError, onClose }: AddDeviceWizardProps) {
             on-chain first (a one-time Base Sepolia transaction). If you have
             already done this, skip.
           </p>
-          {busy ? (
-            <Spinner />
-          ) : (
-            <div className="devices-wizard__actions">
-              <Button onClick={() => void runBootstrap()} data-testid="wizard-bootstrap">
-                Initialize on-chain
-              </Button>
-              <Button
-                variant="ghost"
-                onClick={() => setStep('ingest')}
-                data-testid="wizard-bootstrap-skip"
-              >
-                Skip — already initialized
-              </Button>
-            </div>
-          )}
+          <div className="devices-wizard__actions">
+            <SecurePasswordButton
+              label="Initialize on-chain"
+              onSubmit={runBootstrap}
+              onError={onError}
+              data-testid="wizard-bootstrap"
+            />
+            <Button
+              variant="ghost"
+              onClick={() => setStep('ingest')}
+              data-testid="wizard-bootstrap-skip"
+            >
+              Skip — already initialized
+            </Button>
+          </div>
         </div>
       )}
 
@@ -198,12 +183,12 @@ export function AddDeviceWizard({ onError, onClose }: AddDeviceWizardProps) {
             {sas}
           </Code>
           <div className="devices-wizard__actions">
-            <Button
-              onClick={() => void confirmAndPublish()}
+            <SecurePasswordButton
+              label="The codes match — authorize"
+              onSubmit={confirmAndPublish}
+              onError={onError}
               data-testid="wizard-sas-confirm"
-            >
-              The codes match — authorize
-            </Button>
+            />
             <Button variant="ghost" onClick={cancel} data-testid="wizard-sas-reject">
               They don&apos;t match — cancel
             </Button>
