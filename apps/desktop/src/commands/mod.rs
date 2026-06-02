@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod account;
+pub mod beta_warning;
 pub mod install_native_host;
 pub mod pairing;
 pub mod recovery;

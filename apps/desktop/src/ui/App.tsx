@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { Toast } from '@pangolin/component-library';
 
+import { BetaChip } from './components/BetaChip';
+import { BetaWarningModal } from './components/BetaWarningModal';
+import { ExtensionBanner } from './components/ExtensionBanner';
 import { useToast } from './hooks/useToast';
 import { useVault, type UnlockResult } from './hooks/useVault';
 import { AccountDetailScreen } from './screens/AccountDetailScreen';
 import { AccountListScreen } from './screens/AccountListScreen';
 import { DevicesScreen } from './screens/DevicesScreen';
 import { RecoveryScreen } from './screens/RecoveryScreen';
+import { SettingsScreen } from './screens/SettingsScreen';
 import { UnlockScreen } from './screens/UnlockScreen';
 import { WelcomeScreen } from './screens/WelcomeScreen';
 import type { DesktopError } from './lib/invoke';
@@ -68,6 +72,16 @@ export function App() {
 
   return (
     <div className="app">
+      {/* MVP-4-M L4: persistent "BETA · TESTNET" chip + one-shot
+          first-launch / version-bump warning modal. Chip shows on every
+          launch regardless of dismissal state; modal fires once per
+          fresh version and persists dismissal in app_data_dir(). */}
+      <BetaChip fixed />
+      <BetaWarningModal onError={(msg) => toastActions.danger(msg)} />
+      {/* MVP-4-M L3: soft "connect browser extension?" banner shown
+          ONCE per session when no native-host manifest is installed.
+          Non-blocking; user can dismiss to "Maybe later". */}
+      {state.stage === 'active' && <ExtensionBanner onConfigure={actions.goToSettings} />}
       {state.stage === 'welcome' && <WelcomeScreen onOpen={onOpen} />}
       {state.stage === 'locked' && (
         <UnlockScreen onUnlock={onUnlock} onClose={actions.closeVault} />
@@ -82,10 +96,17 @@ export function App() {
           }}
           onDevices={actions.goToDevices}
           onRecovery={actions.goToRecovery}
+          onSettings={actions.goToSettings}
         />
       )}
       {state.stage === 'recovery' && (
         <RecoveryScreen
+          onClose={actions.backToList}
+          onError={(msg) => toastActions.danger(msg)}
+        />
+      )}
+      {state.stage === 'settings' && (
+        <SettingsScreen
           onClose={actions.backToList}
           onError={(msg) => toastActions.danger(msg)}
         />

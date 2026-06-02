@@ -151,6 +151,11 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         commands::account::copy_to_clipboard,
         commands::install_native_host::install_native_host,
         commands::install_native_host::uninstall_native_host,
+        // MVP-4-M L3: native-host install status reader.
+        commands::install_native_host::native_host_status,
+        // MVP-4-M L4: closed-beta first-launch warning persistence.
+        commands::beta_warning::beta_warning_state,
+        commands::beta_warning::beta_warning_dismiss,
         // MVP-4-I: multi-device pairing (add-device) command surface.
         commands::pairing::pairing_begin_new_device,
         commands::pairing::pairing_decode_bytes,

@@ -39,7 +39,7 @@ use base64::Engine;
 use zeroize::Zeroize;
 
 use pangolin_native_messaging_host::manifest::{
-    install_manifests, uninstall_manifests, InstallOutcome, PLACEHOLDER_EXTENSION_ID,
+    install_manifests, uninstall_manifests, InstallOutcome,
 };
 use pangolin_native_messaging_host::paths::{token_file_path, KEYRING_ACCOUNT, KEYRING_SERVICE};
 
@@ -219,16 +219,120 @@ fn overwrite_with_zeros(path: &Path) -> Result<(), std::io::Error> {
     std::fs::write(path, zeros)
 }
 
+/// MVP-4-M L3: validate a Chromium extension ID. Chrome assigns 32-
+/// character identifiers drawn from `a-p` (a base-16 encoding of the
+/// hashed public key, mapped to lowercase letters to avoid case-
+/// sensitivity collisions on the URL).
+///
+/// Returns `Err(DesktopError::Validation { kind, message })` on
+/// malformed input so the React UI can surface a useful inline error
+/// instead of writing a manifest that Chrome will silently reject.
+fn validate_extension_id(id: &str) -> Result<(), DesktopError> {
+    if id.len() != 32 {
+        return Err(DesktopError::Validation {
+            kind: "extension_id_length".to_string(),
+            message: format!(
+                "extension ID must be exactly 32 characters (got {})",
+                id.len()
+            ),
+        });
+    }
+    if !id.chars().all(|c| c.is_ascii_lowercase() && c <= 'p') {
+        return Err(DesktopError::Validation {
+            kind: "extension_id_alphabet".to_string(),
+            message:
+                "extension ID must contain only lowercase letters a through p (per Chrome's hash-to-a-p encoding)"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Per-browser manifest presence. Returned by [`native_host_status`]
+/// so the React Settings panel can show a checklist of which
+/// Chromium-family browsers currently have the manifest written.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeHostBrowserState {
+    pub browser: String,
+    pub manifest_path: String,
+    pub present: bool,
+}
+
+/// Aggregate native-host install status. Returned to the React UI.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeHostStatus {
+    /// True when at least one browser has the manifest written. The
+    /// first-launch banner reads this to decide whether to surface
+    /// itself.
+    pub connected: bool,
+    /// Per-browser detail. Empty on Windows (the registry-based install
+    /// path is gated behind a separate MVP).
+    pub browsers: Vec<NativeHostBrowserState>,
+}
+
+/// `#[tauri::command]` — return whether the native-messaging manifest
+/// is currently installed in any Chromium-family browser. Used by the
+/// first-launch banner (`ExtensionBanner`) and the Settings panel
+/// (`BrowserConnectionPanel`) to decide what to show.
+///
+/// Under `--features test-hooks`, the env var
+/// `PANGOLIN_TEST_SKIP_EXTENSION_BANNER=1` short-circuits this command
+/// to return `connected: true` with an empty browsers list — the
+/// desktop-e2e suite sets it so the first-launch banner doesn't
+/// interfere with the existing scenarios. Same posture as the
+/// `beta_warning_state` skip env var — test-hooks gated so release
+/// binaries cannot hide the banner via env var.
+#[tauri::command]
+pub async fn native_host_status() -> Result<NativeHostStatus, DesktopError> {
+    #[cfg(feature = "test-hooks")]
+    {
+        if std::env::var("PANGOLIN_TEST_SKIP_EXTENSION_BANNER").as_deref() == Ok("1") {
+            return Ok(NativeHostStatus {
+                connected: true,
+                browsers: vec![],
+            });
+        }
+    }
+    let paths = pangolin_native_messaging_host::paths::browser_manifest_paths(None);
+    let browsers: Vec<NativeHostBrowserState> = paths
+        .into_iter()
+        .map(|(browser, path)| {
+            let present = path.exists();
+            NativeHostBrowserState {
+                browser: browser.to_string(),
+                manifest_path: path.display().to_string(),
+                present,
+            }
+        })
+        .collect();
+    let connected = browsers.iter().any(|b| b.present);
+    Ok(NativeHostStatus {
+        connected,
+        browsers,
+    })
+}
+
 /// `#[tauri::command]` wrapper for the install path.
 ///
-/// The React UI's first-run wizard (MVP-4-G) calls this. The current
-/// implementation passes the [`PLACEHOLDER_EXTENSION_ID`]; once the
-/// extension is loaded in MVP-4-G, the wizard will prompt the user
-/// for the real ID and forward it through this command.
+/// The React UI's `BrowserConnectionPanel` (MVP-4-M L3) calls this
+/// with the user-pasted extension ID and an explicit native-host
+/// binary path. Per plan-LOCK Q-d LOCKED: no baked-in extension ID;
+/// the user pastes from `chrome://extensions` after they've loaded
+/// the extension zip from the same Release.
+///
+/// Empty / placeholder strings are intentionally rejected — passing
+/// `""` for `extension_id` makes Chrome refuse to spawn the host with
+/// a confusing error; failing loud here is friendlier.
 #[tauri::command]
-pub async fn install_native_host(binary_path: String) -> Result<(), DesktopError> {
+pub async fn install_native_host(
+    binary_path: String,
+    extension_id: String,
+) -> Result<(), DesktopError> {
+    validate_extension_id(&extension_id)?;
     let path = std::path::PathBuf::from(binary_path);
-    install(&path, &[PLACEHOLDER_EXTENSION_ID], None)?;
+    install(&path, &[extension_id.as_str()], None)?;
     Ok(())
 }
 
@@ -242,6 +346,7 @@ pub async fn uninstall_native_host() -> Result<(), DesktopError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pangolin_native_messaging_host::manifest::PLACEHOLDER_EXTENSION_ID;
     use tempfile::TempDir;
 
     #[test]
@@ -340,6 +445,61 @@ mod tests {
             assert!(v["path"].is_string());
             assert_eq!(v["type"], "stdio");
             assert!(v["allowed_origins"].is_array());
+        }
+    }
+
+    // ---- MVP-4-M L3: extension-ID validation ----
+
+    #[test]
+    fn validate_extension_id_rejects_wrong_length() {
+        let too_short = "abcd";
+        let too_long = "a".repeat(64);
+        let err = validate_extension_id(too_short).expect_err("short rejected");
+        match err {
+            DesktopError::Validation { kind, .. } => assert_eq!(kind, "extension_id_length"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        validate_extension_id(&too_long).expect_err("long rejected");
+    }
+
+    #[test]
+    fn validate_extension_id_rejects_invalid_alphabet() {
+        // 32 chars but includes 'z' (outside a..=p)
+        let bad = "abcdefghijklmnopabcdefghijklmnoz";
+        let err = validate_extension_id(bad).expect_err("z rejected");
+        match err {
+            DesktopError::Validation { kind, .. } => assert_eq!(kind, "extension_id_alphabet"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        // Uppercase letters are also rejected
+        let upper = "ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP";
+        validate_extension_id(upper).expect_err("uppercase rejected");
+
+        // Digits are also rejected
+        let digits = "abcdefghijklmnopabcdefghijklmno1";
+        validate_extension_id(digits).expect_err("digits rejected");
+    }
+
+    #[test]
+    fn validate_extension_id_accepts_canonical_form() {
+        // 32 chars, all lowercase a..=p — what Chrome actually assigns.
+        let ok = "abcdefghijklmnopabcdefghijklmnop";
+        validate_extension_id(ok).expect("canonical 32-char a..p accepted");
+        // Boundary check: exactly 'p' is valid
+        let edge_p = "pppppppppppppppppppppppppppppppp";
+        validate_extension_id(edge_p).expect("32 p's accepted");
+        // Boundary check: exactly 'a' is valid
+        let edge_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        validate_extension_id(edge_a).expect("32 a's accepted");
+    }
+
+    #[test]
+    fn validate_extension_id_rejects_empty() {
+        let err = validate_extension_id("").expect_err("empty rejected");
+        match err {
+            DesktopError::Validation { kind, .. } => assert_eq!(kind, "extension_id_length"),
+            other => panic!("expected Validation, got {other:?}"),
         }
     }
 }
