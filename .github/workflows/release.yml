@@ -97,8 +97,24 @@ jobs:
         with:
           node-version: 20
           cache: 'pnpm'
+          # This repo doesn't have a root pnpm workspace; each app
+          # carries its own lockfile. Point setup-node's cache at the
+          # desktop one (the bigger of the dep graphs). The component-
+          # library install below is small + fast even uncached.
+          cache-dependency-path: 'apps/desktop/pnpm-lock.yaml'
 
-      - name: Install JS deps
+      # Pre-build the component-library — apps/desktop/package.json
+      # has a `file:../component-library` dep, so the library's `dist/`
+      # must exist BEFORE `pnpm install --frozen-lockfile` runs in
+      # apps/desktop. Mirrors ci.yml's `desktop / scaffold` setup.
+      - name: "Pre-build component-library (file: dep target)"
+        working-directory: apps/component-library
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Install desktop deps (frozen lockfile)
+        working-directory: apps/desktop
         run: pnpm install --frozen-lockfile
 
       # tauri-cli matching the runtime version in apps/desktop/Cargo.toml.
@@ -108,6 +124,9 @@ jobs:
 
       - name: Build bundle
         working-directory: apps/desktop
+        # `cargo tauri build` runs `pnpm build:ui` (vite build) as the
+        # configured beforeBuildCommand, then `cargo build --release`
+        # + the platform bundlers per --bundles.
         run: cargo tauri build --bundles ${{ matrix.platform.tauri_targets }}
 
       # ─── Linux bundles → release attachment (Phase 1) ──────────────
@@ -182,10 +201,16 @@ jobs:
         with:
           node-version: 20
           cache: 'pnpm'
-      - run: pnpm install --frozen-lockfile
+          # No root workspace — point at the extension's lockfile.
+          cache-dependency-path: 'apps/extension/pnpm-lock.yaml'
+
+      - name: Install extension deps (frozen lockfile)
+        working-directory: apps/extension
+        run: pnpm install --frozen-lockfile
 
       - name: Build extension
-        run: pnpm --filter @pangolin/extension build
+        working-directory: apps/extension
+        run: pnpm build
 
       # Chrome's manifest.json `version` field accepts only 1-4 dot-
       # separated integers — `0.1.0-beta.1` is rejected at load time.
