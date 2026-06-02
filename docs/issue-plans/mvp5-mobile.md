@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-# MVP-5 — mobile (iOS + Android) — overview plan-gate DRAFT
+# MVP-5 — mobile (Android first, iOS to follow) — overview plan-gate LOCKED
 
-**Status: DRAFT — awaiting Kelvin call on Q-a..f.** Other decisions self-locked.
+**Status: LOCKED — Kelvin call 2026-06-02.** Q-a..f all resolved.
 
 ## 0. One-paragraph summary
 
@@ -24,105 +24,75 @@ Reference posture memories:
 
 ## 0a. LOCKED decisions (proposed — Kelvin to confirm)
 
-### Open questions (need Kelvin's call)
+### Kelvin-locked decisions (2026-06-02)
 
-- **Q-a — UI framework / shell**. Drives every downstream sub-slice
-  decision.
-  - **Option 1 (recommended): Tauri 2 Mobile.** Same React + Rust
-    architecture as desktop. ~90% UI code reuse (the existing
-    `SetupGuardiansWizard`, `RecoverVaultWizard`, etc. ship as-is
-    minus mobile-specific tweaks). Platform-specific Tauri plugins
-    for biometric / camera / Keychain. Tauri 2 Mobile is stable as
-    of late 2024; tracks the same toolchain we already know.
-  - **Option 2: Native SwiftUI + Jetpack Compose.** Best mobile UX
-    polish; matches platform conventions exactly. But three
-    independent codebases (desktop React + iOS Swift + Android
-    Kotlin) for the same product — long-term maintenance multiplier.
-  - **Option 3: React Native (single mobile codebase, separate from
-    desktop).** Unifies iOS+Android but forks from desktop. Rust
-    bridge via uniffi-rs's foreign-function support.
-  - **Option 4: Flutter.** Single mobile codebase, Dart instead of
-    Rust/JS — biggest cognitive switch for the team.
+- **Q-a — UI framework = Tauri 2 Mobile.** Same React + Rust
+  architecture as desktop. ~90% UI code reuse (existing
+  `SetupGuardiansWizard`, `RecoverVaultWizard`, etc. ship as-is with
+  mobile-layout tweaks). Platform-specific Tauri plugins for
+  biometric / camera / Keychain. The competing options (Native
+  SwiftUI+Compose, React Native, Flutter) all sacrifice desktop
+  code reuse and add a second codebase to maintain forever — for
+  the closed-beta scope where the vault is mostly forms + lists +
+  modals, Tauri 2 Mobile's edge-case weakness on heavy animations /
+  gestures doesn't apply.
 
-- **Q-b — Platform sequencing.** iOS and Android have very different
-  distribution/signing constraints; doing them in parallel is feasible
-  but doubles closed-beta tester pool work.
-  - **Option 1 (recommended): Android first, iOS to follow.**
-    Android sideload is cheap + works (.apk direct download, "unknown
-    sources" toggle). $25 Play Store fee is one-time. iOS sideload
-    in 2026 effectively requires AltStore / paid Apple Developer
-    account ($99/yr) — gate iOS until Android proves the mobile
-    architecture.
-  - **Option 2: iOS first.** Apple Dev account ($99/yr) is the cost;
-    TestFlight closed-beta distribution is clean. But the architecture
-    is unproven and iOS has more constraints.
-  - **Option 3: Both in parallel.** Maximum surface to test
-    simultaneously. Doubles the closed-beta tester ask + double the
-    cost ($99 + $25 = $124).
+  **Key clarification** (per Kelvin's 2026-06-02 framing):
+  "React Native" and "Tauri 2 Mobile" are not interchangeable.
+  React Native renders native widgets (`<View>` / `<Text>` / etc.)
+  via a separate React runtime; web React (`<div>` / `<Input>`)
+  doesn't run on it. Tauri 2 Mobile = same React-in-WebView as
+  desktop, so the JSX from `apps/desktop/src/ui/screens/` actually
+  runs on mobile too.
 
-- **Q-c — Closed-beta distribution model.** Determines the "click
-  to download" story on mobile.
-  - **Option 1 (recommended): Android-side direct .apk on GitHub
-    Releases (same workflow as desktop), iOS via TestFlight if/when
-    Apple Dev account ($99/yr) is acquired.** Mirrors the desktop
-    posture: unsigned, friction-OK closed beta. Android users toggle
-    "install from unknown sources." iOS waits until we're willing
-    to pay $99/yr.
-  - **Option 2: Public Google Play + Apple App Store releases.**
-    Requires paid dev accounts on both ($25 + $99/yr) + the review
-    process. Store reviewers won't have testnet vaults; review may
-    fail until we provide explicit "demo vault" tooling.
-  - **Option 3: Sideload-only on both (no TestFlight).** Android
-    is fine; iOS effectively shut out (sideload on iOS in 2026
-    requires AltStore + macOS box + USB cable for non-dev users).
+- **Q-b — Platform sequencing = Android first, iOS to follow.**
+  Android sideload (`.apk` direct download + "unknown sources"
+  toggle) is cheap and works without paid dev accounts. iOS
+  sideload in 2026 effectively requires AltStore + macOS +
+  paid Apple Developer ($99/yr); gate iOS until Android proves
+  the mobile architecture. When iOS happens, it's a follow-on
+  sub-slice (not in MVP-5's initial scope).
 
-- **Q-d — Mobile unlock + biometric integration.** Desktop's
-  master-password-only flow doesn't translate cleanly to mobile.
-  Mobile users expect Face ID / Touch ID / Fingerprint.
-  - **Option 1 (recommended): Biometric AUGMENTS, doesn't replace,
-    the master password.** On first vault unlock, user types the
-    master password into a native widget. With user consent, the
-    master password is stored in iOS Keychain / Android Keystore
-    under biometric protection. Subsequent unlocks: biometric prompt
-    → Keychain returns master password → existing FFI unlock path
-    runs. Same pattern as 1Password, Bitwarden.
-  - **Option 2: Biometric REPLACES master password.** The biometric
-    is the only unlock. Master password becomes recovery-only. Risk:
-    if biometric fails (changed face, broken sensor, OS reset), user
-    is locked out. Recovery flow is the only escape.
-  - **Option 3: Master password only, no biometric this MVP.**
-    Simplest; worst UX. Mobile users will hate it.
+- **Q-c — Distribution = Android `.apk` on GitHub Releases.**
+  Same workflow as desktop's `release.yml`. Tag-triggered job
+  produces `Pangolin-<version>.apk` and attaches it to the
+  GitHub Release. Mirrors the unsigned / friction-OK posture
+  of the desktop builds. iOS distribution (when it lands) will
+  use TestFlight, gated on a $99/yr Apple Developer Program
+  seat — separate decision when iOS sub-slice opens.
 
-- **Q-e — Recovery flow on mobile.** 24-word seed-phrase typing on
-  mobile is painful.
-  - **Option 1 (recommended): Both — typed seed phrase + QR-imported
-    seed phrase.** Recovery wizard accepts either. QR generated on
-    desktop during backup creation; user scans on mobile. Typed
-    path remains for "lost the QR, only have the paper words."
-  - **Option 2: Typed only.** Same as desktop. Hostile mobile UX.
-  - **Option 3: Mobile recovery is "view-only" — full restore must
-    happen on desktop, mobile re-pairs to the desktop after.**
-    Simplest mobile codebase; pushes friction onto the user.
+- **Q-d — Biometric = augments, doesn't replace, the master
+  password.** Standard 1Password / Bitwarden pattern. First
+  vault unlock: user types master password via native secure
+  widget; with user consent, the master password is stored in
+  Android Keystore (iOS: Keychain when iOS sub-slice ships)
+  under biometric protection (`setUserAuthenticationRequired(true)`
+  + `setUnlockedDeviceRequired(true)` + `setInvalidatedByBiometricEnrollment(true)`).
+  Subsequent unlocks: biometric prompt → Keystore returns master
+  password → existing FFI unlock path runs.
 
-- **Q-f — Mobile browser autofill.** The biggest fork from desktop.
-  iOS Safari uses AutoFill Credentials API (system-level extension,
-  totally different code from Chromium MV3). Android Chrome supports
-  MV3 extensions in dev channel as of 2026 but stable Chrome doesn't
-  yet.
-  - **Option 1 (recommended): Punt to MVP-6.** Ship the mobile vault
-    + multi-device + recovery in MVP-5; defer autofill until either
-    iOS AutoFill Credentials integration is built OR Chrome Android
-    MV3 stabilizes. Mobile users can copy-paste from the vault to
-    the browser manually in the interim — matches the closed-beta
-    "friction OK" posture.
-  - **Option 2: Ship iOS AutoFill Credentials in MVP-5.** Native
-    Swift implementation of `ASCredentialProviderExtension`. New
-    code surface, significant audit cost. Worth it if mobile-first
-    users won't tolerate copy-paste.
-  - **Option 3: Android Chrome MV3 sideload in MVP-5.** Distribute
-    the existing browser extension as an Android Chrome-loadable
-    add-on. Limited browser support (dev channel only) but minimal
-    code change.
+- **Q-e — Recovery = typed + QR-imported seed phrase.** Mobile
+  recovery wizard accepts either. QR generation is added to the
+  desktop's existing backup-create UX so users can scan on
+  mobile; the typed path stays for "lost the QR, only have the
+  paper words." The QR carries plaintext seed phrase — same
+  display-once posture as the existing desktop seed-phrase UX,
+  with the same "do not photograph / do not share" warning copy.
+
+- **Q-f — Android system Autofill Service in MVP-5.** The mobile
+  shell registers a Kotlin `AutofillService` subclass so Pangolin
+  becomes a system-level autofill provider — works in **every**
+  browser + every app on the device (Chrome, Firefox, Brave,
+  Edge, banking apps, etc.). User toggles "Use Pangolin for
+  autofill" once in Android Settings. New sub-slice MVP-5-I
+  covers this. iOS equivalent (`ASCredentialProviderExtension`)
+  ships when the iOS sub-slice happens — not in MVP-5 scope.
+
+  Initial Q-f framing offered "Android Chrome MV3 sideload" as
+  an option; that was a misframing — Chrome MV3 on Android is
+  dev-channel-only and would only cover Chrome. The
+  `AutofillService` API is the standard Android pattern (used by
+  every major password manager) and covers the whole OS.
 
 ### Self-locked (no gate needed)
 
@@ -169,25 +139,31 @@ Reference posture memories:
   managed by a desktop. Manager-on-mobile is a follow-on UX slice.
 - **Mainnet contracts.** Same Base Sepolia testnet as desktop.
 
-## 1. Sub-slice breakdown (proposed)
+## 1. Sub-slice breakdown (LOCKED)
 
-Contingent on Q-a = Option 1 (Tauri 2 Mobile). Sub-slice plan-LOCKs
-draft separately once this overview is locked.
+Sub-slice plan-LOCKs draft separately once dispatched. The sequence
+below is the build order; each lands as its own PR against main with
+its own merge boundary.
 
 | Sub-slice | What it ships | Depends on |
 |---|---|---|
-| **MVP-5-A** | Tauri 2 Mobile scaffold for chosen first platform (Q-b); minimal "open vault file picker" + "unlock with typed master password" flow; CI matrix extension for the new platform target | Q-a + Q-b |
-| **MVP-5-B** | Vault open / unlock / lock / accounts-list / account-detail UX — port the desktop screens with mobile layout tweaks (touch targets, scroll behavior) | A |
-| **MVP-5-C** | Secure mobile input widget — native iOS `UITextField` (secureTextEntry) + Android `EditText` (`inputType=textPassword`). Mobile equivalent of the desktop's MVP-4-H per-OS secure widgets. | A |
-| **MVP-5-D** | Biometric integration per Q-d (Keychain/Keystore-protected master password if Q-d = Option 1) | B + C |
-| **MVP-5-E** | Multi-device pairing — mobile joins an existing desktop vault via QR scan (camera) + short-code paste fallback. Reuses pangolin-ffi pairing FFI. | B + secure input from C |
-| **MVP-5-F** | Recovery flow per Q-e (typed + QR-imported seed phrase if Q-e = Option 1) | E |
-| **MVP-5-G** | Settings + first-launch posture (extension banner from desktop becomes a "manage paired devices" panel; beta warning modal ports as-is) | B |
-| **MVP-5-H** | Packaged release workflow — tag-triggered `.apk` (and `.ipa` if Q-b/c include iOS); GitHub Releases attachment; release-notes template mirrors MVP-4-M's | A through G |
-| **MVP-5-I** (optional, depends on Q-f) | Autofill — iOS AutoFill Credentials Provider OR Android Chrome MV3 sideload | F |
+| **MVP-5-A** | Tauri 2 Mobile Android scaffold; minimal "open vault file picker" + "unlock with typed master password" flow; CI matrix extension for the Android target; verify Rust core compiles for `aarch64-linux-android` | (none) |
+| **MVP-5-B** | Vault open / unlock / lock / accounts-list / account-detail UX — port the desktop screens with mobile layout tweaks (touch targets, scroll behavior, soft-keyboard handling, status-bar styling) | A |
+| **MVP-5-C** | Secure mobile input widget for Android — Kotlin plugin wrapping `EditText` with `inputType=textPassword` + `setShowSoftInputOnFocus(true)`. Mobile equivalent of the desktop's MVP-4-H per-OS secure widgets (no V8 residue path) | A |
+| **MVP-5-D** | Biometric integration per Q-d — Android Keystore + `BiometricPrompt` API. Kotlin plugin stores the master password under `setUserAuthenticationRequired(true)` + `setUnlockedDeviceRequired(true)` + `setInvalidatedByBiometricEnrollment(true)`; biometric prompt unlocks for subsequent vault opens | B + C |
+| **MVP-5-E** | Multi-device pairing — mobile joins an existing desktop vault via camera QR scan + short-code paste fallback. Reuses `pangolin-ffi` pairing API; camera permission flow; QR decoding via `tauri-plugin-camera` or in-tree Kotlin equivalent | B + secure input from C |
+| **MVP-5-F** | Recovery flow per Q-e — typed seed phrase wizard + QR-import flow. QR generation lands on the desktop side too (new "Show QR" button on the existing backup-create wizard) | E |
+| **MVP-5-G** | Settings + first-launch posture — beta warning modal ports as-is, BetaChip ports as-is, ExtensionBanner is replaced with a "Connect to your desktop" banner that links into the pairing wizard | B |
+| **MVP-5-H** | Packaged release workflow — `.github/workflows/release-mobile.yml` tag-triggered on `mobile-v*.*.*-*`, produces signed `.apk` (debug-signed for closed beta) and uploads to GitHub Releases. Mirrors `release.yml` shape | A through G |
+| **MVP-5-I** | Android system `AutofillService` Kotlin plugin per Q-f. Registers Pangolin as system autofill provider; IPC from autofill service back to the main app to query the vault; biometric prompt fires if vault is locked. UX: a "Use Pangolin for autofill" Settings entry that deep-links to Android Settings → Autofill | D + B |
 
-Total ~6-9 sub-slices depending on Q-f. Roughly comparable to MVP-4's
-A-M arc.
+Total ~9 sub-slices. Roughly comparable to MVP-4's A-M arc.
+
+**Not in MVP-5 (deferred to a separate iOS-mvp slice):**
+- iOS scaffold + Swift secure-input widget + iOS Keychain + iOS biometric
+- iOS recovery flow port
+- iOS `ASCredentialProviderExtension` (the iOS equivalent of MVP-5-I)
+- TestFlight distribution + Apple Developer Program seat decision
 
 ## 2. Surface that needs to change (overview level)
 
@@ -264,15 +240,18 @@ level prompts that apply across sub-slices:
 
 ## 6. Out-of-band coordination
 
-- **Q-c Option 1**: requires Kelvin to decide whether to acquire an
-  Apple Developer Program seat ($99/yr) for TestFlight iOS
-  distribution. If skipped, iOS is effectively shut out of closed
-  beta.
-- **Q-b Option 1 (Android first)**: requires a test Android device or
-  emulator setup. Kelvin or a closed-beta tester needs one.
+- **Test Android device or emulator**: Kelvin or a closed-beta
+  tester needs one to actually run the binary. Android Studio's
+  AVD emulator works for CI + early dev; physical-device smoke
+  is required before each release tag (same posture as the
+  desktop macOS smoke per [[pangolin_macos_release_smoke]]).
 - **First mobile release tag** (`mobile-v0.1.0-beta.1`): same
-  workflow-trigger pattern as desktop. macOS-style "PENDING SMOKE"
-  applies if Q-c includes iOS (TestFlight processing takes ~24h).
+  workflow-trigger pattern as desktop. Manual install + unlock
+  smoke on a real Android device required before the tag is
+  announced.
+- **iOS sub-slice (separate MVP)**: when that opens, decide
+  whether to acquire an Apple Developer Program seat ($99/yr)
+  for TestFlight distribution. Until then iOS is out of scope.
 
 ## 7. Merge-boundary policy
 
