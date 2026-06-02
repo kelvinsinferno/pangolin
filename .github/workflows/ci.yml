@@ -760,8 +760,9 @@ jobs:
       # vm.startBroadcast misuse) at build time. RecoveryV1 has NO
       # constructor args (no signer authorities), so no env vars are
       # needed. Per docs/issue-plans/102-recovery-v1-contract.md L14 the
-      # testnet deploy is a follow-on + mainnet is external-audit-gated
-      # (D-011); this step only gates that the script compiles + dry-runs.
+      # testnet deploy is a follow-on + mainnet ships after community review
+      # + tester feedback (see feedback_audit_funding_pivot); this step only
+      # gates that the script compiles + dry-runs.
       - name: forge script (deploy recovery-v1 dry-run)
         run: forge script script/DeployRecoveryV1.s.sol --sig "run()" --tc DeployRecoveryV1
       # MVP-3 issue #106a: same dry-run for RevisionLogV2. Same audit-gap-7
@@ -771,7 +772,8 @@ jobs:
       # to it, so the two-contract construction path is exercised without
       # needing a pre-deployed address. Per
       # docs/issue-plans/106a-revisionlogv2-contract.md L18 the testnet
-      # deploy is a follow-on + mainnet is external-audit-gated (D-011).
+      # deploy is a follow-on + mainnet ships after community review +
+      # tester feedback (see feedback_audit_funding_pivot).
       - name: forge script (deploy revision-log-v2 dry-run)
         run: forge script script/DeployRevisionLogV2.s.sol --sig "run()" --tc DeployRevisionLogV2
       # MVP-2 issue 2.3: smoke-test the deploy-wrapper script
@@ -974,13 +976,15 @@ jobs:
       # MVP-3 issue #102: same slither posture for RecoveryV1. Zero
       # high-severity findings required per
       # docs/issue-plans/102-recovery-v1-contract.md (the highest-risk
-      # EPIC; external-audit-gated before mainnet per D-011).
+      # EPIC; community review + tester feedback gate mainnet — see
+      # feedback_audit_funding_pivot for the audit-funding posture).
       - name: slither (recovery-v1)
         run: slither src/RecoveryV1.sol --fail-high
       # MVP-3 issue #106a: same slither posture for RevisionLogV2. Zero
       # high-severity findings required per
       # docs/issue-plans/106a-revisionlogv2-contract.md (same external-audit
-      # tier as RecoveryV1 / RevisionLogV1; gated before mainnet by D-011).
+      # tier as RecoveryV1 / RevisionLogV1; mainnet ships after community review
+      # + tester feedback per feedback_audit_funding_pivot).
       - name: slither (revision-log-v2)
         run: slither src/RevisionLogV2.sol --fail-high
 

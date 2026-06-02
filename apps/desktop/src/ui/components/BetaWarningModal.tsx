@@ -5,7 +5,7 @@
  * On mount calls the Rust-side `beta_warning_state` to learn whether
  * the user has dismissed the warning for the current binary version.
  * If not, renders a blocking modal explaining the closed-beta /
- * testnet-only / pre-D-011 posture and offering an "I understand"
+ * testnet-only / unaudited posture and offering an "I understand"
  * button that calls `beta_warning_dismiss` (persisting the current
  * version) and hides the modal for this session.
  *
@@ -87,8 +87,8 @@ export function BetaWarningModal({ onError }: BetaWarningModalProps): React.JSX.
         </h2>
         <p className="beta-modal__body">
           Pangolin is in closed beta on the Base Sepolia testnet. This build
-          has <strong>not</strong> been audited yet (D-011 is the next track).
-          Please:
+          has <strong>not</strong> been independently audited — the AGPL source is public
+          for community review. Please:
         </p>
         <ul className="beta-modal__list">
           <li>Do not store production secrets in this vault.</li>

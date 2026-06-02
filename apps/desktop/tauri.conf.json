@@ -31,7 +31,7 @@
     "targets": "all",
     "category": "Utility",
     "shortDescription": "Pangolin password manager (closed-beta, Base Sepolia testnet)",
-    "longDescription": "Pangolin — closed-beta desktop password manager. Pre-D-011 audit, testnet only. Do not store production secrets.",
+    "longDescription": "Pangolin — closed-beta desktop password manager. Unaudited; testnet only. Do not store production secrets.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

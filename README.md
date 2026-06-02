@@ -6,7 +6,7 @@
 [![Latest release](https://img.shields.io/github/v/release/kelvinsinferno/pangolin?include_prereleases&sort=semver)](https://github.com/kelvinsinferno/pangolin/releases/latest)
 [![CI](https://github.com/kelvinsinferno/pangolin/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kelvinsinferno/pangolin/actions/workflows/ci.yml)
 
-**Status: closed beta on Base Sepolia testnet. Pre-D-011 external audit. Do not store production secrets.**
+**Status: closed beta on Base Sepolia testnet. Unaudited — independent community audits welcomed. Do not store production secrets.**
 
 Pangolin is a password manager built on a hard threat model:
 
@@ -36,7 +36,7 @@ Closed-beta installers are published to the [GitHub Releases page](https://githu
 | macOS (Apple Silicon) | `Pangolin_<version>_aarch64.dmg` | Right-click the .dmg → Open. Drag to Applications. Right-click Pangolin.app → Open (first launch). See below if Gatekeeper still blocks. |
 | Browser extension | `pangolin-extension-<version>.zip` | `chrome://extensions` → enable Developer Mode → Load Unpacked → point at the unzipped folder |
 
-> **Heads-up:** these are unsigned beta binaries. The OS will warn you on first launch because no Apple/Microsoft code-signing cert is in the chain of trust. Code-signing is a separate post-mainnet workstream tied to the D-011 audit outcome.
+> **Heads-up:** these are unsigned beta binaries. The OS will warn you on first launch because no Apple/Microsoft code-signing cert is in the chain of trust. Code-signing is a separate post-mainnet workstream.
 
 ### Windows — getting past SmartScreen
 
@@ -179,11 +179,14 @@ Closed beta covers the full MVP-4 desktop + extension surface on Base Sepolia te
 
 **Not in beta yet (mainnet-gated):**
 
-- D-011 external audit
 - Code-signing for installers (Apple Developer ID + Authenticode)
 - Mainnet contracts + production funder
 - Auto-updater
 - iOS / Android shells (later MVP)
+
+## Security review
+
+The full Pangolin source is AGPL-3.0 — anyone is welcome to read, fork, and audit it. We don't have a paid external audit lined up; independent community audits are welcomed and findings filed as GitHub issues or via the responsible-disclosure path in `SECURITY.md` will be triaged on the same HIGH/MED/LOW/INFO ladder used internally. The threat model is documented in `THREAT_MODEL.md`.
 
 ## License
 
