@@ -84,6 +84,13 @@ pub use state::VaultState;
 pub fn build_app() -> tauri::Builder<tauri::Wry> {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
+        // MVP-4-N: native file open / save dialogs for the welcome
+        // screen's Create-new-vault / Open-existing-vault flow. The
+        // JS side calls `@tauri-apps/plugin-dialog`'s `save({...})`
+        // + `open({...})`; the plugin handles the platform-native
+        // dialog (NSOpenPanel on macOS, GtkFileChooser on Linux,
+        // IFileDialog on Windows).
+        .plugin(tauri_plugin_dialog::init())
         .manage(VaultState::default())
         // MVP-4-E: spawn the IPC server task that the native-
         // messaging host bridge connects to. The server holds a
@@ -212,6 +219,10 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         // an audit-cleanup commit gates the legacy commands behind
         // `cfg(feature = "test-hooks")`. Plan-LOCK §3.
         commands::secure_prompt::vault_unlock_via_secure_prompt,
+        // MVP-4-N: first-launch vault-create flow. Companion to
+        // vault_unlock_via_secure_prompt; the welcome screen calls
+        // this AFTER tauri-plugin-dialog's save() returns a path.
+        commands::secure_prompt::vault_create_via_secure_prompt,
         commands::secure_prompt::pairing_open_and_join_via_secure_prompt,
         commands::secure_prompt::pairing_chain_bootstrap_via_secure_prompt,
         commands::secure_prompt::pairing_add_device_via_secure_prompt,

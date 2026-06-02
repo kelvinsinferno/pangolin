@@ -25,6 +25,7 @@ import {
   isDesktopError,
   revealPassword,
   vaultClose,
+  vaultCreateViaSecurePrompt,
   vaultLock,
   vaultOpen,
   vaultUnlockViaSecurePrompt,
@@ -65,6 +66,12 @@ export type UnlockResult =
 
 export interface VaultActions {
   openVault(path: string): Promise<{ ok: true } | { ok: false; error: DesktopError }>;
+  /** MVP-4-N first-launch vault-create. Opens the OS native password
+   *  dialog (no V8 password residue), creates the file on disk, then
+   *  calls `vaultOpen(path)` so the state machine lands on Locked +
+   *  the user can unlock immediately (same SecurePasswordButton
+   *  flow as the existing unlock path). */
+  createVault(path: string): Promise<{ ok: true } | { ok: false; error: DesktopError }>;
   unlockVault(): Promise<UnlockResult>;
   lockVault(): Promise<{ ok: true } | { ok: false; error: DesktopError }>;
   closeVault(): Promise<void>;
@@ -95,6 +102,22 @@ function toDesktopError(e: unknown): DesktopError {
 
 export function useVault(): { state: VaultState; actions: VaultActions } {
   const [state, setState] = useState<VaultState>(initialState);
+
+  const createVault = useCallback(async (path: string) => {
+    try {
+      await vaultCreateViaSecurePrompt(path);
+      // Same path the openVault callback uses — install the new file
+      // as the active handle so the state machine lands on Locked.
+      // The user types the password again on the unlock screen
+      // (intentional confirmation step; see vault_create_via_secure_prompt
+      // doc-comment for the UX rationale).
+      await vaultOpen(path);
+      setState((prev) => ({ ...prev, stage: 'locked' }));
+      return { ok: true as const };
+    } catch (e) {
+      return { ok: false as const, error: toDesktopError(e) };
+    }
+  }, []);
 
   const openVault = useCallback(async (path: string) => {
     try {
@@ -219,6 +242,7 @@ export function useVault(): { state: VaultState; actions: VaultActions } {
     state,
     actions: {
       openVault,
+      createVault,
       unlockVault,
       lockVault,
       closeVault,

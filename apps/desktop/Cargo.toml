@@ -113,6 +113,12 @@ base64 = "=0.22.1"
 # lockstep with cargo-deny advisories.
 tauri = { version = "=2.11.2", default-features = false, features = ["wry"] }
 tauri-plugin-clipboard-manager = "=2.3.2"
+# MVP-4-N: native file open / save dialogs for the welcome screen
+# (create-vault / open-existing-vault flow). Pinned to the version
+# cargo resolved against tauri = 2.11.2; bump in lockstep with
+# clipboard-manager + tauri itself per the repo's plugin pinning
+# discipline.
+tauri-plugin-dialog = "=2.7.1"
 
 # Workspace-pinned deps. `tokio` powers Tauri's async runtime + the
 # `tauri::command` async handlers; `zeroize` is the discipline tool for

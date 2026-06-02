@@ -123,6 +123,55 @@ pub async fn vault_unlock_via_secure_prompt(
 }
 
 // ---------------------------------------------------------------------------
+// 1b / 10 — vault_create_via_secure_prompt
+// ---------------------------------------------------------------------------
+
+/// **Create a new vault file at `path` via the OS native password dialog.**
+///
+/// First-launch flow: the welcome screen's "Create new vault" button
+/// calls this AFTER a native save-dialog has picked `path`. We open the
+/// secure-input dialog to collect the master password, then call
+/// `pangolin_ffi::session::vault_create(path, password)`.
+///
+/// Unlike the other `*_via_secure_prompt` commands this one is NOT
+/// gated on `state.require_open()` — the whole point is that no vault
+/// is open yet. After a successful create, the caller must:
+///
+/// 1. Call `vault_open(path)` to install the new file as the active
+///    handle (sets stage = Locked).
+/// 2. Call `vault_unlock_via_secure_prompt()` to unlock (sets stage =
+///    Active). The user types the same password they just chose;
+///    `vault_create` and `vault_unlock` derive the authority from the
+///    password independently, so the password isn't cached anywhere.
+///
+/// We intentionally do NOT auto-unlock after create — the user just
+/// chose a password; making them type it twice catches typos before
+/// they're locked out of a freshly-created vault. (UX trade: one extra
+/// password entry vs. permanent lockout from a fat-fingered initial
+/// password.)
+///
+/// # Errors
+///
+/// - [`DesktopError::Validation`] (`kind = "secure_input_cancelled"`)
+///   if the user dismissed the password dialog.
+/// - [`DesktopError::Store`] for an I/O failure (e.g. the file already
+///   exists, or the parent directory is read-only).
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+pub async fn vault_create_via_secure_prompt(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<(), DesktopError> {
+    let secret = prompt_secret(
+        &app,
+        "Create new vault",
+        "Choose a master password for the new vault",
+    )?;
+    pangolin_ffi::session::vault_create(path, secret).map_err(DesktopError::from)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // 2 / 9 — pairing_open_and_join_via_secure_prompt
 // ---------------------------------------------------------------------------
 

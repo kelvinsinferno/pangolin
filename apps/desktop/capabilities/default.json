@@ -6,6 +6,8 @@
   "permissions": [
     "core:app:default",
     "core:window:default",
-    "clipboard-manager:allow-write-text"
+    "clipboard-manager:allow-write-text",
+    "dialog:allow-save",
+    "dialog:allow-open"
   ]
 }
