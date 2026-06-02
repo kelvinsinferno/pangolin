@@ -362,6 +362,15 @@ jobs:
     name: desktop-e2e
     runs-on: ubuntu-latest
     needs: [desktop, component-library]
+    # MVP-4-M L6: skip the first-launch beta-warning modal + extension-
+    # connect banner. Both are gated behind `--features test-hooks` in
+    # the Rust commands they call, so this env-var skip cannot reach
+    # release binaries. Without them set, a fresh `app_data_dir()`
+    # would block every spec on the modal + drop the banner on top of
+    # the active-stage screens.
+    env:
+      PANGOLIN_TEST_SKIP_BETA_WARNING: '1'
+      PANGOLIN_TEST_SKIP_EXTENSION_BANNER: '1'
     steps:
       - uses: actions/checkout@v4
       - name: "Install Tauri + xvfb Linux system deps (apt)"
@@ -459,6 +468,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+    # MVP-4-M L6: skip the first-launch beta-warning modal + extension-
+    # connect banner (see desktop-e2e job above for posture rationale).
+    env:
+      PANGOLIN_TEST_SKIP_BETA_WARNING: '1'
+      PANGOLIN_TEST_SKIP_EXTENSION_BANNER: '1'
     steps:
       - uses: actions/checkout@v4
 

@@ -80,9 +80,25 @@ fn read_sentinel(path: &std::path::Path) -> Option<BetaWarningFile> {
 }
 
 /// `#[tauri::command]` — return the current dismissal state.
+///
+/// Under `--features test-hooks`, the env var
+/// `PANGOLIN_TEST_SKIP_BETA_WARNING=1` short-circuits the modal — the
+/// desktop-e2e suite sets this so a fresh `app_data_dir()` doesn't
+/// block the first interaction. The skip is intentionally gated to
+/// the test-hooks build so a release binary cannot be tricked into
+/// hiding the warning via an env var.
 #[tauri::command]
 pub async fn beta_warning_state(app: tauri::AppHandle) -> Result<BetaWarningState, DesktopError> {
     let current_version = app.package_info().version.to_string();
+    #[cfg(feature = "test-hooks")]
+    {
+        if std::env::var("PANGOLIN_TEST_SKIP_BETA_WARNING").as_deref() == Ok("1") {
+            return Ok(BetaWarningState {
+                should_show: false,
+                current_version,
+            });
+        }
+    }
     let path = sentinel_path(&app)?;
     let dismissed = read_sentinel(&path)
         .map(|f| f.dismissed_version)

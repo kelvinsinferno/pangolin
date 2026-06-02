@@ -39,7 +39,7 @@ use base64::Engine;
 use zeroize::Zeroize;
 
 use pangolin_native_messaging_host::manifest::{
-    install_manifests, uninstall_manifests, InstallOutcome, PLACEHOLDER_EXTENSION_ID,
+    install_manifests, uninstall_manifests, InstallOutcome,
 };
 use pangolin_native_messaging_host::paths::{token_file_path, KEYRING_ACCOUNT, KEYRING_SERVICE};
 
@@ -276,8 +276,25 @@ pub struct NativeHostStatus {
 /// is currently installed in any Chromium-family browser. Used by the
 /// first-launch banner (`ExtensionBanner`) and the Settings panel
 /// (`BrowserConnectionPanel`) to decide what to show.
+///
+/// Under `--features test-hooks`, the env var
+/// `PANGOLIN_TEST_SKIP_EXTENSION_BANNER=1` short-circuits this command
+/// to return `connected: true` with an empty browsers list — the
+/// desktop-e2e suite sets it so the first-launch banner doesn't
+/// interfere with the existing scenarios. Same posture as the
+/// `beta_warning_state` skip env var — test-hooks gated so release
+/// binaries cannot hide the banner via env var.
 #[tauri::command]
 pub async fn native_host_status() -> Result<NativeHostStatus, DesktopError> {
+    #[cfg(feature = "test-hooks")]
+    {
+        if std::env::var("PANGOLIN_TEST_SKIP_EXTENSION_BANNER").as_deref() == Ok("1") {
+            return Ok(NativeHostStatus {
+                connected: true,
+                browsers: vec![],
+            });
+        }
+    }
     let paths = pangolin_native_messaging_host::paths::browser_manifest_paths(None);
     let browsers: Vec<NativeHostBrowserState> = paths
         .into_iter()
@@ -329,6 +346,7 @@ pub async fn uninstall_native_host() -> Result<(), DesktopError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pangolin_native_messaging_host::manifest::PLACEHOLDER_EXTENSION_ID;
     use tempfile::TempDir;
 
     #[test]
