@@ -44,17 +44,20 @@
 //! `CredUIPromptForCredentialsW` writes the password into a wide
 //! `[u16]` buffer we allocate on the stack. We immediately convert
 //! the buffer to UTF-8 bytes wrapped in `Zeroizing<Vec<u8>>` and
-//! explicitly zero the wide buffer via `SecureZeroMemory` before
-//! letting it drop. The intermediate `String` we use for the
-//! conversion drops at end-of-scope (non-zeroizing residue window,
-//! same as Linux GString / macOS NSString).
+//! explicitly zero the wide buffer via `zeroize::Zeroize::zeroize`
+//! before letting it drop. `Zeroize::zeroize` uses volatile writes
+//! that the optimizer cannot elide as dead stores (plain `[u16]::fill`
+//! is DCE-eligible once the buffer leaves scope). `String::into_bytes`
+//! transfers the intermediate `String`'s heap allocation directly into
+//! the `Zeroizing<Vec<u8>>` without copying, so the same buffer is
+//! protected end-to-end.
 
 #![allow(unsafe_code)]
 
 use std::sync::mpsc;
 
 use super::SecureInputError;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_CANCELLED, ERROR_SUCCESS, HWND};
@@ -122,8 +125,15 @@ fn run_creduidialog(title: &str, body: &str) -> Result<Zeroizing<Vec<u8>>, Secur
     const PASSWORD_BUF_LEN: usize = 256;
     let mut password_buf: [u16; PASSWORD_BUF_LEN] = [0; PASSWORD_BUF_LEN];
 
+    // Compile-time guard: CREDUI_INFOW is ~24 bytes; this assert pins
+    // that to u32 range so a future windows-rs struct change can't
+    // silently truncate cbSize. The `.expect` below is then defensive
+    // belt-and-braces (the const_assert already statically guarantees
+    // success).
+    const _CBSIZE_FITS_U32: () = assert!(std::mem::size_of::<CREDUI_INFOW>() <= u32::MAX as usize);
     let ui_info = CREDUI_INFOW {
-        cbSize: u32::try_from(std::mem::size_of::<CREDUI_INFOW>()).unwrap_or(0),
+        cbSize: u32::try_from(std::mem::size_of::<CREDUI_INFOW>())
+            .expect("CREDUI_INFOW size fits in u32 (statically asserted above)"),
         hwndParent: HWND(std::ptr::null_mut()),
         pszMessageText: PCWSTR(body_wide.as_ptr()),
         pszCaptionText: PCWSTR(title_wide.as_ptr()),
@@ -174,6 +184,14 @@ fn run_creduidialog(title: &str, body: &str) -> Result<Zeroizing<Vec<u8>>, Secur
                 .iter()
                 .position(|c| *c == 0)
                 .unwrap_or(password_buf.len());
+            // `String::from_utf16_lossy` allocates a fresh heap buffer
+            // for the UTF-8 result. `into_bytes()` is documented to
+            // transfer that same allocation to the Vec<u8> without
+            // copying or re-allocating — the `Zeroizing<Vec<u8>>`
+            // wrapper then owns the bytes and reliably zeros them on
+            // drop. There is no residue-window between the two
+            // statements: the heap allocation that holds the password
+            // bytes is wrapped before any other code runs.
             let pw_str = String::from_utf16_lossy(&password_buf[..pw_utf16_len]);
             Ok(Zeroizing::new(pw_str.into_bytes()))
         }
@@ -189,8 +207,11 @@ fn run_creduidialog(title: &str, body: &str) -> Result<Zeroizing<Vec<u8>>, Secur
     // L1: explicitly scrub the wide password buffer before it drops.
     // The `Zeroizing<Vec<u8>>` covers the UTF-8 path; the UTF-16
     // buffer also held the password and would otherwise leak through
-    // the stack allocator's reuse.
-    password_buf.fill(0);
+    // the stack allocator's reuse. Use `Zeroize::zeroize` (volatile
+    // writes) rather than `[u16]::fill(0)`, which the optimizer is
+    // allowed to elide as dead-store elimination once the buffer
+    // leaves scope.
+    Zeroize::zeroize(&mut password_buf[..]);
 
     outcome
 }

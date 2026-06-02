@@ -23,7 +23,14 @@
 # replaced before mainnet). Error messages still need to mention
 # "blockchain"/"gas"/"revisions" because they describe RPC and
 # Foundry-wallet behavior to the operator.
-^apps/cli/
+#
+# Narrowed to .rs + .toml suffixes (the only file types in apps/cli/
+# today — Rust sources, integration tests, and the Cargo manifest).
+# This way a future user-facing asset added under apps/cli/
+# (HTML/CSS/Markdown user-docs/JSON config bundled with a packaged
+# CLI) would NOT be silently allowlisted — that PR would have to
+# explicitly broaden this entry, forcing a human decision.
+^apps/cli/[^:]*\.(rs|toml):
 
 # ─── apps/desktop/src/commands/pairing.rs: Rust `///` doc comment
 # describing the `DesktopError::Chain` variant ("insufficient-gas").

@@ -22,12 +22,18 @@
 //! `NSSecureTextField::stringValue` returns a `Retained<NSString>`
 //! which holds the password in Apple's non-zeroizing UTF-16 buffer
 //! for the lifetime of the field. We immediately extract the bytes
-//! via `to_string()` + `into_bytes()` into a `Zeroizing<Vec<u8>>`.
-//! The NSString and intermediate String are dropped at end-of-scope
-//! (non-zeroizing). This is the same residue hazard the Linux GTK
-//! impl has (see `linux.rs` §L1) and the V8 string we're replacing —
-//! known trade-off; the secure widget closes the keylogger /
-//! screen-grab vector even if the in-memory buffer isn't zeroed.
+//! via `to_string()` + `into_bytes()` into a `Zeroizing<Vec<u8>>` —
+//! `String::into_bytes` transfers the heap allocation directly
+//! without copying, so the same buffer is protected end-to-end on
+//! the success path. The cancel path explicitly calls
+//! `Zeroize::zeroize` on the intermediate `String` (volatile writes
+//! the optimizer cannot elide). The dropped `NSString`'s UTF-16
+//! buffer is the only remaining residue — Apple does not zero it
+//! on dealloc, and `objc2-app-kit` doesn't expose the raw buffer
+//! pointer needed to scrub it ourselves. This is the same hazard
+//! the Linux GTK impl has (see `linux.rs` §L1) and the V8 string
+//! we're replacing — known trade-off; the secure widget closes the
+//! keylogger / screen-grab vector that motivates the epic.
 
 // Verified against objc2-app-kit 0.3.2 source: NSAlert::new(mtm),
 // setMessageText/setInformativeText/setAlertStyle/addButtonWithTitle/
@@ -46,7 +52,7 @@ use objc2_app_kit::{
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
 use super::SecureInputError;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// **Open an NSAlert modal password dialog.** Dispatches onto the
 /// AppKit main thread via `app.run_on_main_thread`, blocks the caller
@@ -147,7 +153,12 @@ fn run_nsalert(title: &str, body: &str) -> Result<Zeroizing<Vec<u8>>, SecureInpu
         let parent: &NSTextField = field.as_ref();
         parent.stringValue()
     };
-    let text = text_ns.to_string();
+    // `to_string()` allocates a fresh UTF-8 `String` whose heap
+    // buffer holds the password. `let mut` so the cancel path can
+    // explicitly zeroize it before drop (the success path consumes it
+    // via `into_bytes()` → `Zeroizing<Vec<u8>>`, which transfers the
+    // same allocation without copying).
+    let mut text = text_ns.to_string();
     drop(text_ns);
     drop(field);
     drop(alert);
@@ -155,8 +166,19 @@ fn run_nsalert(title: &str, body: &str) -> Result<Zeroizing<Vec<u8>>, SecureInpu
     // NSAlertFirstButtonReturn = 1000 (OK), NSAlertSecondButtonReturn = 1001 (Cancel).
     const NS_ALERT_FIRST_BUTTON_RETURN: NSModalResponse = 1000;
     if response == NS_ALERT_FIRST_BUTTON_RETURN {
+        // `into_bytes()` transfers the `String`'s heap allocation to
+        // the returned `Vec<u8>` without copying or re-allocating — the
+        // `Zeroizing<Vec<u8>>` wrapper then owns the same buffer that
+        // held the password as a `String` and reliably zeros it on
+        // drop. No residue-window between the two statements.
         Ok(Zeroizing::new(text.into_bytes()))
     } else {
+        // Cancel path: `text` is not consumed, so its heap allocation
+        // would otherwise drop without being scrubbed. Zero it
+        // explicitly before letting it go out of scope (volatile
+        // writes via the `Zeroize` impl for `String` — uncuttable by
+        // DCE, unlike `String::clear()` which the optimizer may elide).
+        text.zeroize();
         Err(SecureInputError::Cancelled)
     }
 }
