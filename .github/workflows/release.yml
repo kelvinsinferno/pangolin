@@ -1,0 +1,331 @@
+# Pangolin release workflow.
+#
+# Builds desktop bundles (Linux .deb + .AppImage, Windows NSIS .exe, macOS .dmg)
+# + browser-extension zip and publishes them to GitHub Releases.
+#
+# Trigger model (plan-LOCK MVP-4-M Q-locked):
+#   - push:tags `v*.*.*` (stable) and `v*.*.*-*` (pre-release) — primary
+#   - workflow_dispatch with explicit tag input — manual re-run if a
+#     transient runner failure needs a kick without re-tagging
+#
+# Two-phase macOS gate (Q-e LOCKED Option 1):
+#   - Linux + Windows desktop bundles + extension zip ATTACH to the
+#     GitHub Release immediately on tag.
+#   - macOS .dmg is BUILT in this workflow but uploaded ONLY as a
+#     workflow artifact, NOT attached to the Release. Release notes
+#     read "macOS: PENDING SMOKE." A human (Kelvin or the homie with
+#     the Mac) downloads the artifact, runs the manual unlock smoke
+#     checklist per the `pangolin_macos_release_smoke` memory, and on
+#     pass attaches the .dmg to the existing Release via a manual
+#     `gh release upload`. See README §macOS section for the smoke
+#     procedure.
+#
+# Secret-hygiene notes (per plan-LOCK §4 audit prompts):
+#   - GITHUB_TOKEN is the only secret used; never echoed.
+#   - No `--generate-notes` (would pull commit messages we may not
+#     want in the release body).
+#   - No third-party action that takes the token without inspection.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"      # stable (e.g. v0.1.0)
+      - "v*.*.*-*"    # pre-release (e.g. v0.1.0-beta.1)
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re-)build (e.g. v0.1.0-beta.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write  # gh release create/upload
+
+env:
+  # Single source of truth for the tag name across all jobs. On a
+  # push:tags event `github.ref_name` is the tag; on workflow_dispatch
+  # the user-supplied input wins.
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  desktop-bundle:
+    name: Desktop bundle (${{ matrix.platform.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { os: ubuntu-latest, target: linux-amd64, tauri_targets: "deb,appimage" }
+          - { os: windows-latest, target: windows-amd64, tauri_targets: "nsis" }
+          - { os: macos-14, target: macos-aarch64, tauri_targets: "dmg" }
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      # Tauri's Linux build pulls webkit2gtk + GTK + appindicator + dbus.
+      # Mirrors the deps installed in ci.yml's `secure-input-e2e
+      # (ubuntu-latest)` job — kept in sync intentionally.
+      - name: Install Linux deps
+        if: matrix.platform.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct cache key so the release workflow doesn't pollute
+          # the regular CI cache (different feature sets / target dirs).
+          prefix-key: "release-v1"
+          shared-key: ${{ matrix.platform.target }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      - name: Install JS deps
+        run: pnpm install --frozen-lockfile
+
+      # tauri-cli matching the runtime version in apps/desktop/Cargo.toml.
+      # Pinned to a minor range to match what we test against locally.
+      - name: Install tauri-cli
+        run: cargo install --locked tauri-cli --version "^2.0"
+
+      - name: Build bundle
+        working-directory: apps/desktop
+        run: cargo tauri build --bundles ${{ matrix.platform.tauri_targets }}
+
+      # ─── Linux bundles → release attachment (Phase 1) ──────────────
+      - name: Stage Linux bundles
+        if: matrix.platform.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          mkdir -p release-staging
+          cp target/release/bundle/deb/*.deb release-staging/
+          cp target/release/bundle/appimage/*.AppImage release-staging/
+          ls -lh release-staging/
+
+      - name: Upload Linux artifacts (for publish-release job)
+        if: matrix.platform.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-linux-amd64
+          path: release-staging/
+          if-no-files-found: error
+          retention-days: 7
+
+      # ─── Windows NSIS bundle → release attachment (Phase 1) ────────
+      - name: Stage Windows bundle
+        if: matrix.platform.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release-staging | Out-Null
+          Copy-Item target/release/bundle/nsis/*.exe release-staging/
+          Get-ChildItem release-staging/ | Format-Table Name, Length
+
+      - name: Upload Windows artifact (for publish-release job)
+        if: matrix.platform.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-windows-amd64
+          path: release-staging/
+          if-no-files-found: error
+          retention-days: 7
+
+      # ─── macOS .dmg → workflow artifact ONLY (Phase 2 manual attach) ─
+      # Per Q-e LOCKED Option 1: this DOES NOT go to the Release until
+      # the manual unlock smoke is signed off. Released artifact only.
+      - name: Stage macOS bundle
+        if: matrix.platform.os == 'macos-14'
+        shell: bash
+        run: |
+          mkdir -p release-staging
+          cp target/release/bundle/dmg/*.dmg release-staging/
+          ls -lh release-staging/
+
+      - name: Upload macOS artifact (PENDING manual smoke — NOT attached to Release)
+        if: matrix.platform.os == 'macos-14'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-macos-aarch64-pending-smoke
+          path: release-staging/
+          if-no-files-found: error
+          retention-days: 30  # longer — smoke can take a few days
+
+  # ─── Browser extension bundle ──────────────────────────────────────
+  extension-bundle:
+    name: Extension bundle (Chromium MV3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build extension
+        run: pnpm --filter @pangolin/extension build
+
+      # Chrome's manifest.json `version` field accepts only 1-4 dot-
+      # separated integers — `0.1.0-beta.1` is rejected at load time.
+      # We map the semver tag to a Chrome-compatible numeric version
+      # AND set `version_name` (display-only string Chrome accepts in
+      # any form) to the full semver. Result: Chrome's chrome://
+      # extensions page shows "Pangolin 0.1.0-beta.1" while the
+      # numeric version is `0.1.0`.
+      - name: Sync extension manifest version with tag
+        shell: bash
+        run: |
+          TAG="${RELEASE_TAG#v}"                  # 0.1.0-beta.1
+          NUMERIC="${TAG%%-*}"                    # 0.1.0
+          DISPLAY="${TAG}"                        # 0.1.0-beta.1
+          jq --arg v "$NUMERIC" --arg vn "$DISPLAY" \
+            '.version = $v | .version_name = $vn' \
+            apps/extension/dist/manifest.json \
+            > apps/extension/dist/manifest.json.tmp
+          mv apps/extension/dist/manifest.json.tmp apps/extension/dist/manifest.json
+          echo "Patched manifest.json:"
+          jq '{version, version_name}' apps/extension/dist/manifest.json
+
+      - name: Zip extension dist
+        shell: bash
+        run: |
+          TAG="${RELEASE_TAG#v}"
+          OUT="pangolin-extension-${TAG}.zip"
+          (cd apps/extension/dist && zip -r "../../../${OUT}" .)
+          ls -lh "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension-zip
+          path: pangolin-extension-*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  # ─── Publish to GitHub Releases (Phase 1: Linux + Windows + ext) ───
+  publish-release:
+    name: Publish Release (Phase 1 — Linux + Windows + extension)
+    needs: [desktop-bundle, extension-bundle]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Download Phase 1 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          # Only the artifacts that ship in Phase 1. The macOS .dmg
+          # artifact name ends in `-pending-smoke` and is intentionally
+          # NOT matched here.
+          pattern: "{bundle-linux-amd64,bundle-windows-amd64,extension-zip}"
+          merge-multiple: true
+
+      - name: List downloaded artifacts
+        shell: bash
+        run: ls -lh artifacts/
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          TAG_VERSION="${RELEASE_TAG#v}"
+          cat > release-notes.md <<NOTES
+          # Pangolin ${TAG_VERSION}
+
+          **Closed beta — Base Sepolia testnet only — pre-D-011 audit.**
+          Do not store production secrets in this build.
+
+          ## Downloads
+
+          | Platform | File |
+          |---|---|
+          | Linux (Debian/Ubuntu) | \`Pangolin_${TAG_VERSION}_amd64.deb\` |
+          | Linux (portable AppImage) | \`Pangolin_${TAG_VERSION}_amd64.AppImage\` |
+          | Windows (NSIS installer) | \`Pangolin_${TAG_VERSION}_x64-setup.exe\` |
+          | macOS (Apple Silicon) | ⏳ **PENDING MANUAL SMOKE** — see [#release-smoke](https://github.com/kelvinsinferno/pangolin/issues?q=is%3Aissue+label%3Arelease-smoke) |
+          | Browser extension (Chromium MV3) | \`pangolin-extension-${TAG_VERSION}.zip\` |
+
+          ## Install notes
+
+          - **Windows**: SmartScreen will warn "Windows protected your PC"
+            on first launch — that's expected for unsigned beta builds.
+            Click **More info** → **Run anyway**.
+          - **macOS**: ⏳ The \`.dmg\` is built in this workflow but is
+            not attached to this Release until the manual unlock-smoke
+            checklist has been completed on real macOS hardware. Look
+            for a Phase 2 update on this Release once that's done. To
+            track or run the smoke, see the project's macOS release
+            smoke checklist.
+          - **Linux AppImage**: \`chmod +x Pangolin_${TAG_VERSION}_amd64.AppImage\`
+            then run.
+          - **Linux .deb**: \`sudo dpkg -i Pangolin_${TAG_VERSION}_amd64.deb\`
+            (Debian/Ubuntu-family distros).
+          - **Browser extension**: open \`chrome://extensions\` → enable
+            **Developer Mode** → **Load Unpacked** → point at the
+            unzipped folder. The desktop app's first-launch wizard
+            (Q-d) walks through the rest of the setup.
+
+          ## Source commit
+
+          \`${{ github.sha }}\`
+
+          ## Reproduce from source
+
+          \`\`\`
+          git clone https://github.com/kelvinsinferno/pangolin
+          cd pangolin
+          git checkout ${{ env.RELEASE_TAG }}
+          pnpm install
+          (cd apps/desktop && cargo tauri build --bundles deb,appimage)
+          \`\`\`
+
+          For the full build matrix per OS, see \`.github/workflows/release.yml\`.
+          NOTES
+          echo "--- release notes ---"
+          cat release-notes.md
+
+      - name: Create or update Release (Phase 1 attach)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          # Idempotent on re-run via workflow_dispatch: if the Release
+          # exists (e.g. Phase 2 already attached the macOS .dmg or
+          # a previous run created it) we update assets + notes in
+          # place; otherwise we create the Release fresh as a
+          # pre-release flagged tag.
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} exists — uploading Phase 1 assets (--clobber)"
+            gh release upload "${RELEASE_TAG}" artifacts/* --clobber
+            gh release edit "${RELEASE_TAG}" --notes-file release-notes.md
+          else
+            echo "Creating Release ${RELEASE_TAG} (Phase 1 — pre-release, macOS pending)"
+            gh release create "${RELEASE_TAG}" \
+              --title "Pangolin ${RELEASE_TAG}" \
+              --notes-file release-notes.md \
+              --target "${{ github.sha }}" \
+              --prerelease \
+              artifacts/*
+          fi
