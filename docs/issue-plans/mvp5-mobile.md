@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-# MVP-5 — mobile (Android first, iOS to follow) — overview plan-gate LOCKED
+# MVP-5 — mobile (iOS + Android parallel) — overview plan-gate LOCKED
 
-**Status: LOCKED — Kelvin call 2026-06-02.** Q-a..f all resolved.
+**Status: LOCKED — Kelvin call 2026-06-02.** Q-a..f resolved (Q-b updated 2026-06-02 to parallel after PANGOLIN_PLAN.md alignment review).
 
 ## 0. One-paragraph summary
 
@@ -45,21 +45,33 @@ Reference posture memories:
   desktop, so the JSX from `apps/desktop/src/ui/screens/` actually
   runs on mobile too.
 
-- **Q-b — Platform sequencing = Android first, iOS to follow.**
-  Android sideload (`.apk` direct download + "unknown sources"
-  toggle) is cheap and works without paid dev accounts. iOS
-  sideload in 2026 effectively requires AltStore + macOS +
-  paid Apple Developer ($99/yr); gate iOS until Android proves
-  the mobile architecture. When iOS happens, it's a follow-on
-  sub-slice (not in MVP-5's initial scope).
+- **Q-b — Platform sequencing = iOS + Android in parallel** (revised
+  2026-06-02 after PANGOLIN_PLAN.md §8 alignment check). Each sub-
+  slice plan-LOCK covers the architecture for BOTH OSes; both
+  implementations land in the same sub-slice. Reasoning: iOS-specific
+  constraints (App Groups for autofill ↔ main-app keychain sharing,
+  Keychain access-groups, App Extension sandboxing) often FORCE design
+  decisions that retroactively rework Android code if Android ships
+  first in isolation. Designing both together = ~1-2 extra hours per
+  sub-slice plan-LOCK, no incremental implementation cost since the
+  iOS code would be written either way (just later). Initial Q-b
+  lock had iOS deferred; that was reverted to better honor
+  PANGOLIN_PLAN.md §8's "2 in parallel" intent while keeping the
+  cost-asymmetric distribution model from Q-c.
 
-- **Q-c — Distribution = Android `.apk` on GitHub Releases.**
-  Same workflow as desktop's `release.yml`. Tag-triggered job
-  produces `Pangolin-<version>.apk` and attaches it to the
-  GitHub Release. Mirrors the unsigned / friction-OK posture
-  of the desktop builds. iOS distribution (when it lands) will
-  use TestFlight, gated on a $99/yr Apple Developer Program
-  seat — separate decision when iOS sub-slice opens.
+- **Q-c — Distribution: Android `.apk` immediate / iOS `.ipa` as
+  workflow artifact pending dev-account decision.** Tag-triggered
+  `release-mobile.yml` produces both `Pangolin-<version>.apk` (Android)
+  AND `Pangolin-<version>.ipa` (iOS) on every release tag. The `.apk`
+  attaches to the GitHub Release immediately (mirrors desktop's
+  unsigned/friction-OK posture). The `.ipa` uploads as a workflow
+  artifact ONLY — NOT attached to the Release — until either:
+  (a) an Apple Developer Program seat ($99/yr) is acquired and
+  the `.ipa` is signed + submitted to TestFlight, or
+  (b) a sideload-via-AltStore path is documented.
+  Same two-phase pattern as desktop's macOS-pending-smoke gate
+  (Q-e on MVP-4-M). iOS code still ships in CI; iOS releases are
+  blocked on the account-acquisition decision.
 
 - **Q-d — Biometric = augments, doesn't replace, the master
   password.** Standard 1Password / Bitwarden pattern. First
@@ -119,15 +131,42 @@ Reference posture memories:
 - **No auto-updater.** Same reason as desktop: unsigned releases can't
   be cryptographically verified; users re-download manually.
 - **AGPL-3.0-or-later SPDX header** on every new file.
+- **No prices in the mobile UI — ever.** Per PANGOLIN_PLAN.md §8.1.5
+  + "iOS entitlement-state model" + pricing-spec rule. The mobile
+  app MUST NOT render currency strings, payment buttons, "Subscribe"
+  CTAs, billing-tier comparison tables, or any UI that implies
+  in-app purchase. Pricing copy lives on a website. The app reads
+  an entitlement state (ACTIVE / LIMITED_WRITES / IMPORT_RESTRICTED
+  / RECOVERY_ONLY / SUSPENDED) from the chain (or a future server)
+  and renders feature-gating based on it. Closed-beta has no
+  pricing yet; this invariant is documented now so no future
+  contributor accidentally adds a price string the App Store
+  reviewer would reject. Same rule applies to Android by symmetry,
+  even though Play Store is more permissive — keeps a single
+  pricing-display posture across both OSes.
+- **PANGOLIN_PLAN.md §8 issue numbering** (8.1.1 iOS shell, 8.1.2
+  Keychain, 8.1.3 ASCredentialProviderExtension, 8.1.4 iOS
+  recovery, 8.1.5 entitlement-state, 8.1.6 design-system port,
+  8.2.1 Android shell, 8.2.2 Keystore, 8.2.3 AutofillService,
+  8.2.4 Android recovery, 8.2.5 Android design system) maps to
+  our sub-slice A-I structure — each sub-slice carries an
+  explicit reference to the 8.x.y items it implements in §1.
 
 ## 0b. What NOT to ship in this MVP
 
 - **Native messaging-host equivalent on mobile.** Browser extension
-  ↔ desktop IPC is desktop-only by design; mobile autofill (if Q-f
-  ships) uses platform-native autofill APIs, not native messaging.
-- **App Store / Play Store reviewable production builds.** Paid
-  dev accounts + review process are explicitly deferred to MVP-6
-  unless Q-c picks Option 2.
+  ↔ desktop IPC is desktop-only by design; mobile autofill uses
+  platform-native autofill APIs (per Q-f), not native messaging.
+- **App Store / Play Store reviewable production builds.** Paid dev
+  accounts + review process deferred. iOS `.ipa` builds in CI but
+  doesn't ship to TestFlight until an Apple Developer seat is
+  acquired (per Q-c two-phase distribution). Android `.apk` ships
+  via GitHub Releases unsigned; Play Store deferred indefinitely.
+- **In-app pricing UI.** Per the no-prices-in-app self-locked
+  invariant — no $ strings, no payment buttons, no Subscribe CTAs.
+  Pricing lives on a website (when there is one); the app reads
+  entitlement state and renders feature-gating. No closed-beta
+  pricing infra exists; this is documented for future safety.
 - **iOS App Clips / Android Instant Apps.** Out of scope.
 - **Apple Watch / Wear OS companions.** Out of scope.
 - **Push notifications.** Pangolin is local-first; there's no Pangolin-
@@ -141,29 +180,46 @@ Reference posture memories:
 
 ## 1. Sub-slice breakdown (LOCKED)
 
-Sub-slice plan-LOCKs draft separately once dispatched. The sequence
-below is the build order; each lands as its own PR against main with
-its own merge boundary.
+Each sub-slice covers BOTH iOS and Android implementations (per Q-b
+parallel decision). Sub-slice plan-LOCKs draft separately once
+dispatched. The table below is the build order; each sub-slice lands
+as its own PR against main with its own merge boundary.
 
-| Sub-slice | What it ships | Depends on |
-|---|---|---|
-| **MVP-5-A** | Tauri 2 Mobile Android scaffold; minimal "open vault file picker" + "unlock with typed master password" flow; CI matrix extension for the Android target; verify Rust core compiles for `aarch64-linux-android` | (none) |
-| **MVP-5-B** | Vault open / unlock / lock / accounts-list / account-detail UX — port the desktop screens with mobile layout tweaks (touch targets, scroll behavior, soft-keyboard handling, status-bar styling) | A |
-| **MVP-5-C** | Secure mobile input widget for Android — Kotlin plugin wrapping `EditText` with `inputType=textPassword` + `setShowSoftInputOnFocus(true)`. Mobile equivalent of the desktop's MVP-4-H per-OS secure widgets (no V8 residue path) | A |
-| **MVP-5-D** | Biometric integration per Q-d — Android Keystore + `BiometricPrompt` API. Kotlin plugin stores the master password under `setUserAuthenticationRequired(true)` + `setUnlockedDeviceRequired(true)` + `setInvalidatedByBiometricEnrollment(true)`; biometric prompt unlocks for subsequent vault opens | B + C |
-| **MVP-5-E** | Multi-device pairing — mobile joins an existing desktop vault via camera QR scan + short-code paste fallback. Reuses `pangolin-ffi` pairing API; camera permission flow; QR decoding via `tauri-plugin-camera` or in-tree Kotlin equivalent | B + secure input from C |
-| **MVP-5-F** | Recovery flow per Q-e — typed seed phrase wizard + QR-import flow. QR generation lands on the desktop side too (new "Show QR" button on the existing backup-create wizard) | E |
-| **MVP-5-G** | Settings + first-launch posture — beta warning modal ports as-is, BetaChip ports as-is, ExtensionBanner is replaced with a "Connect to your desktop" banner that links into the pairing wizard | B |
-| **MVP-5-H** | Packaged release workflow — `.github/workflows/release-mobile.yml` tag-triggered on `mobile-v*.*.*-*`, produces signed `.apk` (debug-signed for closed beta) and uploads to GitHub Releases. Mirrors `release.yml` shape | A through G |
-| **MVP-5-I** | Android system `AutofillService` Kotlin plugin per Q-f. Registers Pangolin as system autofill provider; IPC from autofill service back to the main app to query the vault; biometric prompt fires if vault is locked. UX: a "Use Pangolin for autofill" Settings entry that deep-links to Android Settings → Autofill | D + B |
+| Sub-slice | What it ships (both OSes) | Maps to PANGOLIN_PLAN.md §8 | Depends on |
+|---|---|---|---|
+| **MVP-5-A** | Tauri 2 Mobile scaffolds — Android (`aarch64-linux-android` target, Kotlin plugin host) AND iOS (`aarch64-apple-ios` target, Swift plugin host); minimal "open vault + unlock with typed master password" flow on both; CI matrix extension (Android NDK build + iOS Xcode build legs) | 8.1.1, 8.2.1 | (none) |
+| **MVP-5-B** | Vault open / unlock / lock / accounts-list / account-detail UX — port desktop React screens with mobile layout tweaks (touch targets, scroll behavior, soft-keyboard handling, status-bar styling). Same React JSX renders on both via Tauri 2 Mobile's WebView | (no §8 mapping — UX layer) | A |
+| **MVP-5-C** | Secure mobile input widgets — Kotlin plugin wrapping `EditText` (`inputType=textPassword`) for Android; Swift plugin wrapping `UITextField` (`isSecureTextEntry = true`) for iOS. Mobile equivalents of the desktop's MVP-4-H per-OS secure widgets (no V8 residue path on either) | (no §8 mapping — secure-input dependency for 8.1.2, 8.2.2) | A |
+| **MVP-5-D** | Biometric integration per Q-d — Android: Keystore + `BiometricPrompt` API (`setUserAuthenticationRequired(true)` + `setUnlockedDeviceRequired(true)` + `setInvalidatedByBiometricEnrollment(true)`). iOS: Keychain Services with `kSecAttrAccessControl` = `.biometryCurrentSet`, App Group set up so the autofill extension can later share access. Both unlock the vault via the existing FFI path after biometric success | 8.1.2 (iOS Keychain + Secure Enclave) + 8.2.2 (Android Keystore) | B + C |
+| **MVP-5-E** | Multi-device pairing — mobile joins existing desktop vault via camera QR scan + short-code paste fallback. Camera permission flow on both OSes (`AVCaptureDevice` on iOS, `Camera2 API` on Android). Reuses `pangolin-ffi` pairing API | (no §8 mapping — uses MVP-4-I existing infrastructure) | B + secure input from C |
+| **MVP-5-F** | Recovery flow per Q-e — typed seed phrase wizard + QR-import flow on both OSes. QR generation lands on the desktop side too (new "Show QR" button on the existing backup-create wizard). Re-uses MVP-4-L recovery FFI | 8.1.4 (iOS guardian + recovery) + 8.2.4 (Android guardian + recovery) | E |
+| **MVP-5-G** | Settings + first-launch posture — BetaWarningModal + BetaChip port as-is on both. ExtensionBanner is replaced with a "Connect to your desktop" banner that links into the pairing wizard. Per the **no-prices-in-app invariant**, Settings shows entitlement state (ACTIVE / LIMITED_WRITES / etc.) read-only — no purchase UI | 8.1.5 (iOS entitlement-state model — display only this slice) | B |
+| **MVP-5-H** | Packaged release workflow — `.github/workflows/release-mobile.yml` tag-triggered on `mobile-v*.*.*-*`. Android: produces `.apk`, attaches to Release immediately. iOS: produces `.ipa`, uploads as workflow artifact ONLY (NOT attached to Release) per Q-c — pending Apple Developer Program seat. Same two-phase pattern as MVP-4-M's macOS gate | 8.1.7, 8.2.6 (TestFlight + Play Console builds — iOS half pending seat) | A through G |
+| **MVP-5-I** | System autofill on both OSes — Android: Kotlin `AutofillService` subclass registers Pangolin as system autofill provider. iOS: `ASCredentialProviderExtension` (App Group sharing with main app for Keychain access). Biometric prompts fire if vault is locked. "Use Pangolin for autofill" Settings entry deep-links into OS Settings → Autofill / Passwords  | 8.1.3 (iOS ASCredentialProviderExtension) + 8.2.3 (Android Autofill Service + Inline Suggestions) | D + B |
+| **MVP-5-J** (cross-platform) | Mobile design system port — same color/type/motion tokens as desktop; vertical stacking; thumb-friendly spacing; iOS-side Material → SwiftUI-look mapping; Android-side Material 3 mapping. Most of this can land alongside G but breaks out for visibility | 8.1.6 (iOS) + 8.2.5 (Android) | B |
 
-Total ~9 sub-slices. Roughly comparable to MVP-4's A-M arc.
+Total ~10 sub-slices. Roughly comparable to MVP-4's A-M arc, but
+each sub-slice now ships both OS implementations.
 
-**Not in MVP-5 (deferred to a separate iOS-mvp slice):**
-- iOS scaffold + Swift secure-input widget + iOS Keychain + iOS biometric
-- iOS recovery flow port
-- iOS `ASCredentialProviderExtension` (the iOS equivalent of MVP-5-I)
-- TestFlight distribution + Apple Developer Program seat decision
+**iOS-specific design notes that bake in NOW** (per parallel design
+discipline):
+- **App Groups**: iOS Keychain entries that need to be shared between
+  the main app and the `ASCredentialProviderExtension` (MVP-5-I)
+  require an App Group + `kSecAttrAccessGroup` configured at
+  Keychain-write time. MVP-5-D Keychain plumbing MUST set the access
+  group from day one — not retrofittable without a vault-data
+  migration.
+- **App Extension sandboxing**: iOS extensions run in a separate
+  sandbox from the main app. The autofill extension (MVP-5-I) cannot
+  spawn the main app or share memory; it reads the vault via
+  Keychain-shared encrypted store + biometric prompt. Architecture
+  must match: vault accessor in the extension is read-only via
+  Keychain-shared FFI, not via cross-process IPC.
+- **Sandboxed file system**: iOS apps have NSDocumentDirectory +
+  NSCachesDirectory; the vault file lives in Documents (excluded
+  from iCloud backup via `kCFURLIsExcludedFromBackupKey`). MVP-5-A
+  must wire the Tauri path resolver to use these — different from
+  Android's `getFilesDir()`.
 
 ## 2. Surface that needs to change (overview level)
 
@@ -174,13 +230,13 @@ new surface is:
 |---|---|
 | Rust core | unchanged |
 | `pangolin-ffi` | likely 0-3 small additions for biometric-keychain bindings (depends on Q-d) |
-| `apps/desktop` | unchanged |
+| `apps/desktop` | unchanged (except for the new "Show QR" button on the backup-create wizard for MVP-5-F's QR-import flow) |
 | `apps/extension` | unchanged |
-| `apps/mobile-android/` (new) | Tauri 2 Android shell + Kotlin platform-glue plugins (if Q-a = Option 1) |
-| `apps/mobile-ios/` (new) | Tauri 2 iOS shell + Swift platform-glue plugins (if Q-a = Option 1 and Q-b/c include iOS) |
-| `apps/mobile-shared/` (new) | Shared mobile React UI components (mostly re-exports from `@pangolin/component-library` with mobile-layout overrides) |
-| `.github/workflows/release-mobile.yml` (new) | Tag-triggered mobile release workflow |
-| `.github/workflows/ci.yml` | New mobile CI matrix legs (toolchain install, build, mobile-specific tests) |
+| `apps/mobile-android/` (new) | Tauri 2 Android shell + Kotlin platform-glue plugins. Per-sub-slice Kotlin plugins for secure input (C), biometric+Keystore (D), camera+QR (E), autofill service (I) |
+| `apps/mobile-ios/` (new) | Tauri 2 iOS shell + Swift platform-glue plugins. Per-sub-slice Swift plugins for secure input (C), biometric+Keychain (D), camera+QR (E), `ASCredentialProviderExtension` (I). App Groups configured from day one |
+| `apps/mobile-shared/` (new) | Shared mobile React UI components (mostly re-exports from `@pangolin/component-library` with mobile-layout overrides). One JSX tree renders on both Android + iOS |
+| `.github/workflows/release-mobile.yml` (new) | Tag-triggered mobile release workflow. Matrix: ubuntu-latest (Android build) + macos-14 (iOS build via Xcode). Android `.apk` attaches to Release; iOS `.ipa` uploads as workflow artifact only per Q-c |
+| `.github/workflows/ci.yml` | New mobile CI matrix legs (Android NDK install + Kotlin build, iOS Xcode build, both compile-only unit tests this MVP — emulator/simulator e2e is a follow-on) |
 
 ## 3. Threat model + posture notes
 
@@ -245,13 +301,22 @@ level prompts that apply across sub-slices:
   AVD emulator works for CI + early dev; physical-device smoke
   is required before each release tag (same posture as the
   desktop macOS smoke per [[pangolin_macos_release_smoke]]).
+- **Test iOS device or simulator**: needed for iOS code review,
+  even though iOS doesn't ship to TestFlight without an Apple
+  Developer seat. macOS host + Xcode simulator is the minimum
+  bar. Without one, MVP-5-A iOS scaffold can't be smoke-tested
+  locally and merges only on CI's signal.
+- **Apple Developer Program seat decision** ($99/yr): unblocks the
+  iOS Phase 2 release attach. Decision can be deferred indefinitely
+  per the audit-funding-pivot posture — code ships in CI as a
+  workflow artifact in the interim. Whenever the seat is acquired,
+  attaching `.ipa` to existing Releases is a single `gh release
+  upload` step (mirrors macOS Phase 2 from MVP-4-M).
 - **First mobile release tag** (`mobile-v0.1.0-beta.1`): same
   workflow-trigger pattern as desktop. Manual install + unlock
   smoke on a real Android device required before the tag is
-  announced.
-- **iOS sub-slice (separate MVP)**: when that opens, decide
-  whether to acquire an Apple Developer Program seat ($99/yr)
-  for TestFlight distribution. Until then iOS is out of scope.
+  announced. iOS smoke (on simulator + a physical device if
+  available) is the analogous gate for iOS `.ipa` attach.
 
 ## 7. Merge-boundary policy
 
