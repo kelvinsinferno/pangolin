@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Pangolin",
-  "version": "0.0.0",
+  "version": "0.1.0-beta.1",
   "identifier": "studio.kelvinsinferno.pangolin",
   "build": {
     "frontendDist": "dist",
@@ -27,11 +27,17 @@
     "withGlobalTauri": true
   },
   "bundle": {
-    "active": false,
+    "active": true,
     "targets": "all",
     "category": "Utility",
-    "shortDescription": "Pangolin password manager",
-    "longDescription": "Pangolin — closed-beta desktop password manager.",
-    "icon": []
+    "shortDescription": "Pangolin password manager (closed-beta, Base Sepolia testnet)",
+    "longDescription": "Pangolin — closed-beta desktop password manager. Pre-D-011 audit, testnet only. Do not store production secrets.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
   }
 }
