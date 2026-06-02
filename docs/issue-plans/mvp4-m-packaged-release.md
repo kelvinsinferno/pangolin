@@ -55,6 +55,28 @@ Reference posture memories:
   IDs; reversible via `uninstall-native-host`. Surfaces the file paths
   being written so users know what's happening on disk.
 
+- **Q-L3 (L3 sub-decision) — extension is OPTIONAL, surfaced via soft
+  banner.** The desktop is fully functional standalone (vault, accounts,
+  pairing, recovery all work without the extension); the extension is
+  for browser autofill convenience only. Therefore L3 ships:
+  - A non-blocking "Connect browser extension?" banner on first
+    launch (dismissible; reappears in Settings)
+  - A `Settings → Browser Connection` panel that hosts the actual
+    install wizard (paste extension ID → invoke `install_native_host`)
+    AND the "Disconnect browser extension" affordance (invokes
+    `uninstall_native_host`)
+  - First-launch banner does NOT block the unlock flow. Users who only
+    want desktop vault get out of the box without the extension nag.
+
+- **Q-L4 (L4 sub-decision) — beta warning re-fires on every new beta
+  tag.** Dismissal stores the dismissed version string in
+  `app_data_dir()` (e.g. `beta_warning_dismissed_at: "0.1.0-beta.1"`).
+  On app start the current version is compared to the stored one; if
+  they differ (including pre-release identifier — `beta.1` → `beta.2`
+  re-fires) the modal fires again. Rationale: every new beta = new
+  code = re-affirm warning. The persistent BETA/TESTNET title-bar chip
+  shows on every launch regardless of modal dismissal state.
+
 - **Q-e — macOS release gating = two-phase release.** Tag triggers
   Linux + Windows publish immediately; release notes start with
   "macOS: PENDING SMOKE." The `.dmg` is built in CI and uploaded as a
@@ -137,8 +159,13 @@ Reference posture memories:
 | L1 | `apps/desktop/icons/` | Regenerate via `pnpm tauri icon apps/desktop/icons/icon.png` (produces `.icns`, multi-size `.ico`, per-size PNGs) |
 | L2 | `.github/workflows/release.yml` (new) | Tag-triggered (`v*.*.*-*` + `v*.*.*`) + `workflow_dispatch` fallback; matrix over ubuntu-latest / windows-latest / macos-14 (Apple Silicon); steps: install deps → `pnpm install` → `pnpm tauri build --bundles <os-targets>` → upload artifacts → `gh release create` (or upload to existing release if Q-e picks Option 1's two-phase flow) |
 | L2 | `.github/workflows/release.yml` | Extension job: `pnpm --filter @pangolin/extension build` → zip `apps/extension/dist/` → attach to release (gated on Q-c = Option 1) |
-| L3 | `apps/desktop/src/ui/` (TBD per Q-d) | If Q-d = Option 1: new `BrowserConnectScreen` wizard or first-launch detection in `useVault.ts` + an `installNativeHost` invoke wrapper |
-| L4 | `apps/desktop/src/ui/` (TBD per Q-b) | If Q-b = Option 1: new first-launch dialog modal + a persistent "BETA / TESTNET" title-bar annotation |
+| L3 | `apps/desktop/src/ui/screens/SettingsScreen.tsx` (new) | `BrowserConnectionPanel` with paste-ID install + uninstall affordances (per Q-L3 = Optional) |
+| L3 | `apps/desktop/src/ui/components/ExtensionBanner.tsx` (new) | First-launch soft banner; dismissible, links to Settings. Persistence via `app_data_dir()` |
+| L3 | `apps/desktop/src/ui/lib/invoke.ts` | `installNativeHost(extensionId)` + `uninstallNativeHost()` invoke wrappers around existing Tauri commands |
+| L3 | `apps/desktop/src/commands/install_native_host.rs` | Verify the existing Tauri commands take an extension-ID arg; add manifest-presence check command if missing |
+| L4 | `apps/desktop/src/ui/components/BetaWarningModal.tsx` (new) | First-launch one-shot modal with the warning text + "I understand" button |
+| L4 | `apps/desktop/src/ui/components/BetaChip.tsx` (new) | Persistent title-bar chip ("BETA / TESTNET") shown on every launch |
+| L4 | `apps/desktop/src/commands/beta_warning.rs` (new) | `beta_warning_should_show()` + `beta_warning_dismiss(current_version)` reading/writing `app_data_dir()/beta_warning.json` |
 | L5 | `README.md` | New "## Download" section near the top with badges pointing at the latest Release + per-OS install instructions; per-OS Gatekeeper/SmartScreen notes (Q-a-dependent); separate "## Build from source" section for the existing flow |
 | L5 | `README.md` | "## Browser extension" section: link to the `.zip` asset + Load-Unpacked instructions (Q-c-dependent) |
 | L6 | Tag `v0.1.0-beta.1` | First release. Smoke-test the pipeline end-to-end. If Q-e = Option 1: macOS leg waits for manual smoke before adding the `.dmg` to the same release |
