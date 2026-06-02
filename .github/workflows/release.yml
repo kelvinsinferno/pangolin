@@ -279,7 +279,8 @@ jobs:
           cat > release-notes.md <<NOTES
           # Pangolin ${TAG_VERSION}
 
-          **Closed beta — Base Sepolia testnet only — pre-D-011 audit.**
+          **Closed beta — Base Sepolia testnet only — unaudited.**
+          Independent community audits are welcomed; the AGPL source is public.
           Do not store production secrets in this build.
 
           ## Downloads

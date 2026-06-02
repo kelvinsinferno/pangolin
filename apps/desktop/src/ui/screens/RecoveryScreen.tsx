@@ -148,8 +148,8 @@ export function RecoveryScreen({ onClose, onError }: RecoveryScreenProps) {
       </header>
 
       <p className="recovery-screen__testnet" role="note" data-testid="recovery-testnet-banner">
-        Testnet only — recovery stays on Base Sepolia until the external audit
-        (D-011) clears.
+        Testnet only — recovery stays on Base Sepolia until enough community review
+        + tester feedback clears it for mainnet.
       </p>
 
       {showGuardiansWizard ? (

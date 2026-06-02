@@ -188,7 +188,7 @@ export function DevicesScreen({ onClose, onError, onJoined, onRekeyed }: Devices
 
       <p className="devices-screen__testnet" role="note" data-testid="devices-testnet-banner">
         Testnet only — pairing + removal publish to Base Sepolia. Multi-device
-        stays on testnet until the external audit (D-011) clears.
+        stays on testnet until enough community review + tester feedback clears it for mainnet.
       </p>
 
       {pending.length > 0 && mode === 'landing' && (
