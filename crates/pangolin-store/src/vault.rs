@@ -450,14 +450,12 @@ pub struct Vault {
     /// actually waiting 4 hours.
     clock: Box<dyn Clock>,
     /// Sidecar lock file held open for the lifetime of the `Vault`.
-    /// The file is created with `create_new(true)` so a second `open`
-    /// attempt on the same vault path observes its presence and
-    /// returns [`StoreError::AlreadyOpen`]. The file is removed on
-    /// `Drop`. After a hard crash the file remains and the next
-    /// `Vault::open` call will surface as `AlreadyOpen` until the
-    /// stale `.lock` is manually removed — this is the documented
-    /// operational hazard from `docs/issue-plans/P2.md` "Failure modes
-    /// considered" §"File deleted while open" sibling.
+    /// The file is created with `create_new(true)` and stamped with
+    /// the holder's PID + timestamp so a second `open` attempt on the
+    /// same vault path can distinguish a live holder (returns
+    /// [`StoreError::AlreadyOpen`]) from a stale leftover (auto-
+    /// reclaimed; MVP-4-O recovery in `acquire_lock`). The file is
+    /// removed on `Drop`.
     _lock_file: File,
 }
 
@@ -467,16 +465,160 @@ fn lock_path(vault_path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// Write our PID + a Unix timestamp into the freshly-created lock
+/// file. The format is line-based + parseable; the next process to
+/// race for the same lock reads these fields back via
+/// [`parse_lock_pid`] to decide whether the previous owner is still
+/// alive (see MVP-4-O).
+fn stamp_lock_file(f: &mut File) {
+    let pid = std::process::id();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Best-effort; a failure here doesn't block us — the worst case is
+    // that a future force-quit recovery treats this lock as stale
+    // (which is the right direction: a missing-PID file means an
+    // unknown holder, and we already reclaim those).
+    let _ = writeln!(f, "pangolin-store vault lock");
+    let _ = writeln!(f, "pid={pid}");
+    let _ = writeln!(f, "ts={ts}");
+}
+
+/// Parse the `pid=<u32>` line out of an existing lock file. Returns
+/// `None` if the file is empty, malformed, or missing the pid line
+/// (which is the case for legacy lock files written before MVP-4-O
+/// added PID tracking — those are treated as stale by the recovery
+/// path because the holder is by definition long-gone if its lock
+/// file lacks the new format).
+fn parse_lock_pid(vault_path: &Path) -> Option<u32> {
+    let lp = lock_path(vault_path);
+    let contents = std::fs::read_to_string(&lp).ok()?;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("pid=") {
+            return rest.trim().parse::<u32>().ok();
+        }
+    }
+    None
+}
+
+/// Cross-platform PID liveness check. Returns `true` if the process
+/// with the given id is currently running.
+///
+/// **Unix:** uses `nix::sys::signal::kill(pid, None)` — equivalent to
+/// `kill -0 <pid>`, returns Ok if alive, Err(ESRCH) if dead. Safe
+/// wrapper, no `unsafe` needed at our call site (preserves
+/// `forbid(unsafe_code)`).
+///
+/// **Windows:** spawns `tasklist /FI "PID eq <pid>" /NH /FO CSV`. The
+/// output is empty (header-only) when no process matches; non-empty
+/// when one does. Avoids a `windows-sys` direct dep (which would
+/// require relaxing `forbid(unsafe_code)`).
+///
+/// Conservative direction: when the check itself fails for any
+/// reason (couldn't spawn `tasklist`, kill returned an unexpected
+/// errno), we report `true` (assumed alive) so we don't accidentally
+/// steal a lock from a live holder. The "we leaked a sidecar"
+/// outcome is recoverable (delete the .lock manually); the "two
+/// processes wrote to the same `SQLite` WAL" outcome is not.
+#[cfg(unix)]
+fn is_pid_alive(pid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    // POSIX `pid_t` is `i32`. A `u32` value that overflows `i32`
+    // can never be a real PID, so treat it as dead — important for
+    // the stale-lock recovery path (a corrupted lock file or
+    // u32::MAX sentinel must reclaim, not perma-block the user).
+    let raw: i32 = match i32::try_from(pid) {
+        Ok(v) if v > 0 => v,
+        _ => return false,
+    };
+    // `Ok(())` (alive) and `Err(non-ESRCH)` (e.g. EPERM — the
+    // process exists but we can't signal it) both mean "assumed
+    // alive"; collapsing them is intentional, see the doc-comment.
+    !matches!(kill(Pid::from_raw(raw), None), Err(Errno::ESRCH))
+}
+
+#[cfg(windows)]
+fn is_pid_alive(pid: u32) -> bool {
+    use std::process::Command;
+    // Mirror the Unix overflow guard: PIDs above `i32::MAX` can never
+    // be a real Windows process (DWORD is technically `u32` but the
+    // PID allocator never crosses 2^31). Without this, `tasklist`
+    // rejects the filter string and we'd fall through to the
+    // conservative-alive path — causing PR #8 CI's
+    // `stale_lock_with_dead_pid_is_reclaimed` test to flake on
+    // Windows with `pid=u32::MAX` (4294967295).
+    if pid > i32::MAX as u32 {
+        return false;
+    }
+    let filter = format!("PID eq {pid}");
+    let out = match Command::new("tasklist")
+        .args(["/FI", &filter, "/NH", "/FO", "CSV"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return true,
+    };
+    // Examine stdout regardless of exit status: tasklist sometimes
+    // returns non-zero for "filter matched nothing" depending on the
+    // Windows build, but the stdout payload is still authoritative.
+    // If the PID needle is absent the process is gone.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let needle = format!("\"{pid}\"");
+    stdout.contains(&needle)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_pid_alive(_pid: u32) -> bool {
+    true
+}
+
 fn acquire_lock(vault_path: &Path) -> Result<File> {
     let lp = lock_path(vault_path);
     match OpenOptions::new().write(true).create_new(true).open(&lp) {
         Ok(mut f) => {
-            // Stamp the lock file so a human inspecting it knows what
-            // it is. Best-effort; failure here doesn't block us.
-            let _ = writeln!(f, "pangolin-store vault lock");
+            stamp_lock_file(&mut f);
             Ok(f)
         }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(StoreError::AlreadyOpen),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            // MVP-4-O stale-lock recovery. The collision could be:
+            //   (a) a live concurrent `Vault` holding the lock — must
+            //       return AlreadyOpen so we don't corrupt the SQLite
+            //       WAL with two writers.
+            //   (b) a leftover sidecar from a prior force-quit — the
+            //       holder process is gone but its `Drop` never ran.
+            //       We must reclaim or the user is bricked out of
+            //       their own vault.
+            //
+            // We distinguish (a) from (b) by reading the PID stamped
+            // into the lock file and checking liveness. A missing /
+            // unparseable PID line is treated as (b) — pre-MVP-4-O
+            // lock files predate PID tracking and by definition can't
+            // have a live holder using the current code path.
+            let stale = parse_lock_pid(vault_path).is_none_or(|pid| !is_pid_alive(pid));
+            if !stale {
+                return Err(StoreError::AlreadyOpen);
+            }
+            // Best-effort remove + retry create_new ONCE. If two
+            // processes race for the same stale lock, only one wins
+            // the create_new; the loser observes AlreadyExists on
+            // retry and returns AlreadyOpen (caller can re-attempt
+            // later, which is the same UX as today's "wait + retry"
+            // for a live lock).
+            let _ = std::fs::remove_file(&lp);
+            match OpenOptions::new().write(true).create_new(true).open(&lp) {
+                Ok(mut f) => {
+                    stamp_lock_file(&mut f);
+                    Ok(f)
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Err(StoreError::AlreadyOpen)
+                }
+                Err(other) => Err(StoreError::Io(other)),
+            }
+        }
         Err(other) => Err(StoreError::Io(other)),
     }
 }
@@ -11290,7 +11432,10 @@ impl RawRevisionRow {
 
 #[cfg(test)]
 mod tests {
-    use super::{recovery_escrow::GUARDIAN_SIGNER_LEN, RevisionLogVersion, Vault, VaultState};
+    use super::{
+        is_pid_alive, lock_path, parse_lock_pid, recovery_escrow::GUARDIAN_SIGNER_LEN,
+        RevisionLogVersion, Vault, VaultState,
+    };
     use crate::account::AccountSnapshot;
     use crate::error::StoreError;
     use crate::meta::{FORMAT_VERSION, MAGIC};
@@ -12210,6 +12355,67 @@ mod tests {
         let _v1 = Vault::open(&p).unwrap();
         let err = Vault::open(&p).unwrap_err();
         assert!(matches!(err, StoreError::AlreadyOpen));
+    }
+
+    /// MVP-4-O: a sidecar `.pvf.lock` left behind by a force-quit
+    /// (with a PID that no longer exists) must be auto-reclaimed on
+    /// the next `Vault::open`. Without this, the user is bricked out
+    /// of their own vault after a single kill -9 / power loss.
+    ///
+    /// Uses `u32::MAX` as the synthetic dead PID. POSIX caps PIDs at
+    /// `INT_MAX` and Windows caps process IDs well below `u32::MAX`,
+    /// so no process can ever have this id — the liveness check
+    /// returns false deterministically on every platform.
+    #[test]
+    fn stale_lock_with_dead_pid_is_reclaimed() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "stale.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let lp = lock_path(&p);
+        std::fs::write(&lp, "pangolin-store vault lock\npid=4294967295\nts=0\n").unwrap();
+        // A live-PID sentinel under the same path was NOT in flight,
+        // so the open MUST succeed — the dead PID triggers reclaim.
+        let _v = Vault::open(&p).expect("stale lock with dead PID must be reclaimed");
+        // And the new owner's PID is now stamped into the file.
+        assert_eq!(parse_lock_pid(&p), Some(std::process::id()));
+    }
+
+    /// MVP-4-O: a legacy lock file from a pre-MVP-4-O build (no
+    /// `pid=` line) must also reclaim — by definition such a file
+    /// has no live holder using the new code path.
+    #[test]
+    fn stale_lock_without_pid_line_is_reclaimed() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "legacy.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let lp = lock_path(&p);
+        std::fs::write(&lp, "pangolin-store vault lock\n").unwrap();
+        let _v = Vault::open(&p).expect("legacy lock (no PID line) must be reclaimed");
+    }
+
+    /// MVP-4-O: a live lock — sidecar stamped with THIS process's
+    /// PID — must NOT be reclaimed. Returning `AlreadyOpen` here is
+    /// the difference between "user is bricked out" (acceptable;
+    /// they delete the .pvf.lock manually) and "two writers
+    /// corrupt the `SQLite` WAL" (NOT acceptable; data loss).
+    #[test]
+    fn live_lock_with_current_pid_is_not_reclaimed() {
+        let dir = TempDir::new().unwrap();
+        let p = vault_path(&dir, "live.pvf");
+        Vault::create(&p, &fresh_password()).unwrap();
+        let lp = lock_path(&p);
+        let pid = std::process::id();
+        std::fs::write(&lp, format!("pangolin-store vault lock\npid={pid}\nts=0\n")).unwrap();
+        let err = Vault::open(&p).expect_err("live PID must block open");
+        assert!(matches!(err, StoreError::AlreadyOpen));
+    }
+
+    /// MVP-4-O: PID liveness check returns true for our own PID.
+    /// Belt-and-braces sanity check on `is_pid_alive` so we don't
+    /// have to fork a child just to assert the positive direction.
+    #[test]
+    fn is_pid_alive_for_self() {
+        assert!(is_pid_alive(std::process::id()));
     }
 
     /// Success criterion 9: lock drops the cache (best-effort,

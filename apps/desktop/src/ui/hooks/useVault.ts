@@ -66,11 +66,14 @@ export type UnlockResult =
 
 export interface VaultActions {
   openVault(path: string): Promise<{ ok: true } | { ok: false; error: DesktopError }>;
-  /** MVP-4-N first-launch vault-create. Opens the OS native password
-   *  dialog (no V8 password residue), creates the file on disk, then
-   *  calls `vaultOpen(path)` so the state machine lands on Locked +
-   *  the user can unlock immediately (same SecurePasswordButton
-   *  flow as the existing unlock path). */
+  /** MVP-4-O first-launch vault-create + auto-unlock. The backend
+   *  command now performs create + open + unlock atomically using the
+   *  password collected by the OS native dialog, so the state machine
+   *  lands on Active (with the accounts list, which is empty for a
+   *  fresh vault) — not Locked. This avoids the v0.1.0-beta.2
+   *  dead-end where the user typed a password into a non-echoing
+   *  dialog and then had to type it AGAIN on the unlock screen with
+   *  no feedback. */
   createVault(path: string): Promise<{ ok: true } | { ok: false; error: DesktopError }>;
   unlockVault(): Promise<UnlockResult>;
   lockVault(): Promise<{ ok: true } | { ok: false; error: DesktopError }>;
@@ -105,14 +108,12 @@ export function useVault(): { state: VaultState; actions: VaultActions } {
 
   const createVault = useCallback(async (path: string) => {
     try {
+      // Backend chains create -> open -> install -> unlock atomically
+      // with the same password the user typed into the OS native
+      // dialog. No second password prompt.
       await vaultCreateViaSecurePrompt(path);
-      // Same path the openVault callback uses — install the new file
-      // as the active handle so the state machine lands on Locked.
-      // The user types the password again on the unlock screen
-      // (intentional confirmation step; see vault_create_via_secure_prompt
-      // doc-comment for the UX rationale).
-      await vaultOpen(path);
-      setState((prev) => ({ ...prev, stage: 'locked' }));
+      const list = await accountsList();
+      setState((prev) => ({ ...prev, stage: 'active', accounts: list }));
       return { ok: true as const };
     } catch (e) {
       return { ok: false as const, error: toDesktopError(e) };
