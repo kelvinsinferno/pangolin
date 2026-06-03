@@ -126,48 +126,64 @@ pub async fn vault_unlock_via_secure_prompt(
 // 1b / 10 — vault_create_via_secure_prompt
 // ---------------------------------------------------------------------------
 
-/// **Create a new vault file at `path` via the OS native password dialog.**
+/// **Create a new vault file at `path` AND unlock it via the OS
+/// native password dialog.**
 ///
 /// First-launch flow: the welcome screen's "Create new vault" button
 /// calls this AFTER a native save-dialog has picked `path`. We open the
-/// secure-input dialog to collect the master password, then call
-/// `pangolin_ffi::session::vault_create(path, password)`.
+/// secure-input dialog ONCE to collect the master password, then chain:
+///
+/// 1. `pangolin_ffi::session::vault_create(path, password)` — writes
+///    the `.pvf` file. `bytes_for_bridge` copies the password without
+///    consuming the Arc, so the same Arc can be reused for unlock.
+/// 2. `pangolin_ffi::session::vault_open(path)` — opens the freshly-
+///    written file, returns a VaultHandle.
+/// 3. `state.install(handle)` — places the handle in the Tauri-managed
+///    `VaultState` slot so subsequent commands route to it.
+/// 4. `pangolin_ffi::session::vault_unlock(handle, password, presence)`
+///    — derives the authority + activates the session.
+///
+/// **MVP-4-O revision (2026-06-02):** the prior behavior asked for the
+/// password twice (create + then unlock on the next screen) — see the
+/// beta.2 feedback. The "type twice to catch typos" pattern was
+/// confusing because the OS native dialog doesn't show the typed
+/// password. New behavior: type once, vault is created AND unlocked
+/// atomically. Typo risk is mitigated separately in a follow-on
+/// (richer password-creation UX with show/hide + strength + autogen).
 ///
 /// Unlike the other `*_via_secure_prompt` commands this one is NOT
 /// gated on `state.require_open()` — the whole point is that no vault
-/// is open yet. After a successful create, the caller must:
-///
-/// 1. Call `vault_open(path)` to install the new file as the active
-///    handle (sets stage = Locked).
-/// 2. Call `vault_unlock_via_secure_prompt()` to unlock (sets stage =
-///    Active). The user types the same password they just chose;
-///    `vault_create` and `vault_unlock` derive the authority from the
-///    password independently, so the password isn't cached anywhere.
-///
-/// We intentionally do NOT auto-unlock after create — the user just
-/// chose a password; making them type it twice catches typos before
-/// they're locked out of a freshly-created vault. (UX trade: one extra
-/// password entry vs. permanent lockout from a fat-fingered initial
-/// password.)
+/// is open yet.
 ///
 /// # Errors
 ///
 /// - [`DesktopError::Validation`] (`kind = "secure_input_cancelled"`)
 ///   if the user dismissed the password dialog.
-/// - [`DesktopError::Store`] for an I/O failure (e.g. the file already
-///   exists, or the parent directory is read-only).
+/// - [`DesktopError::Store`] for an I/O failure (e.g. file already
+///   exists, parent dir read-only, or stale `.pvf.lock` sidecar from
+///   a prior force-quit). Stale-lock recovery lands in the same slice.
+/// - [`DesktopError::AuthenticationFailed`] — should be impossible
+///   given the same password is used for create + unlock, but
+///   surfaced for safety.
 #[allow(clippy::needless_pass_by_value)]
 #[tauri::command]
 pub async fn vault_create_via_secure_prompt(
     app: tauri::AppHandle,
     path: String,
+    state: State<'_, VaultState>,
 ) -> Result<(), DesktopError> {
     let secret = prompt_secret(
         &app,
         "Create new vault",
         "Choose a master password for the new vault",
     )?;
-    pangolin_ffi::session::vault_create(path, secret).map_err(DesktopError::from)?;
+    pangolin_ffi::session::vault_create(path.clone(), Arc::clone(&secret))
+        .map_err(DesktopError::from)?;
+    let handle = pangolin_ffi::session::vault_open(path).map_err(DesktopError::from)?;
+    state.install(Arc::clone(&handle))?;
+    let presence = crate::commands::vault::cli_presence_proof();
+    let _session_info = pangolin_ffi::session::vault_unlock(handle, secret, presence)
+        .map_err(DesktopError::from)?;
     Ok(())
 }
 
