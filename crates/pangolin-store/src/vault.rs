@@ -543,6 +543,16 @@ fn is_pid_alive(pid: u32) -> bool {
 #[cfg(windows)]
 fn is_pid_alive(pid: u32) -> bool {
     use std::process::Command;
+    // Mirror the Unix overflow guard: PIDs above `i32::MAX` can never
+    // be a real Windows process (DWORD is technically `u32` but the
+    // PID allocator never crosses 2^31). Without this, `tasklist`
+    // rejects the filter string and we'd fall through to the
+    // conservative-alive path — causing PR #8 CI's
+    // `stale_lock_with_dead_pid_is_reclaimed` test to flake on
+    // Windows with `pid=u32::MAX` (4294967295).
+    if pid > i32::MAX as u32 {
+        return false;
+    }
     let filter = format!("PID eq {pid}");
     let out = match Command::new("tasklist")
         .args(["/FI", &filter, "/NH", "/FO", "CSV"])
@@ -551,9 +561,10 @@ fn is_pid_alive(pid: u32) -> bool {
         Ok(o) => o,
         Err(_) => return true,
     };
-    if !out.status.success() {
-        return true;
-    }
+    // Examine stdout regardless of exit status: tasklist sometimes
+    // returns non-zero for "filter matched nothing" depending on the
+    // Windows build, but the stdout payload is still authoritative.
+    // If the PID needle is absent the process is gone.
     let stdout = String::from_utf8_lossy(&out.stdout);
     let needle = format!("\"{pid}\"");
     stdout.contains(&needle)
